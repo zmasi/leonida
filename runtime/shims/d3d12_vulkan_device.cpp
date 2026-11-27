@@ -10990,6 +10990,15 @@ public:
         file_ = journal::read_with_seed(path_, pipeline_journal_roots().seed, device_.pso_identity, role);
     }
 
+    // Re-reads `path_` when an earlier load found no usable entry (after waiting on a lock, gate drain, or `.building`).
+    bool reload() {
+        if (!enabled_ || has_file_data() || path_.empty()) return has_file_data();
+        namespace journal = leonida::pipeline_journal;
+        const auto role = compile_helper::build_host.load() ? journal::ReadRole::materialize_local : journal::ReadRole::runtime;
+        file_ = journal::read_with_seed(path_, pipeline_journal_roots().seed, device_.pso_identity, role);
+        return has_file_data();
+    }
+
     // In the build's driver turn.
     void create() {
         if (!enabled_) return;
@@ -11236,9 +11245,18 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
             marked = path;
         }
     }
-    // Only a compile here is serialized: a pipeline from its journal file takes milliseconds.
-    if (!journal.has_file_data() && options.serialize_big && big_compiles() == BigCompiles::serial && big_compute(bytes))
-        big_lock.lock();
+    // Only a compile here is serialized: a pipeline from its journal file takes milliseconds. Re-check the journal
+    // after any compile-gate drain, `big_lock` wait, or active helper `.building` lock before entering `DriverTurn`.
+    const bool serial_big = options.serialize_big && big_compiles() == BigCompiles::serial && big_compute(bytes);
+    if (!journal.has_file_data()) {
+        if (journal.enabled()) {
+            compile_helper::coordinate_fallback_compile(
+                out.journal_path, device.pso_identity, serial_big, compile_helper::wanted(bytes), big_lock,
+                [&] { return journal.reload(); }, [&] { submits.wait_for_compile_gate_drain(); }, &marked);
+        } else if (serial_big) {
+            big_lock.lock();
+        }
+    }
     const bool ask_shared = journal.enabled() && !journal.has_file_data() && shared && device.pipeline_cache_seeded &&
                             device.info.pipeline_cache_control && device.journal_ask_shared.load();
 

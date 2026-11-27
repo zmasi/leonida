@@ -2760,7 +2760,9 @@ Pipeline creation:
   later helper does not read every module again. `requests/<name>.building` is a lock file a process holds for the
   whole build (no sharing, deleted by the OS when that process ends, killed or not), whose contents name the process:
   the helper and `--precompile-pipelines` leave an entry its holder is building to it, and a file no process holds is
-  stale whatever process id it names. Measured, RTX 4070 Ti,
+  stale whatever process id it names. When a build here falls back after a helper wait or pending bound, it re-reads the
+  journal file after any compile-gate drain or serialization wait, waits out an active `.building` lock if the helper
+  started the entry meanwhile, and otherwise holds `.building` and removes `.req` across its own build. Measured, RTX 4070 Ti,
   driver 630.20, a boot with an empty journal and the helper waiting (no asynchronous builds): the helper compiled 171
   pipelines of 128 KiB or more (148 s in its driver), every one of them was a hit in the title's process (at most
   2 ms), and no submission waited at the compile gate.

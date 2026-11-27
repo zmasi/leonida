@@ -194,6 +194,41 @@ int compile_gate() {
         EXPECT(other_waited.load() == 0);
     }
     std::printf("compile gate: creates pass it together\n");
+    // wait_for_compile_gate_drain returns at once when no submission waits, and blocks until a queued submission leaves
+    // without entering the compile gate itself (no increment to stats.creates).
+    EXPECT(m.wait_for_compile_gate_drain() == 0);
+    {
+        const std::uint64_t creates_before = m.gate_stats().creates;
+        std::atomic<bool> in_compile{false};
+        std::atomic<std::int64_t> sub_left_at{0}, drained_at{0}, drained_ms{-1};
+        std::thread holder([&] {
+            const SubmitMutex::CompileTurn turn(m);
+            in_compile = true;
+            std::this_thread::sleep_for(120ms);
+        });
+        EXPECT(eventually([&] { return in_compile.load(); }));
+        std::thread sub([&] {
+            m.lock();
+            {
+                const SubmitMutex::SubmitTurn turn(m);
+                std::this_thread::sleep_for(80ms);
+                sub_left_at = now_ms();
+            }
+            m.unlock();
+        });
+        EXPECT(eventually([&] { return m.gate_waiter() != 0; }));
+        std::thread drainer([&] {
+            drained_ms = m.wait_for_compile_gate_drain();
+            drained_at = now_ms();
+        });
+        holder.join();
+        sub.join();
+        drainer.join();
+        EXPECT(drained_at.load() >= sub_left_at.load());
+        EXPECT(drained_ms.load() >= 50);
+        EXPECT(m.gate_stats().creates == creates_before);
+    }
+    std::printf("compile gate: drain waits for queued submission without taking a compile turn\n");
     return 0;
 }
 

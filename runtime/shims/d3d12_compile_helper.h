@@ -323,6 +323,14 @@ public:
         tried_ = true;
     }
 
+    // Current `LEONIDA_COMPILE_HELPER_WAIT_MS` bound (default 120 s; 0: no limit). Read per call so tests can adjust it.
+    static unsigned long long wait_limit_ms() {
+        char text[32]{};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_COMPILE_HELPER_WAIT_MS", text, sizeof(text));
+        if (n == 0 || n >= sizeof(text)) return 120000ull;
+        return std::strtoull(text, nullptr, 10);
+    }
+
 private:
     // Under mutex_ (or before it is taken): this process's bookkeeping for a request that is answered.
     void drop(const std::string& stem) {
@@ -410,6 +418,101 @@ private:
     std::map<std::string, std::uint64_t> asked_;  // stem -> priority of the request written
     std::map<std::string, std::chrono::steady_clock::time_point> pending_since_;  // stem -> first seen pending
 };
+
+// Waits while another process or thread holds `journal_file`'s `.building` lock (up to `max_wait_ms`; 0: no limit),
+// returning true if a usable `journal_file` is present when the wait ends.
+inline bool wait_for_active_build(const std::filesystem::path& journal_file,
+                                  const leonida::cached_pso::Identity& identity,
+                                  unsigned long long max_wait_ms = Client::wait_limit_ms()) {
+    if (leonida::pipeline_journal::entry_usable(journal_file, identity)) return true;
+    if (!building_held(journal_file)) return leonida::pipeline_journal::entry_usable(journal_file, identity);
+    const auto start = std::chrono::steady_clock::now();
+    while (building_held(journal_file)) {
+        if (max_wait_ms && std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(max_wait_ms))
+            return leonida::pipeline_journal::entry_usable(journal_file, identity);
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return leonida::pipeline_journal::entry_usable(journal_file, identity);
+}
+
+// Coordinates an in-process fallback build of a helper-eligible `journal_file` before entering `DriverTurn`:
+//   1. Returns true if `journal_file` became usable (while waiting on a lock or an active helper `.building`).
+//   2. Otherwise claims `.building` into `*claimed_out` and removes any leftover `.req` so the helper does not start a
+//      duplicate concurrent compile after this process enters the driver. Re-checks `entry_usable` once after claiming
+//      `.building` to close the window between the helper's publish and lock release.
+inline bool await_late_journal_or_claim_local(const std::filesystem::path& journal_file,
+                                              const leonida::cached_pso::Identity& identity,
+                                              std::filesystem::path* claimed_out,
+                                              unsigned long long max_wait_ms = Client::wait_limit_ms()) {
+    if (wait_for_active_build(journal_file, identity, max_wait_ms)) return true;
+    if (!mark_building(journal_file)) {
+        if (wait_for_active_build(journal_file, identity, max_wait_ms)) return true;
+        if (!mark_building(journal_file)) return leonida::pipeline_journal::entry_usable(journal_file, identity);
+    }
+    if (leonida::pipeline_journal::entry_usable(journal_file, identity)) {
+        unmark_building(journal_file);
+        return true;
+    }
+    if (claimed_out) *claimed_out = journal_file;
+    std::error_code ec;
+    std::filesystem::remove(request_path(journal_file), ec);
+    return false;
+}
+
+// Coordinates serialization (`big_lock`, when `serial_big`), compile-gate drain (`drain_gate`), late journal reload
+// (`reload`, returning true when usable journal bytes are now loaded), and `.building` ownership (`claimed_out`, when
+// `use_building`) right before entering `DriverTurn`. Leaves `big_lock` unlocked whenever `reload()` succeeds so a fast
+// journal hit never holds or serializes on `big_lock`, and maintains strict `big_lock` -> `.building` lock order.
+template<typename Lock, typename Reload, typename DrainGate>
+bool coordinate_fallback_compile(const std::filesystem::path& journal_file,
+                                 const leonida::cached_pso::Identity& identity,
+                                 bool serial_big,
+                                 bool use_building,
+                                 Lock& big_lock,
+                                 Reload&& reload,
+                                 DrainGate&& drain_gate,
+                                 std::filesystem::path* claimed_out,
+                                 unsigned long long max_wait_ms = Client::wait_limit_ms()) {
+    if (use_building && wait_for_active_build(journal_file, identity, max_wait_ms) && reload()) {
+        if (big_lock.owns_lock()) big_lock.unlock();
+        return true;
+    }
+    if (!reload()) {
+        drain_gate();
+        if (reload()) {
+            if (big_lock.owns_lock()) big_lock.unlock();
+            return true;
+        }
+    } else {
+        if (big_lock.owns_lock()) big_lock.unlock();
+        return true;
+    }
+    if (serial_big && !big_lock.owns_lock()) {
+        big_lock.lock();
+        if (reload()) {
+            big_lock.unlock();
+            return true;
+        }
+    }
+    if (!use_building || (claimed_out && !claimed_out->empty())) return false;
+    if (big_lock.owns_lock() && building_held(journal_file)) big_lock.unlock();
+    if (await_late_journal_or_claim_local(journal_file, identity, claimed_out, max_wait_ms) && reload()) {
+        if (big_lock.owns_lock()) big_lock.unlock();
+        return true;
+    }
+    if (serial_big && !big_lock.owns_lock()) {
+        if (claimed_out && !claimed_out->empty()) {
+            unmark_building(*claimed_out);
+            claimed_out->clear();
+        }
+        big_lock.lock();
+        if (reload() || (await_late_journal_or_claim_local(journal_file, identity, claimed_out, max_wait_ms) && reload())) {
+            big_lock.unlock();
+            return true;
+        }
+    }
+    return false;
+}
 
 // One pending request, as the helper lists them.
 struct Request {

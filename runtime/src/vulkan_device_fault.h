@@ -444,6 +444,17 @@ public:
         return stats_;
     }
 
+    // Waits (without entering the compile gate) while a submission is queued at the gate behind an earlier compile,
+    // so a caller about to compile locally can re-check its journal file before taking a turn.
+    std::int64_t wait_for_compile_gate_drain() {
+        if (!compile_gate_enabled()) return 0;
+        std::unique_lock lock(gate_mutex_);
+        if (!submits_) return 0;
+        const std::int64_t start = diagnostic_ms();
+        gate_changed_.wait(lock, [&] { return submits_ == 0; });
+        return diagnostic_ms() - start;
+    }
+
     std::int64_t enter_compile() {
         if (!compile_gate_enabled()) return 0;
         std::unique_lock lock(gate_mutex_);

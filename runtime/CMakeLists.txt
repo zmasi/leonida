@@ -894,6 +894,10 @@ if(BUILD_TESTING)
     add_executable(compile_helper_test test/compile_helper_test.cpp)
     target_compile_definitions(compile_helper_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     add_test(NAME compile_helper COMMAND compile_helper_test)
+
+    add_executable(compile_helper_late_reload_test test/compile_helper_late_reload_test.cpp)
+    target_compile_definitions(compile_helper_late_reload_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    add_test(NAME compile_helper_late_reload COMMAND compile_helper_late_reload_test)
   endif()
 
   # D24/D16 fragment depth quantisation and bias SPIR-V patcher (runtime/src/depth24_fragment.h): pure stdlib.
