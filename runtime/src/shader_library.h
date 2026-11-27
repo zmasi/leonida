@@ -9,6 +9,7 @@
 // it carries its own inflate (RFC 1950/1951), SHA-256 (FIPS 180-4) and a minimal JSON reader.
 
 #include "descriptor_table.h"
+#include "mesh_compute_pair.h"
 #include "spirv_words.h"
 
 #include <algorithm>
@@ -22,6 +23,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -880,6 +882,11 @@ struct ShaderEntry {
     // against the device's maxMeshOutputVertices / maxMeshOutputPrimitives when a pipeline is created. 0: not given.
     std::uint32_t max_vertices = 0;
     std::uint32_t max_primitives = 0;
+    // --mesh-compute (mesh_compute_pair.h): the validated slot layout for a logical-ms GLCompute producer plus its
+    // generated Vertex companion (<name>.mesh_vs.spv). Present only for stage "ms" with a well-formed object;
+    // absent/null (native mesh) and malformed (fails closed) both read as nullopt. A 128-byte pc-tail layout stays
+    // present with uses_pc_tail so the PSO refuses it explicitly instead of misreading it as native.
+    std::optional<MeshComputeLayout> mesh_compute;
 };
 
 // Which descriptor-table hash finalizer the loaded modules probe with (descriptor_table.h). Each module's index.json
@@ -1171,6 +1178,132 @@ public:
         }
         return read_spirv_words(file, file.tellg());
     }
+    // The mesh-compute companion's file: <dir>/<name>.mesh_vs.spv, adjacent to the producer (mesh_compute_pair.h).
+    // The generator names it from the index key, never from spv_file, so a hash-named producer still finds its
+    // companion under its own entry name; sub-index entries (name "fspx/...") resolve inside their own folder.
+    // Unchecked bytes: callers must use load_mesh_compute_pair / validate_mesh_compute_modules, never this alone
+    // for a declared mesh-compute representation.
+    std::filesystem::path mesh_companion_file(const ShaderEntry& entry) const {
+        auto path = dir_;
+        path += "/" + entry.name + kMeshComputeCompanionSuffix + ".spv";
+        return path;
+    }
+
+    // The companion's words, or empty when <dir>/<name>.mesh_vs.spv is missing or not SPIR-V. Unchecked (see above).
+    std::vector<std::uint32_t> mesh_companion_spirv(const ShaderEntry& entry) const {
+        auto path = dir_;
+        path += "/" + entry.name + kMeshComputeCompanionSuffix + ".spv";
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (!file) return {};
+        return read_spirv_words(file, file.tellg());
+    }
+
+    // The versioned seal binding the validated layout to both module bytes:
+    // <dir>/<name>.mesh_compute.seal.json (prefix-aware like the companion). Written by rdna2spirv.py at
+    // generation (partial: layout+producer) and completed by mesh_compute_vs.py (full: +companion hashes).
+    std::filesystem::path mesh_compute_seal_file(const ShaderEntry& entry) const {
+        auto path = dir_;
+        path += "/" + entry.name + kMeshComputeSealSuffix;
+        return path;
+    }
+
+    // Loads and validates BOTH byte vectors for PSO creation, bound to the sealed layout. On true, *producer_words
+    // and *companion_words hold the exact validated bytes (caller owns, retain immutably, use SAME vectors for
+    // vkCreateShaderModule/Pipelines with no re-reads). On false both are cleared and *error explains: missing or
+    // malformed seal on a declared ms (never silent native), layout/producer/companion hash mismatch (swapped,
+    // tampered, or stale), wrong execution models, LocalSize disagreement with metadata, or 128B pc-tail (explicit).
+    bool load_mesh_compute_pair(const ShaderEntry& entry, std::vector<std::uint32_t>* producer_words,
+                                std::vector<std::uint32_t>* companion_words, std::string* error = nullptr) const {
+        const auto fail = [&](const std::string& why) {
+            if (producer_words) producer_words->clear();
+            if (companion_words) companion_words->clear();
+            if (error) *error = why;
+            return false;
+        };
+        if (!entry.mesh_compute) return fail("mesh_compute: no layout (native mesh or malformed, fails closed)");
+        if (!entry.mesh_compute->is_supported_push()) {
+            if (entry.mesh_compute->is_pc_tail())
+                return fail("mesh_compute: 128-byte pc-tail UBO layout (address at tail dwords 4..5) has no verified "
+                            "companion in this wave; refusing (need the 152-byte push variant)");
+            return fail("mesh_compute: unsupported push contract");
+        }
+        // Single read each (no TOCTOU/duplicate I/O): the exact vectors below are hashed and returned on success.
+        std::vector<std::uint32_t> producer = spirv(entry);
+        if (producer.empty()) {
+            std::error_code ec;
+            const bool exists = std::filesystem::exists(spirv_file(entry), ec) && !ec;
+            return fail(exists ? "mesh_compute: malformed producer SPIR-V for " + entry.name
+                               : "mesh_compute: missing producer SPIR-V for " + entry.name);
+        }
+        std::vector<std::uint32_t> companion = mesh_companion_spirv(entry);
+        if (companion.empty()) {
+            std::error_code ec;
+            const bool exists = std::filesystem::exists(mesh_companion_file(entry), ec) && !ec;
+            return fail(exists ? "mesh_compute: malformed companion SPIR-V for " + entry.name
+                               : "mesh_compute: missing companion " + entry.name +
+                                     std::string(kMeshComputeCompanionSuffix) + ".spv");
+        }
+        if (!validate_mesh_compute_modules(entry, producer, companion, error))
+            return fail(error ? *error : "mesh_compute: pair validation failed");
+        if (producer_words) *producer_words = std::move(producer);
+        if (companion_words) *companion_words = std::move(companion);
+        return true;
+    }
+
+    // Revalidates retained vectors against a FRESH seal + current entry (lazy reload, no .spv disk reads, only the
+    // seal file is reread). Hashes the given spans' bytes (size*4 LE, must equal file-byte hashes) and re-runs all
+    // checks. False (with *error) on any mismatch; never vkCreate* on false.
+    bool validate_mesh_compute_modules(const ShaderEntry& entry, std::span<const std::uint32_t> producer_words,
+                                       std::span<const std::uint32_t> companion_words,
+                                       std::string* error = nullptr) const {
+        const auto fail = [&](const std::string& why) {
+            if (error) *error = why;
+            return false;
+        };
+        if (!entry.mesh_compute) return fail("mesh_compute: no layout (native mesh or malformed, fails closed)");
+        const MeshComputeLayout& layout = *entry.mesh_compute;
+        if (!layout.is_supported_push()) {
+            if (layout.is_pc_tail())
+                return fail("mesh_compute: 128-byte pc-tail UBO layout has no verified companion; refusing");
+            return fail("mesh_compute: unsupported push contract");
+        }
+        MeshComputeSeal seal;
+        if (!read_mesh_compute_seal(entry, &seal, error)) return fail(error ? *error : "mesh_compute: seal error");
+        if (!seal.has_companion())
+            return fail("mesh_compute: seal for " + entry.name + " lacks companion hashes (not built)");
+        const std::string layout_json = canonical_mesh_compute_json(layout);
+        const std::span<const std::uint8_t> layout_span(reinterpret_cast<const std::uint8_t*>(layout_json.data()),
+                                                        layout_json.size());
+        if (sha256_hex(layout_span) != seal.layout_sha256)
+            return fail("mesh_compute: index layout does not match the seal for " + entry.name +
+                        " (tampered index while modules unchanged)");
+        const auto hash_words = [](std::span<const std::uint32_t> words) {
+            const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(words.data());
+            return sha256_hex(std::span<const std::uint8_t>(bytes, words.size() * 4));
+        };
+        if (producer_words.empty() || companion_words.empty()) return fail("mesh_compute: empty module words");
+        if (hash_words(producer_words) != seal.producer_sha256)
+            return fail("mesh_compute: producer bytes do not match the seal for " + entry.name +
+                        " (swapped or stale module)");
+        if (hash_words(companion_words) != *seal.companion_spv_sha256)
+            return fail("mesh_compute: companion bytes do not match the seal for " + entry.name +
+                        " (replaced cached binary)");
+        if (!mesh_producer_is_compute(producer_words, error)) return false;
+        std::array<std::uint32_t, 3> actual_size{0, 0, 0};
+        if (!mesh_producer_local_size(producer_words, actual_size, error)) return false;
+        if (actual_size != entry.local_size)
+            return fail("mesh_compute: producer LocalSize does not match index metadata for " + entry.name);
+        if (!mesh_consumer_is_vertex(companion_words, error)) return false;
+        return mesh_companion_matches_layout(layout, companion_words, error);
+    }
+
+    // Whether this entry is usable for direct replay (seal-bound). Implemented via load_mesh_compute_pair and
+    // discarding the vectors, so no stale blessing: same seal/hash/exec/LocalSize checks, same explicit 128B and
+    // missing-stamp errors. Prefer load_mesh_compute_pair when the bytes are needed (single validated load).
+    bool validate_mesh_compute_pair(const ShaderEntry& entry, std::string* error = nullptr) const {
+        std::vector<std::uint32_t> producer, companion;
+        return load_mesh_compute_pair(entry, &producer, &companion, error);
+    }
 
 private:
     // A non-negative integer field, or 0 when it is missing, not a number or out of range.
@@ -1178,6 +1311,211 @@ private:
         if (!value || value->kind != Json::Kind::number) return 0;
         const double n = value->number;
         return n >= 0 && n <= 4294967295.0 ? std::uint32_t(n) : 0;
+    }
+
+    // Strict JSON integers for mesh_compute validation (fail closed, unlike lenient u32() above).
+    static bool json_u32(const Json* value, std::uint32_t* out) {
+        if (!value || value->kind != Json::Kind::number) return false;
+        const double n = value->number;
+        if (n < 0.0 || n > 4294967295.0 || double(std::uint32_t(n)) != n) return false;
+        if (out) *out = std::uint32_t(n);
+        return true;
+    }
+    static bool json_u64(const Json* value, std::uint64_t* out) {
+        if (!value || value->kind != Json::Kind::number) return false;
+        const double n = value->number;
+        // JSON numbers are doubles: integers only up to 2^53-1, ample for slot byte counts.
+        if (n < 0.0 || n > 9007199254740991.0 || double(std::uint64_t(n)) != n) return false;
+        if (out) *out = std::uint64_t(n);
+        return true;
+    }
+    static bool json_key_u32(const std::string& key, std::uint32_t* out) {
+        if (key.empty() || key.size() > 10) return false;
+        std::uint64_t v = 0;
+        for (const char c : key) {
+            if (c < '0' || c > '9') return false;
+            v = v * 10u + std::uint64_t(c - '0');
+            if (v > UINT32_MAX) return false;
+        }
+        if (out) *out = std::uint32_t(v);
+        return true;
+    }
+    static bool is_hex64(const std::string& s) {
+        if (s.size() != 64) return false;
+        for (const char c : s)
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) return false;
+        return true;
+    }
+    // Reads and validates <dir>/<name>.mesh_compute.seal.json v1 (hashes only; the seal's "layout" copy is ignored,
+    // the canonical hash is recomputed from entry.mesh_compute). False for missing/malformed/unknown-version seals
+    // on a declared representation (never silent native).
+    bool read_mesh_compute_seal(const ShaderEntry& entry, MeshComputeSeal* seal,
+                                std::string* error = nullptr) const {
+        const auto fail = [&](const std::string& why) {
+            if (error) *error = why;
+            return false;
+        };
+        auto path = dir_;
+        path += "/" + entry.name + kMeshComputeSealSuffix;
+        std::ifstream file(path, std::ios::binary);
+        if (!file) return fail("mesh_compute: missing seal for declared representation " + entry.name);
+        const std::string text((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+        Json root;
+        if (!JsonReader(text).parse(root) || root.kind != Json::Kind::object)
+            return fail("mesh_compute: malformed seal JSON for " + entry.name);
+        std::uint32_t version = 0;
+        if (!json_u32(root.find("version"), &version) || version != std::uint32_t(kMeshComputeSealVersion))
+            return fail("mesh_compute: unsupported seal version for " + entry.name);
+        const Json* layout_hash = root.find("layout_sha256");
+        const Json* producer_hash = root.find("producer_sha256");
+        if (!layout_hash || layout_hash->kind != Json::Kind::string || !is_hex64(layout_hash->string) ||
+            !producer_hash || producer_hash->kind != Json::Kind::string || !is_hex64(producer_hash->string)) {
+            return fail("mesh_compute: malformed seal hashes for " + entry.name);
+        }
+        MeshComputeSeal out;
+        out.version = int(version);
+        out.layout_sha256 = layout_hash->string;
+        out.producer_sha256 = producer_hash->string;
+        const Json* asm_hash = root.find("companion_asm_sha256");
+        const Json* spv_hash = root.find("companion_spv_sha256");
+        const bool asm_null = !asm_hash || asm_hash->kind == Json::Kind::null;
+        const bool spv_null = !spv_hash || spv_hash->kind == Json::Kind::null;
+        if (asm_null != spv_null) return fail("mesh_compute: partial companion seal for " + entry.name);
+        if (!asm_null) {
+            if (asm_hash->kind != Json::Kind::string || !is_hex64(asm_hash->string) ||
+                spv_hash->kind != Json::Kind::string || !is_hex64(spv_hash->string)) {
+                return fail("mesh_compute: malformed companion seal hashes for " + entry.name);
+            }
+            out.companion_asm_sha256 = asm_hash->string;
+            out.companion_spv_sha256 = spv_hash->string;
+        }
+        if (seal) *seal = std::move(out);
+        return true;
+    }
+
+    // Validates one index.json "mesh_compute" object for a logical-ms entry whose top-level push/max/f16 fields
+    // are already in `entry`. Returns nullopt for any malformed layout (fails closed); the caller only calls this
+    // for stage "ms" with an object value, so absent/null (native) and wrong-stage entries never reach here.
+    static std::optional<MeshComputeLayout> parse_mesh_compute_layout(const Json& mc, const ShaderEntry& entry) {
+        MeshComputeLayout layout;
+        std::uint32_t vertex_stride = 0, max_vertices = 0, max_primitives = 0, clip_count = 0, clip_offset = 0;
+        std::uint32_t cull_count = 0, cull_offset = 0, vertices = 0, primitive_stride = 0, push_bytes = 0;
+        std::uint64_t slot_bytes = 0, primitives = 0;
+        if (!json_u64(mc.find("slot_bytes"), &slot_bytes) || !json_u32(mc.find("vertices"), &vertices) ||
+            !json_u32(mc.find("vertex_stride"), &vertex_stride) || !json_u64(mc.find("primitives"), &primitives) ||
+            !json_u32(mc.find("primitive_stride"), &primitive_stride) ||
+            !json_u32(mc.find("max_vertices"), &max_vertices) ||
+            !json_u32(mc.find("max_primitives"), &max_primitives) ||
+            !json_u32(mc.find("clip_count"), &clip_count) || !json_u32(mc.find("clip_offset"), &clip_offset) ||
+            !json_u32(mc.find("cull_count"), &cull_count) || !json_u32(mc.find("cull_offset"), &cull_offset) ||
+            !json_u32(mc.find("push_constant_bytes"), &push_bytes)) {
+            return std::nullopt;
+        }
+        if (vertices != kMeshComputeHeaderBytes || primitive_stride != kMeshComputePrimitiveStride ||
+            clip_offset != kMeshComputeVerticesOffset) {
+            return std::nullopt;
+        }
+        if (max_vertices == 0 || max_vertices > kMeshComputeMaxVertices || max_primitives == 0 ||
+            max_primitives > kMeshComputeMaxPrimitives || clip_count > kMeshComputeMaxClipCull ||
+            cull_count > kMeshComputeMaxClipCull || vertex_stride == 0 || vertex_stride % 16 != 0 ||
+            vertex_stride > kMeshComputeMaxStride) {
+            return std::nullopt;
+        }
+        if (push_bytes != kMeshComputePush152 && push_bytes != kMeshComputePush128) return std::nullopt;
+        const Json* params = mc.find("params");
+        if (!params || params->kind != Json::Kind::object || params->object.size() > kMeshComputeMaxParams)
+            return std::nullopt;
+        std::map<std::uint32_t, std::uint32_t> param_offsets;
+        for (const auto& [key, val] : params->object) {
+            std::uint32_t loc = 0, off = 0;
+            if (!json_key_u32(key, &loc) || !json_u32(&val, &off) || loc > kMeshComputeMaxLocation ||
+                !param_offsets.emplace(loc, off).second) {
+                return std::nullopt;  // bad key/offset, over-limit location, or duplicate ("0" vs "00")
+            }
+        }
+        const std::uint32_t clip_vec4 = (clip_count + 3) / 4;
+        const std::uint32_t cull_vec4 = (cull_count + 3) / 4;
+        if (cull_offset != 16u * (1u + clip_vec4)) return std::nullopt;
+        if (vertex_stride != 16u * (1u + clip_vec4 + cull_vec4 + std::uint32_t(param_offsets.size())))
+            return std::nullopt;
+        std::uint32_t k = 0;
+        for (const auto& [loc, off] : param_offsets) {
+            (void)loc;
+            if (off != 16u * (1u + clip_vec4 + cull_vec4 + k)) return std::nullopt;
+            ++k;
+        }
+        // All products in 64 bits before any narrowing: u32*u32 always fits u64.
+        const std::uint64_t want_primitives =
+            std::uint64_t(kMeshComputeVerticesOffset) + std::uint64_t(max_vertices) * vertex_stride;
+        if (primitives != want_primitives) return std::nullopt;
+        const std::uint64_t want_slot = want_primitives + std::uint64_t(max_primitives) * 16u;
+        if (slot_bytes != want_slot || slot_bytes % 16 != 0 || slot_bytes > kMeshComputeMaxSlotBytes)
+            return std::nullopt;
+        layout.slot_bytes = slot_bytes;
+        layout.vertices = vertices;
+        layout.vertex_stride = vertex_stride;
+        layout.primitives = primitives;
+        layout.primitive_stride = primitive_stride;
+        layout.max_vertices = max_vertices;
+        layout.max_primitives = max_primitives;
+        layout.clip_count = clip_count;
+        layout.clip_offset = clip_offset;
+        layout.cull_count = cull_count;
+        layout.cull_offset = cull_offset;
+        layout.params = std::move(param_offsets);
+        layout.push_constant_bytes = push_bytes;
+        const Json* addr = mc.find("address_dwords");
+        const Json* tail_addr = mc.find("pc_tail_address_dwords");
+        if (push_bytes == kMeshComputePush152) {
+            std::uint32_t d0 = 0, d1 = 0;
+            if (!addr || addr->kind != Json::Kind::array || addr->array.size() != 2 ||
+                !json_u32(&addr->array[0], &d0) || !json_u32(&addr->array[1], &d1) || d0 != 36 || d1 != 37 ||
+                (tail_addr && tail_addr->kind != Json::Kind::null)) {
+                return std::nullopt;
+            }
+            layout.has_address_dwords = true;
+            layout.address_dwords = {d0, d1};
+        } else {
+            std::uint32_t t0 = 0, t1 = 0;
+            if (!addr || addr->kind != Json::Kind::null || !tail_addr ||
+                tail_addr->kind != Json::Kind::array || tail_addr->array.size() != 2 ||
+                !json_u32(&tail_addr->array[0], &t0) || !json_u32(&tail_addr->array[1], &t1) || t0 != 4 || t1 != 5) {
+                return std::nullopt;
+            }
+            layout.uses_pc_tail = true;
+            layout.pc_tail_address_dwords = {t0, t1};
+        }
+        if (const Json* fh = mc.find("f16_halves"); fh && fh->kind != Json::Kind::null) {
+            if (fh->kind != Json::Kind::object) return std::nullopt;
+            std::map<std::uint32_t, std::array<std::uint32_t, 2>> halves;
+            std::set<std::uint32_t> used = layout.raw_locations();
+            for (const auto& [key, val] : fh->object) {
+                std::uint32_t param = 0, lo = 0, hi = 0;
+                if (!json_key_u32(key, &param) || val.kind != Json::Kind::array || val.array.size() != 2 ||
+                    !json_u32(&val.array[0], &lo) || !json_u32(&val.array[1], &hi) || lo == hi ||
+                    lo > kMeshComputeMaxLocation || hi > kMeshComputeMaxLocation ||
+                    !layout.params.count(param) || used.count(lo) || used.count(hi) ||
+                    !halves.emplace(param, std::array<std::uint32_t, 2>{lo, hi}).second) {
+                    return std::nullopt;
+                }
+                used.insert(lo);
+                used.insert(hi);
+            }
+            layout.f16_halves = std::move(halves);
+        }
+        // The entry's top-level fields must agree with the layout, or the pair is not the translator's.
+        if (entry.push_constant_bytes != layout.push_constant_bytes ||
+            entry.max_vertices != layout.max_vertices || entry.max_primitives != layout.max_primitives ||
+            entry.f16_halves != layout.f16_halves) {
+            return std::nullopt;
+        }
+        if (entry.local_size[0] == 0 || entry.local_size[1] == 0 || entry.local_size[2] == 0 ||
+            entry.local_size[0] > 1024 || entry.local_size[1] > 1024 || entry.local_size[2] > 1024 ||
+            std::uint64_t(entry.local_size[0]) * entry.local_size[1] * entry.local_size[2] > 1024 ||
+            entry.lds_bytes > (128u << 10)) {
+            return std::nullopt;
+        }
+        return layout;
     }
 
     using LookupKey = std::pair<std::string_view, std::string_view>;
@@ -1311,6 +1649,13 @@ private:
             }
             e.max_vertices = u32(meta.find("max_vertices"));
             e.max_primitives = u32(meta.find("max_primitives"));
+            // --mesh-compute: typed slot layout on logical "ms" only. Absent/null is a native mesh shader;
+            // malformed fails closed (nullopt, never a half-validated layout the PSO could misread).
+            if (e.stage == "ms") {
+                if (const Json* mc = meta.find("mesh_compute"); mc && mc->kind == Json::Kind::object) {
+                    e.mesh_compute = parse_mesh_compute_layout(*mc, e);
+                }
+            }
             // Which finalizer this module's shader probes the descriptor table with (descriptor_table.h). Absent, or not
             // a kind this runtime knows, is the old bare FNV-1a.
             if (const Json* dh = meta.find("descriptor_hash");

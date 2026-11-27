@@ -99,6 +99,7 @@ public:
     std::uint32_t compute_family = 0, copy_family = 0;
     std::vector<VkQueueFamilyProperties> families;
     VkPhysicalDeviceFeatures enabled{};  // the core features enabled on `device`
+    bool request_clip_distance = false;  // set before create(): enable shaderClipDistance where supported
     bool bindless = false;         // the features the bindless set 0 needs are enabled
     bool partially_bound = false;  // and its slots can stay empty
     bool image_view_min_lod = false;
@@ -138,6 +139,8 @@ public:
     bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
     bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
     bool mesh_shader_queries = false;  // the meshShaderQueries feature is enabled on the device
+    bool request_fragment_shader_barycentric = false;  // set before create(): enable fragmentShaderBarycentric where available
+    bool fragment_shader_barycentric = false;          // VK_KHR_fragment_shader_barycentric + feature are enabled
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
@@ -503,6 +506,8 @@ private:
         enable.geometryShader = features.features.geometryShader;  // d3d12_geometry_test, where available
         enable.dualSrcBlend = features.features.dualSrcBlend;  // d3d12_translated_draw_test --dual-source
         enable.depthBounds = features.features.depthBounds;  // depth-bounds PSOs (d3d12_mesh_test), where available
+        // Mesh-compute clip edge (d3d12_mesh_compute_test): only when requested, and only where supported.
+        if (request_clip_distance) enable.shaderClipDistance = features.features.shaderClipDistance;
         const char* conditional_extension = VK_EXT_CONDITIONAL_RENDERING_EXTENSION_NAME;
 
         // VK_EXT_host_image_copy where the device has it, for the D3D12 layer's CPU texture copies.
@@ -645,6 +650,22 @@ private:
             mesh_features.meshShaderQueries = mesh_shader_queries ? VK_TRUE : VK_FALSE;
             *v13_.next() = &mesh_features;
         }
+        // VK_KHR_fragment_shader_barycentric where requested and available (native bary PS):
+        // the extension plus its feature, negotiated like mesh_shader above.
+        VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR bary_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR};
+        if (request_fragment_shader_barycentric &&
+            std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &bary_features};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            fragment_shader_barycentric = bary_features.fragmentShaderBarycentric == VK_TRUE;
+            if (fragment_shader_barycentric) {
+                bary_features.pNext = *v13_.next();
+                *v13_.next() = &bary_features;
+            }
+        }
         enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available
         enable.pipelineStatisticsQuery = features.features.pipelineStatisticsQuery;
         occlusion_query_precise = features.features.occlusionQueryPrecise == VK_TRUE;
@@ -778,6 +799,8 @@ private:
         if (custom_border_color) device_extensions.push_back(custom_border_color_name);
         if (null_descriptor || robust_index_view) device_extensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);
         if (mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+        if (fragment_shader_barycentric)
+            device_extensions.push_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME);
         buffer_marker = request_buffer_marker && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
             return std::strcmp(e.extensionName, VK_AMD_BUFFER_MARKER_EXTENSION_NAME) == 0;
         });

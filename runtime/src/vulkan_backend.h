@@ -1371,6 +1371,24 @@ public:
 
     }
 
+    // Direct DispatchMesh expansion (mesh-as-compute, vulkan_replay.h): publishes the physical limits the replay
+    // validates direct draws against. Call once with the device's limits before any queue uses them; without it
+    // direct draws are refused (unknown group counts). max_buffer_size is maxBufferSize (maintenance4) and
+    // max_allocation_size is maxMemoryAllocationSize (maintenance3), both via vkGetPhysicalDeviceProperties2 (see
+    // query_arena_limits in arena_size.h); 0 for either skips that size check. The scratch itself comes from
+    // enable_copy_scratch: its chunks need STORAGE_BUFFER and SHADER_DEVICE_ADDRESS usage on
+    // device-address-capable memory. The per-queue dispatch flag needs no init (set per ExecuteCommandLists).
+    void configure_mesh_compute_direct(const VkPhysicalDeviceLimits& limits, VkDeviceSize max_buffer_size,
+                                       VkDeviceSize max_allocation_size) {
+        std::unique_lock lock(resource_mutex_);
+        replay_.mesh_compute_max_group_count[0] = limits.maxComputeWorkGroupCount[0];
+        replay_.mesh_compute_max_group_count[1] = limits.maxComputeWorkGroupCount[1];
+        replay_.mesh_compute_max_group_count[2] = limits.maxComputeWorkGroupCount[2];
+        replay_.mesh_compute_max_push_constants = limits.maxPushConstantsSize;
+        replay_.mesh_compute_max_buffer_size = max_buffer_size;
+        replay_.mesh_compute_max_allocation_size = max_allocation_size;
+    }
+
     // Every ExecuteIndirect's arguments are clamped on the GPU into scratch before the indirect command reads them
     // (vulkan_indirect_clamp.h), so a stale or garbage record from a skipped compute pass cannot reset the display
     // driver. Needs bufferDeviceAddress and a compute-capable queue; `allocate` gives the record scratch
@@ -1842,6 +1860,10 @@ public:
     // and records what the set needs first. When it fails, nothing of that call is executed.
     void set_transfer_only_family(std::uint32_t family) { transfer_only_family_ = family; }
     void set_graphics_family(std::uint32_t family) { graphics_family_ = family; }
+    // Direct mesh-as-compute queue check: the VkQueueFlags of every queue family index, in
+    // vkGetPhysicalDeviceQueueFamilyProperties order. Call once at device setup before queues execute;
+    // execute() requires GRAPHICS|COMPUTE on the exact executing family_. Empty (unset): direct refused.
+    void set_queue_family_flags(std::vector<VkQueueFlags> flags) { queue_family_flags_ = std::move(flags); }
     void set_compute_copy_aspects(std::function<VkImageAspectFlags(VkFormat)> check) {
         replay_.compute_copy_aspects = std::move(check);
     }
@@ -2440,6 +2462,7 @@ private:
     std::uint32_t predicate_family_ = UINT32_MAX;
     std::uint32_t transfer_only_family_ = UINT32_MAX;
     std::uint32_t graphics_family_ = UINT32_MAX;
+    std::vector<VkQueueFlags> queue_family_flags_;  // empty: unknown, direct mesh refused
     DebugLabelFunctions labels_;
 };
 #ifdef _MSC_VER
@@ -3288,6 +3311,13 @@ private:
             replay.queue_stages = kind_ == QueueKind::copy      ? detail::queue_stages_copy
                                   : kind_ == QueueKind::compute ? detail::queue_stages_compute
                                                                 : 0;
+            // Direct mesh-as-compute needs vkCmdDispatch plus dynamic rendering on the executing queue: the exact
+            // family_ must expose GRAPHICS|COMPUTE. Copy submissions never contain draws. Unset/out-of-range flags:
+            // unknown family, refuse rather than admit a GRAPHICS-only family lacking COMPUTE.
+            bool mesh_queue = false;
+            if (kind_ != QueueKind::copy && family_ < context_.queue_family_flags_.size())
+                mesh_queue = mesh_compute_direct::queue_supports_mesh_compute(context_.queue_family_flags_[family_]);
+            replay.mesh_compute_queue = mesh_queue;
             replay.prepare_khr_instances = [this, &replay, &khr_guard](const BuildAccelerationStructure& build,
                                                                        VkDeviceAddress& address) {
                 return stage_khr_instances(replay, build, khr_guard.stages, address);
@@ -3337,6 +3367,19 @@ private:
                         scratch_guard.active = true;
                     }
                     return context_.scratch_->get(bytes, buffer, offset);
+                };
+                // Direct DispatchMesh output: the same chunks, the same timeline retirement (one guard, one retire
+                // below). False without STORAGE_BUFFER + SHADER_DEVICE_ADDRESS chunks: the draw is then unsupported.
+                replay.mesh_compute_scratch = [this, &tracker_lock, &scratch_guard](
+                                                  VkDeviceSize bytes, VkBuffer& buffer, VkDeviceSize& offset,
+                                                  VkDeviceAddress& address) {
+                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                    if (!scratch_guard.active) {
+                        scratch_guard.scratch = context_.scratch_.get();
+                        context_.scratch_->collect();
+                        scratch_guard.active = true;
+                    }
+                    return context_.scratch_->get(bytes, buffer, offset, address);
                 };
             }
             if (kind_ != QueueKind::copy && context_.indirect_clamp_) {
