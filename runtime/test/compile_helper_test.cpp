@@ -1,13 +1,18 @@
-// The compile helper's file protocol (shims/d3d12_compile_helper.h): request lines, their order, and the markers that
-// keep two processes from compiling one entry at once. No Vulkan, no helper process.
+// The compile helper's file protocol and server queue (shims/d3d12_compile_helper.h): request lines, their order, the
+// markers that keep two processes from compiling one entry at once, the request queue that prevents post-unlink and
+// TOCTOU re-claim spins, and idle-thread request-first scheduling. No Vulkan, no helper process.
 #include "../shims/d3d12_compile_helper.h"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace fs = std::filesystem;
 namespace helper = rt::d3d12::compile_helper;
@@ -158,6 +163,184 @@ static int test_pending_bound(const fs::path& dir) {
     return 0;
 }
 
+static int test_request_queue() {
+    using Clock = std::chrono::steady_clock;
+    const auto t0 = Clock::now();
+    const auto f0 = fs::file_time_type::clock::now();
+    const helper::Request r1{"cs-0000000000000101", "synthetic/cs_one", 0, f0};
+    const helper::Request r2{"cs-0000000000000102", "synthetic/cs_two", 0, f0 + std::chrono::seconds(1)};
+
+    // 1. Immediate finish -> take: a finished request is removed from pending_ at once (zero spin before next scan).
+    helper::RequestQueue queue;
+    queue.refresh({r1, r2}, t0);
+    CHECK(queue.pending_count() == 2 && queue.active());
+    helper::Request out1{}, out2{}, none{};
+    CHECK(queue.take(out1, t0) && out1.stem == r1.stem);
+    CHECK(queue.take(out2, t0) && out2.stem == r2.stem);
+    CHECK(!queue.take(none, t0));
+    queue.finish(out1, false, t0);
+    CHECK(queue.pending_count() == 1 && queue.answered_count() == 1);
+    CHECK(!queue.take(none, t0));  // r1 is gone, r2 is still busy
+    queue.finish(out2, false, t0);
+    CHECK(queue.pending_count() == 0 && !queue.active() && queue.answered_count() == 2);
+
+    // 2. TOCTOU race: an unlocked list_requests snapshot taken before unlink arrives at refresh() after finish().
+    queue.refresh({r1, r2}, t0);
+    CHECK(queue.pending_count() == 0 && !queue.active() && queue.answered_count() == 2);
+    CHECK(!queue.take(none, t0));
+    // Next scan after unlink sees neither .req file on disk: answered stamps are pruned.
+    queue.refresh({}, t0);
+    CHECK(queue.answered_count() == 0);
+
+    // 3. Priority bump or newer mtime on the same stem is served even before an empty scan prunes answered_.
+    const helper::Request warm{"cs-0000000000000103", "synthetic/cs_three", 65536, f0};
+    queue.refresh({warm}, t0);
+    helper::Request got{};
+    CHECK(queue.take(got, t0) && got.priority == 65536);
+    queue.finish(got, false, t0);
+    const helper::Request urgent{"cs-0000000000000103", "synthetic/cs_three", 0, f0};
+    queue.refresh({urgent}, t0);
+    CHECK(queue.take(got, t0) && got.priority == 0);
+    queue.finish(got, false, t0);
+    const helper::Request newer{"cs-0000000000000103", "synthetic/cs_three", 0, f0 + std::chrono::seconds(2)};
+    queue.refresh({newer}, t0);
+    CHECK(queue.take(got, t0) && got.asked == newer.asked);
+    queue.finish(got, false, t0);
+    queue.refresh({}, t0);
+    CHECK(queue.answered_count() == 0);
+
+    // 4. leave = true (another process holds .building): cools down for kElsewhereCooldown, then retries.
+    queue.refresh({r1, r2}, t0);
+    CHECK(queue.take(out1, t0) && out1.stem == r1.stem);
+    queue.finish(out1, true, t0);
+    CHECK(queue.active() && queue.pending_count() == 2);
+    CHECK(queue.take(out2, t0 + std::chrono::seconds(1)) && out2.stem == r2.stem);
+    queue.finish(out2, false, t0 + std::chrono::seconds(1));
+    CHECK(!queue.take(none, t0 + std::chrono::seconds(4)));
+    CHECK(queue.take(out1, t0 + helper::RequestQueue::kElsewhereCooldown) && out1.stem == r1.stem);
+    queue.finish(out1, false, t0 + helper::RequestQueue::kElsewhereCooldown);
+    CHECK(!queue.active());
+    return 0;
+}
+
+static int test_server_workers() {
+    const auto f0 = fs::file_time_type::clock::now();
+    const helper::Request r1{"cs-0000000000000201", "synthetic/cs_a", 0, f0};
+    const helper::Request r2{"cs-0000000000000202", "synthetic/cs_b", 0, f0 + std::chrono::seconds(1)};
+    const helper::Request r3{"cs-0000000000000203", "synthetic/cs_c", 0, f0 + std::chrono::seconds(2)};
+    const helper::Request r4{"cs-0000000000000204", "synthetic/cs_d", 0, f0 + std::chrono::seconds(3)};
+
+    std::mutex mutex;
+    std::condition_variable wake;
+    helper::RequestQueue queue;
+    bool stop = false;
+    queue.refresh({r1, r2});
+
+    std::mutex phase_mutex;
+    std::condition_variable phase_cv;
+    unsigned active_serves = 0, max_concurrent_serves = 0, total_serves = 0;
+    unsigned normal_priority_serves = 0, fills_while_serving = 0;
+    unsigned fill_calls = 0, idle_priority_fills = 0;
+    bool hold_serves = true;
+    std::atomic<unsigned> fill_remaining{3};
+
+    auto serve_one = [&](const helper::Request& req) {
+        const int prio = GetThreadPriority(GetCurrentThread());
+        {
+            std::unique_lock lock(phase_mutex);
+            ++active_serves;
+            ++total_serves;
+            if (active_serves > max_concurrent_serves) max_concurrent_serves = active_serves;
+            if (prio == THREAD_PRIORITY_NORMAL) ++normal_priority_serves;
+            phase_cv.notify_all();
+            phase_cv.wait_for(lock, std::chrono::seconds(5), [&] { return !hold_serves; });
+            --active_serves;
+            phase_cv.notify_all();
+        }
+        std::lock_guard lock(mutex);
+        queue.finish(req, false);
+    };
+
+    auto fill_one = [&] {
+        const int prio = GetThreadPriority(GetCurrentThread());
+        {
+            std::lock_guard lock(phase_mutex);
+            if (hold_serves) ++fills_while_serving;
+            const unsigned left = fill_remaining.load(std::memory_order_relaxed);
+            if (!left) {
+                phase_cv.notify_all();
+                return false;
+            }
+            fill_remaining.store(left - 1, std::memory_order_relaxed);
+            ++fill_calls;
+            if (prio == THREAD_PRIORITY_IDLE) ++idle_priority_fills;
+            phase_cv.notify_all();
+        }
+        return true;
+    };
+
+    // 2 total threads, 1 idle-fill thread: when 2 requests are queued, BOTH threads must serve requests in parallel
+    // at normal priority before any idle fill runs.
+    auto pool = helper::start_server_workers(2, 1, mutex, wake, queue, stop, serve_one, fill_one);
+    bool both_serving = false;
+    {
+        std::unique_lock lock(phase_mutex);
+        both_serving = phase_cv.wait_for(lock, std::chrono::seconds(5), [&] { return max_concurrent_serves == 2; });
+        hold_serves = false;
+    }
+    phase_cv.notify_all();
+
+    // Wait for both initial requests to finish and all 3 idle-fill items to run at THREAD_PRIORITY_IDLE.
+    bool idle_drained = false;
+    {
+        std::unique_lock lock(phase_mutex);
+        idle_drained = phase_cv.wait_for(lock, std::chrono::seconds(5),
+                                         [&] { return active_serves == 0 && fill_calls == 3 && fill_remaining.load() == 0; });
+    }
+    // Give workers a brief window to prove zero spin re-claims occur after finish().
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+    unsigned serves_after_batch1 = 0;
+    {
+        std::lock_guard lock(phase_mutex);
+        serves_after_batch1 = total_serves;
+        hold_serves = true;
+        max_concurrent_serves = 0;
+    }
+
+    // Submit a second pair of requests after idle fill completed: both threads must still serve them in parallel.
+    {
+        std::lock_guard lock(mutex);
+        queue.refresh({r3, r4});
+    }
+    wake.notify_all();
+    bool second_batch_parallel = false;
+    {
+        std::unique_lock lock(phase_mutex);
+        second_batch_parallel =
+            phase_cv.wait_for(lock, std::chrono::seconds(5), [&] { return max_concurrent_serves == 2; });
+        hold_serves = false;
+    }
+    phase_cv.notify_all();
+    {
+        std::unique_lock lock(phase_mutex);
+        phase_cv.wait_for(lock, std::chrono::seconds(5), [&] { return total_serves == 4 && active_serves == 0; });
+    }
+
+    {
+        std::lock_guard lock(mutex);
+        stop = true;
+    }
+    wake.notify_all();
+    for (std::thread& t : pool) t.join();
+
+    CHECK(both_serving);
+    CHECK(fills_while_serving == 0);
+    CHECK(serves_after_batch1 == 2);
+    CHECK(idle_drained && fill_calls == 3 && idle_priority_fills == 3);
+    CHECK(second_batch_parallel && total_serves == 4 && normal_priority_serves == 4);
+    return 0;
+}
+
 int main() {
     const auto dir = fs::temp_directory_path() /
         ("leonida_compile_helper_test_" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -169,6 +352,8 @@ int main() {
     if (!failed) failed = test_markers(dir);
     if (!failed) failed = test_state(dir);
     if (!failed) failed = test_pending_bound(dir);
+    if (!failed) failed = test_request_queue();
+    if (!failed) failed = test_server_workers();
     fs::remove_all(dir, ec);
     if (failed) return failed;
     std::printf("compile_helper_test: ok\n");

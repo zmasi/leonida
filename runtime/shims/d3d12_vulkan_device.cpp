@@ -22722,25 +22722,10 @@ int compile_server(const CompileServerOptions& options) {
 
     std::mutex mutex;
     std::condition_variable wake;
-    std::vector<helper::Request> pending;  // the last listing, most urgent first
-    std::set<std::string> busy;            // stems being built here
-    std::map<std::string, std::chrono::steady_clock::time_point> elsewhere;  // stems another process is building
+    helper::RequestQueue queue;
     bool stop = false;
     std::atomic<unsigned> requests_done{0}, filled{0};
 
-    // A request this helper can take: listed, not being built here, not one another process was building a moment ago.
-    auto take_locked = [&](helper::Request& out) {
-        const auto now = std::chrono::steady_clock::now();
-        for (const helper::Request& request : pending) {
-            if (busy.count(request.stem)) continue;
-            if (const auto it = elsewhere.find(request.stem); it != elsewhere.end() && now - it->second < std::chrono::seconds(5))
-                continue;
-            busy.insert(request.stem);
-            out = request;
-            return true;
-        }
-        return false;
-    };
     auto build_entry = [&](const leonida::ShaderEntry& entry, const char* trigger) {
         ComputeBuildOptions build_options;
         build_options.trigger = trigger;
@@ -22753,72 +22738,62 @@ int compile_server(const CompileServerOptions& options) {
         build.pipeline = VK_NULL_HANDLE;
         return build;
     };
-    auto serve = [&] {  // normal priority: a title waits for these
-        for (;;) {
-            helper::Request request;
-            {
-                std::unique_lock lock(mutex);
-                wake.wait_for(lock, std::chrono::milliseconds(100), [&] { return stop || take_locked(request); });
-                if (stop) return;
-                if (request.stem.empty()) continue;
-            }
-            std::string failure;
-            bool leave = false;  // another process is building it: its file answers the request
-            const auto it = by_name.find(request.name);
-            const leonida::ShaderEntry* entry = it == by_name.end() ? nullptr : it->second;
-            const std::size_t bytes = entry ? library->spirv_bytes(*entry) : 0;
-            if (!entry) failure = "no compute entry of that name in this library";
-            else if (skip_compute(entry->name)) failure = "LEONIDA_SKIP_COMPUTE";  // the game drops its dispatches
-            else if (const char* why = host.unbuildable(*entry, bytes)) failure = why;
-            // LOCAL FIX (compile helper: the journal name was checked after the build): the name is hashed from the
-            // module and this device's environment, which costs no driver call. A request from a game whose environment
-            // differs is answered before a compile is spent on a file that game never reads; the build below would only
-            // have found the same mismatch.
-            if (failure.empty()) {
-                ComputeBuildOptions key_options;
-                key_options.trigger = "compile-server";
-                key_options.key_only = true;
-                key_options.use_helper = false;
-                const std::filesystem::path key_path = host.build(*entry, key_options).journal_path;
-                if (!key_path.empty() && key_path.stem().string() != request.stem)
-                    failure = "its journal name here is " + key_path.stem().string() +
-                              ": the helper's environment differs from the game's";
-            }
-            if (failure.empty()) {
-                ComputeBuild build;
-                try {
-                    build = build_entry(*entry, "compile-server");
-                } catch (const std::exception& e) {
-                    failure = e.what();
-                }
-                if (failure.empty()) {
-                    if (build.busy)
-                        leave = true;
-                    else if (!build.skipped && (build.result != VK_SUCCESS || !(build.journaled || build.journal_hit)))
-                        failure = "not built or not journaled (VkResult " + std::to_string(int(build.result)) + ")";
-                    else if (!leonida::pipeline_journal::entry_usable(build.journal_path, host.state().pso_identity))
-                        failure = "requested writable journal file is missing or incompatible";
-                    else
-                        std::fprintf(stderr, "[compile-server] %s (%zu B, priority %llu): %s in %.1f s\n",
-                                     request.name.c_str(), bytes, static_cast<unsigned long long>(request.priority),
-                                     build.skipped ? "journaled already" : "built and journaled",
-                                     double(build.ms) / 1000.0);
-                }
-            }
-            std::error_code ignored;
-            // LOCAL FIX (compile helper: a .failed left with its .request listed): the .req goes first. A request with
-            // no .req and no .failed is one the game reads as answered, so it builds the pipeline itself instead of
-            // waiting for a file that is not coming (Client::state).
-            if (!leave) std::filesystem::remove(requests / (request.stem + ".req"), ignored);
-            if (!failure.empty()) {
-                helper::write_line(requests / (request.stem + ".failed"), failure);
-                std::fprintf(stderr, "[compile-server] %s: %s\n", request.name.c_str(), failure.c_str());
-            }
-            if (!leave) ++requests_done;
-            std::lock_guard lock(mutex);
-            busy.erase(request.stem);
-            if (leave) elsewhere[request.stem] = std::chrono::steady_clock::now();
+    auto serve_one = [&](const helper::Request& request) {  // normal priority: a title waits for these
+        std::string failure;
+        bool leave = false;  // another process is building it: its file answers the request
+        const auto it = by_name.find(request.name);
+        const leonida::ShaderEntry* entry = it == by_name.end() ? nullptr : it->second;
+        const std::size_t bytes = entry ? library->spirv_bytes(*entry) : 0;
+        if (!entry) failure = "no compute entry of that name in this library";
+        else if (skip_compute(entry->name)) failure = "LEONIDA_SKIP_COMPUTE";  // the game drops its dispatches
+        else if (const char* why = host.unbuildable(*entry, bytes)) failure = why;
+        // LOCAL FIX (compile helper: the journal name was checked after the build): the name is hashed from the
+        // module and this device's environment, which costs no driver call. A request from a game whose environment
+        // differs is answered before a compile is spent on a file that game never reads; the build below would only
+        // have found the same mismatch.
+        if (failure.empty()) {
+            ComputeBuildOptions key_options;
+            key_options.trigger = "compile-server";
+            key_options.key_only = true;
+            key_options.use_helper = false;
+            const std::filesystem::path key_path = host.build(*entry, key_options).journal_path;
+            if (!key_path.empty() && key_path.stem().string() != request.stem)
+                failure = "its journal name here is " + key_path.stem().string() +
+                          ": the helper's environment differs from the game's";
         }
+        if (failure.empty()) {
+            ComputeBuild build;
+            try {
+                build = build_entry(*entry, "compile-server");
+            } catch (const std::exception& e) {
+                failure = e.what();
+            }
+            if (failure.empty()) {
+                if (build.busy)
+                    leave = true;
+                else if (!build.skipped && (build.result != VK_SUCCESS || !(build.journaled || build.journal_hit)))
+                    failure = "not built or not journaled (VkResult " + std::to_string(int(build.result)) + ")";
+                else if (!leonida::pipeline_journal::entry_usable(build.journal_path, host.state().pso_identity))
+                    failure = "requested writable journal file is missing or incompatible";
+                else
+                    std::fprintf(stderr, "[compile-server] %s (%zu B, priority %llu): %s in %.1f s\n",
+                                 request.name.c_str(), bytes, static_cast<unsigned long long>(request.priority),
+                                 build.skipped ? "journaled already" : "built and journaled",
+                                 double(build.ms) / 1000.0);
+            }
+        }
+        std::error_code ignored;
+        // LOCAL FIX (compile helper: a .failed left with its .request listed): the .req goes first. A request with
+        // no .req and no .failed is one the game reads as answered, so it builds the pipeline itself instead of
+        // waiting for a file that is not coming (Client::state).
+        if (!leave) std::filesystem::remove(requests / (request.stem + ".req"), ignored);
+        if (!failure.empty()) {
+            helper::write_line(requests / (request.stem + ".failed"), failure);
+            std::fprintf(stderr, "[compile-server] %s: %s\n", request.name.c_str(), failure.c_str());
+        }
+        if (!leave) ++requests_done;
+        std::lock_guard lock(mutex);
+        queue.finish(request, leave);
     };
 
     // The rest of the library, smallest module first, while nothing is asked. The journal names of modules looked at
@@ -22865,83 +22840,65 @@ int compile_server(const CompileServerOptions& options) {
     }
     std::atomic<std::size_t> fill_next{0};
     std::atomic<unsigned> fill_unsaved{0};
-    auto fill = [&] {
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_IDLE);
-        for (;;) {
-            {
-                // Requests first: wait while one is listed that this helper could take.
-                std::unique_lock lock(mutex);
-                wake.wait_for(lock, std::chrono::milliseconds(200), [&] {
-                    if (stop) return true;
-                    for (const helper::Request& request : pending)
-                        if (!busy.count(request.stem)) return false;
-                    return true;
-                });
-                if (stop) return;
-                bool asked = false;
-                for (const helper::Request& request : pending)
-                    if (!busy.count(request.stem)) asked = true;
-                if (asked) continue;
+    auto fill_one = [&] {
+        const std::size_t i = fill_next.fetch_add(1);
+        if (i >= fill_order.size()) {
+            if (i == fill_order.size()) {
+                save_index();
+                std::fprintf(stderr, "[compile-server] the library is in the journal (%u built while idle)\n",
+                             filled.load());
             }
-            const std::size_t i = fill_next.fetch_add(1);
-            if (i >= fill_order.size()) {
-                if (i == fill_order.size()) {
-                    save_index();
-                    std::fprintf(stderr, "[compile-server] the library is in the journal (%u built while idle)\n",
-                                 filled.load());
-                }
-                return;
-            }
-            const leonida::ShaderEntry& entry = *fill_order[i];
-            if (skip_compute(entry.name) || host.unbuildable(entry, fill_bytes[i])) continue;
-            std::error_code stat;
-            const auto spv = library->spirv_file(entry);
-            const long long mtime = static_cast<long long>(std::filesystem::last_write_time(spv, stat).time_since_epoch().count());
-            std::filesystem::path path;
+            return false;
+        }
+        const leonida::ShaderEntry& entry = *fill_order[i];
+        if (skip_compute(entry.name) || host.unbuildable(entry, fill_bytes[i])) return true;
+        std::error_code stat;
+        const auto spv = library->spirv_file(entry);
+        const long long mtime = static_cast<long long>(std::filesystem::last_write_time(spv, stat).time_since_epoch().count());
+        std::filesystem::path path;
+        {
+            std::lock_guard lock(index_mutex);
+            const auto it = index.find(entry.name);
+            if (it != index.end() && it->second.size == fill_bytes[i] && it->second.mtime == mtime)
+                path = dir / (it->second.stem + ".bin");
+        }
+        if (path.empty()) {
+            ComputeBuildOptions key_options;
+            key_options.key_only = true;
+            key_options.use_helper = false;
+            path = host.build(entry, key_options).journal_path;
+            if (path.empty()) return true;
             {
                 std::lock_guard lock(index_mutex);
-                const auto it = index.find(entry.name);
-                if (it != index.end() && it->second.size == fill_bytes[i] && it->second.mtime == mtime)
-                    path = dir / (it->second.stem + ".bin");
+                index[entry.name] = {fill_bytes[i], mtime, path.stem().string()};
             }
-            if (path.empty()) {
-                ComputeBuildOptions key_options;
-                key_options.key_only = true;
-                key_options.use_helper = false;
-                path = host.build(entry, key_options).journal_path;
-                if (path.empty()) continue;
-                {
-                    std::lock_guard lock(index_mutex);
-                    index[entry.name] = {fill_bytes[i], mtime, path.stem().string()};
-                }
-                if (++fill_unsaved % 200 == 0) save_index();
-            }
-            if (journal::entry_usable(path, host.state().pso_identity)) continue;
-            ComputeBuild build;
-            try {
-                build = build_entry(entry, "idle-fill");
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "[compile-server] %s: %s\n", entry.name.c_str(), e.what());
-                continue;
-            }
-            if (!build.skipped && !build.busy && build.result == VK_SUCCESS && build.journaled) {
-                ++filled;
-                std::fprintf(stderr, "[compile-server] idle: %s (%zu B) built and journaled in %.1f s (%zu/%zu)\n",
-                             entry.name.c_str(), fill_bytes[i], double(build.ms) / 1000.0, i + 1, fill_order.size());
-            }
+            if (++fill_unsaved % 200 == 0) save_index();
         }
+        if (journal::entry_usable(path, host.state().pso_identity)) return true;
+        ComputeBuild build;
+        try {
+            build = build_entry(entry, "idle-fill");
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[compile-server] %s: %s\n", entry.name.c_str(), e.what());
+            return true;
+        }
+        if (!build.skipped && !build.busy && build.result == VK_SUCCESS && build.journaled) {
+            ++filled;
+            std::fprintf(stderr, "[compile-server] idle: %s (%zu B) built and journaled in %.1f s (%zu/%zu)\n",
+                         entry.name.c_str(), fill_bytes[i], double(build.ms) / 1000.0, i + 1, fill_order.size());
+        }
+        return true;
     };
 
-    std::vector<std::thread> pool;
-    for (unsigned t = 0; t < threads - idle_threads; ++t) pool.emplace_back(serve);
-    for (unsigned t = 0; t < idle_threads; ++t) pool.emplace_back(fill);
+    std::vector<std::thread> pool =
+        helper::start_server_workers(threads, idle_threads, mutex, wake, queue, stop, serve_one, fill_one);
     auto quiet_since = std::chrono::steady_clock::now();
     for (;;) {
         auto listing = helper::list_requests(requests);
         {
             std::lock_guard lock(mutex);
-            pending = std::move(listing);
-            if (!pending.empty() || !busy.empty()) quiet_since = std::chrono::steady_clock::now();
+            queue.refresh(std::move(listing));
+            if (queue.active()) quiet_since = std::chrono::steady_clock::now();
         }
         wake.notify_all();
         if (options.idle_exit_s &&

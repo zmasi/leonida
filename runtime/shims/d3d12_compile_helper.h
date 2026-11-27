@@ -29,6 +29,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -41,6 +42,7 @@
 #include <string>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "../src/cached_pso.h"
@@ -76,12 +78,20 @@ inline bool building_held(const std::filesystem::path& journal_file) {
     return GetLastError() == ERROR_SHARING_VIOLATION;
 }
 
+// Share delete access so a directory scan reading `<stem>.req` never blocks a worker unlinking or replacing it.
 inline std::string read_line(const std::filesystem::path& path) {
-    std::ifstream file(path, std::ios::binary);
-    std::string line;
-    std::getline(file, line);
-    while (!line.empty() && (line.back() == '\r' || line.back() == '\n')) line.pop_back();
-    return line;
+    const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return {};
+    char buf[4096];
+    DWORD read = 0;
+    const BOOL ok = ReadFile(file, buf, sizeof(buf), &read, nullptr);
+    CloseHandle(file);
+    if (!ok || !read) return {};
+    std::size_t end = 0;
+    while (end < read && buf[end] != '\r' && buf[end] != '\n') ++end;
+    return std::string(buf, end);
 }
 
 inline std::error_code write_line(const std::filesystem::path& path, const std::string& text) {
@@ -438,6 +448,130 @@ inline std::vector<Request> list_requests(const std::filesystem::path& dir) {
         return a.priority != b.priority ? a.priority < b.priority : a.asked < b.asked;
     });
     return out;
+}
+
+// Tracks listed requests across directory scans so a request finished and unlinked by a worker is neither re-claimed
+// from the previous scan's `pending` list nor re-inserted by an unlocked `list_requests` scan that read `<stem>.req`
+// just before it was unlinked.
+class RequestQueue {
+public:
+    static constexpr auto kElsewhereCooldown = std::chrono::seconds(5);
+
+    void refresh(std::vector<Request> listing,
+                 std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) {
+        for (auto it = elsewhere_.begin(); it != elsewhere_.end();) {
+            if (now - it->second >= kElsewhereCooldown)
+                it = elsewhere_.erase(it);
+            else
+                ++it;
+        }
+        std::map<std::string, Stamp> still_listed;
+        pending_.clear();
+        pending_.reserve(listing.size());
+        for (Request& req : listing) {
+            const auto ans = answered_.find(req.stem);
+            if (ans != answered_.end() && ans->second.priority == req.priority && ans->second.asked == req.asked) {
+                still_listed.emplace(req.stem, ans->second);
+                continue;
+            }
+            pending_.push_back(std::move(req));
+        }
+        answered_ = std::move(still_listed);
+    }
+
+    bool take(Request& out, std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) {
+        for (const Request& request : pending_) {
+            if (busy_.count(request.stem)) continue;
+            if (const auto it = elsewhere_.find(request.stem);
+                it != elsewhere_.end() && now - it->second < kElsewhereCooldown)
+                continue;
+            busy_.insert(request.stem);
+            out = request;
+            return true;
+        }
+        return false;
+    }
+
+    void finish(const Request& request, bool leave,
+                std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now()) {
+        busy_.erase(request.stem);
+        if (leave) {
+            elsewhere_[request.stem] = now;
+            return;
+        }
+        elsewhere_.erase(request.stem);
+        answered_[request.stem] = {request.priority, request.asked};
+        std::erase_if(pending_, [&](const Request& queued) { return queued.stem == request.stem; });
+    }
+
+    bool active() const { return !pending_.empty() || !busy_.empty(); }
+    std::size_t pending_count() const { return pending_.size(); }
+    std::size_t answered_count() const { return answered_.size(); }
+
+private:
+    struct Stamp {
+        std::uint64_t priority = 0;
+        std::filesystem::file_time_type asked{};
+    };
+    std::vector<Request> pending_;
+    std::set<std::string> busy_;
+    std::map<std::string, std::chrono::steady_clock::time_point> elsewhere_;
+    std::map<std::string, Stamp> answered_;
+};
+
+struct IdlePriorityScope {
+    HANDLE thread = GetCurrentThread();
+    int saved = GetThreadPriority(thread);
+    IdlePriorityScope() {
+        if (saved != THREAD_PRIORITY_ERROR_RETURN) SetThreadPriority(thread, THREAD_PRIORITY_IDLE);
+    }
+    ~IdlePriorityScope() {
+        if (saved != THREAD_PRIORITY_ERROR_RETURN) SetThreadPriority(thread, saved);
+    }
+    IdlePriorityScope(const IdlePriorityScope&) = delete;
+    IdlePriorityScope& operator=(const IdlePriorityScope&) = delete;
+};
+
+// Starts `threads` request workers at normal priority, the last `idle_threads` (clamped to `threads - 1`) of which
+// also step `fill_one()` at THREAD_PRIORITY_IDLE whenever no takeable request is queued.
+template <class ServeOne, class FillOne>
+std::vector<std::thread> start_server_workers(unsigned threads, unsigned idle_threads, std::mutex& mutex,
+                                              std::condition_variable& wake, RequestQueue& queue, const bool& stop,
+                                              ServeOne serve_one, FillOne fill_one) {
+    threads = (std::max)(1u, threads);
+    idle_threads = (std::min)(idle_threads, threads - 1);
+    const unsigned dedicated = threads - idle_threads;
+    std::vector<std::thread> pool;
+    pool.reserve(threads);
+    for (unsigned t = 0; t < threads; ++t) {
+        const bool can_fill = t >= dedicated;
+        pool.emplace_back([&, can_fill, serve_one, fill_one]() mutable {
+            bool fill_done = !can_fill;
+            for (;;) {
+                Request request;
+                bool has_request = false;
+                {
+                    std::unique_lock lock(mutex);
+                    if (fill_done) {
+                        wake.wait_for(lock, std::chrono::milliseconds(100),
+                                      [&] { return stop || queue.take(request); });
+                        if (stop) return;
+                        has_request = !request.stem.empty();
+                    } else {
+                        if (stop) return;
+                        has_request = queue.take(request);
+                    }
+                }
+                if (has_request) {
+                    serve_one(request);
+                    continue;
+                }
+                IdlePriorityScope idle;
+                if (!fill_one()) fill_done = true;
+            }
+        });
+    }
+    return pool;
 }
 
 }  // namespace rt::d3d12::compile_helper
