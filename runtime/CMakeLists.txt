@@ -2323,6 +2323,9 @@ if(TARGET Vulkan::Headers)
   target_link_libraries(vulkan_mesh_limits_test PRIVATE Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME vulkan_mesh_limits COMMAND vulkan_mesh_limits_test)
+    add_executable(vulkan_mesh_compute_direct_test test/vulkan_mesh_compute_direct_test.cpp)
+    target_link_libraries(vulkan_mesh_compute_direct_test PRIVATE Vulkan::Headers)
+    add_test(NAME vulkan_mesh_compute_direct_bounds COMMAND vulkan_mesh_compute_direct_test)
   endif()
   # CPU-only: Vulkan 1.3 core vs 1.2 KHR/EXT feature probing and proc fallback (runtime/src/vulkan13_features.h).
   add_executable(vulkan13_features_test test/vulkan13_features_test.cpp)
@@ -4371,6 +4374,86 @@ if(TARGET Vulkan::Headers)
       set_tests_properties(d3d12_subgroup PROPERTIES SKIP_RETURN_CODE 77)
     else()
       message(STATUS "llvm-mc (set LLVM_MC) or glslangValidator not found: d3d12_subgroup_test is not built")
+    endif()
+
+    # Mesh-as-compute replay through the D3D12 proxy (direct DispatchMesh only,
+    # no #1930 computed-IJ interop, no command-signature fix): translator-derived
+    # mesh-compute producers plus generated vertex shaders, driven as real
+    # DispatchMesh draws on a no-extension device. test/shaders/build_mesh_compute.py
+    # assembles the hand-written ms_*.asm/ps_*.asm fixtures with llvm-mc,
+    # translates them with tools/rdna2spirv.py --mesh-compute (plus
+    # --f16-interp-fallback for the simple f16 pair; ps_bary goes plainly for
+    # native barycentrics), writes their consumers with tools/mesh_compute_vs.py,
+    # and merges the glslang-built pixel shaders into one staged index. Needs
+    # llvm-mc with the AMDGPU target, the Vulkan SDK's spirv-as and spirv-val,
+    # and glslangValidator; without them the test is not built.
+    if(LEONIDA_LLVM_MC AND LEONIDA_SPIRV_AS AND LEONIDA_SPIRV_VAL AND Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+      set(LEONIDA_MC_FOLD_SPV ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_mesh_group_fold.spv)
+      add_custom_command(
+        OUTPUT ${LEONIDA_MC_FOLD_SPV}
+        COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${LEONIDA_MC_FOLD_SPV}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_mesh_group_fold.frag
+        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/ps_mesh_group_fold.frag
+        COMMENT "Compiling the mesh-compute group-fold pixel shader"
+        VERBATIM)
+      set(LEONIDA_MC_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/mesh_compute_shaders)
+      set(LEONIDA_MC_FILES
+        ${LEONIDA_MC_DIR}/spirv/index.json
+        ${LEONIDA_MC_DIR}/spirv/ms_v5_workgroup.spv ${LEONIDA_MC_DIR}/spirv/ms_v5_workgroup.mesh_vs.spv
+        ${LEONIDA_MC_DIR}/spirv/ms_tri.spv ${LEONIDA_MC_DIR}/spirv/ms_tri.mesh_vs.spv
+        ${LEONIDA_MC_DIR}/spirv/ms_clip.spv ${LEONIDA_MC_DIR}/spirv/ms_clip.mesh_vs.spv
+        ${LEONIDA_MC_DIR}/spirv/ms_overlimit.spv ${LEONIDA_MC_DIR}/spirv/ms_overlimit.mesh_vs.spv
+        ${LEONIDA_MC_DIR}/spirv/ms_f16_pack.spv ${LEONIDA_MC_DIR}/spirv/ms_f16_pack.mesh_vs.spv
+        ${LEONIDA_MC_DIR}/spirv/ps_interp_f16_high.spv
+        ${LEONIDA_MC_DIR}/spirv/ps_bary.spv
+        ${LEONIDA_MC_DIR}/spirv/ms_v5_workgroup.mesh_compute.seal.json
+        ${LEONIDA_MC_DIR}/spirv/ms_tri.mesh_compute.seal.json
+        ${LEONIDA_MC_DIR}/spirv/ms_clip.mesh_compute.seal.json
+        ${LEONIDA_MC_DIR}/spirv/ms_overlimit.mesh_compute.seal.json
+        ${LEONIDA_MC_DIR}/spirv/ms_f16_pack.mesh_compute.seal.json
+        ${LEONIDA_MC_DIR}/spirv/ps_draw.spv ${LEONIDA_MC_DIR}/spirv/ps_mesh_group_fold.spv
+        ${LEONIDA_MC_DIR}/spirv/ms_native.spv ${LEONIDA_MC_DIR}/spirv/vs_fullscreen.spv
+        ${LEONIDA_MC_DIR}/fssm/ms_v5_workgroup.fssm ${LEONIDA_MC_DIR}/fssm/ms_tri.fssm
+        ${LEONIDA_MC_DIR}/fssm/ms_clip.fssm ${LEONIDA_MC_DIR}/fssm/ms_overlimit.fssm
+        ${LEONIDA_MC_DIR}/fssm/ms_f16_pack.fssm
+        ${LEONIDA_MC_DIR}/fssm/ps_interp_f16_high.fssm ${LEONIDA_MC_DIR}/fssm/ps_bary.fssm
+        ${LEONIDA_MC_DIR}/fssm/ps_draw.fssm
+        ${LEONIDA_MC_DIR}/fssm/ps_mesh_group_fold.fssm ${LEONIDA_MC_DIR}/fssm/ms_native.fssm
+        ${LEONIDA_MC_DIR}/fssm/vs_fullscreen.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_MC_FILES}
+        COMMAND ${CMAKE_COMMAND} -E remove_directory ${LEONIDA_MC_DIR}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build_mesh_compute.py
+                ${LEONIDA_MC_DIR} --ps-draw ${LEONIDA_TEST_PS} --fold ${LEONIDA_MC_FOLD_SPV}
+                --ms-native ${LEONIDA_TEST_MS} --vs ${LEONIDA_TEST_VS_FULLSCREEN}
+        DEPENDS ${LEONIDA_TRANSLATOR_DEPS}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build_mesh_compute.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ms_v5_workgroup.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ms_tri.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ms_clip.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ms_overlimit.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ms_f16_pack.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_interp_f16_high.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ps_bary.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/mesh_compute_vs.py
+                ${LEONIDA_MC_FOLD_SPV} ${LEONIDA_TEST_PS} ${LEONIDA_TEST_MS} ${LEONIDA_TEST_VS_FULLSCREEN}
+        COMMENT "Staging translator-derived mesh-compute shaders for d3d12_mesh_compute_test"
+        VERBATIM)
+      add_executable(d3d12_mesh_compute_test test/d3d12_mesh_compute_test.cpp shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp
+                     ${LEONIDA_MC_FILES})
+      target_link_libraries(d3d12_mesh_compute_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_mesh_compute_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_MESH_COMPUTE_DIR="${LEONIDA_MC_DIR}")
+      target_compile_options(d3d12_mesh_compute_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_mesh_compute COMMAND d3d12_mesh_compute_test)
+      set_tests_properties(d3d12_mesh_compute PROPERTIES SKIP_RETURN_CODE 77)
+      # The same draws with pipelines built at creation instead of at the first draw.
+      add_test(NAME d3d12_mesh_compute_eager COMMAND d3d12_mesh_compute_test)
+      set_tests_properties(d3d12_mesh_compute_eager PROPERTIES SKIP_RETURN_CODE 77
+                           ENVIRONMENT "LEONIDA_LAZY_PIPELINES=0")
+    else()
+      message(STATUS "llvm-mc, SPIRV-Tools or glslangValidator not found: d3d12_mesh_compute_test is not built")
     endif()
 
     # Clears on every format class against WARP (needs a Vulkan GPU; exit 77 without one).

@@ -10,6 +10,7 @@
 #endif
 #include "../src/vulkan_graphics_shader_modules.h"
 #include "d3d12_com.h"
+#include "d3d12_mesh_compute_direct.h"  // CPU inspect for direct mesh-as-compute PSOs
 #include "d3d12_compile_exit.h"
 #include "d3d12_pipeline_compile.h"
 #include "d3d12_precompile.h"
@@ -10529,6 +10530,406 @@ bool layout_feeds(const leonida::ShaderEntry& vs, const D3D12_INPUT_LAYOUT_DESC&
     return true;
 }
 
+// Direct mesh-as-compute (no VK_EXT_mesh_shader): a logically-mesh PSO whose index
+// entry carries a validated `mesh_compute` layout runs as a GLCompute producer plus
+// a Vertex+Pixel consumer. Both phases push 152 bytes (144-byte ShaderUserData plus
+// the output buffer address in dwords 36-37); a 128-byte/pc-tail pack is refused.
+// Logical `mesh` stays true; only the Vulkan stages differ. Native mesh (no layout)
+// keeps its extension gate and mesh limits; a GLCompute module without a layout is
+// malformed, never silently native.
+inline constexpr std::uint32_t kMeshComputePushBytes = 152;
+inline constexpr std::uint32_t kSpirvExecGLCompute = 5;
+inline constexpr std::uint32_t kSpirvExecMeshNV = 5268;
+inline constexpr std::uint32_t kSpirvExecMeshEXT = 5365;
+
+// The ExecutionModel of the "main" entry point, or nullopt when the words hold no
+// such OpEntryPoint (malformed SPIR-V counts as none; the driver would refuse it).
+inline std::optional<std::uint32_t> spirv_main_execution_model(std::span<const std::uint32_t> words) {
+    leonida::spirv_detail::Module mod;
+    if (!mod.parse(words)) return std::nullopt;
+    for (const auto& inst : mod.insts) {
+        if (inst.opcode != leonida::spirv_detail::kOpEntryPoint || inst.words.size() < 4) continue;
+        const std::span<const std::uint32_t> tail(inst.words.data() + 3, inst.words.size() - 3);
+        if (leonida::spirv_detail::decode_literal_string(tail) == "main") return inst.words[1];
+    }
+    return std::nullopt;
+}
+
+
+// Empty when the mesh-compute producer fits the device's *compute* limits (its
+// workgroup size/invocations and LDS bytes); else why not. Mesh limits do not
+// apply: the producer dispatches as compute even on mesh-capable adapters.
+inline std::string mesh_compute_producer_limit_refusal(const leonida::ShaderEntry& entry,
+                                                       const VkPhysicalDeviceProperties& props) {
+    const auto& n = entry.local_size;
+    const auto& lim = props.limits;
+    char text[384];
+    const std::uint64_t invocations = std::uint64_t(n[0]) * n[1] * n[2];
+    if (n[0] > lim.maxComputeWorkGroupSize[0] || n[1] > lim.maxComputeWorkGroupSize[1] ||
+        n[2] > lim.maxComputeWorkGroupSize[2] || invocations > lim.maxComputeWorkGroupInvocations) {
+        std::snprintf(text, sizeof text,
+                      "%s needs compute workgroup %ux%ux%u (%llu invocations); the device allows %u/%u/%u and %u",
+                      entry.name.c_str(), n[0], n[1], n[2], static_cast<unsigned long long>(invocations),
+                      lim.maxComputeWorkGroupSize[0], lim.maxComputeWorkGroupSize[1],
+                      lim.maxComputeWorkGroupSize[2], lim.maxComputeWorkGroupInvocations);
+        return text;
+    }
+    if (entry.lds_bytes && entry.lds_bytes > lim.maxComputeSharedMemorySize) {
+        std::snprintf(text, sizeof text,
+                      "%s declares %u bytes of workgroup memory, over the device's maxComputeSharedMemorySize %u",
+                      entry.name.c_str(), entry.lds_bytes, lim.maxComputeSharedMemorySize);
+        return text;
+    }
+    return {};
+}
+
+// Clip/CullDistance lengths from a Vertex module's Output variables (simple float[N]
+// arrays, as the offline companion generator emits). Returns false with `why` on a
+// form the consumer check cannot account for; the PSO is then refused rather than
+// sent to the driver with uncounted built-ins.
+inline bool mesh_vs_clip_cull_counts(std::span<const std::uint32_t> vs_words, std::uint32_t& clip,
+                                     std::uint32_t& cull, std::string& why) {
+    using namespace leonida::spirv_detail;
+    clip = cull = 0;
+    Module mod;
+    if (!mod.parse(vs_words)) {
+        why = "malformed VS SPIR-V";
+        return false;
+    }
+    // SPIR-V BuiltIn values (spirv/unified1/spirv.h): Position 0, Clip 3, Cull 4.
+    constexpr std::uint32_t kBuiltInClip = 3, kBuiltInCull = 4, kBuiltInLayer = 9, kBuiltInViewport = 10;
+    std::map<std::uint32_t, std::uint32_t> const_u32;  // const_id -> value (OpConstant u32)
+    std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> arr_ty;  // arr_id -> (elem_ty, len_id)
+    std::set<std::uint32_t> f32_ty;
+    std::map<std::uint32_t, std::uint32_t> ptr_out;  // ptr_id -> pointee (Output only)
+    std::map<std::uint32_t, std::uint32_t> var_builtin, var_pointee;
+    for (const Inst& inst : mod.insts) {
+        if (inst.opcode == kOpFunction) break;
+        if (inst.opcode == kOpTypeFloat && inst.words.size() == 3 && inst.words[2] == 32) {
+            f32_ty.insert(inst.words[1]);
+        } else if (inst.opcode == 28 /*OpTypeArray*/ && inst.words.size() == 4) {
+            arr_ty[inst.words[1]] = {inst.words[2], inst.words[3]};
+        } else if (inst.opcode == 43 /*OpConstant*/ && inst.words.size() == 4) {
+            const_u32[inst.words[2]] = inst.words[3];
+        } else if (inst.opcode == kOpTypePointer && inst.words.size() == 4 && inst.words[2] == kStorageOutput) {
+            ptr_out[inst.words[1]] = inst.words[3];
+        } else if (inst.opcode == kOpVariable && inst.words.size() >= 4 && inst.words[3] == kStorageOutput) {
+            if (const auto it = ptr_out.find(inst.words[1]); it != ptr_out.end())
+                var_pointee[inst.words[2]] = it->second;
+        } else if (inst.opcode == kOpDecorate && inst.words.size() >= 4 && inst.words[2] == 11 /*BuiltIn*/) {
+            var_builtin[inst.words[1]] = inst.words[3];
+        }
+    }
+    for (const auto& [var, pointee] : var_pointee) {
+        const auto bi = var_builtin.find(var);
+        if (bi == var_builtin.end()) continue;
+        if (bi->second == kBuiltInLayer || bi->second == kBuiltInViewport) {
+            why = "VS writes Layer/ViewportIndex, which the mesh-compute consumer cannot forward";
+            return false;
+        }
+        if (bi->second != kBuiltInClip && bi->second != kBuiltInCull) continue;
+        const auto arr = arr_ty.find(pointee);
+        if (arr == arr_ty.end() || !f32_ty.count(arr->second.first)) {
+            why = "VS ClipDistance/CullDistance output is not float[N]";
+            return false;
+        }
+        const auto len = const_u32.find(arr->second.second);
+        if (len == const_u32.end() || len->second < 1 || len->second > 8) {
+            why = "VS ClipDistance/CullDistance length must be in 1..8";
+            return false;
+        }
+        std::uint32_t& dst = (bi->second == kBuiltInClip) ? clip : cull;
+        if (dst && dst != len->second) {
+            why = "conflicting VS ClipDistance/CullDistance declarations";
+            return false;
+        }
+        dst = len->second;
+    }
+    if (clip && cull) {
+        why = "VS writes both ClipDistance and CullDistance";
+        return false;
+    }
+    return true;
+}
+
+// Fail-closed shape guard for the consumer interface: Location vars must be f32
+// scalars/vectors, except a native PerVertexKHR vec4[3] PS input (ONE location
+// footprint, valid only on a barycentric-capable device). Blocks, structs,
+// matrices and any other array are refused rather than miscounted. This path
+// builds no geometry stage, so only the native array form can occur here.
+inline std::string mesh_interface_shape_refusal(std::span<const std::uint32_t> vs_words,
+                                                std::span<const std::uint32_t> ps_words,
+                                                bool barycentric_capable = true) {
+    using namespace leonida::spirv_detail;
+    const auto check_one = [&](std::span<const std::uint32_t> words, std::uint32_t storage,
+                               const char* what) -> std::string {
+        if (words.empty()) return {};
+        Module mod;
+        if (!mod.parse(words)) return std::string("malformed consumer ") + what + " SPIR-V";
+        std::set<std::uint32_t> f32_ty, v234_ty, vec4_ty, int_ty;
+        std::map<std::uint32_t, std::uint32_t> const_u32;
+        std::map<std::uint32_t, std::pair<std::uint32_t, std::uint32_t>> arr_ty;
+        std::set<std::uint32_t> struct_ty;
+        std::map<std::uint32_t, std::uint32_t> ptr_pointee;
+        std::map<std::uint32_t, std::uint32_t> var_ptr;
+        std::map<std::uint32_t, std::uint32_t> var_location;
+        std::set<std::uint32_t> flat_vars, pervertex_vars;
+        constexpr std::uint32_t kDecFlat = 14, kDecPerVertexKHR = 5285;  // SPIR-V decorations
+        for (const Inst& inst : mod.insts) {
+            if (inst.opcode == kOpFunction) break;
+            if (inst.opcode == kOpTypeFloat && inst.words.size() == 3 && inst.words[2] == 32) {
+                f32_ty.insert(inst.words[1]);
+            } else if (inst.opcode == kOpTypeVector && inst.words.size() == 4 && f32_ty.count(inst.words[2]) &&
+                       inst.words[3] >= 2 && inst.words[3] <= 4) {
+                v234_ty.insert(inst.words[1]);
+                if (inst.words[3] == 4) vec4_ty.insert(inst.words[1]);
+            } else if (inst.opcode == kOpTypeInt && inst.words.size() == 4 && inst.words[2] == 32) {
+                int_ty.insert(inst.words[1]);
+            } else if (inst.opcode == 28 /*OpTypeArray*/ && inst.words.size() == 4) {
+                arr_ty[inst.words[1]] = {inst.words[2], inst.words[3]};
+            } else if (inst.opcode == 30 /*OpTypeStruct*/) {
+                if (inst.words.size() >= 2) struct_ty.insert(inst.words[1]);
+            } else if (inst.opcode == 43 /*OpConstant*/ && inst.words.size() == 4 && int_ty.count(inst.words[1])) {
+                const_u32[inst.words[2]] = inst.words[3];
+            } else if (inst.opcode == kOpTypePointer && inst.words.size() == 4 && inst.words[2] == storage) {
+                ptr_pointee[inst.words[1]] = inst.words[3];
+            } else if (inst.opcode == kOpVariable && inst.words.size() >= 4 && inst.words[3] == storage) {
+                if (ptr_pointee.count(inst.words[1])) var_ptr[inst.words[2]] = inst.words[1];
+            } else if (inst.opcode == kOpDecorate && inst.words.size() >= 3) {
+                if (inst.words[2] == kDecorationLocation && inst.words.size() >= 4)
+                    var_location.emplace(inst.words[1], inst.words[3]);
+                else if (inst.words[2] == kDecFlat)
+                    flat_vars.insert(inst.words[1]);
+                else if (inst.words[2] == kDecPerVertexKHR)
+                    pervertex_vars.insert(inst.words[1]);
+            } else if (inst.opcode == 72 /*OpMemberDecorate*/ && inst.words.size() >= 5 && inst.words[3] == 30) {
+                return std::string("unsupported ") + what + " interface block (MemberDecorate Location); failing closed";
+            }
+        }
+        const bool is_ps = std::string_view(what) == "PS";
+        for (const auto& [var, loc] : var_location) {
+            const auto vp = var_ptr.find(var);
+            if (vp == var_ptr.end()) continue;  // not of this storage; collect_located_vars skipped it too
+            const auto pt = ptr_pointee.find(vp->second);
+            if (pt == ptr_pointee.end()) return std::string("unsupported ") + what + " interface type; failing closed";
+            const std::uint32_t pointee = pt->second;
+            if (f32_ty.count(pointee) || v234_ty.count(pointee)) continue;
+            if (const auto arr = arr_ty.find(pointee); arr != arr_ty.end()) {
+                const auto len = const_u32.find(arr->second.second);
+                const bool is_vec4x3 = len != const_u32.end() && len->second == 3 &&
+                                       vec4_ty.count(arr->second.first) != 0;
+                const bool flat = flat_vars.count(var) > 0;
+                const bool pervertex = pervertex_vars.count(var) > 0;
+                // Native PerVertexKHR vec4[3] (ONE location footprint).
+                if (is_vec4x3 && pervertex && !flat && is_ps) {
+                    if (!barycentric_capable)
+                        return "native PerVertexKHR PS input without a barycentric-capable device; failing closed";
+                    continue;
+                }
+                char text[192];
+                std::snprintf(text, sizeof text,
+                              "unsupported %s interface array at location %u (not a native PerVertexKHR vec4[3]); failing closed",
+                              what, loc);
+                return text;
+            }
+            char text[160];
+            std::snprintf(text, sizeof text, "unsupported %s interface type at location %u; failing closed", what, loc);
+            return text;
+        }
+        return {};
+    };
+    if (const std::string refusal = check_one(vs_words, leonida::spirv_detail::kStorageOutput, "VS");
+        !refusal.empty())
+        return refusal;
+    if (!ps_words.empty()) {
+        if (const std::string refusal =
+                check_one(ps_words, leonida::spirv_detail::kStorageInput, "PS");
+            !refusal.empty())
+            return refusal;
+    }
+    return {};
+}
+
+// True when PS words use native barycentrics (PerVertexKHR inputs, BaryCoordKHR
+// built-ins, or the barycentric capability) rather than the fallback smooth/Flat
+// pair. Such modules need fragment_shader_barycentric; without it they are refused
+// before pipeline creation. Enumerants are from the Khronos SPIR-V unified grammar.
+inline bool ps_uses_native_barycentric(std::span<const std::uint32_t> ps_words) {
+    using namespace leonida::spirv_detail;
+    Module mod;
+    if (ps_words.empty() || !mod.parse(ps_words)) return false;
+    constexpr std::uint32_t kDecPerVertexKHR = 5285, kDecBuiltIn = 11;
+    constexpr std::uint32_t kBuiltInBaryCoord = 5286, kBuiltInBaryNoPersp = 5287;
+    constexpr std::uint32_t kCapBarycentric = 5284;
+    for (const Inst& inst : mod.insts) {
+        if (inst.opcode == kOpCapability && inst.words.size() >= 2 && inst.words[1] == kCapBarycentric) return true;
+        if (inst.opcode == kOpDecorate && inst.words.size() >= 3) {
+            if (inst.words[2] == kDecPerVertexKHR) return true;
+            if (inst.words[2] == kDecBuiltIn && inst.words.size() >= 4 &&
+                (inst.words[3] == kBuiltInBaryCoord || inst.words[3] == kBuiltInBaryNoPersp))
+                return true;
+        }
+        if (inst.opcode == kOpFunction) break;
+    }
+    return false;
+}
+
+// Empty when the linked consumer (VS outputs, PS inputs) fits the device's
+// vertex/fragment interface limits. Never sends a knowingly out-of-limit module
+// to the driver: a vec4 at location 16 needs 68 components and fails on a
+// 64-component profile even when few scalars are live. This path builds no
+// geometry stage, so no geometry accounting is done here.
+inline std::string mesh_consumer_limit_refusal(std::span<const std::uint32_t> vs_words,
+                                               std::span<const std::uint32_t> ps_words,
+                                               const VkPhysicalDeviceProperties& props,
+                                               bool barycentric_capable = true) {
+    if (const std::string shape =
+            mesh_interface_shape_refusal(vs_words, ps_words, barycentric_capable);
+        !shape.empty())
+        return shape;
+    using namespace leonida::spirv_detail;
+    Module vs_mod, ps_mod;
+    if (!vs_mod.parse(vs_words)) return "malformed consumer VS SPIR-V";
+    if (!ps_words.empty() && !ps_mod.parse(ps_words)) return "malformed consumer PS SPIR-V";
+    const auto vs_locs = collect_located_vars(vs_mod, kStorageOutput);
+    std::map<std::uint32_t, std::uint32_t> ps_locs;
+    if (!ps_words.empty()) ps_locs = collect_located_vars(ps_mod, kStorageInput);
+    std::set<std::uint32_t> vs_set, ps_set;
+    std::uint32_t vs_max = 0, ps_max = 0;
+    bool vs_any = false, ps_any = false;
+    for (const auto& [loc, id] : vs_locs) {
+        vs_set.insert(loc);
+        vs_any = true;
+        vs_max = std::max(vs_max, loc);
+    }
+    for (const auto& [loc, id] : ps_locs) {
+        ps_set.insert(loc);
+        ps_any = true;
+        ps_max = std::max(ps_max, loc);
+    }
+    std::uint32_t clip = 0, cull = 0;
+    std::string why;
+    if (!mesh_vs_clip_cull_counts(vs_words, clip, cull, why)) return why;
+    const std::uint64_t vs_total = 4ull + clip + cull + 4ull * vs_set.size();
+    const std::uint64_t vs_high = vs_any ? (std::uint64_t(vs_max) + 1u) * 4u + 4u + clip + cull : 4ull + clip + cull;
+    // Fragment inputs: locations plus 4 for built-ins (FragCoord etc.), mirroring
+    // f16_half_top_location's Position reserve.
+    const std::uint64_t ps_total = 4ull + 4ull * ps_set.size();
+    const std::uint64_t ps_high = ps_any ? (std::uint64_t(ps_max) + 1u) * 4u + 4u : 4ull;
+    char text[384];
+    const auto& lim = props.limits;
+    if (vs_total > lim.maxVertexOutputComponents || vs_high > lim.maxVertexOutputComponents) {
+        std::snprintf(text, sizeof text,
+                      "mesh-compute consumer VS needs %llu components (highest location %s%u); the device allows %u",
+                      static_cast<unsigned long long>(std::max(vs_total, vs_high)), vs_any ? "" : "none, max ",
+                      vs_any ? vs_max : 0, lim.maxVertexOutputComponents);
+        return text;
+    }
+    if (!ps_words.empty() && (ps_total > lim.maxFragmentInputComponents || ps_high > lim.maxFragmentInputComponents)) {
+        std::snprintf(text, sizeof text,
+                      "mesh-compute consumer PS needs %llu input components (highest location %s%u); the device allows %u",
+                      static_cast<unsigned long long>(std::max(ps_total, ps_high)), ps_any ? "" : "none, max ",
+                      ps_any ? ps_max : 0, lim.maxFragmentInputComponents);
+        return text;
+    }
+    return {};
+}
+
+// Demotes every static f16 half output in `vs_entry.f16_halves` from Output to
+// Private for a valid no-PS depth-only pipe (no pixel stage reads them), dropping
+// their Locations so interface limits see the final emitted VS outputs. False with
+// `*error` when a half is missing, non-vec4 or access-chained (fail closed, never
+// send a miscounted module). Used eagerly and on lazy reload.
+inline bool strip_unused_f16_halves(std::vector<std::uint32_t>& vs_words, const leonida::ShaderEntry& vs_entry,
+                                    std::string* error = nullptr) {
+    const auto fail = [&](const std::string& msg) {
+        if (error) *error = msg;
+        return false;
+    };
+    if (vs_entry.f16_halves.empty()) return true;
+    using namespace leonida::spirv_detail;
+    Module mod;
+    if (!mod.parse(vs_words)) return fail("f16_halves: malformed VS SPIR-V");
+    const auto outputs = collect_located_vars(mod, kStorageOutput);
+    std::map<std::uint32_t, std::uint32_t> var_ptr_ty;
+    std::map<std::uint32_t, std::uint32_t> ptr_pointee;
+    std::set<std::uint32_t> chained;
+    std::uint32_t v4_ty = 0, float_ty = 0, priv_ptr_ty = 0;
+    for (const Inst& inst : mod.insts) {
+        if (inst.opcode == kOpFunction) break;
+        if (inst.opcode == kOpTypeFloat && inst.words.size() == 3 && inst.words[2] == 32) float_ty = inst.words[1];
+        if (inst.opcode == kOpTypeVector && inst.words.size() == 4 && inst.words[2] == float_ty && inst.words[3] == 4)
+            v4_ty = inst.words[1];
+        if (inst.opcode == kOpTypePointer && inst.words.size() == 4) {
+            ptr_pointee[inst.words[1]] = inst.words[3];
+            if (inst.words[2] == kStoragePrivate && inst.words[3] == v4_ty) priv_ptr_ty = inst.words[1];
+        }
+        if (inst.opcode == kOpVariable && inst.words.size() >= 4) var_ptr_ty[inst.words[2]] = inst.words[1];
+        if ((inst.opcode == kOpAccessChain || inst.opcode == kOpInBoundsAccessChain) && inst.words.size() >= 4)
+            chained.insert(inst.words[3]);
+    }
+    if (!v4_ty) return fail("f16_halves: VS has no vec4 float type for static halves");
+    std::set<std::uint32_t> demote;
+    for (const auto& [param, pair] : vs_entry.f16_halves) {
+        (void)param;
+        for (std::uint32_t loc : pair) {
+            const auto it = outputs.find(loc);
+            if (it == outputs.end()) return fail("f16_halves: static half location missing from VS outputs");
+            const auto pt = var_ptr_ty.find(it->second);
+            if (pt == var_ptr_ty.end() || ptr_pointee[pt->second] != v4_ty || chained.count(it->second))
+                return fail("f16_halves: cannot demote non-vec4 or access-chained static half");
+            demote.insert(it->second);
+        }
+    }
+    if (demote.empty()) return true;
+    if (!priv_ptr_ty) {
+        priv_ptr_ty = mod.alloc_id();
+        bool inserted = false;
+        for (auto it = mod.insts.begin(); it != mod.insts.end(); ++it) {
+            if (it->opcode == kOpFunction) {
+                mod.insts.insert(it, make_inst(kOpTypePointer, {priv_ptr_ty, kStoragePrivate, v4_ty}));
+                inserted = true;
+                break;
+            }
+        }
+        if (!inserted) return fail("f16_halves: unexpected VS layout for Private pointer");
+    }
+    const bool drop_from_ep = mod.header[1] < kSpirvVersion14;
+    std::vector<Inst> out;
+    out.reserve(mod.insts.size());
+    for (Inst inst : mod.insts) {
+        if (inst.opcode == kOpEntryPoint && inst.words.size() >= 4 && inst.words[1] == kExecModelVertex) {
+            if (!drop_from_ep) {
+                out.push_back(std::move(inst));
+                continue;
+            }
+            const std::size_t if_start = entry_point_interface_start(inst);
+            std::vector<std::uint32_t> operands(inst.words.begin() + 1, inst.words.begin() + std::ptrdiff_t(if_start));
+            for (std::size_t i = if_start; i < inst.words.size(); ++i)
+                if (!demote.count(inst.words[i])) operands.push_back(inst.words[i]);
+            out.push_back(make_inst_vec(kOpEntryPoint, operands));
+            continue;
+        }
+        if (inst.opcode == kOpDecorate && inst.words.size() >= 3 && demote.count(inst.words[1]) &&
+            is_interface_only_decoration(inst.words[2]))
+            continue;
+        if (inst.opcode == kOpVariable && inst.words.size() >= 4 && demote.count(inst.words[2])) {
+            inst.words[1] = priv_ptr_ty;
+            inst.words[3] = kStoragePrivate;
+        }
+        out.push_back(std::move(inst));
+    }
+    mod.insts = std::move(out);
+    vs_words = mod.serialize();
+    return true;
+}
+
+// Push contract shared with the metadata (mesh_compute_pair.h) and replay
+// (vulkan_mesh_compute_direct.h) slices: 152 bytes, output at dwords 36-37.
+static_assert(kMeshComputePushBytes == 152);
+static_assert(kMeshComputePushBytes == leonida::kMeshComputePush152);
+static_assert(kMeshComputePushBytes == leonida::mesh_compute_direct::kPushBytes);
+
 // Known D3D12_PIPELINE_STATE_FLAGS bits: TOOL_DEBUG (0x1, kept for cached-PSO parity), bit 0x2,
 // DYNAMIC_DEPTH_BIAS (0x4), and DYNAMIC_INDEX_BUFFER_STRIP_CUT (0x8). Higher bits fail with E_INVALIDARG
 // on both Windows hardware D3D12 and WARP.
@@ -11110,12 +11511,14 @@ struct ComputeBuildOptions {
     std::uint64_t helper_priority = 0;       // the request's urgency: 0 a dispatch, else the warm-up's module size
     bool mark_building = false;              // precompile, helper: claim the entry, skip it when another process has it
     bool key_only = false;                   // only name the journal file (journal_path), build nothing
+    std::uint32_t push_bytes = std::uint32_t(sizeof(leonida::ShaderUserData));  // journal key: 144, or 152 for a mesh-compute producer
+    const std::vector<std::uint32_t>* validated_words = nullptr;  // sealed mesh-compute producer bytes (no .spv reload when set)
 };
 
 // A compute pipeline from a library entry: what a PSO's first dispatch, the warm-up worker and gta6rt
 // --precompile-pipelines all build, so their journal names and the driver's keys are the same. `layout` is the push
-// range of leonida::ShaderUserData, with the device's bindless set 0 when the entry declares bindings; `subgroup` is
-// leonida::decide_subgroup_size's answer for the entry.
+// range of leonida::ShaderUserData (144 bytes, or 152 for a mesh-compute producer via options.push_bytes), with the
+// device's bindless set 0 when the entry declares bindings; `subgroup` is leonida::decide_subgroup_size's answer.
 ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEntry& compute_entry,
                                     VkPipelineLayout layout, const leonida::SubgroupRequest& subgroup,
                                     const ComputeBuildOptions& options) {
@@ -11140,12 +11543,21 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     // PipelineState::enter_build); LEONIDA_SERIAL_BIG_COMPILES=1 compiles them one at a time here instead.
     static std::mutex big_compile;
     std::unique_lock<std::mutex> big_lock(big_compile, std::defer_lock);  // taken below, only for a compile here
-    auto words = library->spirv(*entry);
-    if (words.empty()) {
-        std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
-        return out;
+    // Sealed mesh-compute producer: use the caller's validated bytes (no .spv
+    // reload, no TOCTOU); ordinary compute reloads from the library here.
+    std::vector<std::uint32_t> owned;
+    std::span<const std::uint32_t> word_span;
+    if (options.validated_words && !options.validated_words->empty()) {
+        word_span = std::span<const std::uint32_t>(*options.validated_words);
+    } else {
+        owned = library->spirv(*entry);
+        if (owned.empty()) {
+            std::fprintf(stderr, "[rt] d3d12: %s.spv is missing or not SPIR-V\n", entry->name.c_str());
+            return out;
+        }
+        word_span = std::span<const std::uint32_t>(owned);
     }
-    const std::size_t bytes = words.size() * sizeof(std::uint32_t);
+    const std::size_t bytes = word_span.size() * sizeof(std::uint32_t);
     out.bytes = bytes;
     VkComputePipelineCreateInfo pipeline_info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pipeline_info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
@@ -11166,13 +11578,13 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
     if (const std::filesystem::path& journal_dir = pipeline_journal_dir(); !journal_dir.empty()) {
         leonida::pipeline_journal::Hasher key;
         key.text("cs");
-        key.value(std::uint64_t(words.size()));
-        key.bytes(words.data(), bytes);
+        key.value(std::uint64_t(word_span.size()));
+        key.bytes(word_span.data(), bytes);
         key.text(pipeline_info.stage.pName);
         key.value(std::uint32_t(pipeline_info.flags));
         key.value(std::uint32_t(pipeline_info.stage.flags));
         key.value(std::uint32_t(pipeline_info.stage.pNext == &required_size ? required_size.requiredSubgroupSize : 0));
-        key.value(std::uint32_t(sizeof(leonida::ShaderUserData)));
+        key.value(options.push_bytes);
         key.value(std::uint32_t(entry->binding_count != 0));
         // NVIDIA's diagnostics config (LEONIDA_DEVICE_FAULT=1, Aftermath) compiles with shader debug info: other
         // pipelines, kept apart so switching it on and off does not rewrite every file. Absent when off, so the
@@ -11234,7 +11646,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
 
     VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     module_info.codeSize = bytes;
-    module_info.pCode = words.data();
+    module_info.pCode = word_span.data();
     VkShaderModule module = VK_NULL_HANDLE;
     const ULONGLONG started = GetTickCount64();
     VkPipeline built = VK_NULL_HANDLE;
@@ -11297,7 +11709,7 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         vk.vkDestroyShaderModule(dev, module, nullptr);  // Vulkan lets a module go once the pipeline exists
         journal.finish(!from_shared && created == VK_SUCCESS && built, trace.hit(), driver_ms);
     }
-    std::vector<std::uint32_t>().swap(words);
+    std::vector<std::uint32_t>().swap(owned);  // free a reload; validated caller bytes stay with the PSO
     profile.finish(int(created));
     trace.end(trigger, entry->name.c_str(), 0, bytes, created);
     if (big_lock.owns_lock()) big_lock.unlock();
@@ -11363,8 +11775,13 @@ public:
         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
+        if (mesh_compute_producer_) vk.vkDestroyPipeline(dev, mesh_compute_producer_, nullptr);
+        if (mesh_compute_producer_layout_) vk.vkDestroyPipelineLayout(dev, mesh_compute_producer_layout_, nullptr);
         modules_.clear();
         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
+        if (mesh_compute_producer_code_bytes_)
+            device_.arena_release(mesh_compute_producer_code_base_, mesh_compute_producer_code_bytes_,
+                                  DeviceState::arena_shader);
         --live_pipeline_state_count;
     }
 
@@ -11378,6 +11795,19 @@ public:
         log_once("pipelines need 144 bytes of push constants (uniform-buffer fallback not built yet); "
                  "maxPushConstantsSize",
                  int(limit));
+        return false;
+    }
+
+    // Mesh-compute direct: both phases push 152 bytes (144-byte user data plus the
+    // output address in dwords 36-37). A 128-byte device (Vulkan's minimum) is
+    // refused explicitly; the set-1 UBO tail variant is not built in this wave.
+    bool mesh_compute_push_fit() const {
+        const std::uint32_t limit = device_.info.max_push_constants_size;
+        if (limit == 0 || limit >= kMeshComputePushBytes) return true;  // 0: not queried
+        std::fprintf(stderr,
+                     "[rt] d3d12: mesh-compute PSOs need %u bytes of push constants for the output address "
+                     "(dwords 36-37); maxPushConstantsSize is %u, so the PSO is refused\n",
+                     kMeshComputePushBytes, limit);
         return false;
     }
 
@@ -11542,15 +11972,16 @@ public:
                      desc.GS.BytecodeLength || desc.StreamOutput.NumEntries))
             return E_INVALIDARG;  // D3D12: a mesh PSO has no vertex, tessellation or geometry stage
         if (!mesh && (!desc.VS.pShaderBytecode || !desc.VS.BytecodeLength)) return E_INVALIDARG;
-        if (mesh && (!device_.info.mesh_shader || !vk.vkCmdDrawMeshTasksEXT)) {
-            return stream_unsupported("mesh-shader PSOs need VK_EXT_mesh_shader, which the device has not enabled; stage", 1);
-        }
+        // Mesh representation is decided after shader lookup: a validated `mesh_compute`
+        // layout runs as compute even without VK_EXT_mesh_shader, while a native MS
+        // without one keeps the extension gate below (never silently native).
         if (desc.NodeMask & ~1u) return E_INVALIDARG;
         if (static_cast<UINT>(desc.Flags) & ~kKnownPipelineStateFlags) return E_INVALIDARG;
         if (!device_.arena.mapped) {
             return stream_unsupported("pipelines need the GPU address arena (bufferDeviceAddress); stage", 1);
         }
-        if (!push_constants_fit()) return stream_unsupported("graphics push-constant limit");
+        // Push limits for mesh wait for the representation (144 native, 152 emulated).
+        if (!mesh && !push_constants_fit()) return stream_unsupported("graphics push-constant limit");
         if (!vk.graphics_complete()) {
             return stream_unsupported("graphics pipelines need Vulkan 1.3 dynamic rendering and extended dynamic state; stage", 1);
         }
@@ -11735,6 +12166,199 @@ public:
                 log_once("shader bytecode holds no FSSM or FSPX program; bytes", int(stage.code.BytecodeLength));
                 return E_INVALIDARG;
             }
+            const bool is_mesh_stage = stage.bit == VK_SHADER_STAGE_MESH_BIT_EXT;
+            if (is_mesh_stage) {
+                // Representation decided here, after lookup: validated `mesh_compute`
+                // runs as compute even without the mesh extension; without one the
+                // native gate below still applies (never silently native).
+                const bool has_layout = stage.entry->mesh_compute.has_value();
+                if (has_layout) {
+                    if (stage.fssm.empty()) {
+                        return stream_unsupported("FSPX mesh-compute producers are not supported; stage", 1);
+                    }
+                    if (!mesh_compute_push_fit()) return stream_unsupported("mesh-compute push-constant limit");
+                    // 128-byte pc-tail layouts stay present so they are refused here
+                    // explicitly, never silently native and never via a seal load.
+                    if (stage.entry->mesh_compute->is_pc_tail())
+                        return stream_unsupported("mesh-compute 128-byte pc-tail packs are not supported here");
+                    // Device features the verified pair needs, before any file I/O or
+                    // module (VUID 08740 and Int64): clip/cull from the layout count
+                    // even with no bary GS, and Int64 always (the pair declares Int64).
+                    if (stage.entry->mesh_compute->clip_count && !device_.info.features.shaderClipDistance) {
+                        return stream_unsupported(
+                            "mesh-compute companion writes ClipDistance, which needs shaderClipDistance; count",
+                            int(stage.entry->mesh_compute->clip_count));
+                    }
+                    if (stage.entry->mesh_compute->cull_count && !device_.info.features.shaderCullDistance) {
+                        return stream_unsupported(
+                            "mesh-compute companion writes CullDistance, which needs shaderCullDistance; count",
+                            int(stage.entry->mesh_compute->cull_count));
+                    }
+                    if (!device_.info.features.shaderInt64) {
+                        return stream_unsupported(
+                            "mesh-compute producer/companion need shaderInt64, which the device has not enabled; stage",
+                            1);
+                    }
+                    // Sealed pair, loaded ONCE (layout+producer+companion seal-bound):
+                    // 152-byte push, GLCompute producer, Vertex companion, exact
+                    // location/capability match. Failures are pack errors and fail red
+                    // (no silent stub on the verified direct path). Both vectors are
+                    // retained immutably for compile, modules, lazy rebuild and inspect.
+                    std::string pair_why;
+                    mesh_validated_producer_.clear();
+                    mesh_validated_companion_.clear();
+                    if (!library->load_mesh_compute_pair(*stage.entry, &mesh_validated_producer_,
+                                                         &mesh_validated_companion_, &pair_why)) {
+                        std::fprintf(stderr, "[rt] d3d12: %s (%s)\n", pair_why.c_str(), stage.entry->name.c_str());
+                        return E_FAIL;
+                    }
+                    if (stage.entry->binding_count && !device_.bindless) {
+                        std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
+                                     stage.entry->name.c_str());
+                        return stream_unsupported("mesh-compute producer requires a bindless descriptor set");
+                    }
+                    if (stage.entry->binding_count) register_literal_samplers(device_, *stage.entry);
+                    if (!stage.entry->graphics_root_window) {
+                        std::fprintf(stderr,
+                                     "[rt] d3d12: mesh shader %s was translated before the graphics root window; translate "
+                                     "the shaders again (make_game.py --stages shaders)\n",
+                                     stage.entry->name.c_str());
+                        return E_INVALIDARG;
+                    }
+                    if (const auto& dinfo = device_.info; dinfo.physical && dinfo.get_instance_proc) {
+                        if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                                dinfo.get_instance_proc(dinfo.instance, "vkGetPhysicalDeviceProperties"))) {
+                            VkPhysicalDeviceProperties props{};
+                            get_props(dinfo.physical, &props);
+                            if (const std::string refusal =
+                                    mesh_compute_producer_limit_refusal(*stage.entry, props);
+                                !refusal.empty()) {
+                                std::fprintf(stderr, "[rt] d3d12: %s\n", refusal.c_str());
+                                return stream_unsupported("mesh-compute producer exceeds a device compute limit");
+                            }
+                        }
+                    }
+                    // Producer code base now (cheap arena copy); the producer pipeline
+                    // itself is built after the consumer validates, so a consumer
+                    // refusal does not pay for a wasted compile. Destructor releases.
+                    if (stage.entry->uses_code_base) {
+                        VkDeviceSize offset = 0;
+                        if (!device_.arena_allocate(stage.fssm.size(), 256, offset, DeviceState::arena_shader))
+                            return E_OUTOFMEMORY;
+                        std::memcpy(device_.arena.mapped + offset, stage.fssm.data(), stage.fssm.size());
+                        mesh_compute_producer_code_base_ = offset;
+                        mesh_compute_producer_code_bytes_ = stage.fssm.size();
+                    }
+                    // Consumer from the retained sealed bytes (copy for linking; the
+                    // retained pre-link vector stays immutable for lazy/inspect).
+                    std::vector<std::uint32_t> companion = mesh_validated_companion_;
+                    // Synthetic consumer VS: the producer's f16 halves for linking, but
+                    // no bindings/code (the companion needs neither) and an emulated
+                    // subgroup (it uses no subgroup ops). Named from the index key for
+                    // traces; lazy rebuild reuses the retained sealed bytes (no reload).
+                    mesh_producer_entry_ = stage.entry;
+                    mesh_companion_entry_ = *stage.entry;
+                    mesh_companion_entry_.name = stage.entry->name + leonida::kMeshComputeCompanionSuffix;
+                    mesh_companion_entry_.spv_file.clear();
+                    mesh_companion_entry_.stage = "vs";
+                    mesh_companion_entry_.binding_count = 0;
+                    mesh_companion_entry_.push_constant_bytes = kMeshComputePushBytes;
+                    mesh_companion_entry_.local_size = {1, 1, 1};
+                    mesh_companion_entry_.lds_bytes = 0;
+                    mesh_companion_entry_.uses_code_base = false;
+                    mesh_companion_entry_.code_base_known = true;
+                    mesh_companion_entry_.wave64 = false;
+                    mesh_companion_entry_.subgroup_size = 0;
+                    mesh_companion_entry_.wave64_exchange = "workgroup";
+                    mesh_companion_entry_.wave64_graphics.clear();
+                    mesh_companion_entry_.graphics_root_window = false;
+                    mesh_companion_entry_.input_signature.clear();
+                    mesh_companion_entry_.inputs.clear();
+                    mesh_companion_entry_.outputs.clear();
+                    mesh_companion_entry_.literal_samplers.clear();
+                    mesh_companion_entry_.max_vertices = 0;
+                    mesh_companion_entry_.max_primitives = 0;
+                    mesh_companion_entry_.mesh_compute.reset();
+                    mesh_companion_entry_ready_ = true;
+                    mesh_compute_ = true;
+                    // From here the stage is the consumer VS: later f16/bary/module
+                    // steps treat it as ordinary VS+PS (no mesh extension).
+                    stage.name = "vs";
+                    stage.bit = VK_SHADER_STAGE_VERTEX_BIT;
+                    stage.entry = &mesh_companion_entry_;
+                    stage.words = std::move(companion);
+                    stage.fssm.clear();
+                    const auto inner = leonida::conservative_raster::inner_coverage_requirements(stage.words);
+                    if (!inner.valid) return E_INVALIDARG;
+                    if (inner.fully_covered) {
+                        return stream_unsupported("FullyCoveredEXT needs an enabled Tier 3 shader ABI and device properties; stage",
+                                                  int(stage.bit));
+                    }
+                    continue;
+                }
+                // Native mesh: extension gate and 144-byte push (both deferred past
+                // lookup so emulated layouts do not trip them), then mesh limits.
+                if (stage.entry->binding_count) {
+                    if (!device_.bindless) {
+                        std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
+                                     stage.entry->name.c_str());
+                        return stream_unsupported("graphics shader requires a bindless descriptor set");
+                    }
+                    uses_bindless = true;
+                    register_literal_samplers(device_, *stage.entry);
+                }
+                if (!device_.info.mesh_shader || !vk.vkCmdDrawMeshTasksEXT) {
+                    return stream_unsupported("mesh-shader PSOs need VK_EXT_mesh_shader, which the device has not enabled; stage", 1);
+                }
+                if (!push_constants_fit()) return stream_unsupported("graphics push-constant limit");
+                if (const std::string refusal = leonida::mesh_limit_refusal(*stage.entry, device_.mesh_limits());
+                    !refusal.empty()) {
+                    std::fprintf(stderr, "[rt] d3d12: %s\n", refusal.c_str());
+                    return stream_unsupported("mesh shader exceeds a device mesh limit");
+                }
+                if (!stage.entry->graphics_root_window) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: mesh shader %s was translated before the graphics root window; translate "
+                                 "the shaders again (make_game.py --stages shaders)\n",
+                                 stage.entry->name.c_str());
+                    return E_INVALIDARG;
+                }
+                if (stage.entry->uses_code_base) {
+                    if (code_stage) {
+                        return stream_unsupported("two stages read their code base; one push-constant slot holds one (question 14)", 0);
+                    }
+                    code_stage = &stage;
+                }
+                stage.words = library->spirv(*stage.entry);
+                if (stage.words.empty()) return E_FAIL;
+                // A GLCompute module without a layout is malformed emulation, never
+                // native (on a mesh-capable adapter it must not become a mesh pipe).
+                // Only EXT MeshEXT is accepted natively here (VK_EXT_mesh_shader);
+                // MeshNV shapes are explicitly untested outside Vega, not simulated.
+                if (const auto model = spirv_main_execution_model(stage.words); !model) {
+                    return E_FAIL;
+                } else if (*model == kSpirvExecGLCompute) {
+                    std::fprintf(stderr,
+                                 "[rt] d3d12: mesh shader %s is a GLCompute module without a mesh_compute layout; refusing\n",
+                                 stage.entry->name.c_str());
+                    return E_FAIL;
+                } else if (*model == kSpirvExecMeshNV) {
+                    std::fprintf(stderr, "[rt] d3d12: mesh shader %s uses MeshNV, which this path does not accept\n",
+                                 stage.entry->name.c_str());
+                    return E_FAIL;
+                } else if (*model != kSpirvExecMeshEXT) {
+                    std::fprintf(stderr, "[rt] d3d12: mesh shader %s has execution model %u, not MeshEXT\n",
+                                 stage.entry->name.c_str(), *model);
+                    return E_FAIL;
+                }
+                const auto inner = leonida::conservative_raster::inner_coverage_requirements(stage.words);
+                if (!inner.valid) return E_INVALIDARG;
+                if (inner.fully_covered) {
+                    return stream_unsupported("FullyCoveredEXT needs an enabled Tier 3 shader ABI and device properties; stage",
+                                              int(stage.bit));
+                }
+                continue;
+            }
             if (stage.entry->binding_count) {
                 if (!device_.bindless) {
                     std::fprintf(stderr, "[rt] d3d12: %s uses set-0 bindings; the device has no bindless set 0\n",
@@ -11743,25 +12367,6 @@ public:
                 }
                 uses_bindless = true;
                 register_literal_samplers(device_, *stage.entry);
-            }
-            if (stage.bit == VK_SHADER_STAGE_MESH_BIT_EXT) {
-                // The SPIR-V's output arrays are sized from PSV0 (the index's max_vertices / max_primitives); Vulkan
-                // has no per-pipeline limit to set, so a mesh shader beyond the device's is refused here
-                // (docs/d3d12_vulkan.md, "Pipelines").
-                if (const std::string refusal = leonida::mesh_limit_refusal(*stage.entry, device_.mesh_limits());
-                    !refusal.empty()) {
-                    std::fprintf(stderr, "[rt] d3d12: %s\n", refusal.c_str());
-                    return stream_unsupported("mesh shader exceeds a device mesh limit");
-                }
-                // The graphics bind point lays root arguments out from push dword 8, which a mesh shader reads from
-                // its s16 only when translated with the graphics root window (index "root_window", D3D-448).
-                if (!stage.entry->graphics_root_window) {
-                    std::fprintf(stderr,
-                                 "[rt] d3d12: mesh shader %s was translated before the graphics root window; translate "
-                                 "the shaders again (make_game.py --stages shaders)\n",
-                                 stage.entry->name.c_str());
-                    return E_INVALIDARG;
-                }
             }
             if (stage.entry->uses_code_base) {
                 if (code_stage) {
@@ -11797,6 +12402,14 @@ public:
         Stage& vs_stage = stages[0];
         Stage& gs_stage = stages[1];
         Stage& ps_stage = stages[2];
+        // Native PerVertexKHR/BaryCoordKHR PS inputs need a barycentric-capable
+        // device. Both emulated and ordinary consumers fail closed here, never
+        // driver VUIDs.
+        if (ps_stage.entry && !ps_stage.words.empty() && ps_uses_native_barycentric(ps_stage.words) &&
+            !device_.info.fragment_shader_barycentric) {
+            return stream_unsupported(
+                "pixel shader needs VK_KHR_fragment_shader_barycentric (native PerVertexKHR/BaryCoordKHR); stage", 2);
+        }
         if (vs_stage.entry && ps_stage.entry && !ps_stage.entry->f16_halves.empty() && gs_stage.entry) {
             log_once("--f16-interp-fallback halves are linked VS->PS only; this PSO has a geometry shader", 0);
         }
@@ -11809,6 +12422,56 @@ public:
                 return E_FAIL;
             }
             f16_linked_ = true;
+        }
+        // Valid no-PS depth-only (emulated companion or ordinary VS): no pixel
+        // stage reads static f16 halves, so strip them before interface limits and
+        // modules. With a PS, linking already demotes unused halves.
+        if (!ps_stage.entry && vs_stage.entry && !vs_stage.entry->f16_halves.empty()) {
+            std::string strip_error;
+            if (!strip_unused_f16_halves(vs_stage.words, *vs_stage.entry, &strip_error)) {
+                std::fprintf(stderr, "[rt] d3d12: %s\n", strip_error.c_str());
+                return E_FAIL;
+            }
+        }
+        if (mesh_compute_) {
+            // Linked consumer VS/PS interface limits (vertex/fragment only; this
+            // path builds no geometry stage). Refuse over-limit before any module.
+            if (const auto& dinfo = device_.info; dinfo.physical && dinfo.get_instance_proc) {
+                if (const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(
+                        dinfo.get_instance_proc(dinfo.instance, "vkGetPhysicalDeviceProperties"))) {
+                    VkPhysicalDeviceProperties props{};
+                    get_props(dinfo.physical, &props);
+                    const std::span<const std::uint32_t> ps_words =
+                        ps_stage.entry ? std::span<const std::uint32_t>(ps_stage.words) : std::span<const std::uint32_t>{};
+                    if (const std::string refusal = mesh_consumer_limit_refusal(
+                            vs_stage.words, ps_words, props,
+                            device_.info.fragment_shader_barycentric);
+                        !refusal.empty()) {
+                        std::fprintf(stderr, "[rt] d3d12: %s\n", refusal.c_str());
+                        return stream_unsupported("mesh-compute consumer exceeds a device interface limit");
+                    }
+                }
+            }
+            // Fail closed when the pixel shader reads an input the linked consumer
+            // VS does not export (a fallback barycentric input has no geometry stage
+            // to supply it here): Vulkan would leave it undefined, so refuse.
+            if (ps_stage.entry) {
+                leonida::spirv_detail::Module vs_mod, ps_mod;
+                if (!vs_mod.parse(vs_stage.words) || !ps_mod.parse(ps_stage.words)) return E_FAIL;
+                const auto vs_out =
+                    leonida::spirv_detail::collect_located_vars(vs_mod, leonida::spirv_detail::kStorageOutput);
+                bool covered = true;
+                for (const auto& [loc, id] : leonida::spirv_detail::collect_located_vars(
+                         ps_mod, leonida::spirv_detail::kStorageInput)) {
+                    (void)id;
+                    if (!vs_out.count(loc)) {
+                        covered = false;
+                        break;
+                    }
+                }
+                if (!covered)
+                    return stream_unsupported("mesh-compute consumer VS does not export a pixel-shader input");
+            }
         }
         // A lazy pipeline keeps where each stage's words come from, not the words or a module: build() makes them
         // again, the same way, and drops them once the pipeline exists.
@@ -11836,6 +12499,16 @@ public:
             graphics_.rectangle_variant_topology = leonida::topology_rect_list;
 
         std::uint64_t spirv_bytes = 0;
+        if (mesh_compute_ && mesh_producer_entry_) {
+            // Cache/large accounting covers the sealed producer bytes (its journal
+            // key hashes them; the consumer's driver key hashes the companion).
+            const std::size_t producer_bytes = mesh_validated_producer_.size() * sizeof(std::uint32_t);
+            spirv_bytes += producer_bytes;
+            if (trace_pipeline_compile()) {
+                profile_shaders_ += mesh_producer_entry_->name;
+                stage_bytes_ += producer_bytes;
+            }
+        }
         for (Stage& stage : stages) {
             if (!stage.entry) continue;
             // After the f16 link above, which can also edit the pixel shader's words.
@@ -11864,7 +12537,7 @@ public:
                 module = shader_module(stage.words);
                 if (!module) return E_FAIL;
             }
-            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT && !geometry && device_.info.features.geometryShader &&
+            if (stage.bit == VK_SHADER_STAGE_VERTEX_BIT && !mesh && !geometry && device_.info.features.geometryShader &&
                 topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) {
                 rectangle_capable_ = true;
                 if (!lazy_) rectangle_vertex_ = modules_.back();
@@ -12004,8 +12677,9 @@ public:
             // A mesh pipeline has no input assembler, so its stream need not set the topology type: what is rasterized
             // is the module's output, and it has to be triangles as well.
             if (r.FillMode != D3D12_FILL_MODE_SOLID) return E_INVALIDARG;
-            if (mesh ? !leonida::conservative_raster::mesh_outputs_triangles(stages[0].words)
-                     : topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE) return E_INVALIDARG;
+            if (!mesh_compute_ &&
+                (mesh ? !leonida::conservative_raster::mesh_outputs_triangles(stages[0].words)
+                      : topology_type != D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)) return E_INVALIDARG;
             // Target-independent rasterization is a separate pipeline path; do not silently ignore its count.
             if (r.ForcedSampleCount)
                 return stream_unsupported("target-independent rasterization; forced sample count", int(r.ForcedSampleCount));
@@ -12207,7 +12881,8 @@ public:
         for (const Stage& stage : stages)
             if (stage.bit != VK_SHADER_STAGE_GEOMETRY_BIT || device_.info.features.geometryShader)
                 graphics_.push_stages |= stage.bit;
-        const VkPushConstantRange push{graphics_.push_stages, 0, sizeof(leonida::ShaderUserData)};
+        const VkPushConstantRange push{graphics_.push_stages, 0,
+                                       mesh_compute_ ? kMeshComputePushBytes : std::uint32_t(sizeof(leonida::ShaderUserData))};
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
@@ -12223,7 +12898,7 @@ public:
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
         graphics_.depth_bounds = depth_bounds;
-        recipe_.mesh = mesh;
+        recipe_.mesh = mesh && !mesh_compute_;  // emulated: a real VS+PS pipe (IA + dynamic topology/strides)
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
         recipe_.bindings = std::move(bindings);
@@ -12237,6 +12912,51 @@ public:
         recipe_.depth = depth;
         recipe_.blends = std::move(blends);
         recipe_.blend = blend;
+        if (mesh_compute_) {
+            // Producer compute pipeline (eager even for a lazy consumer): same
+            // 152-byte push, bindless set 0 when the producer declares bindings,
+            // and the actual compute subgroup decision (never a mesh request, and
+            // never forced on gfx906 whose required-stage mask is empty).
+            const VkPushConstantRange producer_push{VK_SHADER_STAGE_COMPUTE_BIT, 0, kMeshComputePushBytes};
+            VkPipelineLayoutCreateInfo producer_layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            producer_layout_info.pushConstantRangeCount = 1;
+            producer_layout_info.pPushConstantRanges = &producer_push;
+            VkDescriptorSetLayout producer_set0 = VK_NULL_HANDLE;
+            if (mesh_producer_entry_->binding_count) {
+                producer_set0 = device_.bindless->layout();
+                producer_layout_info.setLayoutCount = 1;
+                producer_layout_info.pSetLayouts = &producer_set0;
+                mesh_compute_producer_set_ = device_.bindless->set();
+            }
+            if (vk.vkCreatePipelineLayout(dev, &producer_layout_info, nullptr, &mesh_compute_producer_layout_) !=
+                VK_SUCCESS)
+                return E_FAIL;
+            const leonida::SubgroupRequest producer_subgroup = leonida::decide_subgroup_size_for_stage(
+                *mesh_producer_entry_, VK_SHADER_STAGE_COMPUTE_BIT, device_.info.subgroup);
+            if (producer_subgroup.outcome == leonida::SubgroupOutcome::unavailable)
+                report_subgroup_unavailable(*mesh_producer_entry_, producer_subgroup, device_.info.subgroup);
+            subgroup_requests_.push_back(producer_subgroup);
+            ComputeBuildOptions producer_options;
+            producer_options.trigger = "mesh-compute-producer";
+            producer_options.cache_key = &cache_key_;
+            producer_options.push_bytes = kMeshComputePushBytes;
+            // The compile helper only finds logical cs/144B; a genuine ms/152B
+            // producer would miss there, so build it here from the sealed bytes.
+            producer_options.use_helper = false;
+            producer_options.validated_words = &mesh_validated_producer_;
+            const ComputeBuild producer_build = build_compute_pipeline(
+                device_, *mesh_producer_entry_, mesh_compute_producer_layout_, producer_subgroup, producer_options);
+            if (!producer_build.pipeline) return E_FAIL;
+            mesh_compute_producer_ = producer_build.pipeline;
+            mesh_compute_direct_ = std::make_unique<leonida::MeshComputeDirect>();
+            mesh_compute_direct_->producer = mesh_compute_producer_;
+            mesh_compute_direct_->producer_layout = mesh_compute_producer_layout_;
+            mesh_compute_direct_->producer_set = mesh_compute_producer_set_;
+            mesh_compute_direct_->producer_code_base = mesh_compute_producer_code_base_;
+            mesh_compute_direct_->slot_bytes = mesh_producer_entry_->mesh_compute->slot_bytes;
+            mesh_compute_direct_->max_primitives = mesh_producer_entry_->mesh_compute->max_primitives;
+            graphics_.mesh_compute_direct = mesh_compute_direct_.get();
+        }
         if (!lazy_) {
             VkResult compile_status = VK_SUCCESS;
             const bool cache_only = device_.info.cold_graphics_compile;
@@ -12293,8 +13013,15 @@ public:
         }
         if (device_.info.device_checkpoints) {
             leonida::CheckpointShaders shaders{};
-            for (std::size_t i = 0; i < std::size(stages); ++i)
-                if (stages[i].entry) shaders[i] = stages[i].entry->name.c_str();
+            for (std::size_t i = 0; i < std::size(stages); ++i) {
+                if (!stages[i].entry) continue;
+                // Checkpoint history outlives the PSO: use the library-owned
+                // logical producer name, never the PSO-owned synthetic companion.
+                if (mesh_compute_ && i == 0 && mesh_producer_entry_)
+                    shaders[i] = mesh_producer_entry_->name.c_str();
+                else
+                    shaders[i] = stages[i].entry->name.c_str();
+            }
             device_.context->add_graphics_pipeline(id(), graphics_, &shaders);
         } else {
             device_.context->add_graphics_pipeline(id(), graphics_);
@@ -12946,10 +13673,25 @@ public:
         for (std::size_t i = 0; i < sources_.size(); ++i) {
             const StageSource& source = sources_[i];
             if (source.kind != StageSource::library) continue;
-            words[i] = library->spirv(*source.entry);
-            if (words[i].empty()) {
-                why = source.entry->name + ".spv is missing or not SPIR-V";
-                return false;
+            // Sealed mesh-compute companion: reuse the retained verified bytes
+            // (revalidated against a fresh seal, no .spv re-read) instead of an
+            // unchecked library reload. False drops the PSO, never vkCreate*.
+            if (mesh_compute_ && source.slot == 0 && source.entry == &mesh_companion_entry_) {
+                if (!mesh_producer_entry_ || mesh_validated_producer_.empty() || mesh_validated_companion_.empty()) {
+                    why = "mesh-compute sealed bytes missing for lazy rebuild";
+                    return false;
+                }
+                if (!library->validate_mesh_compute_modules(
+                        *mesh_producer_entry_, std::span<const std::uint32_t>(mesh_validated_producer_),
+                        std::span<const std::uint32_t>(mesh_validated_companion_), &why))
+                    return false;
+                words[i] = mesh_validated_companion_;
+            } else {
+                words[i] = library->spirv(*source.entry);
+                if (words[i].empty()) {
+                    why = source.entry->name + ".spv is missing or not SPIR-V";
+                    return false;
+                }
             }
             if (source.slot == 2 && !rewrite_fragment(words[i], why)) {
                 why = source.entry->name + ": " + why;
@@ -12957,6 +13699,11 @@ public:
             }
             if (source.slot == 0) vs = i;
             if (source.slot == 2) ps = i;
+        }
+        // No-PS depth-only lazy rebuild (emulated companion or ordinary VS): strip
+        // unused static halves before linking/modules, as in create_graphics.
+        if (ps == SIZE_MAX && vs != SIZE_MAX && !sources_[vs].entry->f16_halves.empty()) {
+            if (!strip_unused_f16_halves(words[vs], *sources_[vs].entry, &why)) return false;
         }
         if (f16_linked_) {
             if (vs == SIZE_MAX || ps == SIZE_MAX ||
@@ -12980,6 +13727,25 @@ public:
             }
             if (words[i].empty()) return false;
         }
+        return true;
+    }
+
+    bool is_mesh_compute() const {
+        return native_owner_ ? native_owner_->is_mesh_compute() : mesh_compute_;
+    }
+    const leonida::ShaderEntry* mesh_producer_entry() const {
+        return native_owner_ ? native_owner_->mesh_producer_entry() : mesh_producer_entry_;
+    }
+    const leonida::MeshComputeDirect* mesh_compute_direct() const {
+        return native_owner_ ? native_owner_->mesh_compute_direct() : mesh_compute_direct_.get();
+    }
+    bool mesh_producer_words(std::vector<std::uint32_t>& words, std::string& why) const {
+        const PipelineState* self = native_owner_ ? native_owner_.get() : this;
+        if (!self->mesh_compute_ || !self->mesh_producer_entry_ || self->mesh_validated_producer_.empty()) {
+            why = "not a mesh-compute PSO";
+            return false;
+        }
+        words = self->mesh_validated_producer_;  // sealed bytes retained at creation, no .spv reload
         return true;
     }
 
@@ -13051,6 +13817,29 @@ private:
     }
     VkDeviceSize code_base_ = 0;
     VkDeviceSize code_bytes_ = 0;
+    // Mesh-compute direct (emulated mesh): a GLCompute producer plus a Vertex
+    // consumer. Logical graphics_.mesh stays true; recipe_.mesh is false (the
+    // consumer is a real VS+PS pipeline, no mesh extension). The producer is
+    // built eagerly even for a lazy consumer; the consumer follows the normal
+    // eager/lazy/variant path with the companion VS words.
+    bool mesh_compute_ = false;  // this graphics PSO is emulated mesh-compute
+    const leonida::ShaderEntry* mesh_producer_entry_ = nullptr;  // the logical ms entry (owns the layout)
+    leonida::ShaderEntry mesh_companion_entry_;  // synthetic VS: halves from the producer, emulated subgroup, no bindings/code
+    bool mesh_companion_entry_ready_ = false;
+    // Validated sealed pair, loaded ONCE at creation via load_mesh_compute_pair
+    // (layout+producer+companion seal-bound, pre-link, immutable after load).
+    // Producer compile and lazy companion rebuild use these same bytes (no
+    // unchecked .spv re-reads); lazy revalidates via validate_mesh_compute_modules.
+    std::vector<std::uint32_t> mesh_validated_producer_;
+    std::vector<std::uint32_t> mesh_validated_companion_;
+    VkPipeline mesh_compute_producer_ = VK_NULL_HANDLE;
+    VkPipelineLayout mesh_compute_producer_layout_ = VK_NULL_HANDLE;
+    VkDescriptorSet mesh_compute_producer_set_ = VK_NULL_HANDLE;  // bindless set 0 when the producer declares bindings; not owned
+    VkDeviceSize mesh_compute_producer_code_base_ = 0;  // arena offset of the producer FSSM blob, 0 when unused
+    VkDeviceSize mesh_compute_producer_code_bytes_ = 0;
+    // Stable replay state: graphics_.mesh_compute_direct points here (null when !mesh_compute_).
+    // Defined in vulkan_replay.h; this TU only stores and fills it.
+    std::unique_ptr<leonida::MeshComputeDirect> mesh_compute_direct_;
     bool registered_ = false;
     bool unregistered_ = false;  // taken out of the context's registry (unregister)
     bool is_graphics_ = false;
@@ -14692,6 +15481,32 @@ public:
                 get_props(info.physical, &props);
                 state_.context->configure_counted_dispatch(get_device, state_.memory, props.limits);
                 state_.context->configure_quad_indices(get_device, props.limits);
+                // Direct mesh-as-compute replay validates DispatchMesh grids, sizes and
+                // queue support against these. Arena/upload caps via properties2 (0,0
+                // when unavailable: size checks skipped, alloc failure still refuses).
+                VkDeviceSize max_buffer = 0, max_alloc = 0;
+                if (const auto get_props2 = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties2>(
+                        info.get_instance_proc(info.instance, "vkGetPhysicalDeviceProperties2"))) {
+                    const leonida::ArenaLimits arena_limits = leonida::query_arena_limits(
+                        [get_props2](VkPhysicalDevice physical, VkPhysicalDeviceProperties2* out) {
+                            get_props2(physical, out);
+                        },
+                        info.physical);
+                    max_buffer = arena_limits.max_buffer_size;
+                    max_alloc = arena_limits.max_allocation_size;
+                }
+                state_.context->configure_mesh_compute_direct(props.limits, max_buffer, max_alloc);
+                if (const auto get_families = reinterpret_cast<PFN_vkGetPhysicalDeviceQueueFamilyProperties>(
+                        info.get_instance_proc(info.instance, "vkGetPhysicalDeviceQueueFamilyProperties"))) {
+                    std::uint32_t family_count = 0;
+                    get_families(info.physical, &family_count, nullptr);
+                    std::vector<VkQueueFamilyProperties> families(family_count);
+                    if (family_count) get_families(info.physical, &family_count, families.data());
+                    std::vector<VkQueueFlags> flags;
+                    flags.reserve(family_count);
+                    for (const auto& q : families) flags.push_back(q.queueFlags);
+                    state_.context->set_queue_family_flags(std::move(flags));
+                }
                 // ExecuteIndirect arguments are clamped on the GPU before every indirect command (vulkan_indirect_clamp.h).
                 // Its record scratch is device-local memory with a device address, like the arena's.
                 state_.context->enable_indirect_clamp(get_device, state_.memory, props.limits,
@@ -20945,6 +21760,33 @@ bool pipeline_stage_words(ID3D12PipelineState* pipeline, std::vector<std::vector
         return false;
     }
     return p->stage_words(words, why);
+}
+
+bool pipeline_is_mesh_compute(ID3D12PipelineState* pso) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pso);
+    return p && p->is_mesh_compute();
+}
+
+bool pipeline_mesh_compute_info(ID3D12PipelineState* pso, std::uint64_t* slot_bytes, std::uint32_t* max_primitives,
+                                std::uint64_t* producer_code_base) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pso);
+    if (!p || !p->is_mesh_compute()) return false;
+    const leonida::MeshComputeDirect* direct = p->mesh_compute_direct();
+    if (!direct) return false;
+    if (slot_bytes) *slot_bytes = direct->slot_bytes;
+    if (max_primitives) *max_primitives = direct->max_primitives;
+    if (producer_code_base) *producer_code_base = direct->producer_code_base;
+    return true;
+}
+
+bool pipeline_mesh_compute_producer_words(ID3D12PipelineState* pso, std::vector<std::uint32_t>& words,
+                                          std::string& why) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pso);
+    if (!p) {
+        why = "not a PipelineState";
+        return false;
+    }
+    return p->mesh_producer_words(words, why);
 }
 
 long live_pipeline_states() { return live_pipeline_state_count.load(); }

@@ -1287,6 +1287,332 @@ int main() {
         CHECK(build({{0, state.data(), 28}, {6, code.data(), code.size()}, {99, kind7.data(), 24}}).empty());
     }
 
+    // Mesh-compute layouts (--mesh-compute slot + generated companion): typed reading on logical "ms" only,
+    // null/absent is native, malformed fails closed, 128-byte pc-tail stays present for explicit refusal.
+    {
+        const auto root = dir / "mesh_compute";
+        const auto write_text = [](const std::filesystem::path& file, const std::string& text) {
+            std::filesystem::create_directories(file.parent_path());
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            out << text;
+        };
+        const auto write_words = [](const std::filesystem::path& file, const std::vector<std::uint32_t>& words) {
+            std::filesystem::create_directories(file.parent_path());
+            std::ofstream out(file, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(words.data()),
+                      std::streamsize(words.size() * sizeof(std::uint32_t)));
+        };
+        const auto hash_bytes = [](const std::vector<std::uint32_t>& words) {
+            const std::uint8_t* bytes = reinterpret_cast<const std::uint8_t*>(words.data());
+            return sha256_hex(std::span<const std::uint8_t>(bytes, words.size() * 4));
+        };
+        const auto write_seal = [&](const std::string& name, const ShaderEntry& entry,
+                                    const std::vector<std::uint32_t>& prod_words,
+                                    const std::vector<std::uint32_t>* comp_words) {
+            const std::string canonical = canonical_mesh_compute_json(*entry.mesh_compute);
+            const std::vector<std::uint8_t> canonical_bytes(canonical.begin(), canonical.end());
+            std::string seal = "{\"version\": 1, \"layout_sha256\": \"" + sha256_hex(canonical_bytes) +
+                               "\", \"producer_sha256\": \"" + hash_bytes(prod_words) + "\"";
+            if (comp_words) {
+                seal += ", \"companion_asm_sha256\": \"" + std::string(64, '0') +
+                        "\", \"companion_spv_sha256\": \"" + hash_bytes(*comp_words) + "\"}";
+            } else {
+                seal += ", \"companion_asm_sha256\": null, \"companion_spv_sha256\": null}";
+            }
+            write_text(root / (name + ".mesh_compute.seal.json"), seal);
+        };
+        // Tiny valid 152-byte layout: maxv=1, maxp=1, no clip/cull, one param {0:16} -> stride 32, prim 48, slot 64.
+        const std::string valid152 =
+            "{\"slot_bytes\": 64, \"vertices\": 16, \"vertex_stride\": 32, \"primitives\": 48, "
+            "\"primitive_stride\": 16, \"max_vertices\": 1, \"max_primitives\": 1, \"clip_count\": 0, "
+            "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16}, "
+            "\"push_constant_bytes\": 152, \"address_dwords\": [36, 37]}";
+        const std::string entry152 =
+            "{\"stage\": \"ms\", \"fssm_sha256\": \"" + hash +
+            "\", \"push_constant_bytes\": 152, \"local_size\": [4, 1, 1], \"max_vertices\": 1, "
+            "\"max_primitives\": 1, \"mesh_compute\": " + valid152 + "}";
+        const std::string valid128 =
+            "{\"slot_bytes\": 64, \"vertices\": 16, \"vertex_stride\": 32, \"primitives\": 48, "
+            "\"primitive_stride\": 16, \"max_vertices\": 1, \"max_primitives\": 1, \"clip_count\": 0, "
+            "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16}, "
+            "\"push_constant_bytes\": 128, \"address_dwords\": null, \"pc_tail_address_dwords\": [4, 5]}";
+        // Minimal producer (GLCompute LocalSize [4,1,1] + Int64 + BDA + push 144/148) and companion (Vertex + Loc 0).
+        const std::vector<std::uint32_t> producer = {
+            0x07230203, 0x00010500, 0, 10, 0, (2u << 16) | 17u, 1, (2u << 16) | 17u, 11,
+            (2u << 16) | 17u, 5347, (3u << 16) | 14u, 5348, 1, (5u << 16) | 15u, 5, 1, 0x6E69616Du, 0,
+            (6u << 16) | 16u, 1, 17, 4, 1, 1, (5u << 16) | 72u, 2, 5, 35, 144, (5u << 16) | 72u, 2, 6, 35, 148};
+        const std::vector<std::uint32_t> companion = {
+            0x07230203, 0x00010500, 0, 10, 0, (2u << 16) | 17u, 1, (2u << 16) | 17u, 11,
+            (2u << 16) | 17u, 5347, (3u << 16) | 14u, 5348, 1, (5u << 16) | 15u, 0, 1, 0x6E69616Du, 0,
+            (4u << 16) | 71u, 2, 30, 0, (4u << 16) | 59u, 3, 2, 3, (5u << 16) | 72u, 2, 5, 35, 144,
+            (5u << 16) | 72u, 2, 6, 35, 148};
+        // Null/absent/wrong-stage are native (nullopt), never emulated.
+        write_text(root / "index.json",
+                   "{\"ms_null\": {\"stage\": \"ms\", \"fssm_sha256\": \"" + hash + "\", \"mesh_compute\": null},\n"
+                   " \"ms_absent\": {\"stage\": \"ms\", \"fssm_sha256\": \"" + hash2 + "\"},\n"
+                   " \"vs_wrong\": {\"stage\": \"vs\", \"fssm_sha256\": \"" + hash +
+                   "\", \"mesh_compute\": " + valid152 + "}}");
+        ShaderLibrary native;
+        CHECK(native.load(root.string(), &error));
+        CHECK(native.find("ms", hash) && !native.find("ms", hash)->mesh_compute);
+        CHECK(native.find("ms", hash2) && !native.find("ms", hash2)->mesh_compute);
+        CHECK(native.find("vs", hash) && !native.find("vs", hash)->mesh_compute);
+        // Valid 152-byte layout reads typed, seals bind both modules, and single-load feeds the PSO.
+        write_text(root / "index.json", "{\"ms_valid\": " + entry152 + "}");
+        write_words(root / "ms_valid.spv", producer);
+        write_words(root / "ms_valid.mesh_vs.spv", companion);
+        ShaderLibrary lib;
+        CHECK(lib.load(root.string(), &error));
+        const ShaderEntry* valid = lib.find("ms", hash);
+        CHECK(valid && valid->mesh_compute);
+        CHECK(valid->mesh_compute->slot_bytes == 64 && valid->mesh_compute->max_primitives == 1);
+        CHECK(valid->mesh_compute->max_vertices == 1 && valid->mesh_compute->vertex_stride == 32);
+        CHECK(valid->mesh_compute->primitives == 48 && valid->mesh_compute->params.size() == 1);
+        CHECK(valid->mesh_compute->is_supported_push() && !valid->mesh_compute->is_pc_tail());
+        CHECK(valid->mesh_compute->raw_locations() == std::set<std::uint32_t>{0});
+        CHECK(lib.mesh_companion_file(*valid) == root / "ms_valid.mesh_vs.spv");
+        CHECK(lib.mesh_companion_spirv(*valid) == companion);
+        CHECK(!lib.validate_mesh_compute_pair(*valid, &error) && error.find("missing seal") != std::string::npos);
+        write_seal("ms_valid", *valid, producer, &companion);
+        CHECK(lib.mesh_compute_seal_file(*valid) == root / "ms_valid.mesh_compute.seal.json");
+        CHECK(lib.validate_mesh_compute_pair(*valid, &error));
+        {
+            std::vector<std::uint32_t> prod_words, comp_words;
+            CHECK(lib.load_mesh_compute_pair(*valid, &prod_words, &comp_words, &error));
+            CHECK(prod_words == producer && comp_words == companion);
+            CHECK(lib.validate_mesh_compute_modules(*valid, prod_words, comp_words, &error));
+            comp_words[10] ^= 1u;  // retained-bytes tamper must fail reload validation, never vkCreate*
+            CHECK(!lib.validate_mesh_compute_modules(*valid, prod_words, comp_words, &error));
+        }
+        CHECK(lib.load(root.string(), &error) && lib.find("ms", hash)->mesh_compute);  // reload keeps layout
+        CHECK(lib.validate_mesh_compute_pair(*lib.find("ms", hash), &error));  // and the seal still binds
+        // 128-byte pc-tail stays present for explicit refusal, never silent native nor valid pair.
+        write_text(root / "index.json",
+                   "{\"ms_tail\": {\"stage\": \"ms\", \"fssm_sha256\": \"" + hash +
+                   "\", \"push_constant_bytes\": 128, \"local_size\": [4, 1, 1], \"max_vertices\": 1, "
+                   "\"max_primitives\": 1, \"mesh_compute\": " + valid128 + "}}");
+        ShaderLibrary tail;
+        CHECK(tail.load(root.string(), &error));
+        const ShaderEntry* tail_entry = tail.find("ms", hash);
+        CHECK(tail_entry && tail_entry->mesh_compute && tail_entry->mesh_compute->is_pc_tail());
+        CHECK(!tail_entry->mesh_compute->is_supported_push());
+        CHECK(!tail.validate_mesh_compute_pair(*tail_entry, &error) && error.find("128-byte") != std::string::npos &&
+              error.find("pc-tail") != std::string::npos);
+        // Malformed layouts fail closed (nullopt): bad header/stride/arithmetic/offsets/push/top-level match.
+        const std::vector<std::string> malformed = {
+            "{\"slot_bytes\": 80, \"vertices\": 16, \"vertex_stride\": 32, \"primitives\": 48, "
+            "\"primitive_stride\": 16, \"max_vertices\": 1, \"max_primitives\": 1, \"clip_count\": 0, "
+            "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16}, "
+            "\"push_constant_bytes\": 152, \"address_dwords\": [36, 37]}",  // slot != prim + maxp*16
+            "{\"slot_bytes\": 64, \"vertices\": 0, \"vertex_stride\": 32, \"primitives\": 48, "
+            "\"primitive_stride\": 16, \"max_vertices\": 1, \"max_primitives\": 1, \"clip_count\": 0, "
+            "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16}, "
+            "\"push_constant_bytes\": 152, \"address_dwords\": [36, 37]}",  // vertices != 16
+            "{\"slot_bytes\": 64, \"vertices\": 16, \"vertex_stride\": 16, \"primitives\": 48, "
+            "\"primitive_stride\": 16, \"max_vertices\": 1, \"max_primitives\": 1, \"clip_count\": 0, "
+            "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16}, "
+            "\"push_constant_bytes\": 152, \"address_dwords\": [36, 37]}",  // stride formula
+            "{\"slot_bytes\": 64, \"vertices\": 16, \"vertex_stride\": 32, \"primitives\": 16, "
+            "\"primitive_stride\": 16, \"max_vertices\": 1, \"max_primitives\": 1, \"clip_count\": 0, "
+            "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16}, "
+            "\"push_constant_bytes\": 152, \"address_dwords\": [36, 37]}",  // primitives arithmetic
+            "{\"slot_bytes\": 64, \"vertices\": 16, \"vertex_stride\": 32, \"primitives\": 48, "
+            "\"primitive_stride\": 16, \"max_vertices\": 1, \"max_primitives\": 1, \"clip_count\": 0, "
+            "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 32}, "
+            "\"push_constant_bytes\": 152, \"address_dwords\": [36, 37]}",  // param offset wrong
+            "{\"slot_bytes\": 64, \"vertices\": 16, \"vertex_stride\": 32, \"primitives\": 48, "
+            "\"primitive_stride\": 16, \"max_vertices\": 1, \"max_primitives\": 1, \"clip_count\": 0, "
+            "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16, \"00\": 16}, "
+            "\"push_constant_bytes\": 152, \"address_dwords\": [36, 37]}",  // duplicate loc "0"/"00"
+            "{\"slot_bytes\": 64, \"vertices\": 16, \"vertex_stride\": 32, \"primitives\": 48, "
+            "\"primitive_stride\": 16, \"max_vertices\": 0, \"max_primitives\": 1, \"clip_count\": 0, "
+            "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16}, "
+            "\"push_constant_bytes\": 152, \"address_dwords\": [36, 37]}",  // maxv 0
+            "{\"slot_bytes\": 64, \"vertices\": 16, \"vertex_stride\": 32, \"primitives\": 48, "
+            "\"primitive_stride\": 16, \"max_vertices\": 1, \"max_primitives\": 1, \"clip_count\": 0, "
+            "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16}, "
+            "\"push_constant_bytes\": 144, \"address_dwords\": [36, 37]}",  // unsupported push 144
+        };
+        for (const std::string& bad : malformed) {
+            write_text(root / "index.json",
+                       "{\"ms_bad\": {\"stage\": \"ms\", \"fssm_sha256\": \"" + hash +
+                       "\", \"push_constant_bytes\": 152, \"local_size\": [4, 1, 1], \"max_vertices\": 1, "
+                       "\"max_primitives\": 1, \"mesh_compute\": " + bad + "}}");
+            ShaderLibrary mal;
+            CHECK(mal.load(root.string(), &error));
+            const ShaderEntry* bad_entry = mal.find("ms", hash);
+            CHECK(bad_entry && !bad_entry->mesh_compute);
+        }
+        // Top-level mismatch (push/max/f16) also fails closed, even with an otherwise valid object.
+        write_text(root / "index.json",
+                   "{\"ms_mismatch\": {\"stage\": \"ms\", \"fssm_sha256\": \"" + hash +
+                   "\", \"push_constant_bytes\": 144, \"local_size\": [4, 1, 1], \"max_vertices\": 1, "
+                   "\"max_primitives\": 1, \"mesh_compute\": " + valid152 + "}}");
+        ShaderLibrary mismatch;
+        CHECK(mismatch.load(root.string(), &error) && !mismatch.find("ms", hash)->mesh_compute);
+        // Static f16 halves must name exported params and use distinct locations outside raw outputs.
+        const std::string halves_ok = valid152.substr(0, valid152.size() - 1) +
+                                      ", \"f16_halves\": {\"0\": [28, 29]}}";
+        write_text(root / "index.json",
+                   "{\"ms_f16\": {\"stage\": \"ms\", \"fssm_sha256\": \"" + hash +
+                   "\", \"push_constant_bytes\": 152, \"local_size\": [4, 1, 1], \"max_vertices\": 1, "
+                   "\"max_primitives\": 1, \"f16_halves\": {\"0\": [28, 29]}, \"mesh_compute\": " + halves_ok + "}}");
+        ShaderLibrary halves;
+        CHECK(halves.load(root.string(), &error));
+        CHECK(halves.find("ms", hash)->mesh_compute &&
+              halves.find("ms", hash)->mesh_compute->f16_halves.size() == 1);
+        const std::string halves_bad = valid152.substr(0, valid152.size() - 1) +
+                                       ", \"f16_halves\": {\"1\": [28, 29]}}";  // param 1 not exported
+        write_text(root / "index.json",
+                   "{\"ms_f16bad\": {\"stage\": \"ms\", \"fssm_sha256\": \"" + hash +
+                   "\", \"push_constant_bytes\": 152, \"local_size\": [4, 1, 1], \"max_vertices\": 1, "
+                   "\"max_primitives\": 1, \"mesh_compute\": " + halves_bad + "}}");
+        ShaderLibrary halves_fail;
+        CHECK(halves_fail.load(root.string(), &error) && !halves_fail.find("ms", hash)->mesh_compute);
+        // Pair checks stay seal-bound: missing companion, wrong models, and location mismatch each fail distinctly.
+        write_text(root / "index.json", "{\"ms_valid\": " + entry152 + "}");
+        write_words(root / "ms_valid.spv", producer);
+        write_words(root / "ms_valid.mesh_vs.spv", companion);
+        {
+            ShaderLibrary setup;
+            CHECK(setup.load(root.string(), &error));
+            write_seal("ms_valid", *setup.find("ms", hash), producer, &companion);
+        }
+        std::filesystem::remove(root / "ms_valid.mesh_vs.spv");
+        ShaderLibrary missing;
+        CHECK(missing.load(root.string(), &error));
+        CHECK(!missing.validate_mesh_compute_pair(*missing.find("ms", hash), &error) &&
+              error.find("missing companion") != std::string::npos);
+        write_words(root / "ms_valid.spv", companion);  // producer is Vertex, not GLCompute
+        write_words(root / "ms_valid.mesh_vs.spv", companion);
+        {
+            ShaderLibrary setup;
+            CHECK(setup.load(root.string(), &error));
+            write_seal("ms_valid", *setup.find("ms", hash), companion, &companion);
+        }
+        ShaderLibrary wrong_prod;
+        CHECK(wrong_prod.load(root.string(), &error));
+        CHECK(!wrong_prod.validate_mesh_compute_pair(*wrong_prod.find("ms", hash), &error) &&
+              error.find("GLCompute") != std::string::npos);
+        write_words(root / "ms_valid.spv", producer);
+        write_words(root / "ms_valid.mesh_vs.spv", producer);  // companion is GLCompute, not Vertex
+        {
+            ShaderLibrary setup;
+            CHECK(setup.load(root.string(), &error));
+            write_seal("ms_valid", *setup.find("ms", hash), producer, &producer);
+        }
+        ShaderLibrary wrong_cons;
+        CHECK(wrong_cons.load(root.string(), &error));
+        CHECK(!wrong_cons.validate_mesh_compute_pair(*wrong_cons.find("ms", hash), &error) &&
+              error.find("Vertex") != std::string::npos);
+        std::vector<std::uint32_t> extra_loc = companion;
+        extra_loc.insert(extra_loc.end(), {(4u << 16) | 71u, 4, 30, 1, (4u << 16) | 59u, 3, 4, 3});
+        write_words(root / "ms_valid.mesh_vs.spv", extra_loc);  // Location 1 not in layout
+        {
+            ShaderLibrary setup;
+            CHECK(setup.load(root.string(), &error));
+            write_seal("ms_valid", *setup.find("ms", hash), producer, &extra_loc);
+        }
+        ShaderLibrary mismatch_loc;
+        CHECK(mismatch_loc.load(root.string(), &error));
+        CHECK(!mismatch_loc.validate_mesh_compute_pair(*mismatch_loc.find("ms", hash), &error) &&
+              error.find("locations") != std::string::npos);
+        // LocalSize must agree with metadata: default {1,1,1} cannot pass a [4,1,1] producer's device limit.
+        write_text(root / "index.json",
+                   "{\"ms_wrongsize\": {\"stage\": \"ms\", \"fssm_sha256\": \"" + hash +
+                   "\", \"push_constant_bytes\": 152, \"local_size\": [1, 1, 1], \"max_vertices\": 1, "
+                   "\"max_primitives\": 1, \"mesh_compute\": " + valid152 + "}}");
+        write_words(root / "ms_wrongsize.spv", producer);
+        write_words(root / "ms_wrongsize.mesh_vs.spv", companion);
+        {
+            ShaderLibrary setup;
+            CHECK(setup.load(root.string(), &error));
+            const ShaderEntry* wrong = setup.find("ms", hash);
+            CHECK(wrong && wrong->mesh_compute);  // layout parses; size check happens at sealed load
+            write_seal("ms_wrongsize", *wrong, producer, &companion);
+        }
+        ShaderLibrary wrong_size;
+        CHECK(wrong_size.load(root.string(), &error));
+        CHECK(!wrong_size.validate_mesh_compute_pair(*wrong_size.find("ms", hash), &error) &&
+              error.find("LocalSize") != std::string::npos);
+        // Seal binding regressions: none may reach vkCreate* (all fail in load/validate with distinct errors).
+        write_text(root / "index.json", "{\"ms_valid\": " + entry152 + "}");
+        write_words(root / "ms_valid.spv", producer);
+        write_words(root / "ms_valid.mesh_vs.spv", companion);
+        {
+            ShaderLibrary setup;
+            CHECK(setup.load(root.string(), &error));
+            write_seal("ms_valid", *setup.find("ms", hash), producer, &companion);
+        }
+        {
+            std::vector<std::uint32_t> swapped = producer;
+            swapped[5] ^= 1u;  // same location shape, different compiled bytes/slot binding
+            write_words(root / "ms_valid.spv", swapped);
+            ShaderLibrary swapped_lib;
+            CHECK(swapped_lib.load(root.string(), &error));
+            std::vector<std::uint32_t> prod_words, comp_words;
+            CHECK(!swapped_lib.load_mesh_compute_pair(*swapped_lib.find("ms", hash), &prod_words, &comp_words,
+                                                      &error) &&
+                  error.find("producer bytes do not match the seal") != std::string::npos);
+            CHECK(prod_words.empty() && comp_words.empty());
+            write_words(root / "ms_valid.spv", producer);  // restore
+        }
+        {
+            // In-range tamper: max_primitives 1 -> 2 with matching slot math + top-level, still parses but the
+            // sealed layout hash was computed for maxp=1, so sealed load must refuse (not reach vkCreate*).
+            const std::string tampered152 =
+                "{\"slot_bytes\": 80, \"vertices\": 16, \"vertex_stride\": 32, \"primitives\": 48, "
+                "\"primitive_stride\": 16, \"max_vertices\": 1, \"max_primitives\": 2, \"clip_count\": 0, "
+                "\"clip_offset\": 16, \"cull_count\": 0, \"cull_offset\": 16, \"params\": {\"0\": 16}, "
+                "\"push_constant_bytes\": 152, \"address_dwords\": [36, 37]}";
+            const std::string tampered_entry =
+                "{\"stage\": \"ms\", \"fssm_sha256\": \"" + hash +
+                "\", \"push_constant_bytes\": 152, \"local_size\": [4, 1, 1], \"max_vertices\": 1, "
+                "\"max_primitives\": 2, \"mesh_compute\": " + tampered152 + "}";
+            write_text(root / "index.json", "{\"ms_valid\": " + tampered_entry + "}");
+            ShaderLibrary tampered_lib;
+            CHECK(tampered_lib.load(root.string(), &error));
+            CHECK(tampered_lib.find("ms", hash)->mesh_compute);  // parses (arithmetic valid)
+            CHECK(!tampered_lib.validate_mesh_compute_pair(*tampered_lib.find("ms", hash), &error) &&
+                  error.find("index layout does not match the seal") != std::string::npos);
+            write_text(root / "index.json", "{\"ms_valid\": " + entry152 + "}");  // restore
+        }
+        {
+            std::vector<std::uint32_t> forged = companion;
+            forged[7] ^= 0xFFu;  // replaced cached binary, same .spvasm/seal layout
+            write_words(root / "ms_valid.mesh_vs.spv", forged);
+            ShaderLibrary forged_lib;
+            CHECK(forged_lib.load(root.string(), &error));
+            CHECK(!forged_lib.validate_mesh_compute_pair(*forged_lib.find("ms", hash), &error) &&
+                  error.find("companion bytes do not match the seal") != std::string::npos);
+            write_words(root / "ms_valid.mesh_vs.spv", companion);  // restore
+        }
+        // Auxiliary sub-index entries seal the same way, adjacent in their own folder.
+        write_text(root / "index.json", "{\"cs_game\": {\"stage\": \"cs\", \"fssm_sha256\": \"" + hash + "\"}}");
+        write_text(root / "bvh" / "index.json", "{\"ms_aux\": " + entry152 + "}");
+        write_words(root / "bvh" / "ms_aux.spv", producer);
+        write_words(root / "bvh" / "ms_aux.mesh_vs.spv", companion);
+        {
+            ShaderLibrary setup;
+            CHECK(setup.load(root.string(), &error));
+            const ShaderEntry* aux_setup = setup.find("ms", hash);
+            const std::string canonical = canonical_mesh_compute_json(*aux_setup->mesh_compute);
+            const std::vector<std::uint8_t> canonical_bytes(canonical.begin(), canonical.end());
+            const std::string seal = "{\"version\": 1, \"layout_sha256\": \"" + sha256_hex(canonical_bytes) +
+                                     "\", \"producer_sha256\": \"" + hash_bytes(producer) +
+                                     "\", \"companion_asm_sha256\": \"" + std::string(64, '0') +
+                                     "\", \"companion_spv_sha256\": \"" + hash_bytes(companion) + "\"}";
+            write_text(root / "bvh" / "ms_aux.mesh_compute.seal.json", seal);
+        }
+        ShaderLibrary aux;
+        CHECK(aux.load(root.string(), &error));
+        const ShaderEntry* aux_entry = aux.find("ms", hash);
+        CHECK(aux_entry && aux_entry->name == "bvh/ms_aux" && aux_entry->mesh_compute);
+        CHECK(aux.mesh_compute_seal_file(*aux_entry) == root / "bvh" / "ms_aux.mesh_compute.seal.json");
+        CHECK(aux.validate_mesh_compute_pair(*aux_entry, &error));
+        std::filesystem::remove_all(root);
+    }
+
     CHECK(huffman_lut_checks() == 0);
 
     std::printf("SHA-256, inflate (stored/fixed/dynamic), JSON, FSSM extraction, FSPX programs and index lookup OK\n");

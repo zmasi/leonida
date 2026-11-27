@@ -10,8 +10,8 @@ hand-written RDNA2 run through the translator in `d3d12_translated_draw_test`, a
 set and the host PC device otherwise. Root signatures (packed into the 32 user-data dwords), graphics and compute
 PSOs, draws, dispatches, `ExecuteIndirect`, and presentation through `PresentX` or a DXGI swapchain are implemented
 and have GPU tests; which present path the game uses is still open (question 6). Shader-resource views of buffers,
-pipeline-state streams (`CreatePipelineState`), tessellation and stream-output pipelines are not implemented, and
-mesh shaders are reported as not supported (stream PSOs and mesh shaders: D3D-29, #1712). The device reports
+tessellation and stream-output remain separate gaps. Mesh pipeline-state streams select either native mesh
+shaders or the [direct compute replay](#direct-mesh-compute-replay) described below. The device reports
 `RaytracingTier` as `NOT_SUPPORTED`, yet `BuildRaytracingAccelerationStructure` builds XDXR BVH4 structures on the
 GPU (section 4.8).** This is the plan for
 replacing the console's `d3d12_xs.dll` with an implementation that records D3D12 commands and replays them on
@@ -2930,6 +2930,14 @@ The trace will enumerate them.
   - **The three draws:** a 2×2×1 and a 1×1×2 mesh grid, plus a VS PSO from a stream.
   - **What it doesn't cover:** whether the console flattens a 3D `DispatchMesh` grid the same way. That is an open
     question in `docs/design.md`, "Mesh shaders"; the test shader reads the workgroup ID directly.
+
+### Direct mesh-compute replay
+
+A logical mesh shader in a 152-byte `--mesh-compute` pack has a compute producer, a slot layout and a companion vertex shader. Regenerate the pack and its companions together: the runtime checks both module hashes against the layout seal and rejects missing or mismatched pairs. Native `MeshEXT` modules take the native path instead. No compute fallback is inferred from a shader name.
+
+A direct `DispatchMesh(x,y,z)` allocates per-dispatch device-addressable output, binds the mesh root data to the producer, and orders its writes before vertex reads. The companion draws the generated triangle list with the original graphics state and pixel shader. A zero dimension emits neither dispatch nor draw. The pair needs a graphics+compute queue, buffer device address, shader Int64 and sufficient device limits. The pixel shader's f16 halves link against the companion's exports; native barycentric inputs need the device feature. A pixel-shader input the companion does not export is rejected, as is an over-limit consumer interface — never silently drawn incorrectly.
+
+This path does not advertise native mesh hardware, execute indirect mesh commands in software, support a 128-byte push-tail companion or emulate mesh pipeline statistics. Mesh command signatures without a native mesh tier keep the existing refusal; indirect mesh execution is a separate follow-up. `d3d12_mesh_compute_test` checks pixels through the D3D12 guest interface.
 
 ### Console rectangle and quad lists
 
