@@ -38,7 +38,8 @@ public:
     template<class Device>
     bool write(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
                const xg_xs::Texture& layout, const std::uint8_t* tiled, std::vector<std::uint64_t>& columns,
-               bool inspect, bool& nonzero) {
+               bool inspect, bool& nonzero, bool unreferenced = false, bool* busy = nullptr) {
+        if (busy) *busy = false;
         const auto block = leonida::copy_block_format(image, VK_IMAGE_ASPECT_COLOR_BIT);
         const auto mips = layout.layout.mips;
         const auto layers = layout.array;
@@ -67,9 +68,10 @@ public:
                 regions_.push_back(copy);
             }
         }
-        Slot& slot = slots_[next_];
+        const unsigned slot_index = next_;
+        Slot& slot = slots_[slot_index];
         if (!prepare(d, slot, bytes)) return false;
-        next_ = (next_ + 1) % kSlots;
+        next_ = (slot_index + 1) % kSlots;
         for (const auto& copy : regions_) {
             const auto level = copy.imageSubresource.mipLevel;
             const auto& mip = layout.layout.plane[0].mips[level];
@@ -105,7 +107,11 @@ public:
                     VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
             if ((r = vk.vkEndCommandBuffer(slot.command)) != VK_SUCCESS) return r;
             return submit(d, slot);
-        });
+        }, unreferenced);
+        if (result == VK_NOT_READY) {
+            next_ = slot_index;  // nothing submitted on this slot; reuse its mapped buffer next pass
+            if (busy) *busy = true;
+        }
         return result == VK_SUCCESS;
     }
 

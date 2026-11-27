@@ -1715,15 +1715,23 @@ public:
 
     // A complete CPU-side replacement of these color subresources. Serialize with replay and
     // present while recording the old layouts, finishing prior reads and publishing the copy.
+    // An unreferenced image still in UNDEFINED has never been bound in set 0 or touched by a
+    // replay command, so no earlier submission on another queue can read it; if a wait on an
+    // already-published image times out, return VK_NOT_READY so the caller retries later.
     template<class Copy>
-    VkResult write_staged_title_image(ResourceId id, const VkImageSubresourceRange& range, Copy&& copy) {
+    VkResult write_staged_title_image(ResourceId id, const VkImageSubresourceRange& range, Copy&& copy,
+                                      bool unreferenced = false) {
         std::lock_guard layout_lock(tracker_mutex_);
         std::lock_guard queue_lock(submit_mutex_);
         LayoutPieces pieces;
         if (!tracker_.pieces(id, range, pieces) || pieces.empty()) return VK_ERROR_UNKNOWN;
-        if (image_work_pending_) {
+        const bool all_undefined = std::all_of(pieces.begin(), pieces.end(), [](const LayoutPiece& p) {
+            return p.layout == VK_IMAGE_LAYOUT_UNDEFINED;
+        });
+        if (image_work_pending_ && !(unreferenced && all_undefined)) {
             const SubmitMutex::SubmitTurn turn(submit_mutex_);  // a queue operation: the compile gate (as above)
             const auto r = wait_submitted_locked(kTitleWriteWaitNs, "vkWaitSemaphores (title staging)");
+            if (r == VK_TIMEOUT) return VK_NOT_READY;
             if (r != VK_SUCCESS) return r;
             image_work_pending_ = false;
         }
