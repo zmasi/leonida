@@ -82,7 +82,7 @@ def check_structure(body):
 _IGNORED = frozenset({
     "OpCapability", "OpExtension", "OpExtInstImport", "OpMemoryModel", "OpEntryPoint", "OpExecutionMode",
     "OpDecorate", "OpMemberDecorate", "OpTypeVoid", "OpTypeFunction", "OpLabel", "OpSelectionMerge",
-    "OpLoopMerge", "OpReturn", "OpFunctionEnd", "OpName", "OpSource",
+    "OpLoopMerge", "OpReturn", "OpFunctionEnd", "OpName", "OpSource", "OpModuleProcessed",
 })
 
 _ATOMICS = frozenset({

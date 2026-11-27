@@ -89,7 +89,7 @@ class _Poison:
 _LINE = re.compile(r"^(?:(%\S+)\s*=\s*)?(Op\w+)\s*(.*)$")
 _HEADER_IGNORED = frozenset({
     "OpCapability", "OpExtension", "OpExtInstImport", "OpMemoryModel", "OpEntryPoint", "OpExecutionMode",
-    "OpMemberDecorate", "OpTypeVoid", "OpTypeFunction", "OpName", "OpMemberName", "OpSource",
+    "OpMemberDecorate", "OpTypeVoid", "OpTypeFunction", "OpName", "OpMemberName", "OpSource", "OpModuleProcessed",
 })
 _TERMINATORS = frozenset({"OpBranch", "OpBranchConditional", "OpSwitch", "OpReturn", "OpKill",
                           "OpTerminateInvocation", "OpUnreachable"})
