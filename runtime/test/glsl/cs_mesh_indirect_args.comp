@@ -1,0 +1,36 @@
+#version 460
+// GPU writer of d3d12_mesh_compute_indirect_test's ExecuteIndirect arguments and count words: an actual compute
+// dispatch, so the indirect buffers hold values a shader produced, not an upload. The recipe buffer is a list of
+// (destination word, value ^ key) pairs; invocation i stores recipe value ^ key at the destination word, in the
+// argument buffer or, with the destination's top bit set, in the count buffer. Words no pair names keep whatever the
+// buffer held (the test fills it with a sentinel first), so record padding and records past the count stay as the
+// test left them. Root arguments in the console compute layout (from s4): s4:s5 argument buffer UAV, s6:s7 count
+// buffer UAV, s8:s9 recipe UAV, s10 key, s11 pair count.
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference_uvec2 : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+layout(push_constant) uniform UserData {
+    uint s[32];
+    uvec2 heap_base;
+    uvec2 code_base;
+} pc;
+
+uvec2 add64(uvec2 a, uvec2 b) {
+    uint carry;
+    const uint low = uaddCarry(a.x, b.x, carry);
+    return uvec2(low, a.y + b.y + carry);
+}
+
+Words at(uint lo, uint hi) { return Words(add64(pc.heap_base, uvec2(lo, hi))); }
+
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.s[11]) return;
+    Words recipe = at(pc.s[8], pc.s[9]);
+    const uint destination = recipe.w[2u * i];
+    const uint value = recipe.w[2u * i + 1u] ^ pc.s[10];
+    Words target = at(pc.s[4], pc.s[5]);
+    if ((destination & 0x80000000u) != 0u) target = at(pc.s[6], pc.s[7]);
+    target.w[destination & 0x7fffffffu] = value;
+}

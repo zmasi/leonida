@@ -98,6 +98,16 @@ FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPrese
 # in push-constant dwords 36..37 (the block grows from 144 to 152 bytes). The slot layout is mesh_compute_layout();
 # the index records it as "mesh_compute". tools/mesh_compute_vs.py writes the vertex shader that draws the slots.
 MESH_COMPUTE = False
+# Regenerated 152-byte --mesh-compute producers (never the --pc-tail-ubo variant) also run as GPU-driven indirect
+# tiles (docs/d3d12_vulkan.md, "GPU-driven mesh indirect"). The producer's output-address push dwords 36..37 are then
+# either the real output address (aligned to at least 16, so bit 0 is clear: the direct and legacy contract,
+# unchanged) or the address of a 16-byte, 8-byte-aligned TileMeta {outLo, outHi, firstGroup, reserved} OR 1. A set
+# bit 0 makes the prologue fetch that TileMeta once: the output address becomes {outLo, outHi}, which the epilogue
+# uses with the physical (local) linear group for the slot, and firstGroup is added to the linear group index only
+# where the original shader sees it (v5 = (firstGroup + local group) * NumThreads + local index). Untagged
+# launches never dereference anything: firstGroup is 0 and the output address is the push value. The module
+# declares the support with this exact OpModuleProcessed string; the runtime reads it from the SHA-sealed words.
+MESH_INDIRECT_TILE_MARKER = "leonida.mesh_indirect_tile.v1"
 # --pc-tail-ubo: for devices with 128 bytes of push constants, Vulkan's minimum (AMD's Windows driver on RDNA2 iGPUs,
 # some Intel Arc drivers; D3D-14's push_constants_need_fallback). The push-constant block keeps s0..s31 (128 bytes).
 # The tail that follows them by default (dwords 32..35: heap base, code base; 36..37: the --mesh-compute output
@@ -15988,12 +15998,14 @@ def mesh_compute_epilogue(gen):
          f"%msv = OpExtInst %uint %glsl UMin %msv0 {c(gen.ms['maxv'])}",
          f"%msp = OpExtInst %uint %glsl UMin %msp0 {c(gen.ms['maxp'])}",
          "%mli = OpLoad %uint %local_index",
-         # Slot base = output address (push-constant dwords 36..37, or --pc-tail-ubo dwords 4..5) + linear
-         # workgroup index * slot bytes.
-         pc_tail_chain("%moa_lo_p", 5, c), pc_tail_chain("%moa_hi_p", 6, c),
-         "%moa_lo = OpLoad %uint %moa_lo_p", "%moa_hi = OpLoad %uint %moa_hi_p",
-         "%moa_l64 = OpUConvert %ulong %moa_lo", "%moa_h64 = OpUConvert %ulong %moa_hi",
-         "%moa_sh = OpShiftLeftLogical %ulong %moa_h64 %c64_32", "%moa = OpBitwiseOr %ulong %moa_sh %moa_l64",
+         # Slot base = output address + linear workgroup index * slot bytes. The output address is the push
+         # constant (dwords 36..37, or --pc-tail-ubo dwords 4..5) or, for the indirect-tile contract, the address
+         # the prologue resolved (mesh_compute_tile_prologue): the group index below is always the physical one.
+         *(["%moa = OpLoad %ulong %mt_out"] if gen.msc_tile else
+           [pc_tail_chain("%moa_lo_p", 5, c), pc_tail_chain("%moa_hi_p", 6, c),
+            "%moa_lo = OpLoad %uint %moa_lo_p", "%moa_hi = OpLoad %uint %moa_hi_p",
+            "%moa_l64 = OpUConvert %ulong %moa_lo", "%moa_h64 = OpUConvert %ulong %moa_hi",
+            "%moa_sh = OpShiftLeftLogical %ulong %moa_h64 %c64_32", "%moa = OpBitwiseOr %ulong %moa_sh %moa_l64"]),
          "%mwg = OpLoad %v3uint %wg_id", "%mnw = OpLoad %v3uint %num_wg",
          "%mwx = OpCompositeExtract %uint %mwg 0", "%mwy = OpCompositeExtract %uint %mwg 1",
          "%mwz = OpCompositeExtract %uint %mwg 2", "%mnx = OpCompositeExtract %uint %mnw 0",
@@ -16078,6 +16090,34 @@ def mesh_compute_epilogue(gen):
     return "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L)
 
 
+def mesh_compute_tile_prologue(gen):
+    """--mesh-compute, 152-byte push: the entry code of the indirect-tile contract (MESH_INDIRECT_TILE_MARKER).
+    Reads the output-address push dwords 36..37 once. Bit 0 clear: %mt_out = that address, %mt_first = 0, no memory
+    access. Bit 0 set: one 16-byte fetch of the TileMeta at address - 1 (an uvec4, 8-byte aligned: outLo, outHi,
+    firstGroup, reserved) sets %mt_out = {outLo, outHi} and %mt_first = firstGroup. The test is a push-constant
+    value, so it is uniform; the fetch is inside its own structured selection, so a direct launch never reads
+    tagged metadata. %entry is the merge block: the original entry-block code, and any OpPhi naming %entry as its
+    predecessor, continue there; the function's first block is %mt_head (assemble renames it)."""
+    c = gen.cu
+    return [pc_tail_chain("%mt_lo_p", 5, c), pc_tail_chain("%mt_hi_p", 6, c),
+            "%mt_lo = OpLoad %uint %mt_lo_p", "%mt_hi = OpLoad %uint %mt_hi_p",
+            "%mt_l64 = OpUConvert %ulong %mt_lo", "%mt_h64 = OpUConvert %ulong %mt_hi",
+            "%mt_sh = OpShiftLeftLogical %ulong %mt_h64 %c64_32", "%mt_pa = OpBitwiseOr %ulong %mt_sh %mt_l64",
+            "OpStore %mt_out %mt_pa",
+            f"%mt_bit = OpBitwiseAnd %uint %mt_lo {c(1)}", "%mt_tg = OpINotEqual %bool %mt_bit %c0",
+            "OpSelectionMerge %entry None", "OpBranchConditional %mt_tg %mt_do %entry",
+            "%mt_do = OpLabel",
+            f"%mt_ma = OpISub %ulong %mt_pa {gen.cl(1)}",
+            "%mt_mp = OpConvertUToPtr %_ptr_PSB_v4uint %mt_ma",
+            "%mt_mv = OpLoad %v4uint_mt %mt_mp Aligned 8",
+            "%mt_o0 = OpCompositeExtract %uint %mt_mv 0", "%mt_o1 = OpCompositeExtract %uint %mt_mv 1",
+            "%mt_fg = OpCompositeExtract %uint %mt_mv 2",
+            "%mt_ol64 = OpUConvert %ulong %mt_o0", "%mt_oh64 = OpUConvert %ulong %mt_o1",
+            "%mt_osh = OpShiftLeftLogical %ulong %mt_oh64 %c64_32", "%mt_oa = OpBitwiseOr %ulong %mt_osh %mt_ol64",
+            "OpStore %mt_out %mt_oa", "OpStore %mt_first %mt_fg",
+            "OpBranch %entry", "%entry = OpLabel"]
+
+
 def insert_late_constants(gen, out, written):
     """Define the uint constants assemble asked gen.cu for after it wrote the others (the format tables' lengths and
     entries, prologue indices, ...), right after the last written one, so before any type or instruction that uses
@@ -16108,6 +16148,8 @@ def assemble(gen):
         gen.msc_layout = mesh_compute_layout(gen.ms["maxv"], gen.ms["maxp"], gen.clip_count if gen.uses_clip else 0,
                                              gen.cull_count if gen.uses_cull else 0, gen.ms_params)
         # Built here, before any constant is emitted, so every constant it asks for gets declared.
+        gen.msc_tile = not PC_TAIL_UBO      # the indirect-tile contract; the 128-byte pc-tail variant stays direct-only
+        gen.msc_tile_prologue = mesh_compute_tile_prologue(gen) if gen.msc_tile else []
         gen.msc_epilogue = mesh_compute_epilogue(gen)
     # --pc-tail-ubo: the uniform block exists only when the shader reads the tail (after the epilogue, which reads it).
     gen.uses_pc_tail = PC_TAIL_UBO and (gen.uses_heap or gen.uses_codebase or msc)
@@ -16298,6 +16340,10 @@ def assemble(gen):
             # in modules that declare Float64; --no-float-controls leaves it out with the other modes.
             hdr.append("OpExecutionMode %main SignedZeroInfNanPreserve 64")
         hdr.append("OpExecutionMode %main DenormPreserve 16")
+    if msc and gen.msc_tile:
+        # Module-level debug section (after the execution modes, before the annotations): the exact string the
+        # runtime looks for in the sealed words.
+        hdr.append(f'OpModuleProcessed "{MESH_INDIRECT_TILE_MARKER}"')
     dec = []
     if vs:
         dec.append("OpDecorate %vertex_index BuiltIn VertexIndex")
@@ -16386,6 +16432,9 @@ def assemble(gen):
                   "%rt_uint = OpTypeRuntimeArray %uint", "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
                   "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint"]
         dec.append("OpDecorate %rt_uint ArrayStride 4")
+        if msc and gen.msc_tile:
+            types += ["%_ptr_Function_ulong = OpTypePointer Function %ulong", "%v4uint_mt = OpTypeVector %uint 4",
+                      "%_ptr_PSB_v4uint = OpTypePointer PhysicalStorageBuffer %v4uint_mt"]
         types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(gen.lconsts.items())]
     if tex:
         # Bindless set 0: images (binding 0), samplers (binding 1), descriptor hash table (binding 2).
@@ -16835,6 +16884,12 @@ def assemble(gen):
             (["%ms_layer = OpVariable %_ptr_Function_int_ms Function %null_int_ms"] if gen.uses_layer else []) + \
             (["%ms_viewport = OpVariable %_ptr_Function_int_ms Function %null_int_ms"] if gen.uses_viewport else []) + \
             [f"%ms_param{n} = OpVariable %_ptr_Function_v4_ms Function %null_v4_ms" for n in sorted(gen.ms_params)]
+        if msc and gen.msc_tile:
+            # %mt_head is the first block; the tile prologue ends in the %entry merge block.
+            fn[2:2] = ["%mt_out = OpVariable %_ptr_Function_ulong Function",
+                       "%mt_first = OpVariable %_ptr_Function_uint Function %c0"]
+            fn[1] = "%mt_head = OpLabel"
+            fn += gen.msc_tile_prologue
         # v5 = first launch vertex ID of the lane = linear group index * NumThreads + local index (the game's mesh
         # entry does v5 >> 7 on lane 0 to get the group index; NumThreads is 128 in this corpus).
         # s3 = merged-wave info with the wave id in [27:24].
@@ -16843,7 +16898,8 @@ def assemble(gen):
                "%wgz = OpCompositeExtract %uint %wgi 2", "%nwx = OpCompositeExtract %uint %nwg 0",
                "%nwy = OpCompositeExtract %uint %nwg 1", "%nxy = OpIMul %uint %nwx %nwy",
                "%wz = OpIMul %uint %wgz %nxy", "%wy = OpIMul %uint %wgy %nwx", "%wyz = OpIAdd %uint %wy %wz",
-               "%wlin = OpIAdd %uint %wgx %wyz",
+               *(["%wlin0 = OpIAdd %uint %wgx %wyz", "%mt_fgv = OpLoad %uint %mt_first",
+                  "%wlin = OpIAdd %uint %wlin0 %mt_fgv"] if msc and gen.msc_tile else ["%wlin = OpIAdd %uint %wgx %wyz"]),
                f"%wbase = OpIMul %uint %wlin {gen.cu(gen.ms['threads'])}", "%v5v = OpIAdd %uint %wbase %lidx",
                f"%v5p = OpAccessChain %_ptr_Function_uint %vgpr {gen.cu(5)}", "OpStore %v5p %v5v",
                f"%wave = OpShiftRightLogical %uint %lidx {gen.cu(6)}",

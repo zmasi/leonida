@@ -24,6 +24,7 @@
 #include "vulkan_title_image_pool.h"
 #include "vulkan_indirect_dispatch_count.h"
 #include "vulkan_indirect_clamp.h"
+#include "vulkan_mesh_indirect_args.h"
 #include "vulkan_scratch.h"
 #include "vulkan_replay.h"
 #include "queue_families.h"
@@ -1416,6 +1417,30 @@ public:
             indirect_clamp_->emit(command_buffer, job);
         };
     }
+
+    // Indirect DispatchMesh (ExecuteIndirect of kind dispatch_mesh) for mesh-as-compute: a compute pass per logical record
+    // writes the tiles the replay dispatches and draws on the GPU (vulkan_mesh_indirect_args.h). Needs
+    // bufferDeviceAddress and a compute-capable queue; `allocate` gives the tile slab device-local memory allocated with
+    // VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT (the clamp's allocate callback is the same kind). Call after
+    // enable_indirect_clamp. A device without it leaves prepare_mesh_indirect_tiles unset: the replay refuses indirect
+    // DispatchMesh. Not tied to LEONIDA_INDIRECT_CLAMP: the pass reads the application's arguments itself.
+    void enable_mesh_indirect_tiles(PFN_vkGetDeviceProcAddr get, const VkPhysicalDeviceLimits& limits,
+                                    ScratchBuffers::Allocate allocate, std::vector<std::uint32_t> families = {}) {
+        std::unique_lock lock(resource_mutex_);
+        mesh_indirect_tiles_ = std::make_unique<MeshIndirectTiles>(get, device_, limits, std::move(allocate),
+                                                                  device_fault_.get(), std::move(families));
+        if (!mesh_indirect_tiles_->loaded()) {
+            mesh_indirect_tiles_.reset();
+            replay_.emit_mesh_indirect_tiles = nullptr;
+            return;
+        }
+        // The preparation callback is set per ExecuteCommandLists (execute()), which owns the slab's retirement;
+        // recording the pass has no per-submission state.
+        replay_.emit_mesh_indirect_tiles = [this](VkCommandBuffer command_buffer, const mesh_indirect::Tiles& tiles,
+                                                  std::uint32_t record) {
+            mesh_indirect_tiles_->emit(command_buffer, tiles, record);
+        };
+    }
     VkDevice device() const { return device_; }
 
     // Debug markers become labels from here on; call before any queue or list uses the context. Incomplete sets
@@ -2459,6 +2484,7 @@ private:
     std::unique_ptr<IndirectDispatchCounter> counted_dispatch_;
     std::unique_ptr<QuadIndexExpander> quad_indices_;
     std::unique_ptr<IndirectArgumentClamp> indirect_clamp_;
+    std::unique_ptr<MeshIndirectTiles> mesh_indirect_tiles_;
     std::uint32_t predicate_family_ = UINT32_MAX;
     std::uint32_t transfer_only_family_ = UINT32_MAX;
     std::uint32_t graphics_family_ = UINT32_MAX;
@@ -2655,6 +2681,7 @@ public:
             if (context_.depth24_) context_.depth24_->forget(progress_);  // its scratch is idle now
             if (context_.scratch_) context_.scratch_->forget(progress_);
             if (context_.indirect_clamp_) context_.indirect_clamp_->forget(progress_);
+            if (context_.mesh_indirect_tiles_) context_.mesh_indirect_tiles_->forget(progress_);
         }
         if (progress_) {
             // This queue is idle, so whatever initialisation it published (storage images, zero-filled buffers) has
@@ -3257,6 +3284,14 @@ private:
                 if (active && clamp) clamp->retire(progress, 0);
             }
         } clamp_guard{nullptr, progress_, false};
+        struct MeshTilesGuard {  // and for the indirect DispatchMesh tile slab
+            MeshIndirectTiles* tiles = nullptr;
+            VkSemaphore progress = VK_NULL_HANDLE;
+            bool active = false;
+            ~MeshTilesGuard() {
+                if (active && tiles) tiles->retire(progress, 0);
+            }
+        } mesh_tiles_guard{nullptr, progress_, false};
         const bool transfer_only = family_ == context_.transfer_only_family_;
         // Kept between executions: prepare refills each list's entries in the storage the last execution left, where
         // making them fresh for every command was about half the layer's CPU cost per command (replay_cpu_bench).
@@ -3401,6 +3436,21 @@ private:
                                                 max_count, out);
                 };
             }
+            if (kind_ != QueueKind::copy && context_.mesh_indirect_tiles_) {
+                // The slab belongs to this submission: collected here, retired below with its ticket. Pipeline creation
+                // is lazy and shared across queues; serialize it with other replay preparation.
+                replay.prepare_mesh_indirect_tiles = [this, &tracker_lock, &mesh_tiles_guard](
+                                                         const mesh_indirect::TileRequest& request,
+                                                         mesh_indirect::Tiles& out) {
+                    if (!tracker_lock.owns_lock()) tracker_lock.lock();
+                    if (!mesh_tiles_guard.active) {
+                        mesh_tiles_guard.tiles = context_.mesh_indirect_tiles_.get();
+                        context_.mesh_indirect_tiles_->collect();
+                        mesh_tiles_guard.active = true;
+                    }
+                    return context_.mesh_indirect_tiles_->prepare(request, out);
+                };
+            }
             if (kind_ != QueueKind::copy && context_.counted_dispatch_) {
                 replay.prepare_counted_dispatch = [this, &tracker_lock, &counted_batch](
                     VkBuffer args, VkDeviceSize args_offset, VkBuffer count, VkDeviceSize count_offset,
@@ -3495,6 +3545,10 @@ private:
                 if (clamp_guard.active) {
                     context_.indirect_clamp_->retire(progress_, 0);
                     clamp_guard.active = false;
+                }
+                if (mesh_tiles_guard.active) {
+                    context_.mesh_indirect_tiles_->retire(progress_, 0);
+                    mesh_tiles_guard.active = false;
                 }
                 batch.reset();
                 copy_batch.reset();
@@ -3669,6 +3723,10 @@ private:
             if (clamp_guard.active) {
                 context_.indirect_clamp_->retire(progress_, 0);
                 clamp_guard.active = false;
+            }
+            if (mesh_tiles_guard.active) {
+                context_.mesh_indirect_tiles_->retire(progress_, 0);
+                mesh_tiles_guard.active = false;
             }
             if (bindless_commit) bindless_commit(submitted);
             tracker_lock.unlock();
@@ -3880,6 +3938,10 @@ private:
         if (clamp_guard.active) {
             context_.indirect_clamp_->retire(progress_, submitted ? submitted_ : 0);
             clamp_guard.active = false;
+        }
+        if (mesh_tiles_guard.active) {
+            context_.mesh_indirect_tiles_->retire(progress_, submitted ? submitted_ : 0);
+            mesh_tiles_guard.active = false;
         }
         // Under tracker_mutex_, so no other flush comes between this submit and the set's note of whether it reached
         // the queue (it keeps a single upload obligation).

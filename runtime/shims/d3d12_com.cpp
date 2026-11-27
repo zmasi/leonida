@@ -6,6 +6,7 @@
 #include "d3d12_fence_waiter.h"
 #include "d3d12_feature_compat.h"
 #include "d3d12_indirect_draw_policy.h"
+#include "d3d12_mesh_compute_direct.h"
 #include "d3d12_trace.h"
 #include "d3d12_xs_device.h"
 #include "../src/gfx10_descriptors.h"
@@ -1030,13 +1031,9 @@ public:
         if (!leonida::indirect_records_fit(arg_desc.Width, argument_buffer_offset, max_command_count,
                                           stride, sig->packed_size()))
             return check(false);
-        // A terminal mesh signature is valid metadata even without an indirect mesh replay path.
-        // Refuse real work at recording, including a GPU-supplied count; never silently discard it.
-        if (max_command_count && !sig->execution_supported()) {
-            d3d12_trace::record("MeshIndirect::UnsupportedExecution", "unsupported");
-            return check(false);
-        }
+        // A positive emulated mesh command is checked against its bound PSO in record_indirect.
         if (kind == leonida::IndirectKind::dispatch_mesh && !terminal_only) {
+            if (max_command_count && pipeline_is_mesh_compute(bound_pipeline_)) return check(false);
             // A DISPATCH_MESH signature with root arguments before it is not replayed: nothing is recorded, and the
             // first such call says so. The list stays valid. A terminal-only one is recorded below as a mesh draw
             // (vkCmdDrawMeshTasksIndirect(Count)EXT).
@@ -1057,10 +1054,12 @@ public:
         // Preserve call position, not the bundle's incomplete draw state. No COM pointer is dereferenced
         // later: the signature is decoded now, and the app owns resource lifetimes through GPU completion.
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
-            defer([kind, args](GraphicsCommandList& parent) { parent.record_indirect(kind, true, args); }, true);
+            defer([kind, args, native = sig->execution_supported()](GraphicsCommandList& parent) {
+                parent.record_indirect(kind, true, args, native);
+            }, true);
             return;
         }
-        record_indirect(kind, terminal_only, args);
+        record_indirect(kind, terminal_only, args, sig->execution_supported());
     }
 
     void STDMETHODCALLTYPE BuildRaytracingAccelerationStructure(
@@ -1592,6 +1591,7 @@ private:
     std::uintptr_t compute_pipeline_ = 0;
     bool unregistered_pipeline_ = false;  // the bound PSO has no pipeline here (a stub): see set_pipeline
     std::uintptr_t graphics_pipeline_ = 0;
+    ID3D12PipelineState* bound_pipeline_ = nullptr;  // retained by hold() until reset
     ID3D12DescriptorHeap* cbv_srv_uav_heap_ = nullptr;
     ID3D12DescriptorHeap* sampler_heap_ = nullptr;
     D3D12_GPU_VIRTUAL_ADDRESS cbv_srv_uav_base_ = 0;
@@ -1671,6 +1671,7 @@ private:
         hold(state);
         compute_pipeline_ = compute_pipeline_id(state);
         graphics_pipeline_ = graphics_pipeline_id(state);
+        bound_pipeline_ = state;
         if (compute_pipeline_) request_pipeline_build(compute_pipeline_, 0, false);  // starts its build, if asynchronous
         // A pipeline this device never registered: a LEONIDA_STUB_PIPELINES stub (its translated shader is missing),
         // or one from another device. Its draws resolve to nothing in replay; its dispatches are no-ops too
@@ -2058,23 +2059,34 @@ private:
     // One recorder for both entry points: the direct ExecuteIndirect call and a bundle call deferred into its
     // parent list. A simple DRAW or DRAW_INDEXED signature becomes a stateful Draw (IndirectRasterDraw) carrying the
     // graphics state frozen at the call; anything else stays a legacy ExecuteIndirect command.
-    void record_indirect(leonida::IndirectKind kind, bool terminal_only, const leonida::IndirectDrawArgs& args) {
+    void record_indirect(leonida::IndirectKind kind, bool terminal_only, const leonida::IndirectDrawArgs& args,
+                         bool native_execution) {
         if (kind == leonida::IndirectKind::dispatch_mesh) {
             // As DispatchMesh, with the group counts in the argument buffer: the replay draws the records with
             // vkCmdDrawMeshTasksIndirect(Count)EXT after its clamp pass bounds them.
             if (type_ != D3D12_COMMAND_LIST_TYPE_DIRECT) return check(false);
             if (!args.max_count) return;
+            // The inherited PSO is known here even for a fixed-count call recorded in a bundle.
+            const bool emulated = pipeline_is_mesh_compute(bound_pipeline_);
+            if (!native_execution || emulated) {
+                if (!terminal_only || !graphics_pipeline_ || !pipeline_supports_mesh_compute_indirect(bound_pipeline_) ||
+                    !graphics_.layout || !graphics_.layout->mesh_ok || !any_nonempty_viewport() || indirect_draws_disabled()) {
+                    d3d12_trace::record("MeshIndirect::UnsupportedExecution", "unsupported");
+                    return check(false);
+                }
+            }
             namespace stats = leonida::indirect_stats;
             const auto skip = [](stats::Reason reason) { stats::skip(stats::Event::record_skip, reason); };
             if (indirect_draws_disabled()) return skip(stats::disabled);
             if (!terminal_only) return skip(stats::compound);
             if (!graphics_pipeline_) return skip(stats::pipeline);
             if (!graphics_.layout) return skip(stats::root_layout);
-            if (!(viewport_.width > 0) || !(viewport_.height > 0)) return skip(stats::viewport);
+            if (!emulated && (!(viewport_.width > 0) || !(viewport_.height > 0))) return skip(stats::viewport);
             leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, {}, 0, viewport_,
                                scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, false, 0, 0, 0, 0, 0};
             note_direct_heap_indexing(graphics_.layout);
             draw.mesh = true;
+            if (emulated) draw.viewports = draw_viewports();
             draw.depth_bounds = depth_bounds_;
             request_draw_pipeline();
             const bool recorded = list_.draw_indirect(std::move(draw), args);

@@ -48,8 +48,7 @@
 //     streams are E_INVALIDARG. Native MeshEXT stays E_NOTIMPL, over-limit grids
 //     fail at Close, and wrong-kind draws fail at execution.
 //   - Controls on the no-extension device: MeshShaderTier stays NOT_SUPPORTED,
-//     and a DISPATCH_MESH command signature is refused E_NOTIMPL (stock main;
-//     this branch is independent of the signature fix, so no success is expected).
+//     and a terminal DISPATCH_MESH signature constructs without advertising native mesh.
 //     Direct DispatchMesh only; no ExecuteIndirect mesh in this test.
 // On the unmodified base this test fails red at the first mesh-compute PSO
 // creation (the stock no-extension refusal, E_NOTIMPL). It never skips for a
@@ -264,17 +263,13 @@ int main() {
         const D3D12_PIPELINE_STATE_STREAM_DESC native_desc = native_stream.desc();
         EXPECT(device2->CreatePipelineState(&native_desc, IID_PPV_ARGS(&raw)) == E_NOTIMPL && raw == nullptr);
     }
-    // Stock command-signature behaviour on the no-extension device: a DISPATCH_MESH
-    // description is refused E_NOTIMPL with a nulled pointer. This branch is
-    // independent of the signature fix, so no success is expected here; the
-    // separate d3d12_mesh controls cover the with-extension path.
+    // A terminal signature describes the record independently of native mesh support.
+    // The indirect fixture separately checks execution with a compatible bound producer.
     {
-        const D3D12_INDIRECT_ARGUMENT_DESC mesh_sig_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
-        const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_sig_arg, 0};
-        ID3D12CommandSignature* raw_sig =
-            reinterpret_cast<ID3D12CommandSignature*>(std::uintptr_t(0x5678));
-        EXPECT(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&raw_sig)) == E_NOTIMPL &&
-               raw_sig == nullptr);
+        const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
+        const D3D12_COMMAND_SIGNATURE_DESC desc{12, 1, &mesh_arg, 0};
+        Ref<ID3D12CommandSignature> signature;
+        EXPECT(device->CreateCommandSignature(&desc, nullptr, IID_PPV_ARGS(&signature.p)) == S_OK && signature.p);
     }
 
     // The emulated PSOs. Grid A: no depth buffer, depth explicitly off. Grid B:
@@ -1000,7 +995,7 @@ int main() {
     std::printf("mesh compute: 2x3x4 group pattern, 2x2x1 gradient with depth, the clip edge and the "
                 "simple f16 case matched (%u+%u+%u+%u+%u pixels)%s; zero grids are no-ops; cull BACK "
                 "stays clear and cull FRONT renders (%u+%u pixels); native mesh refused, DISPATCH_MESH "
-                "signature refused (stock); over-limit and native-bary negatives %s; "
+                "signature created; over-limit and native-bary negatives %s; "
                 "MS+GS/MS+VS/truncated and wrong-kind draws refused\n",
                 size * size, size * size, small_extent * small_extent, size * size, size * size,
                 bary_drew ? " plus native bary executed" : ", native bary refused without the feature",

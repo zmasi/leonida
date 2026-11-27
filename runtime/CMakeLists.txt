@@ -1940,6 +1940,38 @@ if(LEONIDA_D3D12_SHIM_TESTS)
 endif()
 endif()
 
+# The indirect DispatchMesh tile pass (src/mesh_indirect_args.comp, src/vulkan_mesh_indirect_args.h) is embedded as
+# src/mesh_indirect_args_spv.h like the other helper shaders: the checked-in words are what the runtime builds, so no
+# build step needs glslang. These two targets (not part of ALL) regenerate the header from the shader, or fail when the
+# checked-in header is not what the shader produces; the header names the glslang it was made with, so a check with
+# another version is advisory. Neither runs a test: registration is with the tests that use the pass.
+find_program(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE glslangValidator HINTS "$ENV{VULKAN_SDK}/Bin" "$ENV{VULKAN_SDK}/bin")
+if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+  set(_mesh_indirect_args_spv "${CMAKE_CURRENT_BINARY_DIR}/generated/mesh_indirect_args.spv")
+  add_custom_command(OUTPUT "${_mesh_indirect_args_spv}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+    COMMAND "${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE}" -V --target-env vulkan1.2 -Os --spirv-val
+            -o "${_mesh_indirect_args_spv}" "${CMAKE_CURRENT_SOURCE_DIR}/src/mesh_indirect_args.comp"
+    DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/mesh_indirect_args.comp"
+    COMMENT "Compiling mesh_indirect_args.comp" VERBATIM)
+  foreach(_mode write check)
+    if(_mode STREQUAL "write")
+      set(_mesh_indirect_args_target mesh_indirect_args_spirv_refresh)
+    else()
+      set(_mesh_indirect_args_target mesh_indirect_args_spirv_check)
+    endif()
+    add_custom_target(${_mesh_indirect_args_target}
+      COMMAND ${CMAKE_COMMAND} "-DSPV=${_mesh_indirect_args_spv}"
+              "-DHEADER=${CMAKE_CURRENT_SOURCE_DIR}/src/mesh_indirect_args_spv.h"
+              -DNAME=mesh_indirect_args_spirv -DSHADER=mesh_indirect_args.comp -DMODE=${_mode}
+              -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_spirv_header.cmake"
+      DEPENDS "${_mesh_indirect_args_spv}"
+      COMMENT "mesh_indirect_args_spv.h: ${_mode}" VERBATIM)
+  endforeach()
+else()
+  message(STATUS "glslangValidator not found: the mesh_indirect_args_spirv_refresh and _check targets are not defined")
+endif()
+
 # CPU-only: which SPIR-V capabilities make the standalone GPU tools ask for shaderInt64 (TEST-468). It includes no
 # Vulkan header, so it builds and runs without them, unlike the tools below that use it.
 add_executable(spirv_capability_test test/spirv_capability_test.cpp)
@@ -2020,6 +2052,30 @@ if(TARGET Vulkan::Headers)
   if(BUILD_TESTING)
     add_test(NAME indirect_clamp COMMAND indirect_clamp_test)
     set_tests_properties(indirect_clamp PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+  # GPU: the tile-preparation pass of ExecuteIndirect(DISPATCH_MESH) on mesh-as-compute run for real; the tiles it
+  # writes for the largest legal record (2^22 groups), one group more, zero, invalid and counted records are read
+  # back and compared (nothing is drawn from them). 77 without a Vulkan device or bufferDeviceAddress.
+  if(Vulkan_GLSLANG_VALIDATOR_EXECUTABLE)
+    set(LEONIDA_TEST_WORDS_SPV ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_buffer_words.spv)
+    add_custom_command(OUTPUT ${LEONIDA_TEST_WORDS_SPV}
+      COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2 -o ${LEONIDA_TEST_WORDS_SPV}
+              ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_buffer_words.comp
+      DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/cs_buffer_words.comp
+      COMMENT "Compiling the word helper of vulkan_mesh_indirect_args_test" VERBATIM)
+    add_executable(vulkan_mesh_indirect_args_test test/vulkan_mesh_indirect_args_test.cpp ${LEONIDA_TEST_WORDS_SPV})
+    target_link_libraries(vulkan_mesh_indirect_args_test PRIVATE Vulkan::Headers ${CMAKE_DL_LIBS})
+    target_compile_definitions(vulkan_mesh_indirect_args_test PRIVATE LEONIDA_TEST_WORDS_SPV="${LEONIDA_TEST_WORDS_SPV}")
+    if(WIN32)
+      target_compile_definitions(vulkan_mesh_indirect_args_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    if(MSVC)
+      target_compile_options(vulkan_mesh_indirect_args_test PRIVATE /W4 /permissive- /utf-8)
+    endif()
+    if(BUILD_TESTING)
+      add_test(NAME vulkan_mesh_indirect_args COMMAND vulkan_mesh_indirect_args_test)
+      set_tests_properties(vulkan_mesh_indirect_args PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
   endif()
   # OpFmaKHR width gate of vk_shader_fma.h (shaderFmaFloat32 / shaderFmaFloat64): no Vulkan instance, no GPU.
   add_executable(vk_shader_fma_test test/vk_shader_fma_test.cpp)
@@ -2331,6 +2387,10 @@ if(TARGET Vulkan::Headers)
     add_executable(vulkan_mesh_compute_direct_test test/vulkan_mesh_compute_direct_test.cpp)
     target_link_libraries(vulkan_mesh_compute_direct_test PRIVATE Vulkan::Headers)
     add_test(NAME vulkan_mesh_compute_direct_bounds COMMAND vulkan_mesh_compute_direct_test)
+    # CPU-only: segmented ExecuteIndirect(DISPATCH_MESH) planning bounds (src/vulkan_mesh_indirect_tiles.h).
+    add_executable(vulkan_mesh_indirect_tiles_test test/vulkan_mesh_indirect_tiles_test.cpp)
+    target_link_libraries(vulkan_mesh_indirect_tiles_test PRIVATE Vulkan::Headers)
+    add_test(NAME vulkan_mesh_indirect_tiles COMMAND vulkan_mesh_indirect_tiles_test)
   endif()
   # CPU-only: Vulkan 1.3 core vs 1.2 KHR/EXT feature probing and proc fallback (runtime/src/vulkan13_features.h).
   add_executable(vulkan13_features_test test/vulkan13_features_test.cpp)
@@ -4471,6 +4531,69 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_mesh_compute_eager COMMAND d3d12_mesh_compute_test)
       set_tests_properties(d3d12_mesh_compute_eager PROPERTIES SKIP_RETURN_CODE 77
                            ENVIRONMENT "LEONIDA_LAZY_PIPELINES=0")
+
+      # GPU-driven ExecuteIndirect(DISPATCH_MESH) over the same mesh-compute producers, with every argument and
+      # count word written by an actual compute dispatch (test/glsl/cs_mesh_indirect_args.comp). The library is
+      # the one staged above plus a wide-slot twin of ms_v5_workgroup, two direct-only copies of it (marker removed
+      # / altered) and the two GLSL modules (test/shaders/build_mesh_indirect_fixtures.py). Runs under the Vulkan
+      # validation layer with synchronization validation when it is installed; LEONIDA_VK_REQUIRE_VALIDATION=1
+      # makes a missing layer a failure.
+      set(LEONIDA_MCI_PS_SPV ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_mesh_indirect_cell.spv)
+      set(LEONIDA_MCI_CS_SPV ${CMAKE_CURRENT_BINARY_DIR}/generated/cs_mesh_indirect_args.spv)
+      foreach(pair "ps_mesh_indirect_cell.frag;${LEONIDA_MCI_PS_SPV}" "cs_mesh_indirect_args.comp;${LEONIDA_MCI_CS_SPV}")
+        list(GET pair 0 source)
+        list(GET pair 1 output)
+        add_custom_command(
+          OUTPUT ${output}
+          # Plain discard is sufficient for the pixel oracle; a Vulkan 1.3 SPIR-V target can
+          # introduce DemoteToHelperInvocation, an optional feature this fixture does not enable.
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.2 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling the mesh indirect test shader ${source}"
+          VERBATIM)
+      endforeach()
+      set(LEONIDA_MCI_DIR ${CMAKE_CURRENT_BINARY_DIR}/generated/mesh_indirect_shaders)
+      set(LEONIDA_MCI_FILES
+        ${LEONIDA_MCI_DIR}/spirv/index.json
+        ${LEONIDA_MCI_DIR}/spirv/ms_v5_wide.spv ${LEONIDA_MCI_DIR}/spirv/ms_v5_wide.mesh_vs.spv
+        ${LEONIDA_MCI_DIR}/spirv/ms_v5_wide.mesh_compute.seal.json
+        ${LEONIDA_MCI_DIR}/spirv/ms_v5_legacy.spv ${LEONIDA_MCI_DIR}/spirv/ms_v5_legacy.mesh_vs.spv
+        ${LEONIDA_MCI_DIR}/spirv/ms_v5_legacy.mesh_compute.seal.json
+        ${LEONIDA_MCI_DIR}/spirv/ms_v5_badmarker.spv ${LEONIDA_MCI_DIR}/spirv/ms_v5_badmarker.mesh_vs.spv
+        ${LEONIDA_MCI_DIR}/spirv/ms_v5_badmarker.mesh_compute.seal.json
+        ${LEONIDA_MCI_DIR}/spirv/ps_mesh_indirect_cell.spv ${LEONIDA_MCI_DIR}/spirv/cs_mesh_indirect_args.spv
+        ${LEONIDA_MCI_DIR}/fssm/ms_v5_wide.fssm ${LEONIDA_MCI_DIR}/fssm/ms_v5_legacy.fssm
+        ${LEONIDA_MCI_DIR}/fssm/ms_v5_badmarker.fssm ${LEONIDA_MCI_DIR}/fssm/ps_mesh_indirect_cell.fssm
+        ${LEONIDA_MCI_DIR}/fssm/cs_mesh_indirect_args.fssm)
+      add_custom_command(
+        OUTPUT ${LEONIDA_MCI_FILES}
+        COMMAND ${CMAKE_COMMAND} -E env "LLVM_MC=${LEONIDA_LLVM_MC}" "LEONIDA_SPIRV_TOOLS=${LEONIDA_SPIRV_TOOLS_NATIVE}"
+                $<TARGET_FILE:Python3::Interpreter> -I ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build_mesh_indirect_fixtures.py
+                ${LEONIDA_MC_DIR} ${LEONIDA_MCI_DIR} --ps-cell ${LEONIDA_MCI_PS_SPV} --cs-args ${LEONIDA_MCI_CS_SPV}
+        DEPENDS ${LEONIDA_MC_FILES} ${LEONIDA_TRANSLATOR_DEPS}
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build_mesh_indirect_fixtures.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/build_mesh_compute.py
+                ${CMAKE_CURRENT_SOURCE_DIR}/test/shaders/ms_v5_workgroup.asm
+                ${CMAKE_CURRENT_SOURCE_DIR}/../tools/mesh_compute_vs.py
+                ${LEONIDA_MCI_PS_SPV} ${LEONIDA_MCI_CS_SPV}
+        COMMENT "Staging mesh indirect fixtures for d3d12_mesh_compute_indirect_test"
+        VERBATIM)
+      add_executable(d3d12_mesh_compute_indirect_test test/d3d12_mesh_compute_indirect_test.cpp
+                     shims/d3d12_xs_device.cpp shims/d3d12_xs_pso_stream.cpp ${LEONIDA_MCI_FILES})
+      target_link_libraries(d3d12_mesh_compute_indirect_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_mesh_compute_indirect_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_MESH_INDIRECT_DIR="${LEONIDA_MCI_DIR}")
+      target_compile_options(d3d12_mesh_compute_indirect_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_mesh_compute_indirect COMMAND d3d12_mesh_compute_indirect_test)
+      set_tests_properties(d3d12_mesh_compute_indirect PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
+      add_test(NAME d3d12_mesh_compute_indirect_eager COMMAND d3d12_mesh_compute_indirect_test)
+      set_tests_properties(d3d12_mesh_compute_indirect_eager PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600
+                           ENVIRONMENT "LEONIDA_LAZY_PIPELINES=0")
+      # Asynchronous, non-strict builds with the consumer's graphics variant held on the compile worker: a positive
+      # emulated ExecuteIndirect is built synchronously, not dropped with the submission's unrelated upload.
+      add_test(NAME d3d12_mesh_compute_indirect_async COMMAND d3d12_mesh_compute_indirect_test --async-pending)
+      set_tests_properties(d3d12_mesh_compute_indirect_async PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600)
     else()
       message(STATUS "llvm-mc, SPIRV-Tools or glslangValidator not found: d3d12_mesh_compute_test is not built")
     endif()

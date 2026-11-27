@@ -1346,6 +1346,41 @@ int main() {
             (2u << 16) | 17u, 5347, (3u << 16) | 14u, 5348, 1, (5u << 16) | 15u, 0, 1, 0x6E69616Du, 0,
             (4u << 16) | 71u, 2, 30, 0, (4u << 16) | 59u, 3, 2, 3, (5u << 16) | 72u, 2, 5, 35, 144,
             (5u << 16) | 72u, 2, 6, 35, 148};
+        // Only an exact global v1 marker may make an output address a tagged metadata pointer.
+        {
+            const auto marker = [](std::string_view text) {
+                std::vector<std::uint32_t> op(1 + (text.size() + 4) / 4, 0);
+                op.front() = (std::uint32_t(op.size()) << 16) | 330u; // OpModuleProcessed
+                for (std::size_t i = 0; i < text.size(); ++i)
+                    op[1 + i / 4] |= std::uint32_t(static_cast<unsigned char>(text[i])) << (8 * (i % 4));
+                return op;
+            };
+            const auto appended = [&](const std::vector<std::uint32_t>& op) {
+                auto words = producer;
+                words.insert(words.end(), op.begin(), op.end());
+                return words;
+            };
+            const auto good = marker("leonida.mesh_indirect_tile.v1");
+            auto words = appended(good);
+            CHECK(leonida::mesh_producer_indirect_tiles_v1(words));
+            CHECK(!leonida::mesh_producer_indirect_tiles_v1(producer));
+            CHECK(!leonida::mesh_producer_indirect_tiles_v1(appended(marker("leonida.mesh_indirect_tile.v10"))));
+            words.insert(words.end(), good.begin(), good.end());
+            CHECK(!leonida::mesh_producer_indirect_tiles_v1(words));
+            auto malformed = good;
+            malformed.back() |= 0x80000000u; // nonzero terminator/padding
+            CHECK(!leonida::mesh_producer_indirect_tiles_v1(appended(malformed)));
+            malformed = good;
+            malformed[0] += 1u << 16;
+            malformed.push_back(0); // not just a prefix of a longer instruction
+            CHECK(!leonida::mesh_producer_indirect_tiles_v1(appended(malformed)));
+            words = appended(good);
+            words[1] = 0x00010000u;
+            CHECK(!leonida::mesh_producer_indirect_tiles_v1(words));
+            words = appended({(5u << 16) | 54u, 1u, 2u, 0u, 3u}); // function, not global metadata
+            words.insert(words.end(), good.begin(), good.end());
+            CHECK(!leonida::mesh_producer_indirect_tiles_v1(words));
+        }
         // Null/absent/wrong-stage are native (nullopt), never emulated.
         write_text(root / "index.json",
                    "{\"ms_null\": {\"stage\": \"ms\", \"fssm_sha256\": \"" + hash + "\", \"mesh_compute\": null},\n"

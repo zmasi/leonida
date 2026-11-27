@@ -1,0 +1,20 @@
+#version 460
+// Word helper of vulkan_mesh_indirect_args_test: the tile slab of the tile-preparation pass has no transfer usage, so
+// the test fills it with a sentinel (mode 1) before the pass runs and copies it out (mode 0) after, with this shader.
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint w[]; };
+layout(push_constant) uniform Params {
+    Words src;
+    Words dst;
+    uint n;
+    uint fill;
+    uint mode;  // 1: dst[i] = fill; else dst[i] = src[i]
+    uint pad;
+} p;
+void main() {
+    const uint i = gl_GlobalInvocationID.x;
+    if (i >= p.n) return;
+    if (p.mode == 1u) p.dst.w[i] = p.fill;
+    else p.dst.w[i] = p.src.w[i];
+}

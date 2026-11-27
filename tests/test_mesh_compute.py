@@ -8,6 +8,10 @@ and draws its slots with the generated vertex shader (vk_harness VKH_MESH_COMPUT
   extension, execution modes, outputs or SetMeshOutputs; it reads the output address from push-constant members
   5/6 (bytes 144/148), and stores the header, vertices and primitives through it; it passes spirv-val, also with
   --wave64-emulate; the metadata records the layout and 152 push-constant bytes;
+  the 152-byte producer also declares the GPU-driven indirect-tile contract: one exact OpModuleProcessed string in
+  the module-level debug section, and a prologue that fetches a tagged TileMeta once inside its own structured
+  selection (a direct launch never dereferences it), used by the epilogue for the local slot while firstGroup only
+  offsets the original shader's v5; the --pc-tail-ubo variant and the mesh shader have neither;
 * without the flag the module is the mesh shader it was;
 * the generated vertex shader matches the layout and passes spirv-val;
 * check.py's mesh_env picks the compute variables only when the flag, the layout and the vertex shader are there.
@@ -101,6 +105,72 @@ def test_clip_distances_go_to_the_slot(make_shader):
     lay = meta["mesh_compute"]
     assert lay["clip_count"] >= 1 and lay["clip_offset"] == 16
     assert "OpAccessChain %_ptr_Function_float %ms_clip" in spvasm
+
+
+def _module_ops(spvasm):
+    """(opcode, operand words) of every instruction of the assembled module, in order."""
+    import spirv_asm
+    data = spirv_asm.assemble(spvasm, target_env="vulkan1.2")
+    words = [int.from_bytes(data[i:i + 4], "little") for i in range(0, len(data), 4)]
+    ops, pos = [], 5
+    while pos < len(words):
+        wc, op = words[pos] >> 16, words[pos] & 0xFFFF
+        ops.append((op, words[pos + 1:pos + wc]))
+        pos += wc
+    return ops
+
+
+@requires_tools
+@pytest.mark.parametrize("emulate", [False, True], ids=["native", "wave64-emulate"])
+@pytest.mark.parametrize("name", MESH_TESTS)
+def test_indirect_tile_marker_and_prologue(make_shader, name, emulate):
+    shader, spvasm, meta = _translate(make_shader, name, True, emulate)
+    shader.validate(spvasm)
+    assert meta["push_constant_bytes"] == 152 and meta["mesh_compute"]["address_dwords"] == [36, 37]
+    # The marker: exactly one OpModuleProcessed (opcode 330) with the exact literal, NUL-terminated and padded, in
+    # the debug section: only capabilities, extensions, imports, the memory model, the entry point and execution
+    # modes precede it.
+    ops = _module_ops(spvasm)
+    marks = [i for i, (op, _) in enumerate(ops) if op == 330]
+    assert len(marks) == 1
+    literal = b"".join(w.to_bytes(4, "little") for w in ops[marks[0]][1])
+    assert literal == b"leonida.mesh_indirect_tile.v1" + b"\0" * (len(literal) - len(b"leonida.mesh_indirect_tile.v1"))
+    assert 0 < len(literal) - len(b"leonida.mesh_indirect_tile.v1") <= 4
+    assert {op for op, _ in ops[:marks[0]]} <= {10, 11, 14, 15, 16, 17}      # OpExtension .. OpExecutionMode
+    assert rdna2spirv.MESH_INDIRECT_TILE_MARKER == "leonida.mesh_indirect_tile.v1"
+    # Structure: %mt_head is the first block, the tag test is one uniform selection whose only memory access is
+    # the 16-byte TileMeta fetch (8-byte aligned) inside it; the merge block is %entry.
+    assert re.search(r"%main = OpFunction[^\n]*\n\s*%mt_head = OpLabel", spvasm)
+    assert re.search(r"%mt_bit = OpBitwiseAnd %uint %mt_lo %c1\n\s*%mt_tg = OpINotEqual %bool %mt_bit %c0\n\s*"
+                     r"OpSelectionMerge %entry None\n\s*OpBranchConditional %mt_tg %mt_do %entry", spvasm)
+    start = spvasm.index("%mt_do = OpLabel")
+    inside = spvasm[start:spvasm.index("OpBranch %entry", start)]
+    assert len(re.findall(r"OpLoad %v4uint\w* %mt_mp Aligned 8", inside)) == 1
+    assert len(re.findall(r"OpLoad %v4uint\w* %mt_mp Aligned 8", spvasm)) == 1
+    assert len(re.findall(r"%mt_mp = OpConvertUToPtr %_ptr_PSB_v4\w* %mt_ma", spvasm)) == 1
+    assert "%mt_mp" not in spvasm[:start] and "%mt_mv" not in spvasm[:start]
+    assert spvasm.count("%mt_lo_p = OpAccessChain %_ptr_PC_uint %user_data %c5") == 1
+    assert spvasm.count("%mt_hi_p = OpAccessChain %_ptr_PC_uint %user_data %c6") == 1
+    # firstGroup only offsets the shader-visible group index (v5); the epilogue's output address is the resolved
+    # one and its slot index is the physical group (workgroup id and count), as before.
+    assert spvasm.count("%mt_fgv") == 2 and "%wlin = OpIAdd %uint %wlin0 %mt_fgv" in spvasm
+    assert spvasm.count("OpLoad %uint %mt_first") == 1
+    assert "%moa = OpLoad %ulong %mt_out" in spvasm and "%moa_lo_p" not in spvasm
+    assert "%mwl0 = OpIAdd %uint %mwx %mwyx" in spvasm and "%mso = OpIMul %ulong %mwl64" in spvasm
+
+
+@requires_tools
+def test_pc_tail_and_mesh_shader_have_no_tile_contract(make_shader):
+    _, mesh, _ = _translate(make_shader, "ms_tri", False)
+    assert "OpModuleProcessed" not in mesh and "%mt_" not in mesh
+    old = rdna2spirv.PC_TAIL_UBO
+    rdna2spirv.PC_TAIL_UBO = True
+    try:
+        _, tail, _ = _translate(make_shader, "ms_tri", True)
+    finally:
+        rdna2spirv.PC_TAIL_UBO = old
+    assert "OpModuleProcessed" not in tail and "%mt_" not in tail and "%entry = OpLabel" in tail
+    assert "%moa_lo_p = OpAccessChain %_ptr_Uniform_uint_tail %pc_tail %c4" in tail
 
 
 def _vs_layout(clip=0, cull=0, params=(0,)):

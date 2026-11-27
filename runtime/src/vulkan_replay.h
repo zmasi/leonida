@@ -48,6 +48,7 @@
 #include "vulkan_indirect_dispatch_count.h"
 #include "vulkan_indirect_clamp.h"
 #include "vulkan_mesh_compute_direct.h"
+#include "vulkan_mesh_indirect_tiles.h"
 #include "xdxr_build.h"
 
 #include <algorithm>
@@ -125,6 +126,11 @@ struct ResourceBinding {
     bool (*ensure_residency)(void*) = nullptr;
     ResourceId depth_conversion = 0;  // R32_FLOAT transfer image for a widened Xbox D16+S8 attachment
     bool indirect_arguments = false;   // the backing VkBuffer was created with INDIRECT_BUFFER usage
+    // Real physical device address of byte 0 of the logical RESOURCE (already includes buffer_offset; never add it again).
+    // 0 when the VkBuffer was not created with SHADER_DEVICE_ADDRESS. Set only from a real vkGetBufferDeviceAddress at
+    // registration; last member so positional aggregate initializers stay valid. The emulated mesh indirect reads its
+    // arguments and count through it and refuses when it is 0.
+    VkDeviceAddress buffer_address = 0;
 };
 
 struct VulkanAccess {
@@ -900,6 +906,11 @@ struct MeshComputeDirect {
     std::uint64_t producer_code_base = 0;  // the mesh shader's FSSM blob, as GraphicsPipeline::code_base
     std::uint64_t slot_bytes = 0;  // bytes of one workgroup's output slot, 16-aligned, > 0
     std::uint32_t max_primitives = 0;  // mesh primitives per group, > 0; the draw is G*max_primitives*3 vertices
+    // The producer is the 152-byte one that advertises OpModuleProcessed "leonida.mesh_indirect_tile.v1": it reads the
+    // tagged TileMeta pointer in its output-base push constant (mesh_indirect, vulkan_mesh_indirect_tiles.h) and can
+    // serve an ExecuteIndirect(DISPATCH_MESH). False (the older sealed producer): direct DispatchMesh only; a positive
+    // indirect on such a PSO is refused (unsupported), never skipped.
+    bool indirect_tiles_v1 = false;
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
@@ -938,6 +949,13 @@ struct GraphicsPipeline {
     bool async_build = false;
     bool nonunit_vertex_divisor = false;  // an actual instance divisor > 1, not a zero-stride emulation
     std::uint64_t estimate = 0;  // as ComputePipeline::estimate
+    // `variant`, but always built here: an asynchronous pipeline (async_build) whose variant is queued or compiling on
+    // the compile worker is waited for (or built in place, sharing the one build per variant) instead of answering null
+    // for a later submission. Only work that can never be dropped uses it: a positive ExecuteIndirect(DISPATCH_MESH) on a
+    // direct mesh-as-compute PSO (prepare_draw, `emulated`); ordinary and native draws keep `variant`. It waits, so
+    // prepare never calls it with the resource lock held: PipelineCompiles::add_waited builds it outside the lock. Null
+    // (a test pipeline): `variant` is used, and an asynchronous one then fails the call.
+    std::function<VkPipeline(std::uint32_t flags)> variant_wait;
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -1047,9 +1065,17 @@ public:
     // A compile takes the driver some hundred bytes of memory for each byte of SPIR-V (docs/pipeline_check.md): graphics
     // pipelines of this much or more are `large`. For compute pipelines the D3D12 layer decides.
     static constexpr std::uint64_t large_spirv_bytes = 1u << 20;
+    // Marks a graphics job made by add_waited; above every GraphicsPipeline variant bit.
+    static constexpr std::uint32_t wait_flag = 1u << 31;
 
     Ticket add(const GraphicsPipeline& pipeline, std::uint32_t flags) {
         return add({&pipeline, nullptr, flags}, User::draw);
+    }
+    // As add, for a draw that must have its variant: it is built through GraphicsPipeline::variant_wait, so an asynchronous
+    // pipeline whose variant is pending is waited for rather than left null. A separate ticket from add's (the wait is
+    // part of the key), because the same pipeline and flags can be asked for either way.
+    Ticket add_waited(const GraphicsPipeline& pipeline, std::uint32_t flags) {
+        return add({&pipeline, nullptr, flags | wait_flag}, User::draw);
     }
     Ticket add(const ComputePipeline& pipeline, User user) { return add({nullptr, &pipeline, 0}, user); }
 
@@ -1103,7 +1129,7 @@ public:
         }
         const auto compile = [this](std::size_t i) {
             Job& job = jobs_[i];
-            job.built = job.graphics ? job.graphics->variant(job.flags) : job.compute->build(job.compute->build_context);
+            job.built = job.graphics ? build_graphics(job) : job.compute->build(job.compute->build_context);
         };
         std::mutex mutex;  // guards the four below
         std::size_t next_single = 0, next_large = 0, compiling = 0;
@@ -1150,8 +1176,7 @@ public:
                 done[i] = true;
                 Job& job = jobs_[i];
                 if (!prior || !prior->lookup(job.graphics, job.compute, job.flags, job.built)) {
-                    job.built =
-                        job.graphics ? job.graphics->variant(job.flags) : job.compute->build(job.compute->build_context);
+                    job.built = job.graphics ? build_graphics(job) : job.compute->build(job.compute->build_context);
                 }
             }
             if (!jobs_[i].built && (use.user == User::draw || use.user == User::indirect_dispatch || strict_replay()))
@@ -1167,6 +1192,11 @@ private:
         VkPipeline built = VK_NULL_HANDLE;
     };
     static bool is_large(const Job& job) { return job.graphics ? job.graphics->large : job.compute->large; }
+    static VkPipeline build_graphics(const Job& job) {
+        const GraphicsPipeline& graphics = *job.graphics;
+        const std::uint32_t flags = job.flags & ~wait_flag;
+        return (job.flags & wait_flag) && graphics.variant_wait ? graphics.variant_wait(flags) : graphics.variant(flags);
+    }
     static std::uint64_t estimate(const Job& job) {
         return job.graphics ? job.graphics->estimate : job.compute->estimate;
     }
@@ -1395,6 +1425,18 @@ struct ReplayFunctions {
     VkDeviceSize mesh_compute_max_allocation_size = 0;
     // The executing queue family supports vkCmdDispatch (set per ExecuteCommandLists, not at device init).
     bool mesh_compute_queue = false;
+    // ExecuteIndirect(DISPATCH_MESH) on a direct mesh-as-compute PSO whose producer has indirect_tiles_v1 (segmented,
+    // GPU-driven, no CPU argument or count readback; vulkan_mesh_indirect_tiles.h has the whole contract).
+    // `prepare_mesh_indirect_tiles` is called once per logical call while the list is prepared: it claims the one
+    // tile-command slab that stays alive until the submission completes and records what its pass needs.
+    // `emit_mesh_indirect_tiles` records the pass of logical record `record`: one compute dispatch outside any rendering
+    // scope that writes every Tile of the record. The replay records every barrier around it, runs it outside the
+    // application's predicate and rebinds its own compute state afterwards. Without both, and without dispatch_indirect
+    // and draw_indirect, such a call is unsupported. The device's own entry points (draw_mesh_tasks_indirect*,
+    // the indirect clamp, maxDrawIndirectCount, multiDrawIndirect) are not involved.
+    mesh_indirect::Tuning mesh_indirect_tuning;
+    std::function<bool(const mesh_indirect::TileRequest&, mesh_indirect::Tiles&)> prepare_mesh_indirect_tiles;
+    std::function<void(VkCommandBuffer, const mesh_indirect::Tiles&, std::uint32_t record)> emit_mesh_indirect_tiles;
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -1565,6 +1607,11 @@ struct PreparedDraw {
     VkDeviceSize mesh_output_bytes = 0;
     std::uint32_t mesh_vertex_count = 0;  // G*max_primitives*3, for the consumer vkCmdDraw
     std::uint32_t mesh_groups[3] = {0, 0, 0};  // x, y, z for the producer vkCmdDispatch
+    // ExecuteIndirect(DISPATCH_MESH) on a direct PSO (mesh_compute is true too; mesh_output_* is the shared slab all
+    // tiles of every record reuse, mesh_groups and mesh_vertex_count are unused): the plan and the tile commands.
+    bool mesh_tiled = false;
+    mesh_indirect::Plan mesh_plan;
+    mesh_indirect::Tiles mesh_tiles;
     VkBuffer indirect_buffer = VK_NULL_HANDLE;
     VkDeviceSize indirect_offset = 0;
     VkBuffer indirect_count_buffer = VK_NULL_HANDLE;
@@ -1603,6 +1650,9 @@ struct PreparedDraw {
         mesh_output_bytes = 0;
         mesh_vertex_count = 0;
         mesh_groups[0] = mesh_groups[1] = mesh_groups[2] = 0;
+        mesh_tiled = false;
+        mesh_plan = {};
+        mesh_tiles = {};
         indirect_buffer = VK_NULL_HANDLE;
         indirect_offset = 0;
         indirect_count_buffer = VK_NULL_HANDLE;
@@ -2775,6 +2825,64 @@ inline void copy_depth_uav(const ReplayFunctions& vk, VkCommandBuffer cb, const 
 
 namespace detail {
 
+// A positive-count ExecuteIndirect(DISPATCH_MESH) on a direct PSO whose producer is indirect_tiles_v1: the emulated
+// path. It fails closed in every mode: prepare_draw never turns it into a skipped (dropped) draw, and the outer
+// prepare returns the error instead of dropping it when a resource or pipeline is unresolved (non-strict included).
+// A zero max_count is a valid no-op that recording never passes on; it is not emulated work.
+inline bool emulated_mesh_indirect(const Draw& draw, const IndirectDrawArgs* arguments, const ReplayFunctions& vk) {
+    if (!arguments || !arguments->max_count || !draw.mesh || !vk.graphics_pipeline) return false;
+    const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
+    return pipeline && pipeline->mesh && pipeline->mesh_compute_direct &&
+           pipeline->mesh_compute_direct->indirect_tiles_v1;
+}
+
+// ExecuteIndirect(DISPATCH_MESH) on a direct mesh-as-compute PSO (indirect_tiles_v1): the checked plan, the one output
+// slab and the tile commands, claimed while the list is prepared. The slab is the callback's per-submission one,
+// shared by every call. Everything that cannot be planned within the device's limits is refused here (unsupported),
+// before any work is recorded: nothing is truncated and nothing is skipped.
+inline ReplayResult prepare_mesh_indirect(const MeshComputeDirect& direct, const IndirectDrawArgs& arg,
+                                          VkDeviceAddress arguments, VkDeviceAddress count,
+                                          const ReplayFunctions& vk, PreparedDraw& p) {
+    mesh_indirect::Limits limits;
+    limits.tuning = vk.mesh_indirect_tuning;
+    limits.max_buffer_size = vk.mesh_compute_max_buffer_size;
+    limits.max_allocation_size = vk.mesh_compute_max_allocation_size;
+    limits.max_group_count_x = vk.mesh_compute_max_group_count[0];
+    mesh_indirect::Plan tile_plan;
+    if (!mesh_indirect::plan(direct.slot_bytes, direct.max_primitives, arg.max_count, limits, tile_plan))
+        return unsupported_at(__LINE__);
+    mesh_indirect::TileRequest request;
+    request.arguments_address = arguments;
+    request.count_address = count;
+    request.counted = arg.count_buffer != 0;
+    request.stride = arg.stride;
+    request.records = arg.max_count;
+    request.slots = tile_plan.slots;
+    request.tiles = tile_plan.tiles;
+    request.max_primitives = direct.max_primitives;
+    request.output_bytes = tile_plan.output_bytes;
+    mesh_indirect::Tiles tiles;
+    if (!vk.prepare_mesh_indirect_tiles(request, tiles)) return unsupported_at(__LINE__);
+    if (!mesh_indirect::valid_commands(tiles.commands, tiles.commands_address, tiles.commands_offset,
+                                       tile_plan.command_bytes) ||
+        !tiles.output_buffer ||
+        !mesh_compute_direct::valid_output(tiles.output_address, tiles.output_offset, tile_plan.output_bytes))
+        return unsupported_at(__LINE__);
+    p.mesh_compute = true;
+    p.mesh_tiled = true;
+    p.mesh_producer = direct.producer;
+    p.mesh_producer_layout = direct.producer_layout;
+    p.mesh_producer_set = direct.producer_set;
+    p.mesh_producer_code_base = direct.producer_code_base;
+    p.mesh_output_buffer = tiles.output_buffer;
+    p.mesh_output_offset = tiles.output_offset;
+    p.mesh_output_address = tiles.output_address;
+    p.mesh_output_bytes = tile_plan.output_bytes;
+    p.mesh_plan = tile_plan;
+    p.mesh_tiles = std::move(tiles);
+    return ReplayResult::success;
+}
+
 // Resolves a draw's pipeline, attachments and buffers. Attachment views take the pipeline's formats, so a
 // typeless texture is viewed as the format the pipeline renders.
 template<typename Resolve>
@@ -2784,16 +2892,50 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
     // indirect before any native-only skip(...) success shortcuts, even on a mesh-capable GPU. A positive indirect
     // (max_count > 0, GPU count unknown for counted) with a direct pipeline is unsupported when the stages match and
     // invalid_draw on PSO/draw mismatch, never a silent skip. Unresolvable pipelines fall through to the checks below.
+    // A direct PSO whose producer is indirect_tiles_v1 is lowered as segmented GPU-driven tiles (emulated below, never
+    // through the native entry points, the clamp pass or their limits); the older sealed producer is direct-only.
+    bool emulated = false;
+    VkDeviceAddress emulated_arguments = 0, emulated_count = 0;
     if (arguments && arguments->max_count && vk.graphics_pipeline) {
         if (const GraphicsPipeline* early = vk.graphics_pipeline(draw.pipeline)) {
             if (early->mesh_compute_direct) {
                 if (!early->mesh) return unsupported_at(__LINE__);  // invalid PSO
                 if (early->mesh != draw.mesh) return ReplayResult::invalid_draw;
-                return unsupported_at(__LINE__);  // direct + positive indirect: separate follow-up, not lowered
+                if (!early->mesh_compute_direct->indirect_tiles_v1) return unsupported_at(__LINE__);  // direct-only producer
+                emulated = true;
             }
         }
     }
-    if (arguments) {
+    if (emulated) {
+        const IndirectDrawArgs& arg = *arguments;
+        if (!arg.argument_buffer || arg.stride < mesh_indirect::kRecordBytes ||
+            (arg.stride | arg.argument_offset | arg.count_offset) % 4 || (!arg.count_buffer && arg.count_offset))
+            return ReplayResult::invalid_indirect_arguments;
+        if (!vk.dispatch_indirect || !vk.draw_indirect || !vk.prepare_mesh_indirect_tiles ||
+            !vk.emit_mesh_indirect_tiles)
+            return unsupported_at(__LINE__);
+        // The pass reads the records and the count through their device addresses: no INDIRECT usage is needed, and
+        // nothing is read on the CPU. The last record only needs its twelve bytes, not its stride padding.
+        const ResourceBinding* binding = resolve(arg.argument_buffer);
+        if (!binding || !binding->buffer) return unresolved_at(__LINE__);
+        const VkDeviceSize bytes = VkDeviceSize(arg.max_count - 1) * arg.stride + mesh_indirect::kRecordBytes;
+        if (!indirect_range(*binding, arg.argument_offset, bytes)) return ReplayResult::invalid_indirect_arguments;
+        // The recorded physical address of the resource (never queried here); none: the buffer has no device address.
+        if (!binding->buffer_address || binding->buffer_address > UINT64_MAX - arg.argument_offset - bytes)
+            return unsupported_at(__LINE__);
+        emulated_arguments = binding->buffer_address + arg.argument_offset;
+        if (arg.count_buffer) {
+            const ResourceBinding* count = resolve(arg.count_buffer);
+            if (!count || !count->buffer) return unresolved_at(__LINE__);
+            if (!indirect_range(*count, arg.count_offset, sizeof(std::uint32_t)))
+                return ReplayResult::invalid_indirect_arguments;
+            if (!count->buffer_address ||
+                count->buffer_address > UINT64_MAX - arg.count_offset - sizeof(std::uint32_t))
+                return unsupported_at(__LINE__);
+            emulated_count = count->buffer_address + arg.count_offset;
+        }
+    }
+    if (arguments && !emulated) {
         const IndirectDrawArgs& arg = *arguments;
         const VkDeviceSize record_size = draw.mesh      ? sizeof(VkDrawMeshTasksIndirectCommandEXT)
                                          : draw.indexed ? sizeof(VkDrawIndexedIndirectCommand)
@@ -2857,7 +2999,8 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
     const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw.pipeline);
     // A null pipeline with a variant builder is one built at its first draw: variant 0 (all slots bound).
     if (!pipeline || (!pipeline->pipeline && !pipeline->variant)) return unresolved_at(__LINE__);
-    if (arguments && pipeline->nonunit_vertex_divisor) {
+    if (emulated && pipeline->nonunit_vertex_divisor) return unsupported_at(__LINE__);  // never skipped
+    if (arguments && !emulated && pipeline->nonunit_vertex_divisor) {
         indirect_stats::skip(indirect_stats::Event::replay_skip, indirect_stats::divisor);
         p.skipped = true;
         return ReplayResult::success;
@@ -2869,11 +3012,12 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
     const MeshComputeDirect* direct = pipeline->mesh_compute_direct;
     if (direct && !pipeline->mesh) return unsupported_at(__LINE__);  // invalid PSO
     if (draw.mesh && direct) {
-        if (arguments) return unsupported_at(__LINE__);  // direct is direct DispatchMesh only
+        if (arguments && !emulated) return unsupported_at(__LINE__);  // an unlowered positive indirect
         if (draw.indexed) return ReplayResult::invalid_draw;  // mesh ignores index buffers
         if (pipeline->vertex_slots) return unsupported_at(__LINE__);  // the generated consumer has no inputs
-        // A zero grid is a no-op with no allocation and no side effects (CommandList::draw usually filters it).
-        if (mesh_compute_direct::is_noop(draw.count, draw.instances, draw.first)) {
+        // A zero grid is a no-op with no allocation and no side effects (CommandList::draw usually filters it). An
+        // indirect call's grids are on the GPU: the prepare pass turns a zero or invalid record into zero work.
+        if (!arguments && mesh_compute_direct::is_noop(draw.count, draw.instances, draw.first)) {
             p.graphics = pipeline;
             p.skipped = true;
             return ReplayResult::success;
@@ -2949,19 +3093,34 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
     // Slots the pipeline has a format for but the draw leaves unbound take a variant whose format there is
     // VK_FORMAT_UNDEFINED: D3D12 discards those writes, Vulkan wants the formats to match the attachments.
     std::uint32_t unbound = 0;
-    if (pipeline->rectangle_variant_topology && draw.topology == pipeline->rectangle_variant_topology)
+    // The emulated consumer always draws a triangle list, whatever topology the logical call carries.
+    if (!emulated && pipeline->rectangle_variant_topology && draw.topology == pipeline->rectangle_variant_topology)
         unbound |= GraphicsPipeline::rectangle_stage;
     for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
-    if (unbound || !p.pipeline) {
+    if (emulated && (unbound || !p.pipeline)) {
+        // A positive emulated mesh indirect cannot be dropped for a pending asynchronous build (which would lose the whole
+        // submission's other work), so its first use waits: the variant is built where PipelineCompiles builds the
+        // submission's others, outside the resource lock, sharing the one build per variant with the compile worker.
+        p.pipeline = pipeline->built ? pipeline->built(unbound) : VK_NULL_HANDLE;
+        if (!p.pipeline) {
+            const std::function<VkPipeline(std::uint32_t)>& build =
+                pipeline->variant_wait ? pipeline->variant_wait : pipeline->variant;
+            if (vk.compiles && build) p.compile = vk.compiles->add_waited(*pipeline, unbound);
+            else if (build) p.pipeline = build(unbound);
+        }
+        if (!p.pipeline && !p.compile) return unsupported_at(__LINE__);
+    } else if (unbound || !p.pipeline) {
         const bool indirect_rect_variant = arguments && (unbound & GraphicsPipeline::rectangle_stage);
         if (vk.compiles && pipeline->variant && pipeline->built && !pipeline->async_build && !indirect_rect_variant) {
             p.pipeline = pipeline->built(unbound);
             if (!p.pipeline) p.compile = vk.compiles->add(*pipeline, unbound);
         } else {
             p.pipeline = pipeline->variant ? pipeline->variant(unbound) : VK_NULL_HANDLE;
-            if (!p.pipeline && pipeline->async_build && !strict_replay()) {
+            // A pending asynchronous consumer drops an ordinary draw for this submission. An emulated positive
+            // indirect never is: it falls through to unsupported below.
+            if (!p.pipeline && pipeline->async_build && !strict_replay() && !emulated) {
                 if (arguments) indirect_stats::skip(indirect_stats::Event::replay_skip, indirect_stats::pending_pipeline);
                 p.skipped = true;
                 return ReplayResult::success;
@@ -3057,7 +3216,7 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
         if (!vk.dispatch || !vk.pipeline_barrier || !vk.mesh_compute_scratch || !vk.mesh_compute_queue)
             return unsupported_at(__LINE__);
         if (!direct->producer || !direct->producer_layout) {
-            if (pipeline->async_build && !strict_replay()) {
+            if (pipeline->async_build && !strict_replay() && !emulated) {
                 p.skipped = true;  // the producer builds with the consumer variant; no scratch yet
                 return ReplayResult::success;
             }
@@ -3070,6 +3229,11 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
         // A pipeline-statistics query would count the generated vertex stage as guest VSInvocations: refuse before
         // allocating scratch. Occlusion, timestamp and stream-output queries are unaffected.
         if (statistics_active) return unsupported_at(__LINE__);
+        // The tile-prepare pass is a helper dispatch that runs outside the predicate (its commands are initialized
+        // whatever the predicate says) and rebinds nothing the application sees; the producer's indirect dispatch and
+        // the consumer's indirect draw of every tile are inside it, so a false predicate suppresses all of the call.
+        if (emulated)
+            return prepare_mesh_indirect(*direct, *arguments, emulated_arguments, emulated_count, vk, p);
         const std::uint32_t x = draw.count, y = draw.instances, z = draw.first;
         mesh_compute_direct::Counts counts{};
         if (!mesh_compute_direct::checked_counts(x, y, z, direct->slot_bytes, direct->max_primitives, counts))
@@ -4469,8 +4633,14 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                                                     statistics_active);
                 r != ReplayResult::success) {
                 const bool strict = strict_replay();
-                if (r != ReplayResult::unresolved_resource || strict) return r;
+                // A positive emulated mesh indirect is never dropped: an unresolved buffer, attachment or pipeline
+                // fails the list in every mode.
+                if (r != ReplayResult::unresolved_resource || strict ||
+                    detail::emulated_mesh_indirect(*draw.state, draw.arguments, vk))
+                    return r;
                 prepared_draw.skipped = true;  // dropped at emit (see the dispatch branch above)
+            } else if (prepared_draw.skipped && detail::emulated_mesh_indirect(*draw.state, draw.arguments, vk)) {
+                return unsupported_at(__LINE__);  // invariant: no emulated success-with-skip
             } else if (draw.state->indexed && !draw.state->mesh && draw.state->topology == topology_quad_list) {
                 // The index expansion is a helper dispatch: inside a statistics query it needs the segment pool.
                 if (statistics_active && !statistics_helpers && draw.state->count >= 4) return ReplayResult::unsupported;
@@ -4483,7 +4653,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             // then reads that scratch. Recorded in this command's Prepared so the emit phase records the pass before
             // vkCmdBeginRendering - outside the scope and outside a pipeline-statistics query. A draw that was already
             // dropped, or whose indirect entry point or scratch is missing, keeps the application's argument buffer.
-            if (draw.arguments && !prepared_draw.skipped) {
+            if (draw.arguments && !prepared_draw.skipped && !prepared_draw.mesh_tiled) {
                 const IndirectDrawArgs& arg = *draw.arguments;
                 const ResourceBinding* args_of = resolve(arg.argument_buffer);
                 const ResourceBinding* count = arg.count_buffer ? resolve(arg.count_buffer) : nullptr;
@@ -5725,6 +5895,173 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             const GraphicsPipeline& graphics = *d.graphics;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
+            // Everything one rendering scope needs bound: pipeline, descriptors, push constants and the dynamic state of the
+            // recorded draw. A segmented indirect call rebinds it for every tile (the tiles' compute passes run between).
+            const auto bind_graphics_state = [&] {
+                vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
+                if (graphics.bindless_set) {
+                    const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : graphics.bindless_set;
+                    vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
+                                            &set0, 0, nullptr);
+                }
+                if (d.mesh_compute) {
+                    MeshComputeUserData consumer_data{};
+                    std::copy(draw->user_data.begin(), draw->user_data.end(), consumer_data.base.s);
+                    consumer_data.base.heap_base = vk.heap_base;
+                    consumer_data.base.code_base = graphics.code_base;
+                    consumer_data.output_base = d.mesh_output_address;
+                    vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(consumer_data),
+                                      &consumer_data);
+                } else {
+                    ShaderUserData data{};
+                    std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
+                    data.heap_base = vk.heap_base;
+                    data.code_base = graphics.code_base;
+                    vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
+                }
+                // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
+                // image upright, and winding as D3D12 sees it.
+                if (graphics.viewport_with_count) {
+                    std::array<VkViewport, DrawViewports::max_count> vps{};
+                    std::array<VkRect2D, DrawViewports::max_count> scs{};
+                    const std::uint32_t vp_n = draw->viewports ? draw->viewports->viewport_count : 1u;
+                    const std::uint32_t sc_n = draw->viewports ? draw->viewports->scissor_count : 1u;
+                    const std::uint32_t count = std::clamp(std::max(vp_n, sc_n), 1u, DrawViewports::max_count);
+                    for (std::uint32_t k = 0; k < count; ++k) {
+                        const Viewport v = (draw->viewports && k < vp_n) ? draw->viewports->viewports[k]
+                                                                         : (k == 0 ? draw->viewport : Viewport{});
+                        const bool valid_vp = (k < vp_n) && (v.width > 0.0f) && (v.height > 0.0f);
+                        if (valid_vp) {
+                            vps[k] = {v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
+                        } else {
+                            // Vulkan forbids width/height == 0; pair a 1x1 dummy viewport with an empty scissor so nothing
+                            // rasterizes into an unbound/empty D3D12 viewport slot.
+                            vps[k] = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
+                        }
+                        if (valid_vp && k < sc_n) {
+                            const Rect s = draw->viewports ? draw->viewports->scissors[k] : draw->scissor;
+                            const std::int32_t left = std::max(0, s.left);
+                            const std::int32_t top = std::max(0, s.top);
+                            scs[k] = {{left, top},
+                                      {std::uint32_t(std::max(0, s.right - left)),
+                                       std::uint32_t(std::max(0, s.bottom - top))}};
+                        } else {
+                            scs[k] = {{0, 0}, {0, 0}};
+                        }
+                    }
+                    vk.set_viewport_with_count(command_buffer, count, vps.data());
+                    vk.set_scissor_with_count(command_buffer, count, scs.data());
+                } else {
+                    const Viewport& v = draw->viewport;
+                    const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
+                    vk.set_viewport(command_buffer, 0, 1, &viewport);
+                    const Rect& s = draw->scissor;
+                    const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
+                                           {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
+                                            std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
+                    vk.set_scissor(command_buffer, 0, 1, &scissor);
+                }
+                // Native mesh has no input assembly. The mesh-compute consumer is a vertex pipeline: set
+                // both dynamic IA states even though the logical D3D12 command is DispatchMesh.
+                if (!draw->mesh || d.mesh_compute) {
+                    const VkPrimitiveTopology topology = d.mesh_compute || (draw->topology == topology_quad_list && !draw->indexed)
+                        ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw->topology);
+                    vk.set_primitive_topology(command_buffer, topology);
+                    const bool restart = draw->indexed && detail::strip_topology(topology) &&
+                                         ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
+                                          (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
+                    vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
+                }
+                vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
+                vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
+                vk.set_blend_constants(command_buffer, draw->blend_factor.data());
+                if (graphics.depth_bounds) {
+                    // Vulkan takes bounds in [0, 1] only (without VK_EXT_depth_range_unrestricted), as D3D12 does.
+                    const float lo = std::clamp(draw->depth_bounds[0], 0.0f, 1.0f);
+                    const float hi = std::clamp(draw->depth_bounds[1], 0.0f, 1.0f);
+                    vk.set_depth_bounds(command_buffer, lo, hi);
+                }
+                for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
+                    if (!d.vertex_buffers[slot]) continue;
+                    vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
+                                            &d.vertex_sizes[slot], &d.vertex_strides[slot]);
+                }
+            };
+            if (d.mesh_tiled) {
+                // ExecuteIndirect(DISPATCH_MESH), mesh-as-compute (vulkan_mesh_indirect_tiles.h). Per logical record: one
+                // helper pass writes every Tile (outside the predicate and outside rendering); then, for each tile in order,
+                // the producer's indirect dispatch, the consumer's indirect draw inside its own rendering scope (attachments
+                // are loaded, never cleared, so tiles accumulate exactly like successive draws), and the barriers that let the
+                // one command slab and the one output slab serve the next tile, record and call. Inactive tiles carry zero
+                // work; the GPU decides, nothing is read on the CPU. A false predicate suppresses the producer and the
+                // consumer but not the preparation, whose commands never depend on it.
+                constexpr VkPipelineStageFlags compute = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+                constexpr VkPipelineStageFlags fetch = VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT;
+                const mesh_indirect::Tiles& tiles = d.mesh_tiles;
+                indirect_stats::note(indirect_stats::Event::emitted);  // one logical call, however many records and tiles
+                bool first_tile = true;
+                for (std::uint32_t record = 0; record < d.mesh_plan.records; ++record) {
+                    if (predicate.buffer) vk.end_conditional_rendering(command_buffer);
+                    // The argument and count writers (any earlier command, the previous tile's reads of the shared slabs)
+                    // before the pass reads the records and rewrites the tiles.
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_MEMORY_WRITE_BIT,
+                                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, compute);
+                    vk.emit_mesh_indirect_tiles(command_buffer, tiles, record);
+                    // The tiles to the indirect dispatch and draw and to the producer's shader read of its TileMeta.
+                    detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, compute,
+                                           VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
+                                           fetch | compute);
+                    if (predicate.buffer) vk.begin_conditional_rendering(command_buffer, &predicate);
+                    for (std::uint32_t tile = 0; tile < d.mesh_plan.tiles; ++tile) {
+                        const VkDeviceSize tile_offset =
+                            tiles.commands_offset + VkDeviceSize(tile) * mesh_indirect::kTileBytes;
+                        MeshComputeUserData producer_data{};
+                        std::copy(draw->user_data.begin(), draw->user_data.end(), producer_data.base.s);
+                        producer_data.base.heap_base = vk.heap_base;
+                        producer_data.base.code_base = d.mesh_producer_code_base;
+                        producer_data.output_base = mesh_indirect::tagged_meta_address(tiles.commands_address, tile);
+                        vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, d.mesh_producer);
+                        if (d.mesh_producer_set) {
+                            const VkDescriptorSet producer_set0 = vk.bindless_set ? vk.bindless_set : d.mesh_producer_set;
+                            vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                    d.mesh_producer_layout, 0, 1, &producer_set0, 0, nullptr);
+                        }
+                        vk.push_constants(command_buffer, d.mesh_producer_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                          sizeof(producer_data), &producer_data);
+                        vk.dispatch_indirect(command_buffer, tiles.commands, tile_offset + mesh_indirect::kDispatchOffset);
+                        // The slots the producer wrote to the consumer's vertex reads.
+                        detail::memory_barrier(vk, command_buffer, VK_ACCESS_SHADER_WRITE_BIT, compute,
+                                               VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT);
+                        // The previous tile's attachment writes before this scope loads them again (the first tile's
+                        // were ordered with the transitions above).
+                        if (!first_tile) {
+                            bool colors_bound = false;
+                            for (const auto& a : d.colors) colors_bound |= a.id != 0;
+                            if (colors_bound)
+                                detail::memory_barrier(vk, command_buffer, color_access,
+                                                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, color_access,
+                                                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+                            if (d.depth.id)
+                                detail::memory_barrier(vk, command_buffer, depth_access, depth_stages, depth_access,
+                                                       depth_stages);
+                        }
+                        first_tile = false;
+                        vk.begin_rendering(command_buffer, &rendering);
+                        bind_graphics_state();
+                        vk.draw_indirect(command_buffer, tiles.commands, tile_offset + mesh_indirect::kDrawOffset, 1,
+                                         sizeof(VkDrawIndirectCommand));
+                        vk.end_rendering(command_buffer);
+                        // Reads of this tile's commands, slots and TileMeta before anything rewrites them.
+                        detail::memory_barrier(vk, command_buffer,
+                                               VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT,
+                                               fetch | compute | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT,
+                                               VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT, compute);
+                    }
+                }
+                if (vk.mesh_draw_count) ++*vk.mesh_draw_count;
+                continue;
+            }
             // Direct DispatchMesh expansion: the compute producer runs outside rendering, inside the draw's predicate
             // (a false predicate suppresses it together with the consumer) and inside its statistics segment (guest
             // work, not a helper). The barrier makes exactly the written range visible to the consumer vertex reads.
@@ -5758,94 +6095,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             }
             vk.begin_rendering(command_buffer, &rendering);
 
-            vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
-            if (graphics.bindless_set) {
-                const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : graphics.bindless_set;
-                vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
-                                        &set0, 0, nullptr);
-            }
-            if (d.mesh_compute) {
-                MeshComputeUserData consumer_data{};
-                std::copy(draw->user_data.begin(), draw->user_data.end(), consumer_data.base.s);
-                consumer_data.base.heap_base = vk.heap_base;
-                consumer_data.base.code_base = graphics.code_base;
-                consumer_data.output_base = d.mesh_output_address;
-                vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(consumer_data),
-                                  &consumer_data);
-            } else {
-                ShaderUserData data{};
-                std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
-                data.heap_base = vk.heap_base;
-                data.code_base = graphics.code_base;
-                vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
-            }
-            // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
-            // image upright, and winding as D3D12 sees it.
-            if (graphics.viewport_with_count) {
-                std::array<VkViewport, DrawViewports::max_count> vps{};
-                std::array<VkRect2D, DrawViewports::max_count> scs{};
-                const std::uint32_t vp_n = draw->viewports ? draw->viewports->viewport_count : 1u;
-                const std::uint32_t sc_n = draw->viewports ? draw->viewports->scissor_count : 1u;
-                const std::uint32_t count = std::clamp(std::max(vp_n, sc_n), 1u, DrawViewports::max_count);
-                for (std::uint32_t k = 0; k < count; ++k) {
-                    const Viewport v = (draw->viewports && k < vp_n) ? draw->viewports->viewports[k]
-                                                                     : (k == 0 ? draw->viewport : Viewport{});
-                    const bool valid_vp = (k < vp_n) && (v.width > 0.0f) && (v.height > 0.0f);
-                    if (valid_vp) {
-                        vps[k] = {v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
-                    } else {
-                        // Vulkan forbids width/height == 0; pair a 1x1 dummy viewport with an empty scissor so nothing
-                        // rasterizes into an unbound/empty D3D12 viewport slot.
-                        vps[k] = {0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f};
-                    }
-                    if (valid_vp && k < sc_n) {
-                        const Rect s = draw->viewports ? draw->viewports->scissors[k] : draw->scissor;
-                        const std::int32_t left = std::max(0, s.left);
-                        const std::int32_t top = std::max(0, s.top);
-                        scs[k] = {{left, top},
-                                  {std::uint32_t(std::max(0, s.right - left)),
-                                   std::uint32_t(std::max(0, s.bottom - top))}};
-                    } else {
-                        scs[k] = {{0, 0}, {0, 0}};
-                    }
-                }
-                vk.set_viewport_with_count(command_buffer, count, vps.data());
-                vk.set_scissor_with_count(command_buffer, count, scs.data());
-            } else {
-                const Viewport& v = draw->viewport;
-                const VkViewport viewport{v.x, v.y + v.height, v.width, -v.height, v.min_depth, v.max_depth};
-                vk.set_viewport(command_buffer, 0, 1, &viewport);
-                const Rect& s = draw->scissor;
-                const VkRect2D scissor{{std::max(0, s.left), std::max(0, s.top)},
-                                       {std::uint32_t(std::max(0, s.right - std::max(0, s.left))),
-                                        std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
-                vk.set_scissor(command_buffer, 0, 1, &scissor);
-            }
-            // Native mesh has no input assembly. The mesh-compute consumer is a vertex pipeline: set
-            // both dynamic IA states even though the logical D3D12 command is DispatchMesh.
-            if (!draw->mesh || d.mesh_compute) {
-                const VkPrimitiveTopology topology = d.mesh_compute || (draw->topology == topology_quad_list && !draw->indexed)
-                    ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw->topology);
-                vk.set_primitive_topology(command_buffer, topology);
-                const bool restart = draw->indexed && detail::strip_topology(topology) &&
-                                     ((graphics.strip_cut == 1 && d.index_type == VK_INDEX_TYPE_UINT16) ||
-                                      (graphics.strip_cut == 2 && d.index_type == VK_INDEX_TYPE_UINT32));
-                vk.set_primitive_restart_enable(command_buffer, restart ? VK_TRUE : VK_FALSE);
-            }
-            vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_FRONT_BIT, draw->stencil_front);
-            vk.set_stencil_reference(command_buffer, VK_STENCIL_FACE_BACK_BIT, draw->stencil_back);
-            vk.set_blend_constants(command_buffer, draw->blend_factor.data());
-            if (graphics.depth_bounds) {
-                // Vulkan takes bounds in [0, 1] only (without VK_EXT_depth_range_unrestricted), as D3D12 does.
-                const float lo = std::clamp(draw->depth_bounds[0], 0.0f, 1.0f);
-                const float hi = std::clamp(draw->depth_bounds[1], 0.0f, 1.0f);
-                vk.set_depth_bounds(command_buffer, lo, hi);
-            }
-            for (std::uint32_t slot = 0; slot < d.vertex_buffers.size(); ++slot) {
-                if (!d.vertex_buffers[slot]) continue;
-                vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
-                                        &d.vertex_sizes[slot], &d.vertex_strides[slot]);
-            }
+            bind_graphics_state();
             if (raster.arguments) {
                 indirect_stats::note(indirect_stats::Event::emitted);
                 const auto& arg = *raster.arguments;

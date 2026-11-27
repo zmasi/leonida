@@ -48,6 +48,12 @@ inline constexpr std::uint32_t kMeshComputeMaxStride = 4096;
 inline constexpr std::uint32_t kMeshComputeMaxLocation = 63;
 inline constexpr std::uint32_t kMeshComputeMaxParams = 32;
 
+// GPU-driven indirect tiles (tools/rdna2spirv.py MESH_INDIRECT_TILE_MARKER). A regenerated 152-byte producer that
+// supports them carries exactly one OpModuleProcessed with kMeshComputeIndirectTileMarker in its SHA-sealed words;
+// an older sealed producer does not and stays direct-only. The Tile/TileMeta layout, tagging and alignment rules are
+// the canonical ABI in vulkan_mesh_indirect_tiles.h; this header only recognizes the marker.
+inline constexpr const char* kMeshComputeIndirectTileMarker = "leonida.mesh_indirect_tile.v1";
+
 // One validated --mesh-compute slot layout. Present only for logical stage "ms" with a well-formed object;
 // absent/null (native mesh) and malformed (fails closed) both read as std::nullopt in ShaderEntry.
 struct MeshComputeLayout {
@@ -241,11 +247,25 @@ inline constexpr std::uint16_t kOpVariable = 59;
 inline constexpr std::uint16_t kOpDecorate = 71;
 inline constexpr std::uint16_t kOpMemberDecorate = 72;
 inline constexpr std::uint16_t kOpExecutionModeId = 331;
+inline constexpr std::uint16_t kOpModuleProcessed = 330;
 inline constexpr std::uint32_t kExecModeLocalSize = 17;
 inline constexpr std::uint32_t kExecModeLocalSizeId = 38;
 inline constexpr std::uint32_t kStorageOutput = 3;
 inline constexpr std::uint32_t kDecLocation = 30;
 inline constexpr std::uint32_t kDecOffset = 35;
+
+// True when the OpModuleProcessed at words[pos] (word count wc) is exactly `marker`: its literal bytes, then a NUL,
+// then zero padding to the end of the instruction (no extra word). Compared in place, no allocation.
+inline bool module_processed_is(const std::uint32_t* words, std::size_t wc, const char* marker) {
+    std::size_t n = 0;
+    while (marker[n]) ++n;
+    if (wc < 2 || (wc - 1) * 4 != ((n + 4) & ~std::size_t(3))) return false;  // n bytes + NUL, whole words, no spare word
+    for (std::size_t i = 0; i < (wc - 1) * 4; ++i) {
+        const char ch = char((words[1 + i / 4] >> (8 * (i % 4))) & 0xffu);
+        if (ch != (i < n ? marker[i] : '\0')) return false;
+    }
+    return true;
+}
 
 struct Scan {
     bool valid = false;
@@ -263,6 +283,8 @@ struct Scan {
     std::map<std::uint32_t, std::uint32_t> output_locations;
     std::set<std::uint32_t> member_offsets;
     bool has_function = false;
+    // Global OpModuleProcessed instructions that are exactly kMeshComputeIndirectTileMarker.
+    std::uint32_t indirect_tile_markers = 0;
 };
 
 inline Scan scan_spirv(std::span<const std::uint32_t> words) {
@@ -299,6 +321,8 @@ inline Scan scan_spirv(std::span<const std::uint32_t> words) {
             decorations.push_back({at(1), at(2), at(3)});
         } else if (op == kOpMemberDecorate && wc >= 5 && at(3) == kDecOffset) {
             out.member_offsets.insert(at(4));
+        } else if (op == kOpModuleProcessed && !out.has_function) {
+            if (module_processed_is(&words[pos], wc, kMeshComputeIndirectTileMarker)) ++out.indirect_tile_markers;
         } else if (op == 54) {  // OpFunction: globals end here
             out.has_function = true;
         }
@@ -322,12 +346,11 @@ inline bool is_mesh_exec(std::uint32_t model) {
 
 // The producer must be exactly one GLCompute entry, with 64-bit buffer addressing and no mesh/task capability
 // or execution model. False (with *error when given) for malformed words or anything else.
-inline bool mesh_producer_is_compute(std::span<const std::uint32_t> words, std::string* error = nullptr) {
+inline bool mesh_producer_scan_is_compute(const mesh_compute_detail::Scan& scan, std::string* error) {
     const auto fail = [&](const std::string& why) {
         if (error) *error = why;
         return false;
     };
-    const auto scan = mesh_compute_detail::scan_spirv(words);
     if (!scan.valid) return fail("mesh_compute: malformed producer SPIR-V");
     if (scan.exec_models.size() != 1 || scan.exec_models[0] != mesh_compute_detail::kExecGLCompute)
         return fail("mesh_compute: producer must be exactly one GLCompute entry point");
@@ -341,6 +364,30 @@ inline bool mesh_producer_is_compute(std::span<const std::uint32_t> words, std::
         return fail("mesh_compute: producer must declare Int64 + PhysicalStorageBufferAddresses");
     if (!scan.member_offsets.count(144) || !scan.member_offsets.count(148))
         return fail("mesh_compute: producer must address its output at push bytes 144/148 (dwords 36..37, 152 bytes)");
+    return true;
+}
+
+inline bool mesh_producer_is_compute(std::span<const std::uint32_t> words, std::string* error = nullptr) {
+    return mesh_producer_scan_is_compute(mesh_compute_detail::scan_spirv(words), error);
+}
+
+// True when `words` is a producer the 152-byte mesh-compute contract accepts (mesh_producer_is_compute) that
+// declares the indirect-tile contract: exactly one global OpModuleProcessed whose string is
+// kMeshComputeIndirectTileMarker, parsed from the words themselves (never from a name or path), in a module of
+// SPIR-V 1.1 or later (the first version that has the instruction). Callers pass the SHA-sealed words. False with
+// *why for an older (direct-only) producer, a malformed or duplicated marker, or anything mesh_producer_is_compute
+// refuses.
+inline bool mesh_producer_indirect_tiles_v1(std::span<const std::uint32_t> words, std::string* why = nullptr) {
+    const auto fail = [&](const std::string& reason) {
+        if (why) *why = reason;
+        return false;
+    };
+    const auto scan = mesh_compute_detail::scan_spirv(words);
+    if (!mesh_producer_scan_is_compute(scan, why)) return false;
+    if (words[1] < 0x00010100u) return fail("mesh_compute: SPIR-V older than 1.1 has no OpModuleProcessed marker");
+    if (scan.indirect_tile_markers == 0)
+        return fail("mesh_compute: producer does not declare the indirect-tile contract (direct-only)");
+    if (scan.indirect_tile_markers > 1) return fail("mesh_compute: producer repeats the indirect-tile marker");
     return true;
 }
 

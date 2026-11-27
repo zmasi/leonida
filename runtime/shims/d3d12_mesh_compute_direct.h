@@ -34,6 +34,12 @@ bool pipeline_is_mesh_compute(ID3D12PipelineState* pso);
 // Returns false when `pso` is not an emulated mesh-compute PSO.
 bool pipeline_mesh_compute_info(ID3D12PipelineState* pso, std::uint64_t* slot_bytes,
                                 std::uint32_t* max_primitives, std::uint64_t* producer_code_base);
+// True when `pso` is an emulated mesh-compute PSO whose retained, SHA-sealed producer declares the GPU-driven
+// indirect-tile contract (exactly one OpModuleProcessed "leonida.mesh_indirect_tile.v1", leonida::
+// mesh_producer_indirect_tiles_v1). A producer sealed before it exists is direct-only: false, so a caller must
+// refuse or fall back instead of launching it with a tagged output address. Equals
+// MeshComputeDirect::indirect_tiles_v1, set when the PSO was constructed.
+bool pipeline_supports_mesh_compute_indirect(ID3D12PipelineState* pso);
 // The producer's SPIR-V words (GLCompute), reloaded from the library. False with `why`
 // when not emulated or when the module went missing since creation.
 bool pipeline_mesh_compute_producer_words(ID3D12PipelineState* pso, std::vector<std::uint32_t>& words,

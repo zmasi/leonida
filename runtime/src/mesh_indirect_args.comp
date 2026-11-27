@@ -1,0 +1,84 @@
+// Prepare the tiles of ONE logical record of a D3D12 ExecuteIndirect(DISPATCH_MESH) on the GPU, for mesh-as-compute (no
+// VK_EXT_mesh_shader; runtime/src/vulkan_mesh_indirect_tiles.h has the contract, vulkan_mesh_indirect_args.h the host).
+//
+// A record is DispatchMesh(x, y, z) written by the title's own GPU passes: its G = x*y*z groups run as one flat range
+// cut into `tile_count` consecutive tiles of `slots` groups, because one physical dispatch has at most 65535 groups
+// and the output slab has `slots` slots. One thread writes one 48-byte tile, every word of it, so nothing of an earlier
+// use of the tile slab survives:
+//     words 0-2   VkDispatchIndirectCommand {n, 1, 1}                     n = groups of this tile, or {0, 0, 0}
+//     word  3     reserved, 0
+//     words 4-7   VkDrawIndirectCommand {n * vertices_per_group, 1, 0, 0}, or {0, 0, 0, 0}
+//     words 8-11  TileMeta {output address (lo, hi), first logical linear group of the tile, reserved 0}
+// A tile with no groups has zero indirect work. The record has none at all when it is past the executed count (the
+// count word is then the only thing read: the record's arguments are not touched), when a dimension is zero (a legal
+// no-op), or when it is invalid: a dimension over 65535, more than 2^22 groups, or more groups than slots * tile_count
+// can draw (all its tiles are zero, never a partial draw of the record). x*y is below 2^32 once both are at most 65535,
+// and the total is compared by division, so nothing wraps. The caller dispatches ceil(tile_count / 64) groups.
+#version 460
+#extension GL_EXT_buffer_reference : require
+layout(local_size_x = 64) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) readonly buffer WordsIn { uint data[]; };
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer TilesOut { uint data[]; };
+
+layout(push_constant) uniform Params {
+    WordsIn arguments;      // this record's three words (x, y, z)
+    WordsIn count;          // the D3D12 count word, read when counted != 0
+    TilesOut tiles;         // tile 0 of the slab: tile_count entries of 12 words
+    uvec2 output_address;   // the real output slab, 16-byte aligned
+    uint slots;             // groups of one full tile, 1..65535
+    uint tile_count;        // tiles of one record
+    uint vertices_per_group;  // max_primitives * 3; slots * vertices_per_group fits 32 bits
+    uint record;            // this record's index
+    uint records;           // max_command_count
+    uint counted;           // 1: the executed count is min(*count, records)
+    uint reserved0;
+    uint reserved1;
+} p;
+
+const uint max_dimension = 65535u;
+const uint max_groups = 1u << 22u;
+
+void main() {
+    const uint tile = gl_GlobalInvocationID.x;
+    if (tile >= p.tile_count) return;
+
+    uint executed = p.records;
+    if (p.counted != 0u) executed = min(executed, p.count.data[0]);
+
+    uint n = 0u;
+    uint first = 0u;
+    if (p.record < executed) {
+        const uint x = p.arguments.data[0];
+        const uint y = p.arguments.data[1];
+        const uint z = p.arguments.data[2];
+        if (x != 0u && y != 0u && z != 0u && x <= max_dimension && y <= max_dimension && z <= max_dimension) {
+            const uint xy = x * y;
+            if (xy <= max_groups / z) {
+                const uint groups = xy * z;
+                const uint needed = (groups + p.slots - 1u) / p.slots;
+                // Past `needed` tiles there is nothing to draw (and tile * slots could wrap); a record that needs
+                // more tiles than the slab has is not drawn at all.
+                if (needed <= p.tile_count && tile < needed) {
+                    first = tile * p.slots;
+                    n = min(p.slots, groups - first);
+                }
+            }
+        }
+    }
+
+    const uint live = n != 0u ? 1u : 0u;
+    const uint base = tile * 12u;
+    p.tiles.data[base + 0u] = n;
+    p.tiles.data[base + 1u] = live;
+    p.tiles.data[base + 2u] = live;
+    p.tiles.data[base + 3u] = 0u;
+    p.tiles.data[base + 4u] = n * p.vertices_per_group;
+    p.tiles.data[base + 5u] = live;
+    p.tiles.data[base + 6u] = 0u;
+    p.tiles.data[base + 7u] = 0u;
+    p.tiles.data[base + 8u] = p.output_address.x;
+    p.tiles.data[base + 9u] = p.output_address.y;
+    p.tiles.data[base + 10u] = first;
+    p.tiles.data[base + 11u] = 0u;
+}

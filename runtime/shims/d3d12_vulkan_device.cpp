@@ -8480,6 +8480,7 @@ public:
             va_ = arena_offset_;
             binding.va = va_;
             binding.buffer = device_.arena.buffer;
+            binding.buffer_address = device_.arena.address + arena_offset_;
             binding.indirect_arguments = device_.arena.indirect_arguments;
             binding.buffer_offset = arena_offset_;
             // No host pointer: this is DEFAULT-heap arena memory the GPU may write, so its mapped bytes can be
@@ -8597,6 +8598,7 @@ public:
             }
         }
         binding.buffer = buffer_;
+        binding.buffer_address = buffer_va_;
         binding.indirect_arguments = (info.usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
         binding.size = desc_.Width;
         binding.host = cpu_writable() ? static_cast<const std::uint8_t*>(mapped_) : nullptr;
@@ -8792,6 +8794,7 @@ public:
         }
         leonida::ResourceBinding binding{};
         binding.buffer = buffer_;
+        binding.buffer_address = buffer_va_;
         binding.indirect_arguments = (info.usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
         binding.buffer_offset = offset;
         binding.size = desc_.Width;
@@ -8844,6 +8847,7 @@ public:
             device_.log_va("title-placed buffer (arena shadow)", va_, desc_.Width);
             leonida::ResourceBinding binding{};
             binding.buffer = device_.arena.buffer;
+            binding.buffer_address = buffer_va_;
             binding.indirect_arguments = device_.arena.indirect_arguments;
             binding.buffer_offset = arena_offset_;
             binding.size = desc_.Width;
@@ -8896,6 +8900,7 @@ public:
         device_.log_va("title-placed buffer (shadow)", va_, desc_.Width);
         leonida::ResourceBinding binding{};
         binding.buffer = buffer_;
+        binding.buffer_address = buffer_va_;
         binding.indirect_arguments = (info.usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
         binding.size = desc_.Width;
         // CPU-side reads take the shadow, not the title's pages: it is as fresh as what the GPU reads and every byte
@@ -8925,9 +8930,11 @@ public:
             !(sparse->memory_types & device_.sparse_buffer_memory_types)) return E_NOTIMPL;
         VkBufferDeviceAddressInfo address{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
         address.buffer = sparse->buffer;
-        va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &address) - device_.arena.address;
+        const VkDeviceAddress address_at_zero = vk.vkGetBufferDeviceAddress(device_.info.device, &address);
+        va_ = address_at_zero - device_.arena.address;
         leonida::ResourceBinding binding{};
         binding.buffer = sparse->buffer;
+        binding.buffer_address = address_at_zero;
         binding.indirect_arguments = (info.usage & VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT) != 0;
         binding.size = desc_.Width;
         binding.va = va_;
@@ -9004,6 +9011,7 @@ public:
         leonida::ResourceBinding binding{};
         binding.size = desc_.Width;
         binding.buffer = device_.arena.buffer;
+        binding.buffer_address = device_.arena.address + va_;
         binding.indirect_arguments = device_.arena.indirect_arguments;
         binding.buffer_offset = va_;
         binding.va = va_;
@@ -12965,6 +12973,10 @@ public:
             mesh_compute_direct_->producer_code_base = mesh_compute_producer_code_base_;
             mesh_compute_direct_->slot_bytes = mesh_producer_entry_->mesh_compute->slot_bytes;
             mesh_compute_direct_->max_primitives = mesh_producer_entry_->mesh_compute->max_primitives;
+            // Tile-indirect support is what the SHA-sealed producer words say (exact OpModuleProcessed marker), not
+            // a name or path; an older sealed producer stays direct-only.
+            mesh_compute_direct_->indirect_tiles_v1 =
+                leonida::mesh_producer_indirect_tiles_v1(std::span<const std::uint32_t>(mesh_validated_producer_));
             graphics_.mesh_compute_direct = mesh_compute_direct_.get();
         }
         if (!lazy_) {
@@ -12982,6 +12994,12 @@ public:
             return replay_pipeline("draw", [&] {
                 return graphics_.async_build ? queue_build(false, unbound) : variant(unbound, "draw");
             });
+        };
+        // An emulated indirect mesh call waits for its variant (leonida::GraphicsPipeline::variant_wait): variant() takes
+        // variants_mutex_, so a build the compile worker already runs is waited for and shared, a queued one is built
+        // here once (the worker's job then finds it), and nothing is queued or skipped. Called outside the resource lock.
+        graphics_.variant_wait = [this](std::uint32_t unbound) {
+            return replay_pipeline("draw", [&] { return variant(unbound, "draw"); });
         };
         graphics_.built = [this](std::uint32_t unbound) {
             std::unique_lock lock(variants_mutex_, std::try_to_lock);  // held: another thread is compiling one
@@ -15524,13 +15542,14 @@ public:
                 }
                 // ExecuteIndirect arguments are clamped on the GPU before every indirect command (vulkan_indirect_clamp.h).
                 // Its record scratch is device-local memory with a device address, like the arena's.
-                state_.context->enable_indirect_clamp(get_device, state_.memory, props.limits,
-                                                      [this](const VkMemoryRequirements& requirements) {
-                                                          return state_.allocate(requirements, 0,
-                                                                                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-                                                                                 nullptr, /*device_address=*/true);
-                                                      },
+                const auto allocate_indirect = [this](const VkMemoryRequirements& requirements) {
+                    return state_.allocate(requirements, 0, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, nullptr,
+                                           /*device_address=*/true);
+                };
+                state_.context->enable_indirect_clamp(get_device, state_.memory, props.limits, allocate_indirect,
                                                       state_.families);
+                state_.context->enable_mesh_indirect_tiles(get_device, props.limits, allocate_indirect,
+                                                          state_.families);
             }
         }
         // The copies of a D24 texture stored as D32 convert on the GPU (vulkan_depth24.h), and so do the copies of
@@ -21794,6 +21813,13 @@ bool pipeline_mesh_compute_info(ID3D12PipelineState* pso, std::uint64_t* slot_by
     if (max_primitives) *max_primitives = direct->max_primitives;
     if (producer_code_base) *producer_code_base = direct->producer_code_base;
     return true;
+}
+
+bool pipeline_supports_mesh_compute_indirect(ID3D12PipelineState* pso) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pso);
+    if (!p || !p->is_mesh_compute()) return false;
+    const leonida::MeshComputeDirect* direct = p->mesh_compute_direct();
+    return direct && direct->indirect_tiles_v1;
 }
 
 bool pipeline_mesh_compute_producer_words(ID3D12PipelineState* pso, std::vector<std::uint32_t>& words,

@@ -1,0 +1,55 @@
+# Turns a SPIR-V binary into the checked-in C++ header the runtime embeds (runtime/src/*_spv.h): little-endian 32-bit
+# words, eight to a line, as the other embedded helper shaders are stored. Run as a script:
+#   cmake -DSPV=<in.spv> -DHEADER=<out.h> -DNAME=<array name> -DSHADER=<source.comp> -DMODE=write|check -P embed_spirv_header.cmake
+# MODE=write replaces HEADER; MODE=check fails when HEADER differs from what SPV would produce (line endings ignored).
+# The header's first line names the glslang that produced the words: a different glslang may emit different words, so
+# a check against another version is advisory.
+foreach(_required SPV HEADER NAME SHADER MODE)
+  if(NOT DEFINED ${_required})
+    message(FATAL_ERROR "embed_spirv_header.cmake: -D${_required}= is required")
+  endif()
+endforeach()
+
+file(READ "${SPV}" _hex HEX)
+string(LENGTH "${_hex}" _length)
+math(EXPR _remainder "${_length} % 8")
+if(_length EQUAL 0 OR NOT _remainder EQUAL 0)
+  message(FATAL_ERROR "embed_spirv_header.cmake: ${SPV} is not a whole number of 32-bit words")
+endif()
+math(EXPR _words "${_length} / 8")
+
+set(_body "")
+set(_row "")
+set(_index 0)
+while(_index LESS _words)
+  math(EXPR _at "${_index} * 8")
+  string(SUBSTRING "${_hex}" ${_at} 8 _word)
+  string(SUBSTRING "${_word}" 0 2 _b0)
+  string(SUBSTRING "${_word}" 2 2 _b1)
+  string(SUBSTRING "${_word}" 4 2 _b2)
+  string(SUBSTRING "${_word}" 6 2 _b3)
+  list(APPEND _row "0x${_b3}${_b2}${_b1}${_b0}u")
+  math(EXPR _index "${_index} + 1")
+  list(LENGTH _row _in_row)
+  if(_in_row EQUAL 8 OR _index EQUAL _words)
+    list(JOIN _row ", " _joined)
+    string(APPEND _body "    ${_joined},\n")
+    set(_row "")
+  endif()
+endwhile()
+
+set(_text "// Generated with glslang 16.6.0: glslangValidator -V --target-env vulkan1.2 -Os --spirv-val ${SHADER}\n")
+string(APPEND _text "#pragma once\n#include <cstdint>\nnamespace leonida {\n")
+string(APPEND _text "inline constexpr std::uint32_t ${NAME}[] = {\n${_body}};\n}  // namespace leonida\n")
+
+if(MODE STREQUAL "write")
+  file(CONFIGURE OUTPUT "${HEADER}" CONTENT "${_text}" @ONLY NEWLINE_STYLE UNIX)
+elseif(MODE STREQUAL "check")
+  file(READ "${HEADER}" _current)
+  string(REPLACE "\r\n" "\n" _current "${_current}")
+  if(NOT _current STREQUAL _text)
+    message(FATAL_ERROR "${HEADER} does not match ${SPV}: regenerate it with the mesh_indirect_args_spirv_refresh target")
+  endif()
+else()
+  message(FATAL_ERROR "embed_spirv_header.cmake: MODE must be write or check")
+endif()
