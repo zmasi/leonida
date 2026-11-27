@@ -159,3 +159,20 @@ def test_mesh_env(tmp_path, monkeypatch):
     assert check.mesh_env(str(tmp_path), "ms_b", {}) == {"VKH_MESH": "1"}
     (tmp_path / "ms_a.mesh_vs.spv").unlink()
     assert check.mesh_env(str(tmp_path), "ms_a", {}) == {"VKH_MESH": "1"}
+
+
+def test_pc_tail_translator_layout_has_no_companion():
+    old = rdna2spirv.PC_TAIL_UBO
+    rdna2spirv.PC_TAIL_UBO = True
+    try:
+        lay = rdna2spirv.mesh_compute_layout(64, 3, 0, 0, [0])
+        lay["params"] = {str(k): v for k, v in lay["params"].items()}
+    finally:
+        rdna2spirv.PC_TAIL_UBO = old
+    assert lay["push_constant_bytes"] == 128 and lay["address_dwords"] is None
+    assert lay["pc_tail_address_dwords"] == [4, 5]
+    assert mesh_compute_vs.is_pc_tail_layout(lay)
+    with pytest.raises(ValueError, match="128-byte.*pc-tail"):
+        mesh_compute_vs.vs_spvasm(lay)
+    # The normal 152-byte contract still passes.
+    mesh_compute_vs.check_push_contract(_vs_layout())

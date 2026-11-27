@@ -47,6 +47,7 @@
 #include "vulkan_predicated_copy.h"
 #include "vulkan_indirect_dispatch_count.h"
 #include "vulkan_indirect_clamp.h"
+#include "vulkan_mesh_compute_direct.h"
 #include "xdxr_build.h"
 
 #include <algorithm>
@@ -235,10 +236,14 @@ inline VkPipelineStageFlags2 vulkan_sync(std::uint32_t sync) {
     };
     static constexpr Bit bits[] = {
         {y::all, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT},
-        {y::draw, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT},
+        // DRAW and VERTEX_SHADING order the mesh logical stage too. A native mesh draw runs in ALL_GRAPHICS /
+        // PRE_RASTERIZATION, but an emulated mesh-as-compute producer runs its guest resource reads/writes in
+        // COMPUTE_SHADER before its vertex consumer: cover COMPUTE as well as the graphics stages, before and
+        // after. A conservative superset for ordinary and native-mesh draws, required for direct emulation.
+        {y::draw, VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
         {y::index_input, VK_PIPELINE_STAGE_2_INDEX_INPUT_BIT},
-        {y::vertex_shading, pre_raster | VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT},
-        {y::pixel_shading, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT},
+        {y::vertex_shading, pre_raster | VK_PIPELINE_STAGE_2_VERTEX_ATTRIBUTE_INPUT_BIT |
+                                VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT},
         {y::depth_stencil,
          VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT},
         {y::render_target, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT},
@@ -882,6 +887,21 @@ struct ComputePipeline {
     std::uint64_t estimate = 0;  // large: the bytes of memory its compile is expected to take
 };
 
+// Direct DispatchMesh expansion (mesh-as-compute, no VK_EXT_mesh_shader): the compute producer that writes
+// per-group output slots, and the slot contract the generated vertex consumer reads. Owned by the PSO alongside
+// its GraphicsPipeline; the pointer stays valid while the PSO lives (add_graphics_pipeline copies the pipeline
+// struct but not this; prepare copies the handles it needs into PreparedDraw). Ordinary graphics: mesh false,
+// direct null. Native mesh: mesh true, direct null. Direct: mesh true, direct non-null. mesh false with direct
+// non-null is an invalid PSO and is refused.
+struct MeshComputeDirect {
+    VkPipeline producer = VK_NULL_HANDLE;
+    VkPipelineLayout producer_layout = VK_NULL_HANDLE;
+    VkDescriptorSet producer_set = VK_NULL_HANDLE;  // set 0 of the producer layout; null: none
+    std::uint64_t producer_code_base = 0;  // the mesh shader's FSSM blob, as GraphicsPipeline::code_base
+    std::uint64_t slot_bytes = 0;  // bytes of one workgroup's output slot, 16-aligned, > 0
+    std::uint32_t max_primitives = 0;  // mesh primitives per group, > 0; the draw is G*max_primitives*3 vertices
+};
+
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
 // reads. code_base: as for compute (one per pipeline; two stages that both read theirs are refused, question 14).
 struct GraphicsPipeline {
@@ -897,6 +917,9 @@ struct GraphicsPipeline {
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
+    // Direct mesh-as-compute expansion (MeshComputeDirect above); null for ordinary and native-mesh pipelines.
+    // Non-null requires mesh true; the consumer in `pipeline`/`layout` is a vertex+pixel pipeline.
+    const MeshComputeDirect* mesh_compute_direct = nullptr;
     bool viewport_with_count = false;     // pipeline uses VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT
     bool depth_bounds = false;            // depthBoundsTestEnable: the bounds are dynamic (vkCmdSetDepthBounds)
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
@@ -924,6 +947,16 @@ struct ShaderUserData {
     std::uint64_t code_base;
 };
 static_assert(sizeof(ShaderUserData) == 144);
+
+// The 152-byte push-constant block for direct mesh-as-compute: the 144-byte graphics block plus the output
+// buffer's device address in dwords 36-37. Both phases push the draw's 32 graphics root dwords (the mesh shader
+// reads s16..s31 through the graphics root window, never compute-root arguments), the arena heap base, their own
+// code base, and the same output address. Other pipeline types keep ShaderUserData.
+struct MeshComputeUserData {
+    ShaderUserData base;
+    std::uint64_t output_base = 0;
+};
+static_assert(sizeof(MeshComputeUserData) == 152);
 
 // A host read of a small CPU-written input either succeeds, names no VA, or names GPU-written memory. The last is a
 // capability limit, not bad contents: DEFAULT and READBACK bytes may still be stale while replay prepares a command.
@@ -1348,6 +1381,20 @@ struct ReplayFunctions {
     // copies go through it, image to buffer to image. Without it such a copy is unsupported. The expanded indices of
     // an indexed quad list are written there too (prepare_quad_indices).
     std::function<bool(VkDeviceSize bytes, VkBuffer&, VkDeviceSize&)> copy_scratch;
+    // Direct DispatchMesh expansion (mesh-as-compute): `bytes` of 16-aligned storage scratch with a device address,
+    // retained until the submission's queue timeline completes, like copy_scratch. The chunks need STORAGE_BUFFER
+    // and SHADER_DEVICE_ADDRESS usage on device-address-capable memory; without all of it such a draw is unsupported.
+    std::function<bool(VkDeviceSize bytes, VkBuffer&, VkDeviceSize&, VkDeviceAddress&)> mesh_compute_scratch;
+    // The physical limits for direct draws: maxComputeWorkGroupCount, maxPushConstantsSize, maxBufferSize
+    // (maintenance4) and maxMemoryAllocationSize (maintenance3). All-zero group counts mean unknown and refuse direct
+    // draws; a zero push/buffer/allocation limit skips that check (unknown, allocation failure still refuses). BDA
+    // scratch is a raw buffer range, not a descriptor, so maxStorageBufferRange does not apply.
+    std::uint32_t mesh_compute_max_group_count[3] = {0, 0, 0};
+    std::uint32_t mesh_compute_max_push_constants = 0;
+    VkDeviceSize mesh_compute_max_buffer_size = 0;
+    VkDeviceSize mesh_compute_max_allocation_size = 0;
+    // The executing queue family supports vkCmdDispatch (set per ExecuteCommandLists, not at device init).
+    bool mesh_compute_queue = false;
     // Returns the query heap with that ID, or nullptr; it stays valid while the lists that use it run.
     std::function<QueryPool*(QueryHeapId)> query_pool;
     bool separate_depth_stencil_layouts = false;  // must match the LayoutTracker, if one is used
@@ -1504,6 +1551,20 @@ struct PreparedDraw {
     VkDeviceSize index_size = 0;  // the bytes of the index buffer view inside its buffer; 0 with no index buffer
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
     QuadIndexExpansion quad_indices;  // an indexed quad list: the triangle indices its draw binds instead
+    // Direct DispatchMesh expansion (mesh-as-compute): the producer the PSO resolved, the submission scratch it
+    // writes, and the consumer draw. Copied from MeshComputeDirect at prepare so emit needs no PSO lifetime beyond
+    // the handles; the scratch stays alive with the submission's timeline. False for ordinary and native-mesh draws.
+    bool mesh_compute = false;
+    VkPipeline mesh_producer = VK_NULL_HANDLE;
+    VkPipelineLayout mesh_producer_layout = VK_NULL_HANDLE;
+    VkDescriptorSet mesh_producer_set = VK_NULL_HANDLE;
+    std::uint64_t mesh_producer_code_base = 0;
+    VkBuffer mesh_output_buffer = VK_NULL_HANDLE;
+    VkDeviceSize mesh_output_offset = 0;
+    VkDeviceAddress mesh_output_address = 0;
+    VkDeviceSize mesh_output_bytes = 0;
+    std::uint32_t mesh_vertex_count = 0;  // G*max_primitives*3, for the consumer vkCmdDraw
+    std::uint32_t mesh_groups[3] = {0, 0, 0};  // x, y, z for the producer vkCmdDispatch
     VkBuffer indirect_buffer = VK_NULL_HANDLE;
     VkDeviceSize indirect_offset = 0;
     VkBuffer indirect_count_buffer = VK_NULL_HANDLE;
@@ -1531,6 +1592,17 @@ struct PreparedDraw {
         index_size = 0;
         index_type = VK_INDEX_TYPE_UINT16;
         quad_indices = {};
+        mesh_compute = false;
+        mesh_producer = VK_NULL_HANDLE;
+        mesh_producer_layout = VK_NULL_HANDLE;
+        mesh_producer_set = VK_NULL_HANDLE;
+        mesh_producer_code_base = 0;
+        mesh_output_buffer = VK_NULL_HANDLE;
+        mesh_output_offset = 0;
+        mesh_output_address = 0;
+        mesh_output_bytes = 0;
+        mesh_vertex_count = 0;
+        mesh_groups[0] = mesh_groups[1] = mesh_groups[2] = 0;
         indirect_buffer = VK_NULL_HANDLE;
         indirect_offset = 0;
         indirect_count_buffer = VK_NULL_HANDLE;
@@ -2707,7 +2779,20 @@ namespace detail {
 // typeless texture is viewed as the format the pipeline renders.
 template<typename Resolve>
 ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, Resolve&& resolve,
-                          const ReplayFunctions& vk, PreparedDraw& p) {
+                          const ReplayFunctions& vk, PreparedDraw& p, bool statistics_active = false) {
+    // Direct mesh-as-compute never lowers indirect: identify the bound emulated representation and reject positive
+    // indirect before any native-only skip(...) success shortcuts, even on a mesh-capable GPU. A positive indirect
+    // (max_count > 0, GPU count unknown for counted) with a direct pipeline is unsupported when the stages match and
+    // invalid_draw on PSO/draw mismatch, never a silent skip. Unresolvable pipelines fall through to the checks below.
+    if (arguments && arguments->max_count && vk.graphics_pipeline) {
+        if (const GraphicsPipeline* early = vk.graphics_pipeline(draw.pipeline)) {
+            if (early->mesh_compute_direct) {
+                if (!early->mesh) return unsupported_at(__LINE__);  // invalid PSO
+                if (early->mesh != draw.mesh) return ReplayResult::invalid_draw;
+                return unsupported_at(__LINE__);  // direct + positive indirect: separate follow-up, not lowered
+            }
+        }
+    }
     if (arguments) {
         const IndirectDrawArgs& arg = *arguments;
         const VkDeviceSize record_size = draw.mesh      ? sizeof(VkDrawMeshTasksIndirectCommandEXT)
@@ -2778,7 +2863,24 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
         return ReplayResult::success;
     }
     if (pipeline->mesh != draw.mesh) return ReplayResult::invalid_draw;
-    if (draw.mesh && !vk.draw_mesh_tasks) return unsupported_at(__LINE__);
+    // Direct mesh-as-compute vs native mesh: the PSO discriminates, not the draw. Ordinary (mesh false, direct
+    // null) and native mesh (mesh true, direct null) keep their paths; direct (mesh true, direct non-null) expands
+    // below. Indirect mesh never lowers here: it keeps the native gate above.
+    const MeshComputeDirect* direct = pipeline->mesh_compute_direct;
+    if (direct && !pipeline->mesh) return unsupported_at(__LINE__);  // invalid PSO
+    if (draw.mesh && direct) {
+        if (arguments) return unsupported_at(__LINE__);  // direct is direct DispatchMesh only
+        if (draw.indexed) return ReplayResult::invalid_draw;  // mesh ignores index buffers
+        if (pipeline->vertex_slots) return unsupported_at(__LINE__);  // the generated consumer has no inputs
+        // A zero grid is a no-op with no allocation and no side effects (CommandList::draw usually filters it).
+        if (mesh_compute_direct::is_noop(draw.count, draw.instances, draw.first)) {
+            p.graphics = pipeline;
+            p.skipped = true;
+            return ReplayResult::success;
+        }
+    } else if (draw.mesh && !vk.draw_mesh_tasks) {
+        return unsupported_at(__LINE__);  // native mesh needs VK_EXT_mesh_shader; unchanged
+    }
     if (pipeline->viewport_with_count && (!vk.set_viewport_with_count || !vk.set_scissor_with_count))
         return unsupported_at(__LINE__);
     if (pipeline->depth_bounds && !vk.set_depth_bounds) return unsupported_at(__LINE__);
@@ -2947,6 +3049,61 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
                 return ReplayResult::success;
             }
         }
+    }
+    // Direct DispatchMesh expansion: checked counts, physical limits, and submission scratch. The consumer
+    // variant and attachments above were validated first; a pending consumer (skipped) takes no scratch.
+    // Order: zero was a no-op above; statistics and queue checks refuse before any scratch is retained.
+    if (draw.mesh && direct && !p.skipped) {
+        if (!vk.dispatch || !vk.pipeline_barrier || !vk.mesh_compute_scratch || !vk.mesh_compute_queue)
+            return unsupported_at(__LINE__);
+        if (!direct->producer || !direct->producer_layout) {
+            if (pipeline->async_build && !strict_replay()) {
+                p.skipped = true;  // the producer builds with the consumer variant; no scratch yet
+                return ReplayResult::success;
+            }
+            return unsupported_at(__LINE__);
+        }
+        if (direct->producer_set && !vk.bind_descriptor_sets) return unsupported_at(__LINE__);
+        if (vk.mesh_compute_max_push_constants &&
+            vk.mesh_compute_max_push_constants < mesh_compute_direct::kPushBytes)
+            return unsupported_at(__LINE__);
+        // A pipeline-statistics query would count the generated vertex stage as guest VSInvocations: refuse before
+        // allocating scratch. Occlusion, timestamp and stream-output queries are unaffected.
+        if (statistics_active) return unsupported_at(__LINE__);
+        const std::uint32_t x = draw.count, y = draw.instances, z = draw.first;
+        mesh_compute_direct::Counts counts{};
+        if (!mesh_compute_direct::checked_counts(x, y, z, direct->slot_bytes, direct->max_primitives, counts))
+            return unsupported_at(__LINE__);
+        if (!mesh_compute_direct::within_compute_limits(x, y, z, vk.mesh_compute_max_group_count))
+            return unsupported_at(__LINE__);
+        // BDA scratch is a raw buffer range: maxBufferSize and maxMemoryAllocationSize bound it, not
+        // maxStorageBufferRange (descriptor ranges). Zero limits are unknown and skip the check.
+        if (vk.mesh_compute_max_buffer_size && counts.bytes > vk.mesh_compute_max_buffer_size)
+            return unsupported_at(__LINE__);
+        if (vk.mesh_compute_max_allocation_size && counts.bytes > vk.mesh_compute_max_allocation_size)
+            return unsupported_at(__LINE__);
+        // Zero was a no-op above; checked_counts refuses empty products otherwise.
+        if (!counts.groups || !counts.bytes || !counts.vertices) return unsupported_at(__LINE__);
+        VkBuffer out_buffer = VK_NULL_HANDLE;
+        VkDeviceSize out_offset = 0;
+        VkDeviceAddress out_address = 0;
+        if (!vk.mesh_compute_scratch(counts.bytes, out_buffer, out_offset, out_address)) return unsupported_at(__LINE__);
+        if (!out_buffer || out_offset > UINT64_MAX - counts.bytes ||
+            !mesh_compute_direct::valid_output(out_address, out_offset, counts.bytes))
+            return unsupported_at(__LINE__);
+        p.mesh_compute = true;
+        p.mesh_producer = direct->producer;
+        p.mesh_producer_layout = direct->producer_layout;
+        p.mesh_producer_set = direct->producer_set;
+        p.mesh_producer_code_base = direct->producer_code_base;
+        p.mesh_output_buffer = out_buffer;
+        p.mesh_output_offset = out_offset;
+        p.mesh_output_address = out_address;
+        p.mesh_output_bytes = counts.bytes;
+        p.mesh_vertex_count = counts.vertices;
+        p.mesh_groups[0] = x;
+        p.mesh_groups[1] = y;
+        p.mesh_groups[2] = z;
     }
     return ReplayResult::success;
 }
@@ -3212,6 +3369,23 @@ inline constexpr VkQueryPipelineStatisticFlags kForbiddenMeshStatisticsFlags =
 // its own kind.
 // Dispatches and segments without draws use the full pool; ExecuteIndirect draws count as vertex draws. Each draw
 // has its own rendering scope, so a split before one stays outside rendering, as a helper's does.
+// A draw's pipeline-statistics kind (D3D-291): 0 vertex, 1 native mesh. Direct mesh-as-compute runs as a compute
+// dispatch plus a vertex draw, never vkCmdDrawMeshTasksEXT, so it segments as vertex (0). Falls back to the logical
+// mesh bit when the prepared draw is unavailable (a skipped draw).
+inline int statistics_draw_kind(const PreparedList& out, std::size_t command, const Draw* logical) {
+    if (!logical) return -1;
+    if (!logical->mesh) return 0;
+    if (command < out.commands.size()) {
+        const std::uint32_t draw = out.commands[command].draw;
+        if (draw < out.draws.size()) {
+            const auto& prepared = out.draws[draw];
+            if (prepared.mesh_compute) return 0;
+            if (prepared.graphics && prepared.graphics->mesh_compute_direct) return 0;
+        }
+    }
+    return 1;
+}
+
 inline void plan_statistics_segments(PreparedList& out) {
     detail::PreparedQuery* begin = nullptr;
     // A split point (a helper or a resolve), or a draw: kind 0 vertex, 1 mesh.
@@ -3228,7 +3402,7 @@ inline void plan_statistics_segments(PreparedList& out) {
         }
         if (begin) {
             int kind = -1;
-            if (const auto* draw = draw_command(commands[i]).state) kind = draw->mesh ? 1 : 0;
+            if (const auto* draw = draw_command(commands[i]).state) kind = statistics_draw_kind(out, i, draw);
             else if (const auto* indirect = std::get_if<ExecuteIndirect>(&commands[i]))
                 kind = indirect->kind == IndirectKind::dispatch ? -1 : 0;
             if (kind >= 0) inner.push_back({&p.statistics_end, &p.statistics_begin, kind});
@@ -3323,7 +3497,7 @@ inline ReplayResult plan_overlapping_statistics_segments(PreparedList& out) {
             }
             // A draw of the other kind than the open segment's starts a segment in its own pool (D3D-291).
             int draw = -1;
-            if (const auto* d = draw_command(commands[i]).state) draw = d->mesh ? 1 : 0;
+            if (const auto* d = draw_command(commands[i]).state) draw = statistics_draw_kind(out, i, d);
             else if (const auto* indirect = std::get_if<ExecuteIndirect>(&commands[i]))
                 draw = indirect->kind == IndirectKind::dispatch ? -1 : 0;
             if (!active.empty() && draw >= 0) {
@@ -4291,7 +4465,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
             auto& prepared_draw = out.draws[out.draw_count];
             prepared_draw.reset();
             p.draw = std::uint32_t(out.draw_count++);
-            if (const auto r = detail::prepare_draw(*draw.state, draw.arguments, resolve, vk, prepared_draw);
+            if (const auto r = detail::prepare_draw(*draw.state, draw.arguments, resolve, vk, prepared_draw,
+                                                    statistics_active);
                 r != ReplayResult::success) {
                 const bool strict = strict_replay();
                 if (r != ReplayResult::unresolved_resource || strict) return r;
@@ -4302,6 +4477,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                 if (const auto r = detail::prepare_quad_indices(*draw.state, vk, prepared_draw); r != ReplayResult::success)
                     return r;
             }
+            // Direct mesh-as-compute statistics refusal happens inside prepare_draw, before scratch is retained.
             // A stateful indirect draw takes the same clamp pass (vulkan_indirect_clamp.h) as a legacy ExecuteIndirect:
             // the arguments it reads are copied and bounded on the GPU before its rendering scope opens, and the draw
             // then reads that scratch. Recorded in this command's Prepared so the emit phase records the pass before
@@ -5549,19 +5725,60 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             const GraphicsPipeline& graphics = *d.graphics;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_DEPTH_BIT)) rendering.pDepthAttachment = &depth;
             if (d.depth.id && (graphics.depth_aspects & VK_IMAGE_ASPECT_STENCIL_BIT)) rendering.pStencilAttachment = &depth;
+            // Direct DispatchMesh expansion: the compute producer runs outside rendering, inside the draw's predicate
+            // (a false predicate suppresses it together with the consumer) and inside its statistics segment (guest
+            // work, not a helper). The barrier makes exactly the written range visible to the consumer vertex reads.
+            if (d.mesh_compute) {
+                MeshComputeUserData producer_data{};
+                std::copy(draw->user_data.begin(), draw->user_data.end(), producer_data.base.s);
+                producer_data.base.heap_base = vk.heap_base;
+                producer_data.base.code_base = d.mesh_producer_code_base;
+                producer_data.output_base = d.mesh_output_address;
+                vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, d.mesh_producer);
+                if (d.mesh_producer_set) {
+                    const VkDescriptorSet producer_set0 =
+                        vk.bindless_set ? vk.bindless_set : d.mesh_producer_set;
+                    vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_COMPUTE, d.mesh_producer_layout,
+                                            0, 1, &producer_set0, 0, nullptr);
+                }
+                vk.push_constants(command_buffer, d.mesh_producer_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                  sizeof(producer_data), &producer_data);
+                vk.dispatch(command_buffer, d.mesh_groups[0], d.mesh_groups[1], d.mesh_groups[2]);
+                VkBufferMemoryBarrier producer_barrier{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+                producer_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                producer_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+                producer_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                producer_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                producer_barrier.buffer = d.mesh_output_buffer;
+                producer_barrier.offset = d.mesh_output_offset;
+                producer_barrier.size = d.mesh_output_bytes;
+                vk.pipeline_barrier(command_buffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                    VK_PIPELINE_STAGE_VERTEX_SHADER_BIT, 0, 0, nullptr, 1, &producer_barrier, 0,
+                                    nullptr);
+            }
             vk.begin_rendering(command_buffer, &rendering);
 
-            ShaderUserData data{};
-            std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
-            data.heap_base = vk.heap_base;
-            data.code_base = graphics.code_base;
             vk.bind_pipeline(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, d.pipeline);
             if (graphics.bindless_set) {
                 const VkDescriptorSet set0 = vk.bindless_set ? vk.bindless_set : graphics.bindless_set;
                 vk.bind_descriptor_sets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, graphics.layout, 0, 1,
                                         &set0, 0, nullptr);
             }
-            vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
+            if (d.mesh_compute) {
+                MeshComputeUserData consumer_data{};
+                std::copy(draw->user_data.begin(), draw->user_data.end(), consumer_data.base.s);
+                consumer_data.base.heap_base = vk.heap_base;
+                consumer_data.base.code_base = graphics.code_base;
+                consumer_data.output_base = d.mesh_output_address;
+                vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(consumer_data),
+                                  &consumer_data);
+            } else {
+                ShaderUserData data{};
+                std::copy(draw->user_data.begin(), draw->user_data.end(), data.s);
+                data.heap_base = vk.heap_base;
+                data.code_base = graphics.code_base;
+                vk.push_constants(command_buffer, graphics.layout, graphics.push_stages, 0, sizeof(data), &data);
+            }
             // Translated vertex shaders write D3D clip coordinates (y up); a negative-height viewport keeps the
             // image upright, and winding as D3D12 sees it.
             if (graphics.viewport_with_count) {
@@ -5604,10 +5821,10 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                                         std::uint32_t(std::max(0, s.bottom - std::max(0, s.top)))}};
                 vk.set_scissor(command_buffer, 0, 1, &scissor);
             }
-            // A mesh pipeline has no input assembly: its topology comes from the shader, and neither the topology
-            // nor primitive restart is dynamic state there (VUID-VkGraphicsPipelineCreateInfo-pDynamicStates-07065).
-            if (!draw->mesh) {
-                const VkPrimitiveTopology topology = draw->topology == topology_quad_list && !draw->indexed
+            // Native mesh has no input assembly. The mesh-compute consumer is a vertex pipeline: set
+            // both dynamic IA states even though the logical D3D12 command is DispatchMesh.
+            if (!draw->mesh || d.mesh_compute) {
+                const VkPrimitiveTopology topology = d.mesh_compute || (draw->topology == topology_quad_list && !draw->indexed)
                     ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : detail::vulkan_topology(draw->topology);
                 vk.set_primitive_topology(command_buffer, topology);
                 const bool restart = draw->indexed && detail::strip_topology(topology) &&
@@ -5662,6 +5879,10 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                     const auto emit_fixed = draw->indexed ? vk.draw_indexed_indirect : vk.draw_indirect;
                     emit_fixed(command_buffer, arguments_buffer, arguments_offset, records, stride);
                 }
+            } else if (d.mesh_compute) {
+                // The generated consumer clips unused/culled primitives; one non-indexed triangle-list draw.
+                vk.draw(command_buffer, d.mesh_vertex_count, 1, 0, 0);
+                if (vk.mesh_draw_count) ++*vk.mesh_draw_count;
             } else if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
                 if (vk.mesh_draw_count) ++*vk.mesh_draw_count;

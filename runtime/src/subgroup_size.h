@@ -96,7 +96,10 @@ inline bool subgroup_workgroup_fits(const std::array<std::uint32_t, 3>& local_si
     return xy <= max_invocations / local_size[2];
 }
 
-// What to ask for one stage of a pipeline made from `entry`.
+// What to ask for one stage of a pipeline made from `entry`, with an explicit
+// effective Vulkan stage (a logical-ms mesh-compute producer dispatched as
+// compute), without copying the entry. Logical metadata stays untouched; only the
+// stage used for required-stage/workgroup/full-subgroup checks is overridden.
 //   - Emulated (`wave64_exchange` present): nothing.
 //   - Otherwise the wanted size is the entry's `subgroup_size`, or 64 for a wave64 entry without one and 32 for the
 //     rest. VkPipelineShaderStageRequiredSubgroupSizeCreateInfo is chained when the subgroupSizeControl feature is
@@ -112,9 +115,10 @@ inline bool subgroup_workgroup_fits(const std::array<std::uint32_t, 3>& local_si
 //   - Where the size cannot be required (stage not listed, feature off) but the device default is the wanted size,
 //     the shader works as it is (`device_default`): nothing guarantees it, a driver may change its default.
 //     Otherwise the outcome is `unavailable`.
-inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const SubgroupSizeCaps& caps) {
+inline SubgroupRequest decide_subgroup_size_for_stage(const ShaderEntry& entry, VkShaderStageFlagBits stage_bit,
+                                                      const SubgroupSizeCaps& caps) {
     SubgroupRequest r;
-    r.stage = subgroup_stage_bit(entry.stage);
+    r.stage = stage_bit;
     if (!r.stage) return r;
     if (entry.emulated()) {
         r.outcome = SubgroupOutcome::emulated;
@@ -148,6 +152,13 @@ inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const Subg
         r.outcome = SubgroupOutcome::unavailable;
     }
     return r;
+}
+
+// What to ask for one stage of a pipeline made from `entry` (effective stage
+// from its `stage` string; behavior matches decide_subgroup_size_for_stage with
+// that bit).
+inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const SubgroupSizeCaps& caps) {
+    return decide_subgroup_size_for_stage(entry, subgroup_stage_bit(entry.stage), caps);
 }
 
 // Puts a request into a stage create-info. `storage` holds the chained structure and must outlive the

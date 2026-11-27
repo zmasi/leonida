@@ -20263,9 +20263,10 @@ def main():
 
     def drop_stale(name):
         # A shader that no longer translates must not stay published from an earlier run: remove its old
-        # module, and the index merge below drops its entry, exactly like a spirv-as/val rejection. The
-        # .spvasm text stays for diagnosis, as it does on a rejection.
+        # module and mesh-compute seal, and the index merge below drops its entry, exactly like a spirv-as/val
+        # rejection. The .spvasm text stays for diagnosis, as it does on a rejection.
         Path(os.path.join(a.out, name + ".spv")).unlink(missing_ok=True)
+        Path(os.path.join(a.out, name + ".mesh_compute.seal.json")).unlink(missing_ok=True)
         invalid.add(name)
 
     for i, p in enumerate(files, 1):
@@ -20313,6 +20314,17 @@ def main():
             try:
                 fssm_sidecar = os.path.join(a.fssm_dir, name + ".fssm") if a.fssm_dir else None
                 meta[name] = shader_meta(translate.last_gen, asm, src_path=p, fssm_path=fssm_sidecar)
+                if isinstance(meta[name], dict) and isinstance(meta[name].get("mesh_compute"), dict):
+                    import mesh_compute_vs
+
+                    lay = meta[name]["mesh_compute"]
+                    canonical = mesh_compute_vs.canonical_layout_json(lay)
+                    seal = {"version": mesh_compute_vs.MESH_COMPUTE_SEAL_VERSION,
+                            "layout": _json.loads(canonical),
+                            "layout_sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                            "producer_sha256": mesh_compute_vs.file_sha256(sv),
+                            "companion_asm_sha256": None, "companion_spv_sha256": None}
+                    mesh_compute_vs.write_seal_file(os.path.join(a.out, name + mesh_compute_vs.SEAL_SUFFIX), seal)
             except Exception as e:  # noqa: BLE001 - metadata must never cost a translation
                 meta[name] = {"error": f"{type(e).__name__}: {e}"}
         else:
