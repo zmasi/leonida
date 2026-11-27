@@ -1521,6 +1521,252 @@ int check_pending_stream_views(ID3D12Device* device) {
     return 0;
 }
 
+// A streaming pool can reuse a placement address for another texture before releasing the earlier slot-133 resource,
+// or view a typed slot-133 texture through a mutable sRGB cast. Slot 70 replaces the registry entry with an owned
+// streamed texture instead of refusing the view or silently binding the earlier extent.
+int check_superseded_slot133_views(ID3D12Device* device) {
+    const char* who = "superseded slot-133 views";
+    if (!rt::d3d12::bindless_set_layout(device)) return 0;
+    constexpr SIZE_T slot_bytes = 4 * 65536, total_bytes = 5 * slot_bytes;
+    auto* pages = static_cast<std::uint8_t*>(
+        VirtualAlloc(nullptr, total_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    EXPECT(pages != nullptr);
+    for (SIZE_T i = 0; i < total_bytes; ++i) pages[i] = std::uint8_t(i * 17 + 3);
+
+    const auto write_slot70 = [&](void* at, const rt::xg_xs::ResourceDesc& d,
+                                  const D3D12_SHADER_RESOURCE_VIEW_DESC& srv, leonida::gfx10::ImageWords& out) {
+        out = {};
+        std::array<UINT, 14> resource{};
+        std::array<UINT, 16> view{};
+        static_assert(sizeof(resource) == sizeof(d));
+        std::memcpy(resource.data(), &d, sizeof(d));
+        std::memcpy(view.data(), &srv, sizeof(srv));
+        return rt::d3d12::write_placed_texture_view(device, false, resource.data(), view.data(),
+                                                    reinterpret_cast<UINT64>(at),
+                                                    {reinterpret_cast<SIZE_T>(out.data())});
+    };
+    const auto lookup = [&](const leonida::gfx10::ImageWords& descriptor) {
+        std::uint32_t key[8];
+        std::memcpy(key, descriptor.data(), sizeof(key));
+        return rt::d3d12::bindless_hash_lookup(device, key);
+    };
+
+    // 1. Different block size and extent: unreleased BC5 64x64 slot-133 texture superseded by BC1_SRGB 32x32 view.
+    {
+        void* at = pages + 0 * slot_bytes;
+        D3D12_RESOURCE_DESC old_desc{};
+        old_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        old_desc.Width = 64;
+        old_desc.Height = 64;
+        old_desc.DepthOrArraySize = old_desc.MipLevels = 1;
+        old_desc.SampleDesc.Count = 1;
+        old_desc.Format = DXGI_FORMAT_BC5_UNORM;
+        Ref<ID3D12Resource> stale;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, at, old_desc, 0, IID_PPV_ARGS(&stale.p)), S_OK);
+        leonida::gfx10::ImageWords old_view{};
+        device->CreateShaderResourceView(stale.p, nullptr, {reinterpret_cast<SIZE_T>(old_view.data())});
+        EXPECT(lookup(old_view) != 0);
+
+        rt::xg_xs::ResourceDesc d{};
+        d.dimension = rt::xg_xs::kTexture2D;
+        d.width = 32;
+        d.height = 32;
+        d.depth_or_array = 1;
+        d.mips = 4;
+        d.format = DXGI_FORMAT_BC1_UNORM_SRGB;
+        d.samples = 1;
+        d.layout = rt::xg_xs::kSwizzled | rt::xg_xs::k4kbS;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_BC1_UNORM_SRGB;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 4;
+        leonida::gfx10::ImageWords next_view{};
+        EXPECT(write_slot70(at, d, srv, next_view));
+        leonida::gfx10::Image decoded{};
+        EXPECT(leonida::gfx10::decode(next_view, decoded));
+        EXPECT(decoded.width == 32 && decoded.height == 32 && decoded.mip_count == 4);
+        const std::uint32_t next_idx = lookup(next_view);
+        EXPECT(next_idx != 0 && lookup(old_view) == 0);
+        // Releasing the superseded slot-133 wrapper later must leave the replacement's bindless entry intact.
+        stale.p->Release();
+        stale.p = nullptr;
+        EXPECT(lookup(next_view) == next_idx);
+    }
+
+    // 2. Same extent and 16-byte block size, different BC codec: unreleased BC7 cubemap superseded by BC6H_UF16 cube.
+    {
+        void* at = pages + 1 * slot_bytes;
+        D3D12_RESOURCE_DESC old_desc{};
+        old_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        old_desc.Width = 16;
+        old_desc.Height = 16;
+        old_desc.DepthOrArraySize = 6;
+        old_desc.MipLevels = 3;
+        old_desc.SampleDesc.Count = 1;
+        old_desc.Format = DXGI_FORMAT_BC7_UNORM;
+        Ref<ID3D12Resource> stale;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, at, old_desc, 0, IID_PPV_ARGS(&stale.p)), S_OK);
+
+        rt::xg_xs::ResourceDesc d{};
+        d.dimension = rt::xg_xs::kTexture2D;
+        d.width = 16;
+        d.height = 16;
+        d.depth_or_array = 6;
+        d.mips = 3;
+        d.format = DXGI_FORMAT_BC6H_UF16;
+        d.samples = 1;
+        d.layout = rt::xg_xs::kSwizzled | rt::xg_xs::k4kbS;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_BC6H_UF16;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.TextureCube.MipLevels = 3;
+        leonida::gfx10::ImageWords cube_view{};
+        EXPECT(write_slot70(at, d, srv, cube_view));
+        leonida::gfx10::Image decoded{};
+        EXPECT(leonida::gfx10::decode(cube_view, decoded));
+        EXPECT(decoded.type == leonida::gfx10::ImageType::cube && decoded.layer_count == 6);
+        EXPECT(decoded.format == leonida::gfx10::format_from_vulkan(VK_FORMAT_BC6H_UFLOAT_BLOCK));
+        EXPECT(lookup(cube_view) != 0);
+        stale.p->Release();
+        stale.p = nullptr;
+        EXPECT(lookup(cube_view) != 0);
+    }
+
+    // 3. Same format (BC1_UNORM), different extent: must not silently bind the stale 64x64 image to a 16x16 view.
+    {
+        void* at = pages + 2 * slot_bytes;
+        D3D12_RESOURCE_DESC old_desc{};
+        old_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        old_desc.Width = 64;
+        old_desc.Height = 64;
+        old_desc.DepthOrArraySize = old_desc.MipLevels = 1;
+        old_desc.SampleDesc.Count = 1;
+        old_desc.Format = DXGI_FORMAT_BC1_UNORM;
+        Ref<ID3D12Resource> stale;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, at, old_desc, 0, IID_PPV_ARGS(&stale.p)), S_OK);
+
+        rt::xg_xs::ResourceDesc d{};
+        d.dimension = rt::xg_xs::kTexture2D;
+        d.width = 16;
+        d.height = 16;
+        d.depth_or_array = 1;
+        d.mips = 3;
+        d.format = DXGI_FORMAT_BC1_UNORM;
+        d.samples = 1;
+        d.layout = rt::xg_xs::kSwizzled | rt::xg_xs::k4kbS;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+        srv.Format = DXGI_FORMAT_BC1_UNORM;
+        srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Texture2D.MipLevels = 3;
+        leonida::gfx10::ImageWords small_view{};
+        EXPECT(write_slot70(at, d, srv, small_view));
+        leonida::gfx10::Image decoded{};
+        EXPECT(leonida::gfx10::decode(small_view, decoded));
+        EXPECT(decoded.width == 16 && decoded.height == 16 && decoded.mip_count == 3);
+        EXPECT(lookup(small_view) != 0);
+        stale.p->Release();
+        stale.p = nullptr;
+    }
+
+    // 4. Typed BC1_UNORM slot-133 cubemap viewed as BC1_UNORM_SRGB: promoted to mutable {UNORM, SRGB} image cleanly.
+    {
+        void* at = pages + 3 * slot_bytes;
+        D3D12_RESOURCE_DESC old_desc{};
+        old_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        old_desc.Width = 16;
+        old_desc.Height = 16;
+        old_desc.DepthOrArraySize = 6;
+        old_desc.MipLevels = 2;
+        old_desc.SampleDesc.Count = 1;
+        old_desc.Format = DXGI_FORMAT_BC1_UNORM;
+        Ref<ID3D12Resource> placed;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, at, old_desc, 0, IID_PPV_ARGS(&placed.p)), S_OK);
+
+        rt::xg_xs::ResourceDesc d{};
+        d.dimension = rt::xg_xs::kTexture2D;
+        d.width = 16;
+        d.height = 16;
+        d.depth_or_array = 6;
+        d.mips = 2;
+        d.format = DXGI_FORMAT_BC1_UNORM;
+        d.samples = 1;
+        d.layout = rt::xg_xs::kSwizzled | rt::xg_xs::k4kbS;
+        D3D12_SHADER_RESOURCE_VIEW_DESC srgb_srv{};
+        srgb_srv.Format = DXGI_FORMAT_BC1_UNORM_SRGB;
+        srgb_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
+        srgb_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srgb_srv.TextureCube.MipLevels = 2;
+        leonida::gfx10::ImageWords srgb_view{}, unorm_view{};
+        EXPECT(write_slot70(at, d, srgb_srv, srgb_view));
+        D3D12_SHADER_RESOURCE_VIEW_DESC unorm_srv = srgb_srv;
+        unorm_srv.Format = DXGI_FORMAT_BC1_UNORM;
+        EXPECT(write_slot70(at, d, unorm_srv, unorm_view));
+        EXPECT(lookup(srgb_view) != 0 && lookup(unorm_view) != 0 && lookup(srgb_view) != lookup(unorm_view));
+        placed.p->Release();
+        placed.p = nullptr;
+    }
+
+    // 5. GPU-written slot-133 target superseded by streamed texture keeps gpu_placements live for target views.
+    {
+        void* at = pages + 4 * slot_bytes;
+        D3D12_RESOURCE_DESC rt_desc{};
+        rt_desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        rt_desc.Width = 32;
+        rt_desc.Height = 32;
+        rt_desc.DepthOrArraySize = rt_desc.MipLevels = 1;
+        rt_desc.SampleDesc.Count = 1;
+        rt_desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rt_desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        Ref<ID3D12Resource> target;
+        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, at, rt_desc, 2, IID_PPV_ARGS(&target.p)), S_OK);
+
+        rt::xg_xs::ResourceDesc stream_d{};
+        stream_d.dimension = rt::xg_xs::kTexture2D;
+        stream_d.width = 16;
+        stream_d.height = 16;
+        stream_d.depth_or_array = 1;
+        stream_d.mips = 1;
+        stream_d.format = DXGI_FORMAT_BC1_UNORM;
+        stream_d.samples = 1;
+        stream_d.layout = rt::xg_xs::kSwizzled | rt::xg_xs::k4kbS;
+        D3D12_SHADER_RESOURCE_VIEW_DESC stream_srv{};
+        stream_srv.Format = DXGI_FORMAT_BC1_UNORM;
+        stream_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        stream_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        stream_srv.Texture2D.MipLevels = 1;
+        leonida::gfx10::ImageWords stream_view{}, rt_view{};
+        EXPECT(write_slot70(at, stream_d, stream_srv, stream_view));
+
+        rt::xg_xs::ResourceDesc rt_d{};
+        rt_d.dimension = rt::xg_xs::kTexture2D;
+        rt_d.width = 32;
+        rt_d.height = 32;
+        rt_d.depth_or_array = 1;
+        rt_d.mips = 1;
+        rt_d.format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rt_d.samples = 1;
+        rt_d.flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+        D3D12_SHADER_RESOURCE_VIEW_DESC rt_srv{};
+        rt_srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        rt_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        rt_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        rt_srv.Texture2D.MipLevels = 1;
+        EXPECT(write_slot70(at, rt_d, rt_srv, rt_view));
+        EXPECT(lookup(stream_view) != 0 && lookup(rt_view) != 0 && lookup(stream_view) != lookup(rt_view));
+        target.p->Release();
+        target.p = nullptr;
+        EXPECT(lookup(stream_view) != 0);
+    }
+
+    VirtualFree(pages, 0, MEM_RELEASE);
+    std::printf("%s: superseded BC5/BC7/BC1/RT slot-133 placements replaced cleanly without stale or null views\n",
+                who);
+    return 0;
+}
+
 namespace {
 std::atomic<DWORD> g_view_av_thread{0};
 std::atomic<unsigned> g_view_avs{0};
@@ -2342,7 +2588,8 @@ void print_cases(const std::vector<Case>& cases, const char* who) {
 int main(int argc, char** argv) {
     const bool prefix_only = argc == 2 && std::strcmp(argv[1], "--host-prefix-only") == 0;
     const bool async_plane = argc == 2 && std::strcmp(argv[1], "--mapped-plane-async") == 0;
-    if (argc != 1 && !prefix_only && !async_plane) return 2;
+    const bool superseded_only = argc == 2 && std::strcmp(argv[1], "--superseded-slot133-only") == 0;
+    if (argc != 1 && !prefix_only && !async_plane && !superseded_only) return 2;
     if (async_plane) _putenv_s("LEONIDA_TEXTURE_REFRESH_ASYNC", "1");  // read once, at the device's first refresh
     _putenv_s("LEONIDA_TITLE_TEXTURE_PERIOD_MS", "0");
     _putenv_s("LEONIDA_TITLE_TEXTURE_CHECK_KB", "0");
@@ -2371,6 +2618,15 @@ int main(int argc, char** argv) {
             const int result = check_host_prefix_buffers(ours.p);
             return result || vk.validation_errors() ? 1 : 0;
         }
+        if (superseded_only) {
+            int result = check_superseded_slot133_views(ours.p);
+            auto no_host_copy = info;
+            no_host_copy.host_image_copy = false;
+            Ref<ID3D12Device> staged;
+            if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
+            result += check_superseded_slot133_views(staged.p);
+            return result || vk.validation_errors() ? 1 : 0;
+        }
         if (async_plane) {
             int result = vk.host_image_copy ? check_mapped_plane_first_use(ours.p) : 0;
             auto no_host_copy = info;  // the staged upload too
@@ -2388,6 +2644,7 @@ int main(int argc, char** argv) {
         if (vk.host_pointer_alignment) failures += check_title_placed_all(ours.p);
         if (vk.host_image_copy) {
             failures += check_pending_stream_views(ours.p);
+            failures += check_superseded_slot133_views(ours.p);
             failures += check_placed_view_map_changes(ours.p);
             failures += check_shared_bc_placements(ours.p);
             failures += check_mapped_plane(ours.p);
@@ -2399,6 +2656,7 @@ int main(int argc, char** argv) {
             no_host_copy.host_image_copy = false;
             Ref<ID3D12Device> staged;
             if (FAILED(rt::d3d12::create_vulkan_device(no_host_copy, IID_PPV_ARGS(&staged.p)))) return 1;
+            failures += check_superseded_slot133_views(staged.p);
             failures += check_placed_view_map_changes(staged.p);
             failures += check_mapped_plane(staged.p);
             failures += check_mapped_bc_array(staged.p);

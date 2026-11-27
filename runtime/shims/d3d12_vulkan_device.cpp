@@ -16219,6 +16219,66 @@ private:
         });
     }
 
+    static int bc_typeless_family(DXGI_FORMAT format) {
+        switch (format) {
+        case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB: return 1;
+        case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB: return 2;
+        case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB: return 3;
+        case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC4_UNORM: case DXGI_FORMAT_BC4_SNORM: return 4;
+        case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC5_UNORM: case DXGI_FORMAT_BC5_SNORM: return 5;
+        case DXGI_FORMAT_BC6H_TYPELESS: case DXGI_FORMAT_BC6H_UF16: case DXGI_FORMAT_BC6H_SF16: return 6;
+        case DXGI_FORMAT_BC7_TYPELESS: case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB: return 7;
+        default: return 0;
+        }
+    }
+
+    // Whether the slot-133 texture currently registered at an address is the texture `d` and `srv` ask to view.
+    // When a streaming pool reuses the address for another texture before releasing the earlier resource, or asks
+    // for a mutable cast a typed slot-133 image lacks, replacing the registry entry avoids stale or null views.
+    static bool slot133_serves_view(const TitleTexture& t, const rt::xg_xs::ResourceDesc& d,
+                                    const D3D12_SHADER_RESOURCE_VIEW_DESC& srv) {
+        const Resource& r = *t.resource;
+        const D3D12_RESOURCE_DESC& rd = r.desc();
+        const bool d_gpu_written = (d.flags & (D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET |
+                                               D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL |
+                                               D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)) != 0 ||
+                                   d.samples > 1;
+        if (t.gpu_written) return d_gpu_written || TitleGpuPlacements<Resource>::matches(d, r);
+        if (d_gpu_written) return false;
+        if (r.aspects() != VK_IMAGE_ASPECT_COLOR_BIT) return TitleGpuPlacements<Resource>::matches(d, r);
+        const char* why = nullptr;
+        rt::xg_xs::Texture layout;
+        if (!title_layout(d, layout, why)) return TitleGpuPlacements<Resource>::matches(d, r);
+        if (!title_layout_fits(layout, d, r, why)) return false;
+        const Format res_fmt = vulkan_format(rd.Format, false);
+        const DXGI_FORMAT view_dxgi = srv.Format == DXGI_FORMAT_UNKNOWN ? DXGI_FORMAT(d.format) : srv.Format;
+        if (!res_fmt.typeless && DXGI_FORMAT(d.format) == rd.Format && view_dxgi == rd.Format) return true;
+        if (srv.Format == DXGI_FORMAT_UNKNOWN) return false;
+        const Format view_fmt = vulkan_format(srv.Format, false);
+        if (view_fmt.format == VK_FORMAT_UNDEFINED || view_fmt.typeless || view_fmt.aspects != VK_IMAGE_ASPECT_COLOR_BIT)
+            return false;
+        const bool mutable_image = res_fmt.typeless || r.uint_backed() != VK_FORMAT_UNDEFINED || r.has_view_format_list();
+        if (!mutable_image) return view_fmt.format == r.format() && alpha_unused(srv.Format) == alpha_unused(rd.Format);
+        if (r.has_view_format_list()) {
+            if (!r.allows_view_format(view_fmt.format)) return false;
+            if (alpha_unused(srv.Format) != alpha_unused(rd.Format) && !r.lists_castable_format(srv.Format))
+                return false;
+        } else if (const int bc = bc_typeless_family(rd.Format); bc || bc_typeless_family(srv.Format)) {
+            if (!bc || bc != bc_typeless_family(srv.Format)) return false;
+        } else if (rd.Format == DXGI_FORMAT_R32G32B32_TYPELESS) {
+            if (srv.Format < DXGI_FORMAT_R32G32B32_FLOAT || srv.Format > DXGI_FORMAT_R32G32B32_SINT) return false;
+        } else {
+            const int family = leonida::detail::typeless_view_family(r.format());
+            if (!family || family != leonida::detail::typeless_view_family(view_fmt.format) ||
+                alpha_unused(srv.Format) != alpha_unused(rd.Format))
+                return false;
+        }
+        const VkFormat logical = r.uint_backed() ? r.uint_backed() : r.format();
+        const std::uint32_t code = leonida::gfx10::format_from_vulkan(
+            view_fmt.rgb96 ? rgb96_named_format(view_fmt.format) : view_fmt.format);
+        return code && leonida::gfx10::vulkan_view_format(logical, code, r.has_view_format_list()) == view_fmt.format;
+    }
+
     bool place_title_view(const rt::xg_xs::ResourceDesc& d, const std::array<std::uint32_t, 14>& words,
                           const D3D12_SHADER_RESOURCE_VIEW_DESC& srv, std::uint64_t address,
                           D3D12_CPU_DESCRIPTOR_HANDLE destination) {
@@ -16238,7 +16298,7 @@ private:
                 return write_title_srv(*gpu, srv, destination, d, address);
             }
         }
-        if (t && !t->owned) {  // the title's slot-133 texture
+        if (t && !t->owned && slot133_serves_view(*t, d, srv)) {  // the title's slot-133 texture
             ++title_stats_.of_slot133;
             if (!t->gpu_written && (t->layout_guessed || t->layout_from_xg || !t->layout_known || t->desc != words)) {
                 const char* why = nullptr;
@@ -16265,7 +16325,9 @@ private:
             if (!t->gpu_written && t->layout_known) refresh_title_texture(*t);
             return write(*t);
         }
-        if (t && !title_texture_matches(*t, words, srv)) {
+        if (t && !t->owned) {
+            t = make_title_texture(d, words, srv, address, {});
+        } else if (t && !title_texture_matches(*t, words, srv)) {
             std::vector<DXGI_FORMAT> formats = t->formats;
             const bool same_shape = [&] {
                 auto a = t->desc, b = words;
@@ -16374,6 +16436,7 @@ private:
         }
         ++title_stats_.made;
         TitleTexture* t = entry.get();
+        state_.mapped_title_textures.erase(address);
         state_.index_texture(*entry);
         state_.title_textures[address] = std::move(entry);
         if (title_fill_async() && !t->memory.pending()) queue_title_fill(address);
