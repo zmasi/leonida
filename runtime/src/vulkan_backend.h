@@ -1743,7 +1743,7 @@ public:
             ++host_texture_stats_.waits;
             // A device wait is a queue operation: it passes the compile gate, so it never waits in the driver behind a
             // long pipeline create (the starved wait that loses the device after 10 s).
-            const SubmitMutex::SubmitTurn turn(submit_mutex_);
+            const SubmitMutex::SubmitTurn turn(submit_mutex_, false);
             const auto result = wait_submitted_locked(kTitleWriteWaitNs, "vkWaitSemaphores (title texture upload)");
             // Not done in time: VK_NOT_READY, so the caller takes its staged path (ordered on the queue) or tries
             // again later, and the skip is not counted as a failed fill.
@@ -1765,7 +1765,7 @@ public:
         LayoutPieces pieces;
         if (!tracker_.pieces(id, range, pieces) || pieces.empty()) return VK_ERROR_UNKNOWN;
         if (image_work_pending_) {
-            const SubmitMutex::SubmitTurn turn(submit_mutex_);  // a queue operation: the compile gate (as above)
+            const SubmitMutex::SubmitTurn turn(submit_mutex_, false);  // a queue operation: the compile gate (as above)
             const auto r = wait_submitted_locked(kTitleWriteWaitNs, "vkWaitSemaphores (title staging)");
             if (r != VK_SUCCESS) return r;
             image_work_pending_ = false;
@@ -2120,7 +2120,7 @@ public:
     }
 
     void mark_device_lost(const char* where = "a Vulkan call returned VK_ERROR_DEVICE_LOST") noexcept {
-        set_device_lost(device_lost_, where);
+        if (set_device_lost(device_lost_, where)) submit_mutex_.report_creates_on_loss();  // which creates were in it
         run_device_lost_hook();  // LEONIDA_AFTERMATH: the GPU crash dump is written before waiters wake
         if (fence_dispatcher_) {
             try {
@@ -2355,10 +2355,11 @@ private:
                 if (gate.submits != gate_logged.submits || gate.creates != gate_logged.creates) {
                     gate_logged = gate;
                     std::fprintf(stderr, "[rt] compile-gate: t=%.0f s: %llu submissions waited for pipeline creates "
-                                         "(%lld ms in all, longest %lld ms); %llu creates waited behind a submission "
-                                         "(%lld ms in all, longest %lld ms)\n",
+                                         "(%lld ms in all, longest %lld ms, %llu went ahead at the limit); %llu creates "
+                                         "waited behind a submission (%lld ms in all, longest %lld ms)\n",
                                  double(diagnostic_ms()) / 1000.0, static_cast<unsigned long long>(gate.submits),
                                  static_cast<long long>(gate.submit_ms), static_cast<long long>(gate.submit_max_ms),
+                                 static_cast<unsigned long long>(gate.ahead),
                                  static_cast<unsigned long long>(gate.creates), static_cast<long long>(gate.create_ms),
                                  static_cast<long long>(gate.create_max_ms));
                 }
@@ -2663,7 +2664,7 @@ public:
         context_.holds().pump_ready();  // presents queued behind what was just dropped can run
         if (queue_) {
             std::lock_guard lock(context_.submit_mutex());
-            const SubmitMutex::SubmitTurn turn(context_.submit_mutex());  // a queue operation: the compile gate
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             for (; open_labels_; --open_labels_) context_.labels_.queue_end(queue_);
             const VkResult idle_result = context_.observe_result(vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle");
             if (idle_result == VK_SUCCESS) {
@@ -2953,7 +2954,7 @@ public:
     bool idle() {
         flush_async();
         std::lock_guard lock(context_.submit_mutex());
-        const SubmitMutex::SubmitTurn turn(context_.submit_mutex());  // a queue operation: the compile gate
+        const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
         return context_.observe_result(context_.vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle") == VK_SUCCESS;
     }
 

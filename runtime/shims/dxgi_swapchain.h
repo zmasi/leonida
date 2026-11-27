@@ -220,7 +220,7 @@ public:
         pi.pSwapchains = &swapchain_;
         pi.pImageIndices = &image_index;
         std::lock_guard lock(submit_mutex_);
-        const SubmitMutex::SubmitTurn turn(submit_mutex_);  // a queue operation: the compile gate
+        const SubmitMutex::SubmitTurn turn(submit_mutex_, false);  // a queue operation: the compile gate
         const VkResult r = observe(fn_.queue_present(queue_, &pi), "vkQueuePresentKHR (DXGI)");
         return r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
     }

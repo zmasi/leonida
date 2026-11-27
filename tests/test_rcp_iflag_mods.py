@@ -67,8 +67,9 @@ class RcpIflagModsTest(unittest.TestCase):
             return m.group(1)
 
         if scale_bits is not None:
-            const = match_result(rf"OpConstant %uint {scale_bits}")
-            scale = match_result(rf"OpBitcast %float {const}")
+            # The omod factor is a float constant with those bits (Gen.fconst), not a bitcast of the uint constant.
+            scale = f"%fc{scale_bits:x}"
+            self.assertRegex(spv, rf"(?m)^ *{scale} = OpConstant %float \S+$")
             value = match_result(rf"OpFMul %float {value} {scale}")
         else:
             self.assertNotRegex(spv, r"\bOpFMul %float\b")

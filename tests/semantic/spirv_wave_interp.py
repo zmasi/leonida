@@ -309,9 +309,22 @@ class _Module:
 
 
 def _float_literal_bits(text):
+    """The bits of an OpConstant %float literal: a decimal, or the SPIRV-Tools hex-float spelling (an infinity or a NaN
+    with its payload at exponent +128) that tools/rdna2spirv.py's float_literal writes."""
+    import re
     import struct
     try:
-        return struct.unpack("<I", struct.pack("<f", float(text)))[0]
+        m = re.fullmatch(r"([+-]?)0[xX]([0-9a-fA-F]*)\.?([0-9a-fA-F]*)[pP]([+-]?\d+)", text)
+        if m is None:
+            return struct.unpack("<I", struct.pack("<f", float(text)))[0]
+        sign, ipart, fpart, exp = m.groups()
+        sig = int(ipart + fpart or "0", 16)
+        top = sig.bit_length() - 1
+        if sig and int(exp) - 4 * len(fpart) + top == 128:
+            frac = sig & ((1 << top) - 1)
+            mant = frac << (23 - top) if top <= 23 else frac >> (top - 23)
+            return (0x80000000 if sign == "-" else 0) | 0x7F800000 | mant
+        return struct.unpack("<I", struct.pack("<f", float.fromhex(text)))[0]
     except (OverflowError, ValueError):
         raise UnsupportedConstruct(f"float literal {text!r}") from None
 

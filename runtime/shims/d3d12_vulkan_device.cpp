@@ -11686,7 +11686,8 @@ ComputeBuild build_compute_pipeline(DeviceState& device, const leonida::ShaderEn
         // gate: from the journal a build takes milliseconds and the warm-up worker makes them back to back, and
         // three warm boots lost the device in a vkQueueSubmit (no GPU fault, no TDR) while only the create was
         // gated. No file I/O in here.
-        const DriverTurn turn(submits, trigger, "vkCreateComputePipelines", true, entry->name.c_str());
+        const DriverTurn turn(submits, trigger, "vkCreateComputePipelines", true, entry->name.c_str(),
+                              leonida::SubmitMutex::CreateKind::compute, bytes);
         {
             const leonida::aftermath::ShaderName named(entry->name);
             if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return out;
@@ -13647,11 +13648,26 @@ private:
         const leonida::dev_status::Build dev_build(r.mesh ? "mesh pipeline" : "graphics pipeline");
         const leonida::pipeline_profile::DriverCall profile(r.mesh ? "ms" : "vs", lazy_ ? "lazy" : "eager",
                                                          program, fragment, unbound);
-        const auto result = device_.create_pipeline(flags, [&](VkPipelineCache with, VkPipelineCreateFlags f) {
-            info.flags = f;
-            pipeline = VK_NULL_HANDLE;
-            return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, with, 1, &info, nullptr, &pipeline);
-        });
+        // Through the compile gate as a graphics create (a mesh pipeline is one): on NVIDIA 621.40 a vkQueueSubmit
+        // sat in the driver for as long as a mesh create was in it (54 s) and lost the device. Not with the classic
+        // gate (the default), which keeps graphics creates out of it as before.
+        const char* gate_name = nullptr;
+        for (const auto& source : sources_)
+            if (source.entry && source.slot == 0) gate_name = source.entry->name.c_str();
+        VkResult result = VK_ERROR_UNKNOWN;
+        {
+            std::optional<DriverTurn> turn;
+            if (leonida::SubmitMutex::compile_gate_graphics())
+                turn.emplace(device_.context->submit_mutex(), trigger,
+                             r.mesh ? "vkCreateGraphicsPipelines (mesh)" : "vkCreateGraphicsPipelines", true, gate_name,
+                             leonida::SubmitMutex::CreateKind::graphics, bytes);
+            result = device_.create_pipeline(flags, [&](VkPipelineCache with, VkPipelineCreateFlags f) {
+                info.flags = f;
+                pipeline = VK_NULL_HANDLE;
+                return device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, with, 1, &info, nullptr,
+                                                                     &pipeline);
+            });
+        }
         if (status) *status = result;
         profile.finish(int(result));
         trace.end(trigger, profile_shaders_.c_str(), unbound, bytes, result);
@@ -15790,7 +15806,7 @@ public:
                 // after it, so the generations flush() retires are free at once.
                 {
                     std::lock_guard submit(context.submit_mutex());
-                    const leonida::SubmitMutex::SubmitTurn turn(context.submit_mutex());  // the compile gate
+                    const leonida::SubmitMutex::SubmitTurn turn(context.submit_mutex(), false);  // the compile gate
                     context.observe_result(context.vk.vkDeviceWaitIdle(state_.info.device), "vkDeviceWaitIdle");
                 }
                 state_.bindless_idle_waits.fetch_add(1, std::memory_order_relaxed);
@@ -16109,7 +16125,7 @@ public:
         if (state_.context) {
             {
                 std::lock_guard lock(state_.context->submit_mutex());
-                const leonida::SubmitMutex::SubmitTurn turn(state_.context->submit_mutex());  // the compile gate
+                const leonida::SubmitMutex::SubmitTurn turn(state_.context->submit_mutex(), false);  // the compile gate
                 state_.context->observe_result(state_.context->vk.vkDeviceWaitIdle(state_.info.device),
                                               "vkDeviceWaitIdle");
             }
