@@ -18015,14 +18015,16 @@ public:
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED: kind = leonida::IndirectKind::draw_indexed; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH: kind = leonida::IndirectKind::dispatch; break;
         case D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH:
-            // As DispatchMesh: only a device with mesh shaders (MeshShaderTier 1) takes it.
-            if (!state_.info.mesh_shader) return E_NOTIMPL;
+            // A terminal-only signature is a typed descriptor, not a mesh PSO or a dispatch.
+            // No state template or mesh capability is required merely to own that description.
+            if (!state_.info.mesh_shader && (desc->NumArgumentDescs != 1 || root_signature)) return E_NOTIMPL;
             kind = leonida::IndirectKind::dispatch_mesh;
             break;
         default: return E_NOTIMPL;
         }
         return create_command_signature(kind, desc->ByteStride, static_cast<UINT>(size), riid, out, identity(),
-                                        {desc->pArgumentDescs, desc->NumArgumentDescs - 1});
+                                        {desc->pArgumentDescs, desc->NumArgumentDescs - 1},
+                                        kind != leonida::IndirectKind::dispatch_mesh || state_.info.mesh_shader);
     }
 
     void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(
