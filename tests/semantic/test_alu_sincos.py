@@ -724,18 +724,19 @@ class SinCosSpecialFloatBoundariesAndNegativeControlsTests(unittest.TestCase):
         self.assertNotEqual(sabotaged_cos_out, expected_cos)
 
     def test_negative_control_turn_scaling_sabotage(self):
-        # Sabotaging the 2*pi scaling factor (1086918619 -> 1.0 = 1065353216) fails the check
+        # Sabotaging the 2*pi scaling factor (the float constant 0x40c90fdb -> 1.0) fails the check
         spv = translate_ps([
             f"v_mov_b32 v1, {H_QUARTER:#x}",
             "v_sin_f16 v0, v1",
             "exp mrt0 v0, v0, v0, v0 done vm",
             "s_endpgm",
         ])
-        self.assertIn("1086918619", spv)
+        two_pi = "%fc40c90fdb = OpConstant %float 6.2831854820251465"
+        self.assertIn(two_pi, spv)
         expected = H_ONE
         self.assertEqual(si.run_fragment(spv)["%out_mrt0"][0] & 0xFFFF, expected)
 
-        sabotaged = spv.replace("1086918619", "1065353216")
+        sabotaged = spv.replace(two_pi, "%fc40c90fdb = OpConstant %float 1.0")
         sabotaged_out = si.run_fragment(sabotaged)["%out_mrt0"][0] & 0xFFFF
         self.assertNotEqual(sabotaged_out, expected)
 

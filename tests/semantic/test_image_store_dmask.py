@@ -194,6 +194,7 @@ def texels(line: str) -> dict[str, list[int | None]]:
     dim = next(m for m in ins["mods"] if m.startswith("dim:"))
     g.image_store(ins["args"], ins["mods"], dim)
     consts = {name: value for value, name in g.consts.items()}
+    consts.update(g.fconst_of)          # the float constants (a uint constant's tof is one), by their bits
     src: dict[str, tuple[str, int]] = {}
     out: dict[str, list[int | None]] = {}
     for line_ in g.body:

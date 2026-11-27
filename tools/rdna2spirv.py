@@ -18,6 +18,7 @@ Prints coverage and validation results.
 import argparse
 import bisect
 import hashlib
+import math
 import os
 import re
 import struct
@@ -433,6 +434,9 @@ class Gen:
         self._active_ssa = None
         self.body = []
         self.consts = {}
+        self.fconsts = {0: "%f0", 0x3F800000: "%f1"}   # fconst: f32 bits -> its OpConstant %float (these two
+                                                       # are declared with the types)
+        self.fconst_of = {v: k for k, v in self.fconsts.items()}     # and back: the id -> its bits
         # tof/tou results -> the id they were bitcast from. A bitcast of a bitcast gives the original id back: wherever
         # the key is valid its source is too (the key's own definition uses it), so no dominance is lost.
         self.bitcast_from = {}
@@ -1822,6 +1826,14 @@ class Gen:
         so u must be a %uint and tou's argument a %float; an %int's bits go through int_bits."""
         if u in self.bitcast_from:
             return self.bitcast_from[u]
+        if u.startswith("%c"):
+            # A uint constant's bits are the float constant with them (fconst_bits), not a bitcast at every use.
+            try:
+                v = int(u[2:], 16)
+            except ValueError:
+                v = None
+            if v is not None and self.consts.get(v) == u:
+                return self.fconst_bits(v)
         f = self.tmp()
         self.emit(f"{f} = OpBitcast %float {u}")
         self.bitcast_from[f] = u
@@ -1830,6 +1842,9 @@ class Gen:
     def tou(self, f):
         if f in self.bitcast_from:
             return self.bitcast_from[f]
+        if f in self.fconst_of:
+            # A float constant's bits are the uint constant with them, as when fconst returned tof's bitcast of it.
+            return self.cu(self.fconst_of[f])
         u = self.tmp()
         self.emit(f"{u} = OpBitcast %uint {f}")
         self.bitcast_from[u] = f
@@ -3577,8 +3592,9 @@ class Gen:
                                  "%fmt_norm_entry = OpLabel"] + lines + [f"OpReturnValue {res}", "OpFunctionEnd"])
         return self.fmt_norm_fn
 
-    def fmt_dec_component(self, k, params):
-        """The value of output component k of an element of the run-time FORMAT, branch-free (SHADER-849).
+    def fmt_dec_component(self, params):
+        """The value of output component k (the uint params[2], 0..3) of an element of the run-time FORMAT, branch-free
+        (SHADER-849).
 
         The format's kind, channel count and channel widths come from one table word; the conversion the kind names
         is chosen with selects, so the decode has no branch and the module carries one copy of it, not one per
@@ -3605,39 +3621,45 @@ class Gen:
             self.emit(f"{w} = OpBitwiseAnd %uint {raw} {self.cu(63)}")
             widths.append(w)
         # The channel of the format that output component k takes: component c = c mod n.
-        # Its width and its bit offset (the sum of the widths before it).
-        if k == 0:
-            wid, off = widths[0], self.cu(0)
-        else:
-            offsets = [self.cu(0)]
-            for i in range(1, 4):
-                o = self.tmp()
-                self.emit(f"{o} = OpIAdd %uint {offsets[-1]} {widths[i - 1]}")
-                offsets.append(o)
-            if k == 1:
-                one, wid, off = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{one} = OpIEqual %bool {ncomp} {self.cu(1)}")
-                self.emit(f"{wid} = OpSelect %uint {one} {widths[0]} {widths[1]}")
-                self.emit(f"{off} = OpSelect %uint {one} {offsets[0]} {offsets[1]}")
-            elif k == 2:
-                two, wid, off = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{two} = OpULessThanEqual %bool {ncomp} {self.cu(2)}")
-                self.emit(f"{wid} = OpSelect %uint {two} {widths[0]} {widths[2]}")
-                self.emit(f"{off} = OpSelect %uint {two} {offsets[0]} {offsets[2]}")
-            else:
-                one, two, three = self.tmp(), self.tmp(), self.tmp()
-                w1, w2, wid, o1, o2, off = (self.tmp() for _ in range(6))
-                self.emit(f"{one} = OpIEqual %bool {ncomp} {self.cu(1)}")
-                self.emit(f"{two} = OpIEqual %bool {ncomp} {self.cu(2)}")
-                self.emit(f"{three} = OpIEqual %bool {ncomp} {self.cu(3)}")
-                # component 3 takes channel 0 of a one- or three-channel format, channel 1 of a two-channel one
-                # and channel 3 of a four-channel one
-                self.emit(f"{w1} = OpSelect %uint {three} {widths[0]} {widths[3]}")
-                self.emit(f"{w2} = OpSelect %uint {two} {widths[1]} {w1}")
-                self.emit(f"{wid} = OpSelect %uint {one} {widths[0]} {w2}")
-                self.emit(f"{o1} = OpSelect %uint {three} {offsets[0]} {offsets[3]}")
-                self.emit(f"{o2} = OpSelect %uint {two} {offsets[1]} {o1}")
-                self.emit(f"{off} = OpSelect %uint {one} {offsets[0]} {o2}")
+        # Its width and its bit offset (the sum of the widths before it), for each k; k is the run-time
+        # parameter params[2], so the selects below pick among the four candidates.
+        offsets = [self.cu(0)]
+        for i in range(1, 4):
+            o = self.tmp()
+            self.emit(f"{o} = OpIAdd %uint {offsets[-1]} {widths[i - 1]}")
+            offsets.append(o)
+        cands = [(widths[0], offsets[0])]
+        one, wid, off = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{one} = OpIEqual %bool {ncomp} {self.cu(1)}")
+        self.emit(f"{wid} = OpSelect %uint {one} {widths[0]} {widths[1]}")
+        self.emit(f"{off} = OpSelect %uint {one} {offsets[0]} {offsets[1]}")
+        cands.append((wid, off))
+        two, wid, off = self.tmp(), self.tmp(), self.tmp()
+        self.emit(f"{two} = OpULessThanEqual %bool {ncomp} {self.cu(2)}")
+        self.emit(f"{wid} = OpSelect %uint {two} {widths[0]} {widths[2]}")
+        self.emit(f"{off} = OpSelect %uint {two} {offsets[0]} {offsets[2]}")
+        cands.append((wid, off))
+        two_eq, three = self.tmp(), self.tmp()
+        w1, w2, wid, o1, o2, off = (self.tmp() for _ in range(6))
+        self.emit(f"{two_eq} = OpIEqual %bool {ncomp} {self.cu(2)}")
+        self.emit(f"{three} = OpIEqual %bool {ncomp} {self.cu(3)}")
+        # component 3 takes channel 0 of a one- or three-channel format, channel 1 of a two-channel one
+        # and channel 3 of a four-channel one
+        self.emit(f"{w1} = OpSelect %uint {three} {widths[0]} {widths[3]}")
+        self.emit(f"{w2} = OpSelect %uint {two_eq} {widths[1]} {w1}")
+        self.emit(f"{wid} = OpSelect %uint {one} {widths[0]} {w2}")
+        self.emit(f"{o1} = OpSelect %uint {three} {offsets[0]} {offsets[3]}")
+        self.emit(f"{o2} = OpSelect %uint {two_eq} {offsets[1]} {o1}")
+        self.emit(f"{off} = OpSelect %uint {one} {offsets[0]} {o2}")
+        cands.append((wid, off))
+        # k picks its candidate; a k above 3 takes component 0's (the caller discards that result).
+        wid, off = cands[0]
+        for i in (1, 2, 3):
+            eq, ws, os_ = self.tmp(), self.tmp(), self.tmp()
+            self.emit(f"{eq} = OpIEqual %bool {params[2]} {self.cu(i)}")
+            self.emit(f"{ws} = OpSelect %uint {eq} {cands[i][0]} {wid}")
+            self.emit(f"{os_} = OpSelect %uint {eq} {cands[i][1]} {off}")
+            wid, off = ws, os_
         # A code outside FORMATS has no channel: keep the width at 1, so the shifts below stay defined.
         is0, wid2 = self.tmp(), self.tmp()
         self.emit(f"{is0} = OpIEqual %bool {wid} {self.cu(0)}")
@@ -3713,7 +3735,7 @@ class Gen:
         return res
 
     def fmt_dec_functions(self):
-        """The shared per-component decode functions (SHADER-849), one per output component."""
+        """The shared decode function %fmt_dec(fmt, words, k) (SHADER-849): output component k of the element."""
         if self.fmt_fn is None:
             self.uses_fmt_tables = True
             # The tables are constants: register them here, while the constant section can still take them.
@@ -3722,34 +3744,35 @@ class Gen:
             for v in Gen.fmt_norm_reps():
                 self.cl(v)
             fns = list(self.fmt_norm_function())
-            for k in range(4):
-                saved, self.body = self.body, []
-                params = [f"%fd{k}_fmt", f"%fd{k}_words"]
-                res = self.fmt_dec_component(k, params)
-                lines, self.body = self.body, saved
-                fns += ([f"%fmt_dec_c{k} = OpFunction %uint None %fn_fmt_dec"] +
-                        [f"{params[0]} = OpFunctionParameter %uint", f"{params[1]} = OpFunctionParameter %v4uint_fmt"] +
-                        [f"%fmt_dec_c{k}_entry = OpLabel"] + lines + [f"OpReturnValue {res}", "OpFunctionEnd"])
+            saved, self.body = self.body, []
+            params = ["%fd_fmt", "%fd_words", "%fd_k"]
+            res = self.fmt_dec_component(params)
+            lines, self.body = self.body, saved
+            fns += (["%fmt_dec = OpFunction %uint None %fn_fmt_dec", f"{params[0]} = OpFunctionParameter %uint",
+                     f"{params[1]} = OpFunctionParameter %v4uint_fmt", f"{params[2]} = OpFunctionParameter %uint",
+                     "%fmt_dec_entry = OpLabel"] + lines + [f"OpReturnValue {res}", "OpFunctionEnd"])
             self.fmt_fn = fns
         return self.fmt_fn
 
-    def format_decode_call(self, fmt, words):
-        """4 uint ids: the element decoded per the run-time FORMAT, through the shared per-component functions.
-
-        One function per output component (SHADER-849): the run-time format picks the conversion with selects, so the
-        decode has no branch and the module carries one copy of it, not one copy per format. Before, the shared
-        function held every format's decode and a binary search over the codes: 3,498 instructions and 306 branches
-        in a module, 250 KB for a shader with one dynamic-format load."""
+    def format_decode_words(self, words):
+        """The element's four dwords as the one v4uint the shared decode function takes."""
         self.fmt_dec_functions()
-        # The four dwords of the element, as one v4uint: the decode functions take them as a vector.
         wvec = self.tmp()
         self.emit(f"{wvec} = OpCompositeConstruct %v4uint_fmt " + " ".join(words[:4]))
-        comps = []
-        for k in range(4):
-            r = self.tmp()
-            self.emit(f"{r} = OpFunctionCall %uint %fmt_dec_c{k} {fmt} {wvec}")
-            comps.append(r)
-        return comps
+        return wvec
+
+    def format_decode_call(self, fmt, wvec, k):
+        """A uint id: component k (a uint id, 0..3) of the element decoded per the run-time FORMAT.
+
+        One shared function per module (SHADER-849): the run-time format picks the conversion with selects, so the
+        decode has no branch and the module carries one copy of it, not one copy per format. Before, the shared
+        function held every format's decode and a binary search over the codes: 3,498 instructions and 306 branches
+        in a module, 250 KB for a shader with one dynamic-format load. The component is a parameter, so a load
+        decodes only the components its DST_SEL fields pick for the registers it writes: buffer_load_format_x
+        makes one call, not four (one function per component, all four called at every load, until 2026-11-27)."""
+        r = self.tmp()
+        self.emit(f"{r} = OpFunctionCall %uint %fmt_dec {fmt} {wvec} {k}")
+        return r
 
     def fmt_size_of(self, fmt):
         """Byte size of the 7-bit buffer FORMAT code `fmt` (a uint id), 0 for a code FORMATS does not decode: one load
@@ -3879,7 +3902,8 @@ class Gen:
             widths = self.FORMATS[fixed_fmt][2]
             d3 = self.cu(sum((4 + c) << (3 * c) for c in range(len(widths))))
         else:
-            comps = self.format_decode_call(fmt, words)
+            # Decoded per register below: only the components the written registers' DST_SEL fields pick.
+            comps, wvec = None, self.format_decode_words(words)
         # DST_SEL swizzle: 0 -> 0, 1 -> 1.0 (float/norm/scaled) or integer 1 (UINT/SINT, INVALID or reserved;
         # SHADER-86, SHADER-429), 4..7 -> X..W. On an out-of-bounds MUBUF load `words` are 0 so `comps` decode to 0,
         # while DST_SEL=1 still produces 1.0f / 1 (MTBUF overrides `d3` above with 4..7 / 0, so OOB and INVALID stay 0).
@@ -3907,7 +3931,7 @@ class Gen:
         self.emit(f"{dst1} = OpSelect %uint {is_int_fmt} {self.cu(1)} {self.cu(0x3F800000)}")
         # In-bounds gate applies to components read from buffer memory, leaving DST_SEL=1 intact (SHADER-429).
         bounded_comps = []
-        for comp in comps:
+        for comp in comps or ():
             cb = self.tmp()
             self.emit(f"{cb} = OpSelect %uint {in_b} {comp} {self.cu(0)}")
             bounded_comps.append(cb)
@@ -3915,12 +3939,27 @@ class Gen:
         for c in range(ncomp):
             sel = self.tmp()
             self.emit(f"{sel} = OpBitFieldUExtract %uint {d3} {self.cu(3 * c)} {self.cu(3)}")
-            r = self.cu(0)
-            for code_v, src in ((1, dst1), (4, bounded_comps[0]), (5, bounded_comps[1]), (6, bounded_comps[2]), (7, bounded_comps[3])):
-                e, s = self.tmp(), self.tmp()
-                self.emit(f"{e} = OpIEqual %bool {sel} {self.cu(code_v)}")
-                self.emit(f"{s} = OpSelect %uint {e} {src} {r}")
-                r = s
+            if comps is None:
+                # Run-time format: DST_SEL 4..7 decodes component sel - 4 (one call), 1 is dst1, the rest 0. The
+                # same value as selecting among the four decoded components: a sel below 4 wraps k past 3, and the
+                # decode of such a k is discarded.
+                k = self.tmp()
+                self.emit(f"{k} = OpISub %uint {sel} {self.cu(4)}")
+                dec = self.format_decode_call(fmt, wvec, k)
+                cb, e1, s1, picked, r = (self.tmp() for _ in range(5))
+                self.emit(f"{cb} = OpSelect %uint {in_b} {dec} {self.cu(0)}")
+                self.emit(f"{e1} = OpIEqual %bool {sel} {self.cu(1)}")
+                self.emit(f"{s1} = OpSelect %uint {e1} {dst1} {self.cu(0)}")
+                self.emit(f"{picked} = OpULessThan %bool {k} {self.cu(4)}")
+                self.emit(f"{r} = OpSelect %uint {picked} {cb} {s1}")
+            else:
+                r = self.cu(0)
+                for code_v, src in ((1, dst1), (4, bounded_comps[0]), (5, bounded_comps[1]), (6, bounded_comps[2]),
+                                    (7, bounded_comps[3])):
+                    e, s = self.tmp(), self.tmp()
+                    self.emit(f"{e} = OpIEqual %bool {sel} {self.cu(code_v)}")
+                    self.emit(f"{s} = OpSelect %uint {e} {src} {r}")
+                    r = s
             if d16:
                 outs.append(r)
             else:
@@ -7231,8 +7270,19 @@ class Gen:
         return out
 
     def fconst(self, x):
-        bits = struct.unpack("<I", struct.pack("<f", x))[0]
-        return self.tof(self.cu(bits))
+        """The %float constant x rounded to f32: one OpConstant %float per value (Gen.fconsts), not an OpBitcast of the
+        uint constant at every use (4.3% of the instructions of a large RaytracingResolve module; tof of a uint
+        constant, a float literal operand for one, takes the same constant). The literal is written so spirv-as and
+        tools/spirv_asm.py give back the same 32 bits (float_literal)."""
+        return self.fconst_bits(struct.unpack("<I", struct.pack("<f", x))[0])
+
+    def fconst_bits(self, bits):
+        """The OpConstant %float with the 32 bits `bits` (fconst, and tof of a uint constant)."""
+        if bits not in self.fconsts:
+            name = f"%fc{bits:x}"
+            self.fconsts[bits] = name
+            self.fconst_of[name] = bits
+        return self.fconsts[bits]
 
     def dconst(self, x):
         """A %double value (needs uses_f64): the two words of x, bitcast."""
@@ -15976,6 +16026,30 @@ def dedupe_types(text):
     return pattern.sub(lambda m: alias[m.group(0)], "\n".join(out))
 
 
+def ms_prim_indices(c):
+    """The mesh epilogue's primitive: from %mpr (the `exp prim` word) and %msv (the vertex count), %mnb = bit 31
+    (null primitive) as 0/1, %mnull as a bool and %mi0..%mi2 the three indices. The 9-bit fields leave out the edge
+    flags. GFX10 epilogues mark a primitive null when a field is at or past the vertex count and keep the field, but
+    Vulkan leaves such an index undefined even on a culled primitive (VK_EXT_mesh_shader), so a null primitive's
+    indices are 0 and the others are clamped to the vertex count - 1, as Mesa 22.3 clamps them (ac_nir_lower_ngg.c
+    line 4112). A primitive is written only when %msv > 0 (the primitive count is 0 otherwise)."""
+    L = [f"%mnb = OpShiftRightLogical %uint %mpr {c(31)}", f"%mnull = OpINotEqual %bool %mnb {c(0)}",
+         f"%mvl = OpISub %uint %msv {c(1)}"]
+    for k in range(3):
+        src = f"%mfr{k}" if k else "%mpr"
+        if k:
+            L.append(f"%mfr{k} = OpShiftRightLogical %uint %mpr {c(10 * k)}")
+        L += [f"%mfi{k} = OpBitwiseAnd %uint {src} {c(0x1FF)}", f"%mci{k} = OpExtInst %uint %glsl UMin %mfi{k} %mvl",
+              f"%mi{k} = OpSelect %uint %mnull {c(0)} %mci{k}"]
+    return L
+
+
+def ms_prim_count(c, maxp):
+    """%msp from the allocation's primitive count %msp0: clamped to PSV0's maximum, and 0 without a vertex."""
+    return [f"%mspc = OpExtInst %uint %glsl UMin %msp0 {c(maxp)}", f"%mvz = OpIEqual %bool %msv {c(0)}",
+            f"%msp = OpSelect %uint %mvz {c(0)} %mspc"]
+
+
 def mesh_compute_epilogue(gen):
     """--mesh-compute: the mesh epilogue as buffer stores. Same barrier and counts as the mesh path; then lane 0
     writes the header, lane i < vertex count its vertex and lane i < primitive count its primitive, at the offsets
@@ -15986,7 +16060,7 @@ def mesh_compute_epilogue(gen):
          f"%msv0 = OpBitwiseAnd %uint %msc {c(0xFFF)}", f"%msp1 = OpShiftRightLogical %uint %msc {c(12)}",
          f"%msp0 = OpBitwiseAnd %uint %msp1 {c(0xFFF)}",
          f"%msv = OpExtInst %uint %glsl UMin %msv0 {c(gen.ms['maxv'])}",
-         f"%msp = OpExtInst %uint %glsl UMin %msp0 {c(gen.ms['maxp'])}",
+         *ms_prim_count(c, gen.ms['maxp']),
          "%mli = OpLoad %uint %local_index",
          # Slot base = output address (push-constant dwords 36..37, or --pc-tail-ubo dwords 4..5) + linear
          # workgroup index * slot bytes.
@@ -16062,20 +16136,26 @@ def mesh_compute_epilogue(gen):
             vals.append(f"%mq{loc}_{i}")
         store_floats(at("%mvb", off), vals)
     L += ["OpBranch %msc_vend", "%msc_vend = OpLabel"]
-    # Primitive mli: three 9-bit indices and the null-primitive bit (bit 31), as in the mesh path.
+    # Primitive mli: three indices and the null-primitive bit (bit 31), as in the mesh path.
     L += ["%mhp = OpLoad %bool %ms_has_prim", "%mpi = OpULessThan %bool %mli %msp",
           "%mwp = OpLogicalAnd %bool %mhp %mpi",
           "OpSelectionMerge %msc_pend None", "OpBranchConditional %mwp %msc_pdo %msc_pend", "%msc_pdo = OpLabel",
           f"%mps = OpIMul %uint %mli {c(16)}", f"%mpb = OpIAdd %uint %mps {c(lay['primitives'])}",
-          "%mpr = OpLoad %uint %ms_prim",
-          f"%mi0 = OpBitwiseAnd %uint %mpr {c(0x1FF)}",
-          f"%mr1 = OpShiftRightLogical %uint %mpr {c(10)}", f"%mi1 = OpBitwiseAnd %uint %mr1 {c(0x1FF)}",
-          f"%mr2 = OpShiftRightLogical %uint %mpr {c(20)}", f"%mi2 = OpBitwiseAnd %uint %mr2 {c(0x1FF)}",
-          f"%mnb = OpShiftRightLogical %uint %mpr {c(31)}"]
+          "%mpr = OpLoad %uint %ms_prim", *ms_prim_indices(c)]
     for i, w in enumerate(("%mi0", "%mi1", "%mi2", "%mnb")):
         store(at("%mpb", 4 * i), w)
     L += ["OpBranch %msc_pend", "%msc_pend = OpLabel"]
     return "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L)
+
+
+def float_literal(bits):
+    """The OpConstant %float literal of the f32 `bits` that spirv-as and tools/spirv_asm.py read back as exactly those
+    bits: the shortest decimal of a finite value (it is the f32's own value, so the round to f32 is exact; -0.0 and
+    the denormals too), the SPIRV-Tools hex-float spelling of an infinity or a NaN, its payload as stored."""
+    f = struct.unpack("<f", struct.pack("<I", bits))[0]
+    if math.isfinite(f):
+        return repr(f)
+    return f"{'-' if bits >> 31 else ''}0x1.{(bits & 0x7FFFFF) << 1:06x}p+128"
 
 
 def insert_late_constants(gen, out, written):
@@ -16084,11 +16164,14 @@ def insert_late_constants(gen, out, written):
     them. Without this a constant nothing else had used (fmt_size_arr's length 128 in a shader with only a d16 typed
     store) was an id with no definition, and the module failed spirv-val."""
     late = sorted(v for v in gen.consts if v not in written)
-    if not late:
+    # fconst's floats asked for after assemble wrote them, after the uint constants (the %float type comes first).
+    late_f = sorted(v for v in gen.fconsts if v not in gen.fconsts_written and v not in (0, 0x3F800000))
+    if not late and not late_f:
         return
     last = max(written)
     at = out.index(f"{written[last]} = OpConstant %uint {last}") + 1
-    out[at:at] = [f"{gen.consts[v]} = OpConstant %uint {v}" for v in late]
+    out[at:at] = ([f"{gen.consts[v]} = OpConstant %uint {v}" for v in late] +
+                  [f"{gen.fconsts[v]} = OpConstant %float {float_literal(v)}" for v in late_f])
 
 
 def assemble(gen):
@@ -16471,7 +16554,11 @@ def assemble(gen):
     gen.consts.setdefault(0, "%c0")
     for v, name in sorted(gen.consts.items()):
         types.append(f"{name} = OpConstant %uint {v}")
+    # fconst's floats (%f0 and %f1 are declared with the types above).
+    types += [f"{name} = OpConstant %float {float_literal(v)}" for v, name in sorted(gen.fconsts.items())
+              if v not in (0, 0x3F800000)]
     written = dict(gen.consts)     # what the module defines; insert_late_constants adds what assemble asks for later
+    gen.fconsts_written = set(gen.fconsts)
     if gen.desc_fn:
         # --descriptor-table tagged: the probe also returns the entry's kind word, so the function returns (index,
         # kind) as a uvec2.
@@ -16489,9 +16576,9 @@ def assemble(gen):
     if gen.fmt_fn or gen.fmt_enc_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
     if gen.fmt_fn:
-        # The decode function takes the format code and the element's four dwords as a v4uint: a type of its own
-        # structure, so it never repeats another function type in the module (SPIR-V forbids that).
-        types.append("%fn_fmt_dec = OpTypeFunction %uint %uint %v4uint_fmt")
+        # The decode function takes the format code, the element's four dwords as a v4uint and the component: a type
+        # of its own structure, so it never repeats another function type in the module (SPIR-V forbids that).
+        types.append("%fn_fmt_dec = OpTypeFunction %uint %uint %v4uint_fmt %uint")
         types.append("%fn_fmt_norm = OpTypeFunction %uint %uint %uint")
     if gen.fmt_enc_fn:
         types.append("%fn_fmt_encode = OpTypeFunction %v4uint_fmt " + " ".join(["%uint"] * 29))
@@ -17078,7 +17165,7 @@ def assemble(gen):
              f"%msv0 = OpBitwiseAnd %uint %msc {c(0xFFF)}", f"%msp1 = OpShiftRightLogical %uint %msc {c(12)}",
              f"%msp0 = OpBitwiseAnd %uint %msp1 {c(0xFFF)}",
              f"%msv = OpExtInst %uint %glsl UMin %msv0 {c(gen.ms['maxv'])}",
-             f"%msp = OpExtInst %uint %glsl UMin %msp0 {c(gen.ms['maxp'])}",
+             *ms_prim_count(c, gen.ms['maxp']),
              "OpSetMeshOutputsEXT %msv %msp",
              "%mli = OpLoad %uint %local_index",
              "%mhv = OpLoad %bool %ms_has_vtx", "%mvi = OpULessThan %bool %mli %msv",
@@ -17123,13 +17210,9 @@ def assemble(gen):
               "%mwp = OpLogicalAnd %bool %mhp %mpi",
               "OpSelectionMerge %ms_pend None", "OpBranchConditional %mwp %ms_pdo %ms_pend",
               "%ms_pdo = OpLabel",
-              "%mpr = OpLoad %uint %ms_prim",
-              f"%mi0 = OpBitwiseAnd %uint %mpr {c(0x1FF)}",
-              f"%mr1 = OpShiftRightLogical %uint %mpr {c(10)}", f"%mi1 = OpBitwiseAnd %uint %mr1 {c(0x1FF)}",
-              f"%mr2 = OpShiftRightLogical %uint %mpr {c(20)}", f"%mi2 = OpBitwiseAnd %uint %mr2 {c(0x1FF)}",
+              "%mpr = OpLoad %uint %ms_prim", *ms_prim_indices(c),
               "%mix = OpCompositeConstruct %v3uint %mi0 %mi1 %mi2",
               "%mixp = OpAccessChain %_ptr_Out_v3u_ms %ms_prim_idx %mli", "OpStore %mixp %mix",
-              f"%mnb = OpShiftRightLogical %uint %mpr {c(31)}", "%mnull = OpINotEqual %bool %mnb %c0",
               f"%mcp = OpAccessChain %_ptr_Out_bool_ms %ms_cull %mli {c(0)}",
               # CullPrimitiveEXT gets a constant on each side of a branch, not the computed bool: llvmpipe
               # (Mesa 25.2.8, LLVM 20) aborts compiling a computed per-primitive bool store in the wave64-emulated

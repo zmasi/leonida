@@ -1,6 +1,7 @@
 """Check the SPIR-V data flow for output modifiers on v_cvt_f32_f64."""
 
 import re
+import struct
 import sys
 import tempfile
 import unittest
@@ -42,8 +43,12 @@ class F64ConversionTest(unittest.TestCase):
 
         value = result(r"OpFConvert %float %\w+")
         if scale_bits is not None:
-            constant = result(rf"OpConstant %uint {scale_bits}")
-            scale = result(rf"OpBitcast %float {constant}")
+            # The scale is one OpConstant %float named by its bits (Gen.fconst_bits), not a uint constant bitcast at
+            # the use; its literal must give back exactly the 32 bits of the omod scale.
+            scale = f"%fc{scale_bits:x}"
+            match = re.search(rf"^ *{scale} = OpConstant %float (\S+)$", spv, re.M)
+            self.assertIsNotNone(match, f"Missing SPIR-V instruction: {scale} = OpConstant %float")
+            self.assertEqual(struct.unpack("<I", struct.pack("<f", float(match.group(1))))[0], scale_bits)
             value = result(rf"OpFMul %float {value} {scale}")
         if clamp:
             # DX10_CLAMP: a NaN is replaced by +0 before FClamp (Gen.clamp_mods).

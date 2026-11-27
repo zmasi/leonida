@@ -1,11 +1,12 @@
 """The run-time FORMAT decode of buffer_load_format (Gen.fmt_dec_component) is table-driven and branch-free.
 
-Every code goes through the translator and the mini interpreter, which runs the shared per-component functions, and is
+Every code goes through the translator and the mini interpreter, which runs the shared decode function, and is
 compared with a reference decoded here from the raw bits with exact quotients. A code outside FORMATS gives zeros.
 
 The decode has no branch: the format's kind, channel count and channel widths come from a table, and the kind picks
-the conversion with selects. The module carries one copy of the decode, one function per output component, instead of
-one copy per format: before, the shared function held every format's decode and a binary search over the codes.
+the conversion with selects. The module carries one copy of the decode, one function whose last parameter is the output
+component, instead of one copy per format: before, the shared function held every format's decode and a binary search
+over the codes.
 """
 import struct
 import unittest
@@ -96,29 +97,29 @@ class FormatDecodeTableTests(unittest.TestCase):
 
     def test_the_decode_has_no_branch(self):
         spv = module_of()
-        for k in range(4):
-            body = function_body(spv, f"%fmt_dec_c{k}")
-            self.assertTrue(body, f"the decode of component {k} is missing")
-            for line in body:
-                for op in BRANCHES:
-                    self.assertNotIn(op, line, f"the decode branches: {line}")
+        body = function_body(spv, "%fmt_dec")
+        self.assertTrue(body, "the decode is missing")
+        for line in body:
+            for op in BRANCHES:
+                self.assertNotIn(op, line, f"the decode branches: {line}")
 
-    def test_the_decode_is_shared_per_component(self):
+    def test_the_decode_is_shared(self):
         spv = module_of()
-        for k in range(4):
-            self.assertIn(f"%fmt_dec_c{k} = OpFunction %uint None %fn_fmt_dec", spv)
-            self.assertIn(f"OpFunctionCall %uint %fmt_dec_c{k} ", spv)
-        # The load site calls the four functions; the decode itself is not inlined there.
+        self.assertIn("%fmt_dec = OpFunction %uint None %fn_fmt_dec", spv)
+        self.assertIn("%fn_fmt_dec = OpTypeFunction %uint %uint %v4uint_fmt %uint", spv)
+        self.assertNotIn("%fmt_dec_c", spv)
+        # The xyzw load calls the one function once per register; the decode itself is not inlined there.
         main = function_body(spv, "%main")
-        calls = [ln for ln in main if "OpFunctionCall %uint %fmt_dec_c" in ln]
+        calls = [ln for ln in main if "OpFunctionCall %uint %fmt_dec " in ln]
         self.assertEqual(len(calls), 4)
 
     def test_the_decode_is_small(self):
         spv = module_of()
-        count = sum(len(function_body(spv, f"%fmt_dec_c{k}")) for k in range(4))
+        count = len(function_body(spv, "%fmt_dec"))
         # Before, the shared function held every format's decode and a binary search over the codes: 3,498
-        # instructions and 306 branches in the module of a shader with one dynamic-format load.
-        self.assertLess(count, 900, f"the decode is {count} instructions")
+        # instructions and 306 branches in the module of a shader with one dynamic-format load. One function per
+        # component (565 instructions for the four) became one with the component as a parameter.
+        self.assertLess(count, 250, f"the decode is {count} instructions")
 
 
 if __name__ == "__main__":

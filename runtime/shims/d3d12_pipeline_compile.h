@@ -165,13 +165,15 @@ inline bool compile_worker_trigger(const char* trigger) {
 //     behind it go first, and does so before its vkCreateShaderModule and vkDestroyShaderModule too; a title thread
 //     waits only for the holder, and only before a pipeline create (it may wait out a vkDeviceWaitIdle or a present:
 //     waits of 50 ms or more are logged).
-//   - a pipeline create passes the compile gate (SubmitMutex::CompileTurn) for the length of the call.
+//   - a pipeline create passes the compile gate (SubmitMutex::CompileTurn) for the length of the call, as its kind
+//     (compute, or graphics with mesh): the adaptive gate keeps a verdict per kind.
 //   - the compile worker, which runs below normal priority, runs the call at normal priority, so a preempted worker
 //     does not sit on a driver lock a submit waits for.
 class DriverTurn {
 public:
     DriverTurn(leonida::SubmitMutex& submits, const char* trigger, const char* call, bool pipeline,
-               const char* name = nullptr)
+               const char* name = nullptr,
+               leonida::SubmitMutex::CreateKind kind = leonida::SubmitMutex::CreateKind::compute, std::size_t bytes = 0)
         : worker_(compile_worker_trigger(trigger)) {
         // Normal priority first: a below-normal worker that waits its turn at normal priority cannot keep losing the
         // race to the next submit, and holds the gate (below) only at normal priority.
@@ -187,7 +189,7 @@ public:
             if (waited >= 50) note("waited for the submit lock", trigger, call, name, waited);
         }
         if (pipeline) {
-            gate_.emplace(submits);
+            gate_.emplace(submits, leonida::SubmitMutex::CreateInfo{kind, name, trigger, bytes});
             if (gate_->waited_ms() >= 50) note("waited at the compile gate", trigger, call, name, gate_->waited_ms());
         }
     }

@@ -210,6 +210,26 @@ def bits_f32(b):
     return _F32(b & MASK)
 
 
+_HEX_FLOAT = re.compile(r"([+-]?)0[xX]([0-9a-fA-F]*)\.?([0-9a-fA-F]*)[pP]([+-]?\d+)")
+
+
+def f32_literal(tok):
+    """The value of a 32-bit OpConstant %float literal as spirv-as reads it: a decimal, or a hex-float, where exponent
+    +128 is the SPIRV-Tools spelling of an infinity (0x1p+128) or a NaN with its payload (0x1.8p+128, the quiet NaN),
+    as rdna2spirv.float_literal writes them."""
+    m = _HEX_FLOAT.fullmatch(tok)
+    if m is None:
+        return f32(float(tok))
+    sign, ipart, fpart, exp = m.groups()
+    sig = int(ipart + fpart or "0", 16)
+    top = sig.bit_length() - 1
+    if sig and int(exp) - 4 * len(fpart) + top == 128:
+        frac = sig & ((1 << top) - 1)
+        mant = frac << (23 - top) if top <= 23 else frac >> (top - 23)
+        return bits_f32((0x80000000 if sign == "-" else 0) | 0x7F800000 | mant)
+    return f32(float.fromhex(tok))
+
+
 def half_to_float(h):
     # Bit-level f16 -> f32 (sign, exponent, fraction; every result is exact in binary32). struct's '<e' is not
     # used because its NaN result depends on the Python version: before 3.14 it drops the payload and returns
@@ -624,7 +644,7 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
         elif op == "OpConstant":
             k = types.t[a[0]]
             if k[0] == "float":
-                constants[res] = values[res] = f32(float(a[1])) if k[1] == 32 else float(a[1])
+                constants[res] = values[res] = f32_literal(a[1]) if k[1] == 32 else float(a[1])
             elif k[0] == "int":
                 constants[res] = values[res] = int(a[1]) & ((1 << k[1]) - 1)
                 id_type[res] = a[0]
