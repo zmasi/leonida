@@ -11496,6 +11496,12 @@ private:
     VkResult result_ = VK_SUCCESS;
 };
 
+// Mesh-compute producer builds started by this process (mesh_compute_producer_builds): the lazy-producer proof reads it.
+inline std::atomic<std::uint64_t>& mesh_producer_build_counter() {
+    static std::atomic<std::uint64_t> builds{0};
+    return builds;
+}
+
 // What one compute pipeline build did (build_compute_pipeline).
 struct ComputeBuild {
     VkPipeline pipeline = VK_NULL_HANDLE;  // the caller's from here on
@@ -12923,7 +12929,8 @@ public:
         recipe_.blends = std::move(blends);
         recipe_.blend = blend;
         if (mesh_compute_) {
-            // Producer compute pipeline (eager even for a lazy consumer): same
+            // Producer compute pipeline layout and subgroup decision (the pipeline is built with the PSO when eager,
+            // at the first mesh draw when lazy): same
             // 152-byte push, bindless set 0 when the producer declares bindings,
             // and the actual compute subgroup decision (never a mesh request, and
             // never forced on gfx906 whose required-stage mask is empty).
@@ -12946,20 +12953,21 @@ public:
             if (producer_subgroup.outcome == leonida::SubgroupOutcome::unavailable)
                 report_subgroup_unavailable(*mesh_producer_entry_, producer_subgroup, device_.info.subgroup);
             subgroup_requests_.push_back(producer_subgroup);
-            ComputeBuildOptions producer_options;
-            producer_options.trigger = "mesh-compute-producer";
-            producer_options.cache_key = &cache_key_;
-            producer_options.push_bytes = kMeshComputePushBytes;
-            // The compile helper only finds logical cs/144B; a genuine ms/152B
-            // producer would miss there, so build it here from the sealed bytes.
-            producer_options.use_helper = false;
-            producer_options.validated_words = &mesh_validated_producer_;
-            const ComputeBuild producer_build = build_compute_pipeline(
-                device_, *mesh_producer_entry_, mesh_compute_producer_layout_, producer_subgroup, producer_options);
-            if (!producer_build.pipeline) return E_FAIL;
-            mesh_compute_producer_ = producer_build.pipeline;
+            // LOCAL FIX (lazy mesh producer): creation keeps every validation (sealed pair, feature and limit
+            // refusals, layout and subgroup decision) but compiles no producer for a lazy PSO: the title creates
+            // thousands and draws few, and each producer is real driver work. The first DispatchMesh that will
+            // execute builds it (build_mesh_producer); an eager PSO (LEONIDA_LAZY_PIPELINES=0) builds it here as before.
+            mesh_producer_subgroup_ = producer_subgroup;
             mesh_compute_direct_ = std::make_unique<leonida::MeshComputeDirect>();
-            mesh_compute_direct_->producer = mesh_compute_producer_;
+            if (lazy_) {
+                mesh_compute_direct_->build = [](void* self) {
+                    return static_cast<PipelineState*>(self)->build_mesh_producer();
+                };
+                mesh_compute_direct_->build_context = this;
+            } else {
+                if (!compile_mesh_producer("mesh-compute-producer")) return E_FAIL;
+                mesh_compute_direct_->producer = mesh_compute_producer_;
+            }
             mesh_compute_direct_->producer_layout = mesh_compute_producer_layout_;
             mesh_compute_direct_->producer_set = mesh_compute_producer_set_;
             mesh_compute_direct_->producer_code_base = mesh_compute_producer_code_base_;
@@ -13754,6 +13762,10 @@ public:
     const leonida::MeshComputeDirect* mesh_compute_direct() const {
         return native_owner_ ? native_owner_->mesh_compute_direct() : mesh_compute_direct_.get();
     }
+    bool mesh_producer_built() const {
+        const PipelineState* self = native_owner_ ? native_owner_.get() : this;
+        return self->mesh_compute_producer_ready_.load(std::memory_order_acquire) != VK_NULL_HANDLE;
+    }
     bool mesh_producer_words(std::vector<std::uint32_t>& words, std::string& why) const {
         const PipelineState* self = native_owner_ ? native_owner_.get() : this;
         if (!self->mesh_compute_ || !self->mesh_producer_entry_ || self->mesh_validated_producer_.empty()) {
@@ -13780,6 +13792,54 @@ private:
             return VK_NULL_HANDLE;
         }
         variants_.emplace(unbound, pipeline);
+        return pipeline;
+    }
+
+    // The mesh-compute producer's compute pipeline, from the sealed bytes retained at creation (no source, feature or
+    // layout validation here: create_graphics did it all). Null when the driver build fails. The caller serialises:
+    // create_graphics for an eager PSO, build_mesh_producer for a lazy one.
+    VkPipeline compile_mesh_producer(const char* trigger) {
+        mesh_producer_build_counter().fetch_add(1, std::memory_order_relaxed);
+        ComputeBuildOptions producer_options;
+        producer_options.trigger = trigger;
+        producer_options.cache_key = &cache_key_;
+        producer_options.push_bytes = kMeshComputePushBytes;
+        // The compile helper only finds logical cs/144B; a genuine ms/152B
+        // producer would miss there, so build it here from the sealed bytes.
+        producer_options.use_helper = false;
+        producer_options.validated_words = &mesh_validated_producer_;
+        const ComputeBuild producer_build = build_compute_pipeline(
+            device_, *mesh_producer_entry_, mesh_compute_producer_layout_, mesh_producer_subgroup_, producer_options);
+        if (!producer_build.pipeline) return VK_NULL_HANDLE;
+        mesh_compute_producer_ = producer_build.pipeline;
+        mesh_compute_producer_ready_.store(producer_build.pipeline, std::memory_order_release);
+        return producer_build.pipeline;
+    }
+
+    // The producer of a lazy mesh-compute PSO, compiled once, at the first DispatchMesh that will execute (the replay
+    // layer calls MeshComputeDirect::build). Any thread may call it: one compiles while the others wait for its answer
+    // (a draw cannot proceed without the producer), and a module over the large-module threshold takes its place at the
+    // compile gate first. A failed compile is logged once and not retried; every later draw of the PSO fails the same
+    // way, so the error reaches the caller instead of the draw vanishing.
+    VkPipeline build_mesh_producer() {
+        if (const VkPipeline ready = mesh_compute_producer_ready_.load(std::memory_order_acquire)) return ready;
+        if (mesh_compute_producer_failed_.load(std::memory_order_acquire)) return VK_NULL_HANDLE;
+        const std::size_t bytes = mesh_validated_producer_.size() * sizeof(std::uint32_t);
+        std::unique_lock lock(mesh_producer_mutex_, std::defer_lock);
+        const bool budgeted = big_compute(bytes) && big_compiles() == BigCompiles::budget;
+        const auto place = enter_build(lock, budgeted ? leonida::large_module_estimate(bytes) : 0, Work::demand, [this] {
+            return mesh_compute_producer_ready_.load(std::memory_order_acquire) != VK_NULL_HANDLE ||
+                   mesh_compute_producer_failed_.load(std::memory_order_acquire);
+        });
+        if (const VkPipeline ready = mesh_compute_producer_ready_.load(std::memory_order_acquire)) return ready;
+        if (mesh_compute_producer_failed_.load(std::memory_order_acquire)) return VK_NULL_HANDLE;
+        const VkPipeline pipeline = compile_mesh_producer("mesh-compute-producer-first-use");
+        if (!pipeline) {
+            mesh_compute_producer_failed_.store(true, std::memory_order_release);
+            std::fprintf(stderr,
+                         "[rt] d3d12: mesh-compute producer %s could not be built; its DispatchMesh draws fail\n",
+                         mesh_producer_entry_->name.c_str());
+        }
         return pipeline;
     }
 
@@ -13835,8 +13895,9 @@ private:
     // Mesh-compute direct (emulated mesh): a GLCompute producer plus a Vertex
     // consumer. Logical graphics_.mesh stays true; recipe_.mesh is false (the
     // consumer is a real VS+PS pipeline, no mesh extension). The producer is
-    // built eagerly even for a lazy consumer; the consumer follows the normal
-    // eager/lazy/variant path with the companion VS words.
+    // built with the PSO when eager (LEONIDA_LAZY_PIPELINES=0) and at the first
+    // executing DispatchMesh when lazy (build_mesh_producer); the consumer follows
+    // the normal eager/lazy/variant path with the companion VS words.
     bool mesh_compute_ = false;  // this graphics PSO is emulated mesh-compute
     const leonida::ShaderEntry* mesh_producer_entry_ = nullptr;  // the logical ms entry (owns the layout)
     leonida::ShaderEntry mesh_companion_entry_;  // synthetic VS: halves from the producer, emulated subgroup, no bindings/code
@@ -13848,6 +13909,12 @@ private:
     std::vector<std::uint32_t> mesh_validated_producer_;
     std::vector<std::uint32_t> mesh_validated_companion_;
     VkPipeline mesh_compute_producer_ = VK_NULL_HANDLE;
+    // Lazy: the producer's compute subgroup decision (made at creation), its build lock, the published handle (set once,
+    // after mesh_compute_producer_) and whether its one build failed.
+    leonida::SubgroupRequest mesh_producer_subgroup_{};
+    std::mutex mesh_producer_mutex_;
+    std::atomic<VkPipeline> mesh_compute_producer_ready_{VK_NULL_HANDLE};
+    std::atomic<bool> mesh_compute_producer_failed_{false};
     VkPipelineLayout mesh_compute_producer_layout_ = VK_NULL_HANDLE;
     VkDescriptorSet mesh_compute_producer_set_ = VK_NULL_HANDLE;  // bindless set 0 when the producer declares bindings; not owned
     VkDeviceSize mesh_compute_producer_code_base_ = 0;  // arena offset of the producer FSSM blob, 0 when unused
@@ -21802,6 +21869,15 @@ bool pipeline_mesh_compute_producer_words(ID3D12PipelineState* pso, std::vector<
         return false;
     }
     return p->mesh_producer_words(words, why);
+}
+
+bool pipeline_mesh_compute_producer_built(ID3D12PipelineState* pso) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pso);
+    return p && p->is_mesh_compute() && p->mesh_producer_built();
+}
+
+std::uint64_t mesh_compute_producer_builds() {
+    return mesh_producer_build_counter().load(std::memory_order_relaxed);
 }
 
 long live_pipeline_states() { return live_pipeline_state_count.load(); }

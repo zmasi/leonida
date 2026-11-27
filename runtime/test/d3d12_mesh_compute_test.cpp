@@ -47,6 +47,12 @@
 //     fragmentShaderBarycentric feature is E_NOTIMPL; MS+GS, MS+VS and truncated
 //     streams are E_INVALIDARG. Native MeshEXT stays E_NOTIMPL, over-limit grids
 //     fail at Close, and wrong-kind draws fail at execution.
+//   - Lazy producers: a mesh-compute PSO is fully validated at creation, but its compute producer is a driver
+//     build, compiled once at the first DispatchMesh that executes it. Under the default (lazy) run no producer
+//     exists after creation and the process-wide build count has not moved; a PSO that is never drawn never gets
+//     one; every drawn PSO gets exactly one and its draw renders (the pixel checks above). Under
+//     LEONIDA_LAZY_PIPELINES=0 (d3d12_mesh_compute_eager) every producer is built at creation, as before.
+//     Signature on stderr: "mesh-compute producers: mode=... psos=N drawn=M built=B unused_built=0|1".
 //   - Controls on the no-extension device: MeshShaderTier stays NOT_SUPPORTED,
 //     and a DISPATCH_MESH command signature is refused E_NOTIMPL (stock main;
 //     this branch is independent of the signature fix, so no success is expected).
@@ -60,6 +66,7 @@
 #include "mesh_compute_fixture.h"
 #include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_mesh_compute_direct.h"
 #include "../shims/d3d12_xs_device.h"
 #include "../shims/d3d12_xs_pso_stream.h"
 
@@ -285,7 +292,10 @@ int main() {
     // (main-native decoded halves, no #1930). pso_bary pairs ms_tri with the
     // native-bary PS where the queried device is barycentric-capable; otherwise
     // its creation is the E_NOTIMPL refusal below and no draw uses it.
-    Ref<ID3D12PipelineState> pso_a, pso_b, pso_clip, pso_back, pso_front, pso_f16, pso_bary, vs_pso, refused;
+    Ref<ID3D12PipelineState> pso_a, pso_b, pso_clip, pso_back, pso_front, pso_f16, pso_bary, pso_unused, vs_pso,
+        refused;
+    // Producer builds so far: every refusal above happens before a producer is built, so this is the baseline.
+    const std::uint64_t producer_builds_at_start = rt::d3d12::mesh_compute_producer_builds();
     const auto grid_a_stream = [&](D3D12_CULL_MODE cull) {
         Stream stream;
         stream.add(RootSubobject{.inner = root_a.p}).add(MsSubobject{.inner = ms_v5});
@@ -308,6 +318,13 @@ int main() {
         EXPECT(SUCCEEDED(create_pso(device.p, stream_back, pso_back)) && pso_back.p);
         Stream stream_front = grid_a_stream(D3D12_CULL_MODE_FRONT);
         EXPECT(SUCCEEDED(create_pso(device.p, stream_front, pso_front)) && pso_front.p);
+        // A mesh PSO no command list ever records: the lazy proof's unused PSO. Its own shape (ms_tri with the
+        // grid-B pixel shader, no depth, front-face culling), so no other PSO shares what it is made of.
+        Stream stream_unused;
+        stream_unused.add(RootSubobject{.inner = root_b.p}).add(MsSubobject{.inner = ms_tri});
+        stream_unused.add(PsSubobject{.inner = ps_draw}).add(TargetsSubobject{.inner = one_target()});
+        stream_unused.add(RasterizerSubobject{.inner = cull_rasterizer(D3D12_CULL_MODE_FRONT)});
+        EXPECT(SUCCEEDED(create_pso(device.p, stream_unused, pso_unused)) && pso_unused.p);
     }
     {
         D3D12_DEPTH_STENCIL_DESC depth_on{};
@@ -415,6 +432,22 @@ int main() {
         EXPECT(device2m->CreatePipelineState(&trunc_desc, IID_PPV_ARGS(&raw_trunc)) == E_INVALIDARG &&
                raw_trunc == nullptr);
     }
+
+    // Lazy producers, after creation: every PSO above passed the sealed-pair, feature and limit validation, and none
+    // has been drawn. Lazy (the default): no producer was compiled and no PSO owns one. Eager
+    // (LEONIDA_LAZY_PIPELINES=0): all were compiled at creation.
+    wchar_t lazy_value[2]{};
+    const bool lazy_producers =
+        !(GetEnvironmentVariableW(L"LEONIDA_LAZY_PIPELINES", lazy_value, 2) == 1 && lazy_value[0] == L'0');
+    std::vector<ID3D12PipelineState*> mesh_psos{pso_a.p, pso_back.p, pso_front.p, pso_b.p,
+                                                pso_clip.p, pso_f16.p, pso_unused.p};
+    if (pso_bary.p) mesh_psos.push_back(pso_bary.p);
+    for (ID3D12PipelineState* pso : mesh_psos) {
+        EXPECT(rt::d3d12::pipeline_is_mesh_compute(pso));
+        EXPECT(rt::d3d12::pipeline_mesh_compute_producer_built(pso) == !lazy_producers);
+    }
+    EXPECT(rt::d3d12::mesh_compute_producer_builds() ==
+           producer_builds_at_start + (lazy_producers ? 0 : mesh_psos.size()));
 
     constexpr UINT size = 64;
     constexpr UINT small_extent = 16;
@@ -668,6 +701,21 @@ int main() {
         queue->ExecuteCommandLists(1, lists);
         EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
         EXPECT(SUCCEEDED(queue->Signal(fence.p, 1)) && SUCCEEDED(fence->SetEventOnCompletion(1, nullptr)));
+    }
+    // The first submission drew pso_a, pso_b, pso_clip, pso_f16 and (where capable) pso_bary; each of those has its
+    // producer now, exactly one each, and (lazy) the PSOs it did not draw still have none. The pixel checks below
+    // prove those draws rendered.
+    {
+        std::vector<ID3D12PipelineState*> drawn{pso_a.p, pso_b.p, pso_clip.p, pso_f16.p};
+        if (pso_bary.p) drawn.push_back(pso_bary.p);
+        for (ID3D12PipelineState* pso : drawn) EXPECT(rt::d3d12::pipeline_mesh_compute_producer_built(pso));
+        if (lazy_producers) {
+            EXPECT(!rt::d3d12::pipeline_mesh_compute_producer_built(pso_back.p));
+            EXPECT(!rt::d3d12::pipeline_mesh_compute_producer_built(pso_front.p));
+            EXPECT(!rt::d3d12::pipeline_mesh_compute_producer_built(pso_unused.p));
+        }
+        EXPECT(rt::d3d12::mesh_compute_producer_builds() ==
+               producer_builds_at_start + (lazy_producers ? drawn.size() : mesh_psos.size()));
     }
     std::vector<std::uint8_t> pixels_a(size * row_pitch), pixels_b(size * row_pitch);
     std::vector<std::uint8_t> pixels_c(small_extent * small_pitch), pixels_d(size * row_pitch);
@@ -965,6 +1013,19 @@ int main() {
     }
     EXPECT(!wrong_a && !wrong_b && !wrong_c && !wrong_d && !wrong_depth && !wrong_cull_back && !wrong_cull_front &&
            !wrong_f16 && !wrong_bary);
+    // Every submission is done: the cull controls drew pso_back and pso_front, so only pso_unused (never recorded)
+    // is without a producer under lazy, and no PSO compiled a second one.
+    {
+        const bool unused_built = rt::d3d12::pipeline_mesh_compute_producer_built(pso_unused.p);
+        EXPECT(unused_built == !lazy_producers);
+        for (ID3D12PipelineState* pso : mesh_psos)
+            if (pso != pso_unused.p) EXPECT(rt::d3d12::pipeline_mesh_compute_producer_built(pso));
+        const std::uint64_t built = rt::d3d12::mesh_compute_producer_builds() - producer_builds_at_start;
+        EXPECT(built == mesh_psos.size() - (lazy_producers ? 1 : 0));
+        std::fprintf(stderr, "mesh-compute producers: mode=%s psos=%zu drawn=%zu built=%llu unused_built=%d\n",
+                     lazy_producers ? "lazy" : "eager", mesh_psos.size(), mesh_psos.size() - 1,
+                     static_cast<unsigned long long>(built), unused_built ? 1 : 0);
+    }
     for (UINT i = 0; i < 256; ++i) EXPECT(up[768 + i] == 0xA5);
     EXPECT(std::memcmp(up, tint_b, sizeof(tint_b)) == 0);
     EXPECT(std::memcmp(up + 256, tint_clip, sizeof(tint_clip)) == 0);
@@ -973,7 +1034,8 @@ int main() {
     for (auto* r : {&upload, &readback_a, &readback_b, &readback_c, &readback_d, &readback_e, &readback_f,
                     &readback_depth, &target_a, &target_b, &target_c, &target_d, &target_e, &target_f, &depth})
         r->reset();
-    for (auto* p : {&pso_a, &pso_b, &pso_clip, &pso_back, &pso_front, &pso_f16, &pso_bary, &vs_pso, &refused})
+    for (auto* p : {&pso_a, &pso_b, &pso_clip, &pso_back, &pso_front, &pso_f16, &pso_bary, &pso_unused, &vs_pso,
+                    &refused})
         p->reset();
     root_a.reset();
     root_b.reset();

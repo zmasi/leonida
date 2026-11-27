@@ -38,5 +38,11 @@ bool pipeline_mesh_compute_info(ID3D12PipelineState* pso, std::uint64_t* slot_by
 // when not emulated or when the module went missing since creation.
 bool pipeline_mesh_compute_producer_words(ID3D12PipelineState* pso, std::vector<std::uint32_t>& words,
                                           std::string& why);
+// True once the producer's Vulkan pipeline exists: at creation for an eager PSO (LEONIDA_LAZY_PIPELINES=0), after the
+// first DispatchMesh that executes it for a lazy one. False for a non-emulated PSO.
+bool pipeline_mesh_compute_producer_built(ID3D12PipelineState* pso);
+// Producer driver builds this process has started (one per PSO at most, a failed one included): the unused PSOs of a
+// lazy device add none.
+std::uint64_t mesh_compute_producer_builds();
 
 }  // namespace rt::d3d12

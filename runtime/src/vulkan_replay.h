@@ -900,6 +900,12 @@ struct MeshComputeDirect {
     std::uint64_t producer_code_base = 0;  // the mesh shader's FSSM blob, as GraphicsPipeline::code_base
     std::uint64_t slot_bytes = 0;  // bytes of one workgroup's output slot, 16-aligned, > 0
     std::uint32_t max_primitives = 0;  // mesh primitives per group, > 0; the draw is G*max_primitives*3 vertices
+    // A producer built on first use (a lazy PSO): with `producer` null, `build(build_context)` compiles it at the first
+    // DispatchMesh that will execute and returns the handle, or null when the compile failed (the PSO logs it and does
+    // not retry): prepare then fails the draw (unsupported), it never skips it. It may wait for a build another thread
+    // runs. Null `build`: `producer` is final (an eagerly created PSO, or a test double).
+    VkPipeline (*build)(void*) = nullptr;
+    void* build_context = nullptr;
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
@@ -3056,7 +3062,7 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
     if (draw.mesh && direct && !p.skipped) {
         if (!vk.dispatch || !vk.pipeline_barrier || !vk.mesh_compute_scratch || !vk.mesh_compute_queue)
             return unsupported_at(__LINE__);
-        if (!direct->producer || !direct->producer_layout) {
+        if (!direct->producer_layout || (!direct->producer && !direct->build)) {
             if (pipeline->async_build && !strict_replay()) {
                 p.skipped = true;  // the producer builds with the consumer variant; no scratch yet
                 return ReplayResult::success;
@@ -3084,6 +3090,13 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
             return unsupported_at(__LINE__);
         // Zero was a no-op above; checked_counts refuses empty products otherwise.
         if (!counts.groups || !counts.bytes || !counts.vertices) return unsupported_at(__LINE__);
+        // The producer of a lazy PSO is compiled here, at the first draw that will execute: every refusal above (grid,
+        // limits, statistics) and every pending or no-op draw cost no driver compile. A failed compile fails the draw.
+        VkPipeline producer = direct->producer;
+        if (!producer) {
+            producer = direct->build(direct->build_context);
+            if (!producer) return unsupported_at(__LINE__);
+        }
         VkBuffer out_buffer = VK_NULL_HANDLE;
         VkDeviceSize out_offset = 0;
         VkDeviceAddress out_address = 0;
@@ -3092,7 +3105,7 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
             !mesh_compute_direct::valid_output(out_address, out_offset, counts.bytes))
             return unsupported_at(__LINE__);
         p.mesh_compute = true;
-        p.mesh_producer = direct->producer;
+        p.mesh_producer = producer;
         p.mesh_producer_layout = direct->producer_layout;
         p.mesh_producer_set = direct->producer_set;
         p.mesh_producer_code_base = direct->producer_code_base;

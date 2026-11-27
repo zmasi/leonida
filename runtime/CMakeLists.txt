@@ -2331,6 +2331,16 @@ if(TARGET Vulkan::Headers)
     add_executable(vulkan_mesh_compute_direct_test test/vulkan_mesh_compute_direct_test.cpp)
     target_link_libraries(vulkan_mesh_compute_direct_test PRIVATE Vulkan::Headers)
     add_test(NAME vulkan_mesh_compute_direct_bounds COMMAND vulkan_mesh_compute_direct_test)
+    # CPU-only: a lazy mesh-compute producer (MeshComputeDirect::build) is asked for only by a draw that will execute, and its
+    # failure fails the draw (test/replay_mesh_lazy_producer_test.cpp). The real-device proof is d3d12_mesh_compute(_eager).
+    add_executable(replay_mesh_lazy_producer_test test/replay_mesh_lazy_producer_test.cpp)
+    target_link_libraries(replay_mesh_lazy_producer_test PRIVATE Vulkan::Headers)
+    if(WIN32)
+      target_compile_definitions(replay_mesh_lazy_producer_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    endif()
+    add_test(NAME replay_mesh_lazy_producer COMMAND replay_mesh_lazy_producer_test)
+    add_test(NAME replay_mesh_lazy_producer_strict COMMAND replay_mesh_lazy_producer_test)
+    set_tests_properties(replay_mesh_lazy_producer_strict PROPERTIES ENVIRONMENT "LEONIDA_STRICT_REPLAY=1")
   endif()
   # CPU-only: Vulkan 1.3 core vs 1.2 KHR/EXT feature probing and proc fallback (runtime/src/vulkan13_features.h).
   add_executable(vulkan13_features_test test/vulkan13_features_test.cpp)
