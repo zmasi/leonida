@@ -1,7 +1,8 @@
 // D3D-29: mesh-shader PSOs from pipeline state streams and DispatchMesh, through the Xbox-ABI proxy over the Vulkan
 // device (docs/d3d12_vulkan.md section 5, "Pipelines").
 //   - A device without VK_EXT_mesh_shader reports D3D12_MESH_SHADER_TIER_NOT_SUPPORTED and refuses a mesh PSO with
-//     E_NOTIMPL; that part runs on every GPU. The rest needs the extension (exit 77 without it).
+//     E_NOTIMPL; a terminal-only DISPATCH_MESH signature is still created there. That part runs on every GPU.
+//     The rest needs the extension (exit 77 without it).
 //   - With it: MeshShaderTier 1; CreatePipelineState builds an MS + PS PSO and a VS + PS PSO from streams laid out as
 //     d3dx12.h lays them out (each subobject a type and its description, pointer-aligned); streams the PC runtime
 //     refuses (MS with VS, CS with PS, a subobject twice or in two versions, an unknown type, a truncated stream) are E_INVALIDARG, and
@@ -13,8 +14,9 @@
 //     bottom-left quadrant (yellow). Each pixel is read back and compared.
 //   - A vertex draw with the mesh PSO, and DispatchMesh with the VS one, fail at execution (ReplayResult::
 //     invalid_draw); a mesh grid beyond D3D12's limits fails at Close; an empty grid records nothing.
-//   - A DISPATCH_MESH command signature is created only with the extension; ExecuteIndirect with it draws as
-//     DispatchMesh (one record {2, 1, 1} fills two cells), and without graphics state it records nothing and closes.
+//   - With the extension, ExecuteIndirect with a DISPATCH_MESH signature draws as DispatchMesh (one record
+//     {2, 1, 1} fills two cells), and without graphics state it records nothing and closes. Without it, the
+//     terminal description is still created; executing it fails Close (d3d12_command_signature_mesh_test).
 // The shaders are GLSL written to the translator's contract (test/glsl/ms_draw.mesh, ps_draw.frag, vs_fullscreen.vert).
 // No game data. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
@@ -220,11 +222,17 @@ int main(int argc, char** argv) {
         stream.add(TargetsSubobject{.inner = one_target()});
         Ref<ID3D12PipelineState> pso;
         EXPECT(create(device.p, stream, pso) == E_NOTIMPL && !pso.p);
-        // A DISPATCH_MESH command signature is refused the same way.
+        // Creating the terminal record description is independent of executing a mesh indirect draw.
         const D3D12_INDIRECT_ARGUMENT_DESC mesh_arg{D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH_MESH};
         const D3D12_COMMAND_SIGNATURE_DESC mesh_sig{12, 1, &mesh_arg, 0};
         Ref<ID3D12CommandSignature> sig;
-        EXPECT(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p)) == E_NOTIMPL && !sig.p);
+        EXPECT(SUCCEEDED(device->CreateCommandSignature(&mesh_sig, nullptr, IID_PPV_ARGS(&sig.p))) && sig.p);
+        leonida::IndirectKind kind{};
+        UINT stride = 0;
+        bool terminal_only = false;
+        EXPECT(rt::d3d12::command_signature_info(sig.p, kind, stride, terminal_only) &&
+               kind == leonida::IndirectKind::dispatch_mesh && stride == 12 && terminal_only);
+        sig.reset();
         root.reset();
         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
     }

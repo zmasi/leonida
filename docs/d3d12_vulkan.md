@@ -2925,6 +2925,11 @@ The trace will enumerate them.
   - **Recording errors** (`Close` returns `E_INVALIDARG`): a grid above 65535 per count or 2^22 groups.
   - **Not recorded:** an empty grid.
   - **Execution error** (`ReplayResult::invalid_draw`): a mesh draw with a VS pipeline, or the reverse.
+- **Indirect mesh signatures:** a terminal-only `DISPATCH_MESH` signature (one 12-byte operation, no root
+  signature) is record metadata and is created with `S_OK` without the extension; any prefix still needs it
+  (`E_NOTIMPL`). Executing without an indirect mesh path fails `Close` for a positive maximum (fixed or GPU
+  count); a zero maximum is a no-op. `MeshShaderTier` is unchanged. Covered by
+  `d3d12_command_signature_mesh_test` (exit 0 on a no-mesh GPU).
 - **Tests:** `d3d12_mesh_test` checks the refusals and three draws pixel by pixel on an RX 9060 XT (RADV, under
   Wine), validation-clean.
   - **The three draws:** a 2×2×1 and a 1×1×2 mesh grid, plus a VS PSO from a stream.

@@ -148,8 +148,9 @@ public:
     static constexpr GUID kTag{0x9a4e1c2b, 0x55d8, 0x4f7a, {0xb0, 0x12, 0x3c, 0x8e, 0x7a, 0x1f, 0x6d, 0x90}};
 
     CommandSignature(leonida::IndirectKind kind, UINT byte_stride, UINT packed_size,
-                     std::span<const D3D12_INDIRECT_ARGUMENT_DESC> prefix)
-        : kind_(kind), stride_(byte_stride), packed_size_(packed_size), terminal_only_(prefix.empty()) {
+                     std::span<const D3D12_INDIRECT_ARGUMENT_DESC> prefix, bool execution_supported)
+        : kind_(kind), stride_(byte_stride), packed_size_(packed_size), terminal_only_(prefix.empty()),
+          execution_supported_(execution_supported) {
         // The caller may free the description immediately. Single-operation signatures allocate nothing.
         if (!prefix.empty() && (kind == leonida::IndirectKind::draw || kind == leonida::IndirectKind::draw_indexed))
             graphics_writes_.assign(prefix.begin(), prefix.end());
@@ -159,6 +160,7 @@ public:
     UINT stride() const { return stride_; }
     UINT packed_size() const { return packed_size_; }
     bool terminal_only() const { return terminal_only_; }
+    bool execution_supported() const { return execution_supported_; }
     const auto& graphics_writes() const { return graphics_writes_; }
     static CommandSignature* from(IUnknown* object) { return Child::from<CommandSignature>(object); }
 
@@ -166,6 +168,7 @@ private:
     leonida::IndirectKind kind_;
     UINT stride_, packed_size_;
     bool terminal_only_;  // no root, vertex, or index updates before the terminal operation
+    bool execution_supported_;  // a signature describes records; it need not be executable on this device
     std::vector<D3D12_INDIRECT_ARGUMENT_DESC> graphics_writes_;
 };
 
@@ -1027,6 +1030,12 @@ public:
         if (!leonida::indirect_records_fit(arg_desc.Width, argument_buffer_offset, max_command_count,
                                           stride, sig->packed_size()))
             return check(false);
+        // A terminal mesh signature is valid metadata even without an indirect mesh replay path.
+        // Refuse real work at recording, including a GPU-supplied count; never silently discard it.
+        if (max_command_count && !sig->execution_supported()) {
+            d3d12_trace::record("MeshIndirect::UnsupportedExecution", "unsupported");
+            return check(false);
+        }
         if (kind == leonida::IndirectKind::dispatch_mesh && !terminal_only) {
             // A DISPATCH_MESH signature with root arguments before it is not replayed: nothing is recorded, and the
             // first such call says so. The list stays valid. A terminal-only one is recorded below as a mesh draw
@@ -2952,10 +2961,11 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
 }
 
 HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, UINT packed_size, REFIID riid, void** out,
-                                 IUnknown* device, std::span<const D3D12_INDIRECT_ARGUMENT_DESC> prefix) {
+                                 IUnknown* device, std::span<const D3D12_INDIRECT_ARGUMENT_DESC> prefix,
+                                 bool execution_supported) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* sig = new CommandSignature(kind, byte_stride, packed_size, prefix);
+    auto* sig = new CommandSignature(kind, byte_stride, packed_size, prefix, execution_supported);
     sig->attach_device(device);
     return hand_out(sig, riid, out);
 }
