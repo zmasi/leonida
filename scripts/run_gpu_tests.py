@@ -856,6 +856,10 @@ def _w64_graphics_only() -> frozenset:
 
 W64_GRAPHICS_ONLY = _w64_graphics_only()
 
+# These gradient triangles take vertex 64 from the second wave and need the 128-vertex PSV0.
+MESH_VERTEX64 = ("ms_w64x_wave_votes", "ms_w64x_wave_loops", "ms_w64x_lds_wave0",
+                 "ms_w64x_ctl_readlane_alu", "ms_w64x_ctl_lds_exchange")
+
 
 def run_suite(a, work: str) -> int:
     assembler = resolve_assembler(getattr(a, "assembler", "auto"))
@@ -907,7 +911,7 @@ def run_suite(a, work: str) -> int:
             ])
         elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3", "ms_f16_pack"):
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
-        elif name in ("ms_w64x_wave_votes", "ms_w64x_wave_loops", "ms_w64x_lds_wave0"):  # vertex 64 comes from the second wave: 128 output vertices
+        elif name in MESH_VERTEX64:
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 128, 64, 2))])
         elif name == "ms_v5_workgroup":
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(32, 3, 1, group_shared=128))])
@@ -1640,15 +1644,12 @@ def run_suite(a, work: str) -> int:
             problem = mesh_v5_test(a.build, spirv_dir, Path(raw_dir) / f"{name}.raw")
             results.append((name, None if isinstance(problem, Skip) else not problem,
                             problem or "24/24 workgroup coordinates exact (2 x 3 x 4)"))
-        elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3", "ms_w64x_wave_votes", "ms_w64x_wave_loops",
-                      "ms_w64x_lds_wave0"):
+        elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3") or name in MESH_VERTEX64:
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)
             rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, fs_passthru, raw], env=env)
-            # ms_w64x_ballot needs exact wave64 (a 64-wide subgroup, or --wave64-emulate): skip it elsewhere, as
-            # the wave64 compute dumps are.
-            no64 = (name in ("ms_w64x_ballot", "ms_w64x_wave_votes", "ms_w64x_wave_loops", "ms_w64x_lds_wave0") and
-                    not w64_emulated() and
+            # The ballot and second-wave triangles need exact wave64, either native or emulated.
+            no64 = ((name == "ms_w64x_ballot" or name in MESH_VERTEX64) and not w64_emulated() and
                     not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg)))
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))

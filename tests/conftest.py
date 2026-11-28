@@ -137,15 +137,15 @@ def mesh_psv0_chunk(threads=(128, 1, 1), max_vertices=64, max_primitives=64, top
 GS_TRI_DXBC = make_dxbc([signature_chunk(b"ISG1", [(0, 1, 0xF), (1, 0, 0xF)]),      # SV_Position reg 0, TEXCOORD0 reg 1
                          signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 0, 0xF)])])
 MS_TRI_DXBC = make_dxbc([mesh_psv0_chunk()])                                          # 128 threads, 64/64, triangles
+MS_VERTEX64_DXBC = make_dxbc([mesh_psv0_chunk(max_vertices=128)])  # vertex 64 comes from the second wave
 MS_CLIP_DXBC = make_dxbc([mesh_psv0_chunk(),
                           signature_chunk(b"OSG1", [(0, 1, 0xF), (1, 2, 0x1)])])      # SV_Position + SV_ClipDistance.x
 SAMPLE_DXBC = {"gs_tri": GS_TRI_DXBC, "ms_tri": MS_TRI_DXBC, "ms_clip": MS_CLIP_DXBC, "ms_wave_info_s3": MS_TRI_DXBC,
                "ms_w64x_ballot": MS_TRI_DXBC, "ms_f16_pack": MS_TRI_DXBC,      # scripts/run_gpu_tests.py, ms_tri's PSV0
                "gs_w64_a_ring": GS_TRI_DXBC, "gs_w64_c_lane_id": GS_TRI_DXBC,  # build.py gives every gs_* gs_tri's
-               # vertex 64 comes from the second wave: 128 output vertices (scripts/run_gpu_tests.py)
-               "ms_w64x_wave_votes": make_dxbc([mesh_psv0_chunk(max_vertices=128)]),
-               "ms_w64x_wave_loops": make_dxbc([mesh_psv0_chunk(max_vertices=128)]),
-               "ms_w64x_lds_wave0": make_dxbc([mesh_psv0_chunk(max_vertices=128)]),
+               "ms_w64x_wave_votes": MS_VERTEX64_DXBC, "ms_w64x_wave_loops": MS_VERTEX64_DXBC,
+               "ms_w64x_lds_wave0": MS_VERTEX64_DXBC, "ms_w64x_ctl_readlane_alu": MS_VERTEX64_DXBC,
+               "ms_w64x_ctl_lds_exchange": MS_VERTEX64_DXBC,
                "ms_v5_workgroup": make_dxbc([mesh_psv0_chunk(threads=(32, 1, 1), max_vertices=3,
                                                            max_primitives=1, group_shared=128)])}
 

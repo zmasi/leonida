@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import rdna2spirv  # noqa: E402
 
 SERIAL = ("ms_tri", "ms_clip", "ms_f16_pack", "ms_w64x_ballot", "ms_w64x_wave_votes", "ms_w64x_wave_loops",
-          "ms_w64x_lds_wave0")          # LDS that only wave 0 stores to (ms_lds_wave0_only)
+          "ms_w64x_lds_wave0", "ms_w64x_ctl_readlane_alu", "ms_w64x_ctl_lds_exchange")
 SIDE_BY_SIDE = ("ms_wave_info_s3",      # LDS every wave adds to
                 "ms_v5_workgroup")      # 32 threads: one partial wave
 

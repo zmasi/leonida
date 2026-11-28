@@ -581,6 +581,12 @@ shaders with `--mesh-serial-waves` (`docs/design.md`, "Mesh shaders with their w
 qualify run one pass per wave in 64 invocations. The `ms_*` tests must pass with and without it;
 `ms_w64x_wave_votes` is the one whose two waves take different branches and both give the triangle a vertex. `ms_w64x_wave_loops` is the one whose two waves run a loop of different length (5 and 9 iterations), each iteration reading a wave-wide count, so under emulation the waves reach different numbers of barriers. `ms_w64x_lds_wave0` is the one with LDS that only wave 0 stores to (a launch value, then the counts) and both waves read behind barriers, as the pipeline library's mesh programs do; it runs in series too, and `ms_wave_info_s3`, whose waves all add to LDS, does not.
 
+`--filter ms_w64x_ctl_` selects two independent controls. `ms_w64x_ctl_readlane_alu` reads a lane to set a bounded
+trip count; the loop does arithmetic only. `ms_w64x_ctl_lds_exchange` has a lane exchange, a wave-0-only LDS
+write and synchronization, but no source loop. Both check the gradient from a triangle whose third vertex comes
+from wave 1. A pass does not establish how synchronization behaves inside a readlane-controlled loop. Check
+`mesh_serial_waves` in the translation index before counting a draw as serial execution.
+
 ## GPUs without mesh shaders (NVIDIA Pascal and older)
 
 Without `VK_EXT_mesh_shader`, the `ms_*` tests are skipped; that's expected, not a failure. To test the path that
