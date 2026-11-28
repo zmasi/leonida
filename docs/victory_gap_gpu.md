@@ -58,5 +58,6 @@ closed on this branch; **left** = gap kept, with the reason. "V" is `victory/cra
 
 - `xs_proxy_mock` (`runtime/test/xs_proxy_mock_test.cpp`): `check_console_headers`, `check_console_features`, and
   slot 13 in the slot-table check.
-- `d3d12_xs_exports` (`runtime/test/d3d12_xs_exports_test.cpp`): the IID data import and the virtual memory range.
+- `d3d12_xs_exports` (`d3d12_xs_exports_test.cpp` on the gap branch; not merged into `main`): the IID data import and
+  the virtual memory range.
 - `xgameruntime_offline`: the deferral is an open power-request handle; null output refused.

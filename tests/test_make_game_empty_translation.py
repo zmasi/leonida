@@ -1,15 +1,17 @@
 """make_game.py: an empty translated shader index is not kept, and a later stage refuses one.
 
-Standard library only; no GPU, no Vulkan SDK, no game data: the shard processes and rdna2spirv.py are mocked.
+The synthetic two-shard integration test uses SPIRV-Tools when installed. All other cases mock translation.
 
     python -I tests/test_make_game_empty_translation.py
 """
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -69,6 +71,11 @@ class TranslateEmptyIndexTest(unittest.TestCase):
         with self.assertRaises(SystemExit) as cm:
             self.translate_with_index("not json")
         self.assertEqual(cm.exception.code, 1)
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
+
+    def test_merge_cannot_publish_a_non_object(self):
+        with self.assertRaises(SystemExit):
+            self.translate_with_index('["shader"]')
         self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
 
     def test_a_non_empty_index_is_kept(self):
@@ -205,6 +212,11 @@ class RequireTranslatedShadersTest(unittest.TestCase):
         write(os.path.join(self.spirv, "index.json"), '{"shader_0": {}}')
         self.assertEqual(self.call()[0], self.spirv)
 
+    def test_a_list_is_not_a_translation_index(self):
+        write(os.path.join(self.spirv, "index.json"), '["shader"]')
+        with self.assertRaises(SystemExit):
+            self.call()
+
 
 class ShadersStageTest(unittest.TestCase):
     """shaders(): a saved `{}` from a merge that produced nothing is translated again, and its plan goes with it."""
@@ -257,6 +269,67 @@ class ShadersStageTest(unittest.TestCase):
         self.assertEqual(self.run_stage(), [])
         with open(self.index(), encoding="utf-8") as f:
             self.assertEqual(json.load(f), {"shader_0": {"stage": "ps"}})
+
+    def test_damaged_index_is_regenerated_and_its_shards_can_be_reused(self):
+        self.run_stage()
+        write(self.plan(), '{"jobs":2}')
+        for damaged in ('{"shader_0":', '["shader_0"]', 'null', b'\xff'):
+            with self.subTest(damaged=damaged):
+                with open(self.index(), "wb") as f:
+                    f.write(damaged if isinstance(damaged, bytes) else damaged.encode())
+                with mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"):
+                    self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False))
+                self.assertEqual(self.run_stage(), ["translate"])
+                self.assertTrue(os.path.isfile(self.plan()))
+                self.assertEqual(self.run_stage(), [])
+
+    def test_utf8_bom_index_remains_reusable(self):
+        self.run_stage()
+        write(self.index(), '\ufeff{"shader_0":{"stage":"ps"}}')
+        self.assertEqual(self.run_stage(), [])
+        with mock.patch.object(make_game, "llvm_mc_signature", return_value="test llvm-mc 21"):
+            self.assertTrue(make_game.shader_outputs_reusable(self.work, False, False))
+
+    def test_temporarily_locked_index_survives_the_retry(self):
+        self.run_stage()
+        saved = Path(self.index()).read_bytes()
+        with mock.patch.object(make_game, "read_translation_index", side_effect=PermissionError(13, "locked")), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err, self.assertRaises(SystemExit):
+            self.run_stage()
+        self.assertIn("locked", err.getvalue())
+        self.assertEqual(Path(self.index()).read_bytes(), saved)
+        self.assertEqual(self.run_stage(), [])
+
+    @unittest.skipUnless(shutil.which("spirv-as") and shutil.which("spirv-val"), "needs SPIRV-Tools")
+    def test_real_shards_restore_the_index_without_rebuilding_modules(self):
+        dxbc, spirv = Path(self.dxbc), Path(self.spirv)
+        names = ("ps_first", "ps_second")
+        (dxbc / "disasm").mkdir(parents=True)
+        for name in names:
+            (dxbc / "disasm" / (name + ".s")).write_text("\ts_endpgm\n", encoding="utf-8")
+            (dxbc / (name + ".dxbc")).write_bytes(b"DXBC" + bytes(28))
+        write(dxbc / "index.json", json.dumps([{"file": n + ".dxbc", "stage": "ps"} for n in names]))
+        write(dxbc / "fssm_index.json", json.dumps([{"name": n} for n in names]))
+        write(dxbc / "disasm.done", "synthetic llvm-mc")
+        with mock.patch.object(make_game, "llvm_mc_signature", return_value="synthetic llvm-mc"):
+            make_game.shaders(self.work, self.work, jobs=2)
+            index = spirv / "index.json"
+            original = index.read_bytes()
+            self.assertEqual(set(json.loads(original)), set(names))
+            products = [spirv / (n + ".spv") for n in names] + sorted(spirv.glob("index.part*.json"))
+            self.assertEqual(len(products), 4)
+
+            def snapshot():
+                return [(p.stat().st_mtime_ns, p.read_bytes()) for p in products]
+
+            before = snapshot()
+            index.write_bytes(original[:len(original) // 2])
+            self.assertTrue(make_game.shader_outputs_reusable(self.work, False, False, jobs=2))
+            self.assertFalse(make_game.shader_outputs_reusable(self.work, False, False, jobs=1))
+            make_game.shaders(self.work, self.work, jobs=2)
+            self.assertEqual(index.read_bytes(), original)
+            self.assertEqual(snapshot(), before)
+            self.assertEqual(make_game.require_translated_shaders(self.work), self.spirv)
 
 
 if __name__ == "__main__":

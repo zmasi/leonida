@@ -102,6 +102,10 @@ class GameRunSummaryTest(unittest.TestCase):
         cases = [
             (dict(exit_code=124), [], "time limit (120 s) reached, stopped (exit 124)"),
             (dict(exit_code=137), [], "time limit (120 s) reached, stopped (exit 137)"),
+            (dict(exit_code=124, seconds=120), [], "time limit (120 s) reached, stopped (exit 124)"),
+            (dict(exit_code=124, seconds=4), [{"kind": "exit", "code": 124}],
+             "guest returned 124 (process exit 124)"),
+            (dict(exit_code=137, seconds=4), [], "process exit 137 (0x00000089), no exit event"),
             (dict(exit_code=0), [{"kind": "exit", "code": 3}], "guest returned 3 (process exit 0)"),
             (dict(exit_code=1), [{"kind": "error", "what": SECRET}], "loader error event (process exit 1)"),
             (dict(exit_code=-1073741819), [], "process exit -1073741819 (0xc0000005), no exit event"),

@@ -24,12 +24,17 @@ import argparse
 from fractions import Fraction
 import json
 import os
+import stat
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+from file_mode import published_mode  # noqa: E402
+import replace_retry  # noqa: E402
 
 M16 = 0xFFFF
 M32 = 0xFFFFFFFF
@@ -391,10 +396,25 @@ def evaluate_results(waves: list[int], meta, raw_results) -> dict:
     """Compare hardware outputs against expected words and check wave32 == wave64."""
     by_key: dict[tuple[str, str, int, str, bool], list[int]] = {}
     harness_errors: list[dict] = []
-    total_words = 0
+    total_words = sum(len(m[5]) for m in meta)
+
+    if len(raw_results) != len(meta):
+        return {
+            "total_words": total_words,
+            "mismatches": 0,
+            "wave_diffs": 0,
+            "harness_errors": [{
+                "kind": "batch",
+                "op": "*",
+                "wave": 0,
+                "variant": "count",
+                "error": f"expected {len(meta)} kernel results, got {len(raw_results)}",
+            }],
+            "mismatch_details": [],
+            "wave_diff_details": [],
+        }
 
     for (kind, op, wave, variant, clamp, expected), res in zip(meta, raw_results):
-        total_words += len(expected)
         if isinstance(res, str):
             harness_errors.append({"kind": kind, "op": op, "wave": wave, "variant": variant, "error": res})
             continue
@@ -558,6 +578,93 @@ def _parse_ops(spec: str) -> list[str] | None:
     return list(dict.fromkeys(parts))
 
 
+def _has_trailing_sep(path: str) -> bool:
+    seps = tuple(s for s in (os.sep, os.altsep) if s)
+    return path.endswith(seps)
+
+
+def _resolve_output_target(path: str) -> tuple[str, str]:
+    out_path = os.path.abspath(path)
+    target = os.path.realpath(out_path) if os.path.islink(out_path) else out_path
+    return out_path, target
+
+
+def validate_json_path(path: str) -> str | None:
+    """Validate --json destination before opening the GPU oracle. Returns an error string or None."""
+    if not isinstance(path, str) or not path.strip():
+        return "--json path must not be empty"
+    out_path, target = _resolve_output_target(path)
+    if _has_trailing_sep(path) or os.path.isdir(out_path) or os.path.isdir(target):
+        return f"--json path is a directory: {out_path}"
+    parent = os.path.dirname(target)
+    probe = parent
+    while probe and not os.path.exists(probe):
+        nxt = os.path.dirname(probe)
+        if nxt == probe:
+            break
+        probe = nxt
+    if probe and os.path.exists(probe) and not os.path.isdir(probe):
+        return f"cannot write {out_path}: parent path is not a directory: {probe}"
+    if os.path.exists(target):
+        try:
+            fd = os.open(target, os.O_WRONLY)
+            os.close(fd)
+        except OSError as exc:
+            return f"cannot write {out_path}: {exc.strerror or exc}"
+    return None
+
+
+def write_json_report(path: str, payload: dict) -> str | None:
+    """Write JSON report with LF line endings atomically (direct write for non-regular targets like /dev/null)."""
+    err = validate_json_path(path)
+    if err:
+        return err
+    out_path, target = _resolve_output_target(path)
+    try:
+        text = json.dumps(payload, indent=2, allow_nan=False) + "\n"
+    except (TypeError, ValueError) as exc:
+        return f"cannot serialize JSON report for {out_path}: {exc}"
+    try:
+        st = os.stat(target) if os.path.exists(target) else None
+    except OSError as exc:
+        return f"cannot write {out_path}: {exc.strerror or exc}"
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        try:
+            with open(target, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            return None
+        except OSError as exc:
+            return f"cannot write {out_path}: {exc.strerror or exc}"
+    parent = os.path.dirname(target)
+    tmp_path = None
+    try:
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".cvt_norm_mods_probe.", suffix=".tmp", dir=parent or ".")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+                f.flush()
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        os.chmod(tmp_path, published_mode(target))
+        replace_retry.replace(tmp_path, target)
+        tmp_path = None
+        return None
+    except OSError as exc:
+        return f"cannot write {out_path}: {exc.strerror or exc}"
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--waves", default="32,64", help="comma-separated wave sizes (default: 32,64)")
@@ -580,10 +687,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERROR: unknown or malformed --ops {args.ops!r} (valid: {', '.join(OPS)})", file=sys.stderr)
         return 2
 
+    if args.hw_arch is not None and not args.hw_arch.strip():
+        print("ERROR: --hw-arch must not be empty", file=sys.stderr)
+        return 2
+
     if args.json_out is not None:
-        out_check = os.path.abspath(args.json_out)
-        if os.path.isdir(out_check):
-            print(f"ERROR: --json path is a directory: {out_check}", file=sys.stderr)
+        err = validate_json_path(args.json_out)
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
             return 2
 
     from hw_oracle import asm, runner
@@ -608,6 +719,9 @@ def main(argv: list[str] | None = None) -> int:
         summary = evaluate_results(waves, meta, raw_results)
         device = oracle.device
         arch = oracle.arch
+    except RuntimeError as e:
+        print(f"harness error: {e}")
+        return 2
     finally:
         oracle.close()
 
@@ -634,10 +748,6 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if args.json_out is not None:
-        out_path = os.path.abspath(args.json_out)
-        if os.path.isdir(out_path):
-            print(f"ERROR: cannot write {out_path}: path is a directory", file=sys.stderr)
-            return 2
         payload = {
             "device": device,
             "arch": arch,
@@ -645,15 +755,9 @@ def main(argv: list[str] | None = None) -> int:
             "ops": ops,
             **summary,
         }
-        try:
-            parent = os.path.dirname(out_path)
-            if parent:
-                os.makedirs(parent, exist_ok=True)
-            with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(payload, f, indent=2)
-                f.write("\n")
-        except OSError as e:
-            print(f"ERROR: cannot write {out_path}: {e}", file=sys.stderr)
+        err = write_json_report(args.json_out, payload)
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
             return 2
 
     return 1 if (summary["mismatches"] or summary["wave_diffs"]) else 0

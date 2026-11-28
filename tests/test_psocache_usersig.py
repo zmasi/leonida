@@ -4,6 +4,9 @@ The cache has two graphics PSOs. Their stage records name three chunk records: o
 entries and constants (fits), one with extra slots (fits), and one with 40 constant dwords (does not fit).
 """
 
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import struct
@@ -11,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "psocache_usersig.py")
@@ -385,6 +389,82 @@ class UsersigTest(unittest.TestCase):
         p = run(bad)
         self.assertEqual(p.returncode, 2)
         self.assertNotIn("Traceback", p.stderr)
+
+    def _load_module(self):
+        spec = importlib.util.spec_from_file_location("psocache_usersig_mod", TOOL)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_empty_and_whitespace_cache_path_rejected(self):
+        for bad in ("", "   "):
+            with self.subTest(bad=bad):
+                p = run(bad)
+                self.assertEqual(p.returncode, 2)
+                self.assertIn("cache path must not be empty", p.stderr)
+                self.assertEqual(p.stdout, "")
+
+    def test_out_of_range_entry_does_not_reopen_cache(self):
+        mod = self._load_module()
+        report = mod.pi.inspect(self.path)
+        for bad_entry in ("-1", "99"):
+            with self.subTest(entry=bad_entry):
+                err = io.StringIO()
+                with (
+                    mock.patch.object(mod.pi, "inspect", return_value=report),
+                    mock.patch("builtins.open", side_effect=AssertionError("should not reopen")),
+                    contextlib.redirect_stderr(err),
+                ):
+                    rc = mod.main([self.path, "--entry", bad_entry])
+                self.assertEqual(rc, 2)
+                self.assertIn("outside the 2 graphics records", err.getvalue())
+
+    def test_second_open_or_truncation_failure_returns_exit_two(self):
+        mod = self._load_module()
+        report = mod.pi.inspect(self.path)
+        # Missing / unreadable on the second open.
+        err = io.StringIO()
+        with (
+            mock.patch.object(mod.pi, "inspect", return_value=report),
+            mock.patch("builtins.open", side_effect=OSError("disappeared")),
+            contextlib.redirect_stderr(err),
+        ):
+            rc = mod.main([self.path])
+        self.assertEqual(rc, 2)
+        self.assertIn("disappeared", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+        # File shrank between inspect() and second mmap.
+        short = os.path.join(self.tmp.name, "short.cache")
+        with open(short, "wb") as f:
+            f.write(b"PS\x00\x09" + bytes(128))
+        err = io.StringIO()
+        with (
+            mock.patch.object(mod.pi, "inspect", return_value=report),
+            contextlib.redirect_stderr(err),
+        ):
+            rc = mod.main([short])
+        self.assertEqual(rc, 2)
+        self.assertIn("cache shrank during read", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_summarise_and_describe_pso_validate_arguments_and_bounds(self):
+        mod = self._load_module()
+        report = mod.pi.inspect(self.path)
+        raw = build()
+        for bad_limit in (0, -3, True, False, 1.5):
+            with self.subTest(limit=bad_limit):
+                with self.assertRaises(ValueError):
+                    mod.summarise(raw, report, limit=bad_limit)
+        with self.assertRaises(ValueError):
+            mod.summarise(raw[:0x80], report)
+        for bad_index in (-1, True, 99):
+            with self.subTest(index=bad_index):
+                with self.assertRaises(ValueError):
+                    mod.describe_pso(raw, 0x80, 0, [], {}, bad_index)
+        # stage_record_refs rejects bool stage and skips out-of-bounds spans safely.
+        self.assertEqual(mod.stage_record_refs(raw, 0, [(0, 0x30), (0, 0x30)], {1: []}, True), [])
+        self.assertEqual(mod.stage_record_refs(b"\x00" * 16, 0, [(100, 0x30)], {0: []}, 0), [])
 
 
 if __name__ == "__main__":

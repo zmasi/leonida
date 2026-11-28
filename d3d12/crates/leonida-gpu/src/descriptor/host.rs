@@ -528,6 +528,8 @@ fn neutral() -> Option<&'static ID3D12Resource> {
                     )
                     .ok()?;
                 let made = made?;
+                #[cfg(feature = "diagnostics")]
+                crate::census::made(&made, "the grey texture shown for one not there yet");
                 let queue: ID3D12CommandQueue = device
                     .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC { Type: D3D12_COMMAND_LIST_TYPE_COPY, ..Default::default() })
                     .ok()?;
@@ -2300,6 +2302,45 @@ impl HostHeap {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).hold(index, write, due);
     }
 
+    /// Slot `index`, refused a new host texture for lack of room on the card,
+    /// shows the neutral grey ([`neutral_for`]: 1x1, no card memory) while it
+    /// waits with nothing made, instead of the null view [`HostHeap::mirror`]
+    /// left there ("null, waits"), which reads as black for the four seconds
+    /// it is held back and for as long after as the card stays full. A slot
+    /// that still shows an earlier copy keeps it, and one made from a record
+    /// is left as it is. A view that is no 2D texture's stays null.
+    ///
+    /// `LEONIDA_HELD_GREY=1`; off by default (unset or `0`: null, as before).
+    /// From voidopcode/vilocity b81a5dc and 7aceabd (voidopcode, GPL-3.0),
+    /// where it is on: black faces and black streaks on the sun's glint at
+    /// 1440p with the card full were the reason, and its two runs with the
+    /// card held full showed neither the black nor the grey, so its effect
+    /// is not measured there either.
+    pub(crate) fn texture_slot_grey(&self, index: u32, handle: u64) {
+        if !held_grey() || index >= self.count {
+            return;
+        }
+        let Some(view) = crate::descriptor::view(handle) else {
+            return;
+        };
+        let _made = self.made.lock(index);
+        if self.made.get(index).unwrap_or(0) != 0 || self.kept_in(index).is_some() {
+            return;
+        }
+        // (As `show_later` puts it there.)
+        let kept = neutral_for(&view, self.at(index));
+        self.put(index);
+        self.clear_twin(index);
+        if kept.is_some() {
+            static SHOWN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SHOWN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n == 1 || n.is_multiple_of(500) {
+                tracing::info!(so_far = n, slot = index, "a texture held back on a full card shows the neutral grey");
+            }
+        }
+        self.keep(index, kept);
+    }
+
     /// See [`TextureQueue::room`].
     pub(crate) fn texture_slots_room(&self, frame: u64) -> usize {
         self.textures.lock().unwrap_or_else(|e| e.into_inner()).room(frame)
@@ -3447,6 +3488,23 @@ impl HostHeap {
         if let Some(old) = old {
             crate::host::retire_resource(old);
         }
+    }
+
+    /// For the memory lines (`crate::census::log_slots`): every buffer and
+    /// texture a slot of the heap shows and so keeps alive, once each, with
+    /// how many slots show it. Every slot's lock is taken in turn: not for a
+    /// thread that records.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn kept_now(&self) -> Vec<(ID3D12Resource, u32)> {
+        use windows::core::Interface;
+        let mut found: std::collections::HashMap<usize, (ID3D12Resource, u32)> = std::collections::HashMap::new();
+        for slot in self.kept.iter() {
+            let slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(resource) = slot.as_ref() {
+                found.entry(resource.as_raw() as usize).or_insert_with(|| (resource.clone(), 0)).1 += 1;
+            }
+        }
+        found.into_values().collect()
     }
 
     /// What slot `index` views.
@@ -5268,6 +5326,18 @@ pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::
 fn keep_views() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("LEONIDA_KEEP_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// Whether a slot refused a host texture on a full card shows the neutral
+/// grey while it waits ([`HostHeap::texture_slot_grey`]): `LEONIDA_HELD_GREY=1`,
+/// off by default; `LEONIDA_AB` can flip it while the title runs.
+fn held_grey() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_HELD_GREY") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("LEONIDA_HELD_GREY"))
 }
 
 /// What the texture view a slot is written with has to do with the one it

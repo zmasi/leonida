@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import stat
 import struct
 import subprocess
 import sys
@@ -250,6 +251,60 @@ class Analyze4240Test(unittest.TestCase):
                 stats = A.process_archive(path, limit=n)
                 self.assertEqual(stats["streams"], n)
                 self.assertEqual(stats["blocks_6330"], n)
+
+
+    def test_trailing_high_bit_word_does_not_crash_or_fake_group(self):
+        path = os.path.join(self.root, "trailing-hi.rpf")
+        slots = [0x4042, (0x30 << 8) | 0x01] + [0] * 22
+        # Valid 4240 header (0x60 bytes) + 8 trailing bytes starting with a high-bit word (e.g. -0.0f).
+        page = block_4240(slots) + struct.pack("<II", 0x80000000, 0x12345678)
+        make_archive(path, page)
+        stats = A.process_archive(path)
+        self.assertEqual(stats["streams"], 1)
+        self.assertEqual(stats["blocks_4240"], 1)
+        self.assertEqual(stats["groups"], 0)
+        self.assertEqual(stats["errors"], 0)
+
+        # Also verify a high-bit vertex payload word whose counts exceed the stream is not counted as a group.
+        path2 = os.path.join(self.root, "false-group.rpf")
+        page2 = block_4240(slots) + struct.pack("<4I", 0x80001000, 0x00100000, 0x00100000, 0)
+        make_archive(path2, page2)
+        stats2 = A.process_archive(path2)
+        self.assertEqual(stats2["blocks_4240"], 1)
+        self.assertEqual(stats2["groups"], 0)
+
+    def test_oversized_zlib_stream_is_skipped_and_process_archive_rejects_bad_limit(self):
+        path = os.path.join(self.root, "bomb-and-good.rpf")
+        huge = BLOCK_6330 + bytes(8192)
+        make_archive(path, huge, BLOCK_6330)
+        stats = A.process_archive(path, max_inflate=4096)
+        self.assertEqual(stats["streams"], 1)
+        self.assertEqual(stats["blocks_6330"], 1)
+
+        for bad in (0, -1, True, False):
+            with self.subTest(limit=bad), self.assertRaisesRegex(ValueError, "at least 1"):
+                A.process_archive(path, limit=bad)
+
+    def test_write_json_is_atomic_trailing_lf_and_preserves_mode(self):
+        out = os.path.join(self.root, "report.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("previous\n")
+        if os.name != "nt":
+            os.chmod(out, 0o640)
+        with mock.patch.object(A, "replace_retry", side_effect=OSError("busy")):
+            with self.assertRaises(OSError):
+                A.write_json(out, [{"streams": 1}])
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "previous\n")
+        self.assertEqual([n for n in os.listdir(self.root) if n.startswith(".analyze_4240_full_")], [])
+
+        A.write_json(out, [{"streams": 1}])
+        with open(out, "rb") as f:
+            raw = f.read()
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(json.loads(raw.decode("utf-8")), [{"streams": 1}])
+        if os.name != "nt":
+            self.assertEqual(stat.S_IMODE(os.stat(out).st_mode), 0o640)
 
 
 if __name__ == "__main__":

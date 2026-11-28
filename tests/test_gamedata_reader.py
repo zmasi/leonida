@@ -458,6 +458,59 @@ class Run(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         self.assertIn("not a directory", r.stderr)
 
+    def test_namespaced_root_exports_safely_and_matches_root_filter(self):
+        ns_xml = os.path.join(self.tmp.name, "ns.xml")
+        with open(ns_xml, "wb") as f:
+            f.write(b'<Root xmlns="http://example.com/ns"><v value="7"/></Root>')
+        out_all = os.path.join(self.tmp.name, "ns_all")
+        s_all = R.run([ns_xml], out_dir=out_all, reader=R.Reader(root_handlers={}, type_handlers={}))
+        self.assertEqual(s_all["documents"], 1)
+        out = os.path.join(self.tmp.name, "ns_out")
+        s = R.run([ns_xml], root_filter="{http://example.com/ns}Root", out_dir=out,
+                  reader=R.Reader(root_handlers={}, type_handlers={}))
+        self.assertEqual(s["documents"], 1)
+        files = os.listdir(out)
+        self.assertEqual(len(files), 1)
+        with open(os.path.join(out, files[0]), "rb") as f:
+            raw = f.read()
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertEqual(json.loads(raw.decode("utf-8")), {"{http://example.com/ns}v": 7})
+
+    def test_root_filter_matches_doctype_without_root_hint(self):
+        doc_xml = os.path.join(self.tmp.name, "doctype.xml")
+        other_xml = os.path.join(self.tmp.name, "wrong.xml")
+        with open(doc_xml, "wb") as f:
+            f.write(b'<!DOCTYPE CTarget><CTarget value="9"/>')
+        with open(other_xml, "wb") as f:
+            f.write(b'<!DOCTYPE CWrong><CWrong value="1"/>')
+        s = R.run([doc_xml, other_xml], root_filter="CTarget",
+                  reader=R.Reader(root_handlers={}, type_handlers={}))
+        self.assertEqual(s["documents"], 1)
+        self.assertEqual(s["per_root_documents"], {"CTarget": 1})
+
+    def test_cli_empty_out_and_atomic_write_error_reporting(self):
+        xml = os.path.join(self.dir, "c.xml")
+        for bad in ("", "   "):
+            with self.subTest(bad=bad):
+                r = self._cli(xml, "--out", bad)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("must not be empty", r.stderr)
+
+        out = os.path.join(self.tmp.name, "atomic_out")
+        os.makedirs(out)
+        existing = os.path.join(out, "COther_c.xml.json")
+        with open(existing, "w", encoding="utf-8", newline="\n") as f:
+            f.write("keep-me\n")
+        err = io.StringIO()
+        with mock.patch.object(R.replace_retry, "replace", side_effect=OSError("disk full")), \
+                mock.patch("sys.stderr", err):
+            rc = R.main([xml, "--out", out])
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR: cannot write", err.getvalue())
+        with open(existing, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep-me\n")
+        self.assertEqual([n for n in os.listdir(out) if n.endswith(".tmp")], [])
+
 
 if __name__ == "__main__":
     unittest.main()

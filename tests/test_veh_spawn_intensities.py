@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "veh_spawn_intensities.py")
@@ -92,6 +93,18 @@ class RecordsTest(unittest.TestCase):
     def test_records_and_aggregates(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(vsi.census(write_doc(tmp)), WANT)
+
+    def test_empty_table_and_mud_min_above_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            empty_path = os.path.join(tmp, "empty.xml")
+            with open(empty_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("<CGraphicsDefinitionsData><VehSpawnIntensities/></CGraphicsDefinitionsData>\n")
+            self.assertEqual(vsi.census(empty_path), {
+                "entries": 0, "signatures": 0, "signature_groups": [], "set_counts": [],
+                "per_set_ranges": [], "bands_with_mud": [], "rain_groups": 0, "rain_group_sizes": [],
+            })
+            mud_min_only = [{"key": "", "sets": ((0.0, 0.2, 0.5, 0.0),), "rain": (0.0, 0.0, 0.0)}]
+            self.assertEqual(vsi.aggregate(mud_min_only)["bands_with_mud"], [1])
 
 
 class CliTest(unittest.TestCase):
@@ -193,6 +206,67 @@ class CliTest(unittest.TestCase):
             status, _, err = self.run_tool(tmp)
             self.assertEqual(status, 2)
             self.assertIn("ERROR:", err)
+
+    def test_carve_overwrite_and_empty_or_dir_json_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            blob = DOC.encode("utf-8")
+            stream = os.path.join(carve, "000000001000.bin")
+            with open(stream, "wb") as f:
+                f.write(blob)
+            index_path = os.path.join(carve, "index.json")
+            index_text = json.dumps({"files": [{"off": 0x1000, "stored": len(blob), "size": len(blob),
+                                                "pre": "00" * 16, "head": blob[:16].hex()}]})
+            with open(index_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(index_text)
+
+            cwd = os.path.join(tmp, "cwd")
+            os.mkdir(cwd)
+            old_cwd = os.getcwd()
+            os.chdir(cwd)
+            try:
+                for bad in ("", "   ", carve, index_path, stream):
+                    with self.subTest(bad=bad):
+                        status, out, err = self.run_tool(carve, "--json", bad)
+                        self.assertEqual(status, 2)
+                        self.assertEqual(out, "")
+                        self.assertIn("ERROR:", err)
+                self.assertEqual(os.listdir(cwd), [])
+            finally:
+                os.chdir(old_cwd)
+
+            with open(index_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), index_text)
+            with open(stream, "rb") as f:
+                self.assertEqual(f.read(), blob)
+
+            alias = os.path.join(tmp, "alias.json")
+            try:
+                os.link(stream, alias)
+            except OSError:
+                self.skipTest("hard links unavailable")
+            status, out, err = self.run_tool(carve, "--json", alias)
+            self.assertEqual(status, 2)
+            self.assertEqual(out, "")
+            self.assertIn("--json must not overwrite the input", err)
+            with open(stream, "rb") as f:
+                self.assertEqual(f.read(), blob)
+
+    def test_atomic_json_write_preserves_existing_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            doc_path = write_doc(tmp)
+            report = os.path.join(tmp, "report.json")
+            with open(report, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": 1}\n')
+            with mock.patch.object(vsi, "replace_file", side_effect=OSError("disk full")):
+                status, out, err = self.run_tool(doc_path, "--json", report)
+            self.assertEqual(status, 2)
+            self.assertEqual(out, "")
+            self.assertIn("disk full", err)
+            with open(report, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": 1}\n')
+            self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".veh-spawn-")], [])
 
 
 if __name__ == "__main__":

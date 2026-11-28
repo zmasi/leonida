@@ -91,6 +91,23 @@ class ManifestTest(unittest.TestCase):
         return subprocess.run([sys.executable, "-I", TOOL, *args], capture_output=True,
                               text=True, errors="replace", timeout=60)
 
+    def test_music_id_collisions_keep_every_channel_and_manifest_row(self):
+        regular = entries(with_music=False)[-1]
+        desc, audio = music_blob([0x30, 0x30], 960, 48000)
+        audio = bytearray(audio)
+        audio[2050] = 0x78
+        audio[4098] = 0x7C
+        bank = Path(self.tmp.name) / "mix.awc"
+        bank.write_bytes(build_bank([regular, (0x50, [(0x48, desc), (0x55, audio)])]))
+        awc_manifest.awc_opus.export_bank(bank, self.tmp.name)
+        files = sorted((bank.parent / "mix").glob("*.ogg"))
+        self.assertEqual([p.stem for p in files], ["00000030", "00000030~2", "00000030~3"])
+        self.assertEqual([p.read_bytes()[-1] for p in files], [0xF8, 0x78, 0x7C])
+        rows = awc_manifest._bank_rows(bank, bank.name)
+        self.assertEqual([row["streamed_music"] for row in rows], [False, True, True])
+        for path, row in zip(files[1:], rows[1:]):
+            self.assertIn(path.stem, row["notes"])
+
     def test_csv_rows_codecs_and_bad_bank_skip(self):
         bank = self.write_bank()
         with open(os.path.join(self.tmp.name, "bad.awc"), "wb") as f:

@@ -51,7 +51,7 @@ if SEM_DIR not in sys.path:
     sys.path.insert(0, SEM_DIR)
 
 import rdna2spirv  # noqa: E402
-from spirv_mini_interp import run_fragment  # noqa: E402
+from spirv_mini_interp import UnsupportedConstruct, run_fragment  # noqa: E402
 
 MASK32 = 0xFFFFFFFF
 MASK64 = (1 << 64) - 1
@@ -693,7 +693,7 @@ GENERATORS = {
 def generate_program(rng, n_ops, families=None):
     """A program of n_ops memory operations; its last four result registers are exported through v8..v11."""
     prog = Program()
-    names = sorted(families or GENERATORS)
+    names = sorted(set(families)) if families else sorted(GENERATORS)
     results = []
     for _ in range(n_ops):
         family = rng.choice(names)
@@ -737,17 +737,19 @@ def run_one(name, prog):
     memory = dict(prog.memory)
     try:
         out = run_fragment(spvasm, memory=memory)
-    except Exception as e:  # noqa: BLE001 - the interpreter is half of the comparison
+    except UnsupportedConstruct as e:
         return "skip", f"mini_interp unsupported: {type(e).__name__}: {e}"
-    got = list(out.get("%out_mrt0", ()))
+    got = [w & MASK32 for w in out.get("%out_mrt0", ())]
     if got != want:
         bad = [k for k in range(4) if k >= len(got) or got[k] != want[k]]
+        if not bad:
+            return "mismatch", f"export shape mismatch: expected 4 words, translated {len(got)}"
         i = bad[0]
         g = f"{got[i]:#010x}" if i < len(got) else "missing"
         detail = f"export word {i}: expected {want[i]:#010x}, translated {g}"
         return "mismatch", detail
-    if memory != ref.mem:
-        bad = sorted(a for a in set(memory) | set(ref.mem) if memory.get(a, 0) != ref.mem.get(a, 0))
+    bad = sorted(a for a in set(memory) | set(ref.mem) if (memory.get(a, 0) & MASK32) != (ref.mem.get(a, 0) & MASK32))
+    if bad:
         a = bad[0]
         return "mismatch", (f"memory at {a:#x} ({len(bad)} word(s) differ): expected {ref.mem.get(a, 0):#010x}, "
                             f"translated {memory.get(a, 0):#010x}")

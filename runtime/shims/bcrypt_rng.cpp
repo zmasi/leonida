@@ -113,18 +113,37 @@ bool is_rng_algorithm(LPCWSTR alg_id) {
     return alg_id && _wcsicmp(alg_id, BCRYPT_RNG_ALGORITHM) == 0;
 }
 
+// g_lock held (shared or exclusive).
 bool lookup_live_handle(BCRYPT_ALG_HANDLE h, BCRYPT_ALG_HANDLE& out_host, bool& out_is_rng) {
-    AcquireSRWLockShared(&g_lock);
     for (const AlgHandle* cur = g_live_handles; cur; cur = cur->next) {
         if (cur == h) {
             out_host = cur->host_handle;
             out_is_rng = cur->is_rng;
-            ReleaseSRWLockShared(&g_lock);
             return true;
         }
     }
-    ReleaseSRWLockShared(&g_lock);
     return false;
+}
+
+// Holds g_lock shared for as long as it lives: a handle found under it stays open (close_algorithm_provider unlinks
+// and closes under the exclusive lock), and calls on other handles or other threads still run side by side.
+struct SharedLock {
+    SharedLock() { AcquireSRWLockShared(&g_lock); }
+    ~SharedLock() { ReleaseSRWLockShared(&g_lock); }
+    SharedLock(const SharedLock&) = delete;
+    SharedLock& operator=(const SharedLock&) = delete;
+};
+
+// The host RNG on a handle (null: the system-preferred one), else SystemFunction036.
+NTSTATUS host_random(BCRYPT_ALG_HANDLE host_handle, PUCHAR pbBuffer, ULONG cbBuffer, ULONG dwFlags) {
+    if (!g_disable_host_rng_for_test.load(std::memory_order_acquire)) {
+        if (g_host_gen) {
+            const NTSTATUS st = g_host_gen(host_handle, pbBuffer, cbBuffer, dwFlags);
+            if (st >= 0) return st;
+        }
+        if (g_rtl_gen_random && g_rtl_gen_random(pbBuffer, cbBuffer)) return kStatusSuccess;
+    }
+    return kStatusUnsuccessful;
 }
 
 NTSTATUS WINAPI open_algorithm_provider(BCRYPT_ALG_HANDLE* phAlgorithm, LPCWSTR pszAlgId, LPCWSTR pszImplementation,
@@ -163,7 +182,10 @@ NTSTATUS WINAPI close_algorithm_provider(BCRYPT_ALG_HANDLE hAlgorithm, ULONG dwF
     ensure_initialized();
     if (!hAlgorithm) return kStatusInvalidHandle;
 
+    // Unlinked and closed under the exclusive lock: it waits for a BCryptGenRandom still using the host handle (which
+    // holds the lock shared for its whole call), and no later call can find the handle once it goes.
     AlgHandle* removed = nullptr;
+    NTSTATUS st = kStatusSuccess;
     AcquireSRWLockExclusive(&g_lock);
     AlgHandle** cur = &g_live_handles;
     while (*cur) {
@@ -174,11 +196,9 @@ NTSTATUS WINAPI close_algorithm_provider(BCRYPT_ALG_HANDLE hAlgorithm, ULONG dwF
         }
         cur = &((*cur)->next);
     }
+    if (removed && removed->host_handle && g_host_close) st = g_host_close(removed->host_handle, dwFlags);
     ReleaseSRWLockExclusive(&g_lock);
     if (!removed) return kStatusInvalidHandle;
-
-    NTSTATUS st = kStatusSuccess;
-    if (removed->host_handle && g_host_close) st = g_host_close(removed->host_handle, dwFlags);
     delete removed;
     return st;
 }
@@ -188,35 +208,52 @@ NTSTATUS WINAPI gen_random(BCRYPT_ALG_HANDLE hAlgorithm, PUCHAR pbBuffer, ULONG 
     if (!pbBuffer) return kStatusInvalidParameter;
 
     const bool use_system = (dwFlags & BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0;
-    BCRYPT_ALG_HANDLE host_handle = nullptr;
-    bool is_rng = use_system;
     if (use_system) {
         if (hAlgorithm != nullptr) return kStatusInvalidParameter;
-    } else {
-        if (!hAlgorithm || !lookup_live_handle(hAlgorithm, host_handle, is_rng)) return kStatusInvalidHandle;
-        if (!is_rng) return kStatusInvalidHandle;
-    }
-
-    if (cbBuffer == 0) return kStatusSuccess;
-
-    if (g_seeded_mode) {
-        fill_seeded(pbBuffer, cbBuffer);
-        return kStatusSuccess;
-    }
-    if (!g_disable_host_rng_for_test.load(std::memory_order_acquire)) {
-        if (g_host_gen) {
-            const NTSTATUS st = g_host_gen(use_system ? nullptr : host_handle, pbBuffer, cbBuffer, dwFlags);
-            if (st >= 0) return st;
+        if (cbBuffer == 0) return kStatusSuccess;
+        if (g_seeded_mode) {
+            fill_seeded(pbBuffer, cbBuffer);
+            return kStatusSuccess;
         }
-        if (g_rtl_gen_random && g_rtl_gen_random(pbBuffer, cbBuffer)) return kStatusSuccess;
+        return host_random(nullptr, pbBuffer, cbBuffer, dwFlags);
     }
-    return kStatusUnsuccessful;
+
+    if (!hAlgorithm) return kStatusInvalidHandle;
+    {
+        // The host handle is used under the shared lock it was found under, so a concurrent
+        // BCryptCloseAlgorithmProvider cannot close it mid-call.
+        SharedLock lock;
+        BCRYPT_ALG_HANDLE host_handle = nullptr;
+        bool is_rng = false;
+        if (!lookup_live_handle(hAlgorithm, host_handle, is_rng) || !is_rng) return kStatusInvalidHandle;
+        if (cbBuffer == 0) return kStatusSuccess;
+        if (!g_seeded_mode) return host_random(host_handle, pbBuffer, cbBuffer, dwFlags);
+    }
+    fill_seeded(pbBuffer, cbBuffer);  // takes g_lock exclusive: not under the shared hold
+    return kStatusSuccess;
 }
 
 }  // namespace
 
 void set_host_rng_enabled_for_test(bool enabled) {
     g_disable_host_rng_for_test.store(!enabled, std::memory_order_release);
+}
+
+// Replaces the host bcrypt.dll functions (tests), and returns the previous ones through the same arguments. Call with
+// no handle open.
+void swap_host_functions_for_test(void** open, void** close, void** gen) {
+    ensure_initialized();
+    AcquireSRWLockExclusive(&g_lock);
+    auto* o = reinterpret_cast<void*>(g_host_open);
+    auto* c = reinterpret_cast<void*>(g_host_close);
+    auto* g = reinterpret_cast<void*>(g_host_gen);
+    g_host_open = reinterpret_cast<OpenAlgFn>(*open);
+    g_host_close = reinterpret_cast<CloseAlgFn>(*close);
+    g_host_gen = reinterpret_cast<GenRandomFn>(*gen);
+    *open = o;
+    *close = c;
+    *gen = g;
+    ReleaseSRWLockExclusive(&g_lock);
 }
 }  // namespace rt::bcrypt_rng
 

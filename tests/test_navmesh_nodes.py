@@ -155,6 +155,19 @@ class TallyTest(unittest.TestCase):
         self.assertEqual(wide["nodes_within_max_dz"], 3)
         self.assertEqual(wide["flags18"]["12"]["nodes"], 2)
 
+    def test_huge_finite_extent_does_not_exhaust_grid_memory(self):
+        # A damaged tile with a huge finite float32 extent (1e30 m) would otherwise iterate over ~1e58 grid cells.
+        tile = bytearray(build_tile([(0.0, 0.0, 128.0, 128.0, 4.0, ROAD, MARK)]))
+        struct.pack_into("<3f", tile, 0x60, 1e30, 1e30, 16.0)
+        nodes = [(10.0, 10.0, 4.0), (50.0, 50.0, 4.0)]
+        by_sector = {nn.sector_of(10.0, 10.0): [0, 1]}
+        tally = nn.new_tally()
+        nn.tally_tile(tally, bytes(tile), by_sector, nodes)
+        self.assertEqual(tally["tiles_with_nodes"], 1)
+        self.assertEqual(tally["polygons"], 1)
+        self.assertEqual(sorted(tally["best"]), [0, 1])
+        self.assertEqual(tally["best"][0][1:], (ROAD, MARK))
+
     def test_unreadable_tile_is_counted(self):
         tile = bytearray(build_tile(self.SQUARES))
         struct.pack_into("<Q", tile, 0x98, 0)                       # no polygon array

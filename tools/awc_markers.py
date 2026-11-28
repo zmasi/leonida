@@ -29,8 +29,15 @@ import os
 import statistics
 import struct
 import sys
+import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+if TOOLS not in sys.path:
+    sys.path.insert(0, TOOLS)
+
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from rsc8_audio import parse_adat_at_file  # noqa: E402
 
 TAG_MUSIC, TAG_DATA, TAG_FORMAT, TAG_MARKER = 0x48, 0x55, 0x76, 0xBD
@@ -170,16 +177,17 @@ def _finish(group: dict) -> dict:
     return group
 
 
-def scan(src: str) -> dict:
-    """The report for an archive, one bank or a directory of banks."""
+def _input_paths(src: str) -> list[str]:
     if os.path.isdir(src):
         def scan_failed(error):
             raise error
 
-        paths = sorted(os.path.join(root, f) for root, _dirs, files in os.walk(src, onerror=scan_failed)
-                       for f in files if f.lower().endswith(".awc"))
-    else:
-        paths = [src]
+        return sorted(os.path.join(root, f) for root, _dirs, files in os.walk(src, onerror=scan_failed)
+                      for f in files if f.lower().endswith(".awc"))
+    return [src]
+
+
+def _scan_paths(paths: list[str]) -> dict:
     groups = {"streamed_music": _new_group(), "other": _new_group()}
     banks = streams = 0
     for path in paths:
@@ -197,6 +205,42 @@ def scan(src: str) -> dict:
     return {"banks": banks, "streams": streams, **{name: _finish(g) for name, g in groups.items()}}
 
 
+def scan(src: str) -> dict:
+    """The report for an archive, one bank or a directory of banks."""
+    return _scan_paths(_input_paths(src))
+
+
+def _write_json_atomic(path: str, payload: dict) -> None:
+    """Write ``payload`` to ``path`` via a sibling temp file, preserving mode and retrying transient locks."""
+    dest = os.path.realpath(path)
+    parent = os.path.dirname(dest) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".awc_markers-", suffix=".json")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, published_mode(dest))
+        replace_retry(tmp, dest)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Count AWC marker events (tag 0xBD); hashes and counts only.")
     ap.add_argument("src", help="an RPF9 archive, an .awc bank, or a directory scanned recursively for *.awc")
@@ -205,15 +249,34 @@ def main(argv=None) -> int:
     if not os.path.exists(a.src):
         print(f"awc_markers: error: {a.src}: no such file or directory", file=sys.stderr)
         return 2
+    if a.out is not None:
+        if not a.out.strip():
+            print("awc_markers: error: --out path must not be empty", file=sys.stderr)
+            return 2
+        if a.out.endswith(("/", "\\")) or (os.sep and a.out.endswith(os.sep)) or os.path.isdir(a.out):
+            print(f"awc_markers: error: --out {a.out} is a directory", file=sys.stderr)
+            return 2
     try:
-        report = scan(a.src)
+        paths = _input_paths(a.src)
     except OSError as error:
         print(f"awc_markers: error: cannot read {error.filename or a.src}: {error.strerror or error}", file=sys.stderr)
         return 1
-    if a.out:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=2)
-            f.write("\n")
+    if a.out is not None:
+        for path in paths:
+            if same_report_path(a.out, path):
+                print(f"awc_markers: error: --out {a.out} would overwrite input {path}", file=sys.stderr)
+                return 2
+    try:
+        report = _scan_paths(paths)
+    except OSError as error:
+        print(f"awc_markers: error: cannot read {error.filename or a.src}: {error.strerror or error}", file=sys.stderr)
+        return 1
+    if a.out is not None:
+        try:
+            _write_json_atomic(a.out, report)
+        except OSError as error:
+            print(f"awc_markers: error: cannot write {a.out}: {error.strerror or error}", file=sys.stderr)
+            return 1
     print(f"{report['banks']} banks, {report['streams']} streams")
     for name in ("streamed_music", "other"):
         g = report[name]

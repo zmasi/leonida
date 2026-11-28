@@ -667,5 +667,85 @@ class RageTextureDetectionTest(unittest.TestCase):
                             self.assertEqual(f.read(), old_text)
                         self.assertFalse([n for n in os.listdir(td) if n.startswith(".restofworld_index-")])
 
+    def test_python_api_rejects_invalid_limit_start_and_max_inflate(self):
+        with tempfile.TemporaryDirectory() as td:
+            rpf = os.path.join(td, "small.rpf")
+            with open(rpf, "wb") as f:
+                f.write(b"9FPR" + struct.pack("<I", 0x10) + bytes(8) + zlib.compress(page()))
+            for bad in (0, -10, True, False):
+                with self.assertRaises(ValueError):
+                    restofworld_index.scan_rpf(rpf, limit=bad)
+                with self.assertRaises(ValueError):
+                    restofworld_index.scan_rpf(rpf, max_inflate=bad)
+                with self.assertRaises(ValueError):
+                    restofworld_index.scan_dir(td, max_inflate=bad)
+            with self.assertRaises(ValueError):
+                restofworld_index.scan_rpf(rpf, start=True)
+
+    def test_carve_index_handles_utf8_bom_bk2_entries_and_malformed_summary(self):
+        with tempfile.TemporaryDirectory() as td:
+            with open(os.path.join(td, "000000001000.bin"), "wb") as f:
+                f.write(b"raw bytes " * 100)
+            with open(os.path.join(td, "000000002000.bk2"), "wb") as f:
+                f.write(bink())
+            index = {
+                "summary": {"span": 4000, "zero_padding": 500, "unread_bytes": 1000},
+                "files": [
+                    {"off": 0x1000, "stored": 300, "size": 1000},
+                    {"off": 0x2000, "stored": 96, "size": 64, "type": "bink2"},
+                ],
+            }
+            with open(os.path.join(td, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump(index, f)
+            rows, summary = restofworld_index.scan_dir(td)
+            self.assertEqual([r["stored"] for r in rows], [300, 96])
+            self.assertEqual(summary["span"], 4000)
+
+            with open(os.path.join(td, "index.json"), "w", encoding="utf-8-sig", newline="\n") as f:
+                json.dump(index, f)
+            rows_bom, summary_bom = restofworld_index.scan_dir(td)
+            self.assertEqual([r["stored"] for r in rows_bom], [300, 96])
+            self.assertEqual(summary_bom["span"], 4000)
+            self.assertEqual(summary_bom["zero_padding"], 500)
+            self.assertEqual(summary_bom["unread_bytes"], 1000)
+
+            # Malformed summary values in index.json must fall back cleanly instead of crashing scan_dir().
+            for bad_summary in ({"span": "not-an-int"}, {"span": -1}, {"span": True}, {"span": 4000, "zero_padding": -5}):
+                index["summary"] = bad_summary
+                with open(os.path.join(td, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(index, f)
+                rows2, summary2 = restofworld_index.scan_dir(td)
+                self.assertEqual(summary2["span"], sum(r["stored"] for r in rows2))
+
+    def test_write_output_strict_json_trailing_lf_and_dangling_symlink_guard(self):
+        with tempfile.TemporaryDirectory() as td:
+            out = os.path.join(td, "out.json")
+            summary = restofworld_index.summarise([], span=0, zero=0, unread=0)
+            restofworld_index.write_output(out, [], summary)
+            with open(out, "rb") as f:
+                self.assertTrue(f.read().endswith(b"\n"))
+
+            bad_summary = dict(summary, readable_fraction=float("nan"))
+            with self.assertRaises(ValueError):
+                restofworld_index.write_output(out, [], bad_summary)
+            self.assertFalse([n for n in os.listdir(td) if n.startswith(".restofworld_index-")])
+
+            # Dangling symlink pointing to <folder>/index.json must be refused before scanning.
+            folder = os.path.join(td, "carved")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "000000001000.bin"), "wb") as f:
+                f.write(page())
+            link = os.path.join(td, "alias.json")
+            try:
+                os.symlink(os.path.join(folder, "index.json"), link)
+            except (OSError, NotImplementedError) as e:
+                self.skipTest(f"symlinks unavailable: {e}")
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()) as err:
+                restofworld_index.main([folder, link, "--quiet"])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("output must not overwrite the source archive", err.getvalue())
+            self.assertFalse(os.path.exists(os.path.join(folder, "index.json")))
+
+
 if __name__ == "__main__":
     unittest.main()

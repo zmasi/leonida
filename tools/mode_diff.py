@@ -921,11 +921,19 @@ def run_sweep(seed, ops=None):
 
 
 def run_suite(programs, seed, max_ops=6, ops=None):
+    if type(programs) is not int or programs < 0:
+        raise ValueError("programs must be a nonnegative integer")
+    if type(max_ops) is not int or max_ops < 1:
+        raise ValueError("max_ops must be at least 1")
     counts = _new_counts()
     return counts, _run(counts, suite_items(programs, seed, max_ops, ops), "rn")
 
 
 def run_invariance(programs, seed, max_ops=6):
+    if type(programs) is not int or programs < 0:
+        raise ValueError("programs must be a nonnegative integer")
+    if type(max_ops) is not int or max_ops < 1:
+        raise ValueError("max_ops must be at least 1")
     counts = _new_counts()
     return counts, _run(counts, invariance_items(programs, seed, max_ops), "iv", invariance=True)
 
@@ -1012,7 +1020,7 @@ def self_test():
     return ok
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--programs", type=int, default=300, help="random programs after the sweep")
     ap.add_argument("--invariance", type=int, default=100, help="mode-invariance programs")
@@ -1022,7 +1030,7 @@ def main():
     ap.add_argument("--no-sweep", action="store_true", help="skip the sweep of every form under every MODE write")
     ap.add_argument("--list-ops", action="store_true")
     ap.add_argument("--self-test", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if args.list_ops:
         for op in FAMILY:
             print(f"{op:18s} {OP_FORMS[op]}")
@@ -1030,9 +1038,20 @@ def main():
         return 0
     if args.self_test:
         return 0 if self_test() else 1
+    if args.programs < 0:
+        ap.error("--programs must be nonnegative")
+    if args.invariance < 0:
+        ap.error("--invariance must be nonnegative")
+    if args.max_ops < 1:
+        ap.error("--max-ops must be at least 1")
+    if args.no_sweep and args.programs == 0 and args.invariance == 0:
+        ap.error("nothing to run: pass --programs >= 1, --invariance >= 1, or omit --no-sweep")
     ops = None
-    if args.ops:
-        ops = [o.strip() for o in args.ops.split(",") if o.strip()]
+    if args.ops is not None:
+        tokens = [o.strip() for o in args.ops.split(",")]
+        if not tokens or any(not o for o in tokens):
+            ap.error("--ops must be a comma-separated list of opcodes")
+        ops = list(dict.fromkeys(tokens))
         bad = [o for o in ops if o not in FAMILY]
         if bad:
             print(f"unknown op(s): {', '.join(bad)} (see --list-ops)", file=sys.stderr)
@@ -1077,6 +1096,9 @@ def main():
     if total["skip"]:
         print(f"SKIPPED {total['skip']} program(s): every generated form should translate (reasons above)")
         return 1
+    if judged == 0:
+        print("no judged program ran", file=sys.stderr)
+        return 2
     return 0
 
 

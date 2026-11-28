@@ -2317,7 +2317,9 @@ below 4 GiB). A parameter that does not fit goes, with every later one, to the s
     two dwords from s6). The `pack()` layout contradicts 7 of them, which read the second table at s5, the first
     table's high half in that layout.
 - **Vertex/pixel/geometry s8 and mesh s16: a hypothesis.** It rests on the census above only; no signature
-  confirms these bases, and visibility is not modelled (every parameter takes its place in every stage).
+  confirms these bases, and visibility is not modelled (every parameter takes its place in every stage). Each
+  shader's own root-layout table would make it a per-shader fact; it is parsed but not counted yet ("Per-shader
+  root tables in the FSSM record" below).
 
 The runtime uses the console layout at **both** bind points. Every stage of a pipeline reads one push-constant block
 (`ShaderUserData` in `runtime/src/vulkan_replay.h`), so the graphics bind point lays a signature out once with
@@ -2380,6 +2382,75 @@ block puts the first table, while two dwords per table would put it at s2.
 Still open: which CBV index lands in which pair. The four pairs do appear in declaration order, but nothing in the
 package proves that order, and every parameter in these 29 is `D3D12_SHADER_VISIBILITY_ALL`, so they say nothing
 about the visibility question below.
+
+**Per-shader root tables in the FSSM record (FSSM-ROOT-LAYOUT-TABLES): parsed, not measured yet.** The census
+above reads the code. Each native program's record also names two tables that state the layout directly: a
+root-layout table (where each root parameter arrives in the program's user data) and a used-resource table (which
+descriptors the program reads, by root parameter). This is the record layout as read by VIctory (Marvisak/VIctory,
+GPL-3.0, `native.rs` in its `crates/victory-shader/src`), which builds its user data from these tables instead of
+inferring a base. `root_tables()` in `tools/fssm_root_layout.py` is a parser written for this repository from that
+layout; it contains no VIctory code. **Nothing here has been run on a real shader**: the parser and
+`tools/root_layout_census.py` are tested on hand-built records only (`tests/test_fssm_root_layout.py`). Neither
+file is a translation source and `tools/fssm_unpack.py` is unchanged, so a translated shader library stays valid
+with them.
+
+Offsets stored in the blob count from the payload, which starts at blob offset `0x10`; the offsets other pages
+give for the header (`0xC0`, `0xE8`, ...) are blob offsets.
+
+| Where | What | Basis |
+|---|---|---|
+| payload `+0x08` | `u64` record offset per hardware stage: LS, HS, ES, GS, VS, PS at `+0x08`..`+0x30`, mesh at `+0x48`, compute at `+0x60`; `0xDEADBEEFDEADBEEF` when the blob has no program for the stage | VIctory's reading. [fssm_crosscheck.md](fssm_crosscheck.md) measured blob `0x18`/`0x20` (the LS and HS slots here) as that sentinel in 26,503 of 26,503, and the code offset at blob `0xC0`, where a first record at payload `0xB0` puts it. Which slot holds which record offset is not checked, and the qwords between those slots (`+0x38`, `+0x40`, `+0x50`, `+0x58`) are not read. |
+| record `+0x00`, `+0x08` | `u64` code offset and size | Measured before as blob `0xC0`/`0xC8`. The first instruction is `0x18` bytes into this range (the `u32[0xC0] + 0x28` rule, with the offset counted from the payload). |
+| record `+0x28` | `u64` offset of the root-layout table | VIctory's reading. It is the field fssm_crosscheck.md calls `code_end` (blob `0xE8`): equal to code offset + size in 26,486 blobs, so the table starts where the code ends, and the unset sentinel in the other 17. |
+| record `+0x30` | `u64` offset of the used-resource table | VIctory's reading. The `meta_ptr` of fssm_crosscheck.md (blob `0xF0`), the sentinel in 635 blobs. |
+| record `+0x38`, `+0x3c` | `u32` entry count of each table | VIctory's reading, unconfirmed. |
+| root-layout entry, 20 bytes | `u32` root type (0 constants, 1 root descriptor, 3 descriptor table, 4 immediate sampler, 5 resource heap, 6 sampler heap), `u32` offset of the range in its table in dwords, `u32` user-data dwords it takes, `u32` shader register of the first descriptor, `u8` first user-data dword, `u8` root parameter index, `u16` 0 | VIctory's reading, unconfirmed. `fssm_header.binding_table` already found 20-byte records at this place in all 26,503 blobs (5,640,704 of them) without naming their fields. It starts at the same byte, so its "header" word is this table's first root type: it is 4 in 24,572 blobs and 3 in 1,914, an immediate sampler and a table. Its records begin 8 bytes later, so each straddles two entries. That follows from the two descriptions; it is not checked on data. |
+| used-resource entry, 20 bytes | `u8` resource type (0 SRV, 1 sampler, 2 CBV, 3 UAV), `u8` root type, `u16` 0, `u32` offset in the table in dwords, `u32` lower-bound register, `u32` stride, `u8` dwords per descriptor, `u8` first user-data dword, `u8` root parameter index, `u8` 0 | VIctory's reading, unconfirmed. |
+| user-data dword n → SGPR | `s<n>` in the VS, PS and compute stages; `s<n+8>` in the merged and mesh stages (LS, HS, ES, GS, MS), which have 8 system SGPRs first | VIctory's reading. With it the bases above are first user-data dwords: 8 for a PS, VS or mesh shader (`s8`, `s8`, `s16`), 4 for compute, 0 for a GS (`s8`). Section 7 has the mesh user data at `s16`-`s24` from a corpus measurement. |
+| spill (compute) | 16 user SGPRs; a parameter whose first user-data dword is 16 or more is in memory behind the 40-bit pointer in user data 0-1, and that memory starts with dword 16 | VIctory's reading. The pointer in `s[0:1]` is also section 7's (console-compiler output). The 16 is not measured here: the game's compute shaders launch with at most 14 user SGPRs. VIctory reads a spill for compute only. |
+
+What the parser refuses (`FssmLayoutError`, a `ValueError`): a header that is not version `0x101` with a matching
+payload size, a record or code range outside the payload, records that overlap each other or the slot table, and a
+table that runs past the payload or overlaps a record, its program's code or the program's other table. A count of
+0 is an empty table whatever its offset is. Unnamed types and non-zero reserved fields are kept, so the census can
+count them.
+
+```
+python -I tools/root_layout_census.py <work>/shaders/dxbc --json <report.json>
+python -I tools/root_layout_census.py <work>/shaders/dxbc --base ps=8 vs=8 gs=8 cs=4 ms=16 --expect-agree
+python -I tools/fssm_root_layout.py <work>/shaders/dxbc --out <root_layout.json>
+```
+
+The census reads your own carved containers (every tag-`0x0D` payload) or unpacked `.fssm` blobs and prints counts
+only, per hardware stage: the lowest SGPR a parameter arrives in and the lowest that holds an address (the number
+the SGPR census above measured from the code), the dwords each root type takes (one or two per table), the root
+types and used-resource kinds, the compute programs with a spilled parameter and the first spilled dword, and how
+many programs agree with this section's hypothesis: no parameter below the stage base, one dword per table, two per
+root descriptor, parameters in root order. It lists the reasons for the ones that disagree. `--expect-agree` exits
+1 on a disagreement, a blob that does not parse or an empty run. It also counts what would show the reading to be
+wrong: blobs it cannot read (by reason), record offsets (the first is expected at `0xc0`), whether the root-layout
+table follows the code, the number of entries in each table, used resources with no layout entry for their
+parameter, non-zero reserved fields, unnamed types and parameters past `s31`. With no path, or a folder that has
+no `.fssm` or `.dxbc` file, it prints `no input`. `fssm_root_layout.py` writes the tables themselves as JSON, one
+line per file with an entry per blob (the programs, or why they could not be read); without `--out` it prints
+them, and for a whole library the output is large.
+
+Open:
+- **Every offset and field marked "VIctory's reading" is unconfirmed on this corpus.** A census of a real library
+  settles it: no unread blob, record offsets as expected, a lowest-pointer SGPR per stage that matches the SGPR
+  census (`s8` in 9,830 PS and 1,660 VS, `s4` in 2,364 CS, `s16` in 7,977 MS), and entry totals that can be held
+  against the 5,640,704 records `binding_table` counted in the same region.
+- **Does a table list every parameter of the root signature, or only the ones the program reads?** If only those,
+  a lowest parameter above the base is expected; if all of them, it contradicts the base. The census therefore
+  counts "above the base" apart from "at the base" and calls neither a disagreement.
+- **Root type 2 and the reserved fields** have no reading; the census counts them.
+- **Blobs with two programs.** The 195 GS blobs carry a second PAL stage descriptor, the shader's VS copy
+  ([design.md](design.md), "PAL stage descriptors"), so they should have two records here. Whether each has its
+  own tables is not known: the parser reads each record's tables on their own and lets two records name the same
+  table.
+- **A graphics-stage spill** has no reading at all.
+- **The runtime does not use the tables.** Feeding them to `rt::rootsig::pack_stage` and `ShaderUserData` is the
+  follow-up once the counts are in; until then the hypothesis above stays a hypothesis.
 
 Spill policy: a signature needing more than 32 user SGPRs, or more than the 64-dword D3D12 cost limit, is
 refused loudly (`pack` returns the offending parameter) instead of being truncated. The console spills through
@@ -4065,9 +4136,10 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   the units of `GetTimestampFrequency`) and the CPU stamp in `QueryPerformanceCounter` units. When the device has
   `VK_KHR_calibrated_timestamps` or `VK_EXT_calibrated_timestamps` enabled (`VulkanDeviceInfo::calibrated_timestamps`;
   the standalone device enables whichever the GPU has) and offers the `DEVICE` and `QUERY_PERFORMANCE_COUNTER`
-  domains, it is one `vkGetCalibratedTimestampsKHR` call. Otherwise the queue waits until idle, submits a
-  `vkCmdWriteTimestamp` and waits for it, and answers with the midpoint of the `QueryPerformanceCounter` reads
-  around that submission. This stalls the queue, which is acceptable for a call made once per profiling capture. A
+  domains, it is one `vkGetCalibratedTimestampsKHR` call. The fallback waits for an empty completion marker and
+  then submits a `vkCmdWriteTimestamp`. It answers with the midpoint of the `QueryPerformanceCounter` reads
+  around the timestamp submission. The collecting thread waits on its private timeline, outside the device-wide
+  submission lock, so other application threads can still submit work. A
   queue family with `timestampValidBits = 0` fails with `E_FAIL`. `d3d12_fence_timing_test` takes two calibrations
   50 ms apart and compares the GPU and CPU intervals. On an RTX 4090 (driver 621.14) the gap is 2 us with calibrated
   timestamps, 20 us with the fallback, and 0.4 ms with the fallback under the validation layer. The test fails
@@ -5048,20 +5120,32 @@ contract, not a runtime bug:
   block is still under the 256-byte limit of common desktop GPUs, but above Vulkan's 128-byte minimum; the device
   requirement must be checked.
 - A second option is a per-stage uniform/storage buffer for the code base, patched in at pipeline creation. That
-  adds a descriptor binding and a load per `s_getpc`, but avoids growing push constants. Decide after measuring
-  how many real PSOs have two code-base stages.
+  adds a descriptor binding and a load per `s_getpc`, but avoids growing push constants. Not needed for the 1.0.2.1
+  package: measured over whole PSOs, none has two code-base stages (below).
 
 Measured per stage (all 26,503, `tools/feature_scan.py`): `s_getpc_b64` is kept to read code-embedded data in 54
 VS, 93 PS, 266 MS and 263 CS (0 GS); the 147 VS/PS match the translator's own note. Both stages of a VS+PS or
 MS+PS pipeline can therefore need a code base.
 
+Measured per PSO (all 25,471 graphics records of the 1.0.2.1 pipeline library, `tools/pso_code_base_pairs.py`):
+**no PSO has two code-base stages.** The pipeline library names a program per stage slot, and a stage's
+resource-layout blob ends with the digest of the container its code came from, which is how a record's stage joins to
+that program's `uses_code_base` in the translation index ([shader_library.md](shader_library.md) §3). 25,027 records
+have no code-base stage and 444 have exactly one — 343 in MS, 60 in PS, 41 in VS — in a corpus whose slots are 13,383
+VS+PS, 10,726 MS+PS, 1,336 MS, 24 VS and 2 VS+PS+slot 6. The 21 records left unknown (19 VS+PS, 2 with slot 6) have a
+stage whose program is not in the carve output, so its code base is unknown rather than absent. The per-stage library
+program counts there (38 VS, 46 PS, 260 MS, 263 CS) are lower than the corpus counts above: the library holds a
+second compiled form of 6,522 carved shaders, and a program can serve two stage slots.
+
 **Measured:** across the GPU test fleet (Issue #166), desktop NVIDIA (Turing, Ampere, Ada, Blackwell: 256 bytes), desktop AMD (RDNA2: 256 bytes) and Apple Silicon (MoltenVK: 4096 bytes) all satisfy the 144-byte contract natively (`maxPushConstantsSize >= 144`). Intel Arc is not uniform: the earlier fleet entries report the 128-byte specification minimum (`maxPushConstantsSize == 128`) for Arc, but an Arc B580 (Battlemage) on Windows 11, driver 32.0.101.9175, reports 256 bytes (#166, @rtrexmass), so there D3D-14's fallback never engages. The 128 figure may be specific to another OS or driver (Mesa ANV on Linux is the guess; no Arc run on Linux that records the OS is cited here, and an ANV result would settle it). So does an integrated AMD RDNA2 GPU, a Radeon 680M on the Windows driver 22.40.84.06, so the minimum is not Intel-only. That figure follows the driver as well: a Radeon 610M reports 128 on 24.10.16.14 and 256 on 26.11.2 (#166). 128 bytes cannot fit the 16-byte tail (dwords 32–35: heap base and code base) inside push constants. The runtime detects `maxPushConstantsSize < 144` at device creation (`d3d12_vulkan_device.cpp`) and flags `push_constants_need_fallback` for the uniform-buffer fallback.
-**Open:** the exact count of such PSOs (the pairing is in the executable), and the minimum `maxPushConstantsSize` across target GPUs. If a GPU only
+**Open:** the minimum `maxPushConstantsSize` across target GPUs. The pair count above is measured, and zero, so the
+168-byte block is not needed for this package. If a GPU only
 supports 128 bytes, the current 144-byte contract already fails; the layer needs a fallback (uniform buffer for the
 tail) regardless.
 
-At run time, `CreateGraphicsPipelineState` refuses a pair where both stages read their code base, with a log, so
-the first boot measures the pair count. A device whose `maxPushConstantsSize` is below 144 has every PSO refused,
+At run time, `CreateGraphicsPipelineState` refuses a pair where both stages read their code base, with a log, so a
+pair the measurement missed still shows up on the first boot. A device whose `maxPushConstantsSize` is below 144
+has every PSO refused,
 with the limit in the log, until the uniform-buffer tail exists.
 
 ### 5.3 Descriptor T#/S# parsing
@@ -5280,7 +5364,7 @@ nothing is copied from their trees.
 | 11 | What should `CheckFeatureSupport` answer for UMA, resource binding tier, mesh tier, RT tier? | **Implemented** (D3D-11). Reports truthful host architecture (discrete desktop GPU: non-UMA), ResourceBindingTier 3 (descriptor indexing / bindless support), 48-bit GPU virtual address support matching the arena, and maps `D3D12_FEATURE_FORMAT_SUPPORT` to Vulkan format properties plus multisample render-target/resolve support and one quality level per supported sample count. |
 | 12 | Does the game rely on async compute or copy queues for correctness? | Trace queue creation and cross-queue fences. If only performance, serialize on one queue for boot. |
 | 13 | Is 144 bytes of push constants available on all target GPUs? | **Resolved / Measured** (D3D-14). Checked at device creation in `runtime/shims/d3d12_vulkan_device.cpp`. Measured across the test fleet (#166): NVIDIA (256 B), desktop AMD (256 B), and Apple M1/MoltenVK (4096 B) satisfy 144 B natively. A Radeon 680M on the Windows driver 22.40.84.06 and the earlier Intel Arc entries expose only the core minimum 128 B (`maxPushConstantsSize == 128`), but an Arc B580 on Windows 11 (driver 32.0.101.9175) reports 256 B (#166), so the 128 B figure for Arc depends on the OS or driver; an Arc result on Linux (Mesa ANV) would settle which side it is. `d3d12_vulkan_device_test` accepts either answer and checks that the fallback flag matches it. Below 144 B, the device logs a warning and marks `push_constants_need_fallback`, routing the 16-byte tail (dwords 32..35: heap base and code base) to a uniform-buffer fallback. |
-| 14 | Are there PSOs with two code-base stages? | Count from the PSO/shader hash table and the index metadata. If yes, implement per-stage code-base slots (section 5.2). **Per stage, measured** (`tools/feature_scan.py`, `s_getpc_b64` kept for data rather than a far branch): 54 VS, 93 PS, 266 MS, 263 CS, 0 GS; the translator's `uses_code_base` gives the same counts (with LLVM 23 that needs #223, without which these 1,471 shaders are rejected). So VS+PS and MS+PS pipelines with two code-base stages are possible; whether any exists depends on which shaders a PSO pairs, which is in the executable, not in `shaders.rpf`. |
+| 14 | Are there PSOs with two code-base stages? | **No: 0 of 25,471**, measured per PSO (`tools/pso_code_base_pairs.py`, section 5.2). Per stage (`tools/feature_scan.py`, `s_getpc_b64` kept for data rather than a far branch): 54 VS, 93 PS, 266 MS, 263 CS, 0 GS; the translator's `uses_code_base` gives the same counts (with LLVM 23 that needs #223, without which these 1,471 shaders are rejected). The pairing is in `shaders.rpf` after all, in the pipeline library ([shader_library.md](shader_library.md) §3): each graphics record names a program per stage slot and a stage's resource-layout blob carries the digest of the container its code came from, which joins to the translation index. So one 144-byte block with one code base at dwords 34–35 is enough for this package; the per-stage slot stays a fallback, and the runtime's refusal of a PSO whose two stages both read the code base (section 3.2) can stand. |
 | 15 | Is `ExecuteIndirect` used with signatures Vulkan cannot express directly? | Trace `CreateCommandSignature` and `ExecuteIndirect`; implement simple signatures first, expand the complex ones with compute. The simple signatures are D3D-17 (#313). |
 | 16 | Does the game use append/consume UAV counters or typed buffer formats the translator does not model? | **Shaders: answered** by `tools/feature_scan.py` over all 26,503 (1.0.2.1, disassembled with LLVM 21.1.8 for gfx1013; SHADER-65). **No append/consume counters:** none of the 445,394 PSV0 binding records is a structured UAV with a counter, and there is no `ds_append`/`ds_consume`/GDS instruction. Typed buffers are declared in 5,359 shaders as SRVs (17,328 records) and in 2,177 as UAVs (4,005). **MTBUF** (format in the instruction): 52,890 loads in 10,278 shaders, all in five formats the translator decodes (`16_16_SNORM` 24,881, `8_8_8_8_UNORM` 19,835, `8_8_8_8_UINT` 5,099, `2_10_10_10_UNORM` 2,648, `16_16_16_16_UINT` 427), and no MTBUF store. **MUBUF** `buffer_*_format_*` (format from V# word 3): 90,316 accesses (84,908 loads, 5,408 stores) in 11,591 shaders; word 3 comes from a scalar load in 88,924 of them, is computed in 1,390, and is a literal in 2 (FORMAT 0, INVALID, which reads 0 on the hardware and in the translator). So the shaders fix no MUBUF format: the descriptors the executable writes decide it. Still open: which formats those descriptors carry; the runtime can log a V# format outside `Gen.FORMATS` (those read 0 today) when the descriptor is created or copied. Trace UAV descs and shader `buffer_*` ops; extend the translator/runtime together. **Runtime side done, console side open:** the layer writes typed buffer V#s and a counter V# (a hypothesis for where the shader finds it, section 3.4 "Buffer UAVs"); whether the game uses either is for the trace. |
 | 17 | Do upload/readback resources ever reach shaders (as vertex/index buffers or descriptors), and does the `-heap_base` bias work for them? | Trace `CreateCommittedResource` heap types and every VB/IB/descriptor that points at an upload resource; test the bias with a synthetic draw. |

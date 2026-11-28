@@ -91,6 +91,23 @@ class TestSandboxScene(unittest.TestCase):
         # The original tuple-based selection needs more than twelve on x64.
         self.assertLess(peak, 8 * struct.calcsize("P") * len(rows))
 
+    def test_texture_filter_honors_dds_color_space(self):
+        header = bytearray(148)
+        header[:4] = b"DDS "
+        struct.pack_into("<IIIII", header, 4, 124, 0x100F, 2, 2, 8)
+        struct.pack_into("<II4s", header, 76, 32, 4, b"DX10")
+        struct.pack_into("<I", header, 108, 0x1000)
+        pixels = bytes((0, 0, 0, 255, 255, 255, 255, 255)) * 2
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "albedo.dds")
+            for fmt, gray in ((29, 188), (28, 128)):
+                with self.subTest(fmt=fmt):
+                    struct.pack_into("<5I", header, 128, fmt, 3, 0, 1, 0)
+                    with open(path, "wb") as source:
+                        source.write(header + pixels)
+                    self.assertEqual(sandbox_scene.texture_bytes(path, 1),
+                                     struct.pack("<II4B", 1, 1, gray, gray, gray, 255))
+
     def test_mesh_bytes(self):
         prim = {
             "positions": [(0, 0, 0), (1, 0, 0), (0, 1, 0)],
@@ -153,6 +170,18 @@ class TestCliErrors(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertEqual(len(err.strip().splitlines()), 1)
         self.assertTrue(err.startswith("ERROR:"))
+
+    def test_scene_output_cannot_replace_placements(self):
+        from pathlib import Path
+        original = Path(self.entities).read_bytes()
+        alias = os.path.join(self.tmp.name, "scene.bin")
+        os.link(self.entities, alias)
+        for out in (alias, self.entities):
+            with self.subTest(out=out):
+                rc, err = self._run(self.entities, out)
+                self.assertEqual(rc, 2)
+                self.assertIn("--entities", err)
+                self.assertEqual(Path(self.entities).read_bytes(), original)
 
     def test_missing_entities_is_one_error_line(self):
         rc, err = self._run(os.path.join(self.tmp.name, "nope.jsonl"),

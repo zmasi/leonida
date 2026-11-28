@@ -54,6 +54,7 @@ import argparse
 import gc
 import os
 import random
+import re
 import struct
 import sys
 import tempfile
@@ -330,14 +331,21 @@ def writes_scc(name):
     return (fn(1, 2, 0, 3) if form in RMW_FORMS else fn(1, 2, 0))[1] is not None
 
 
+_BRANCH_SKIP_RE = re.compile(r"^\+([0-9]+)$")
+_SGPR_RE = re.compile(r"^s([0-9]+)$")
+_SGPR_PAIR_RE = re.compile(r"^s\[([0-9]+):([0-9]+)\]$")
+_VGPR_RE = re.compile(r"^v([0-9]+)$")
+
+
 def branch_skip(line):
     """For `s_cbranch_scc0/1 +N`: (mnemonic, N); None for any other line."""
-    op, _, rest = line.partition(" ")
+    op, _, rest = line.strip().partition(" ")
     if op not in SCC_BRANCHES:
         return None
-    if not rest.startswith("+"):
-        raise RefError(f"branch {line!r}: expected +N (instructions skipped)")
-    return op, int(rest[1:])
+    m = _BRANCH_SKIP_RE.fullmatch(rest.strip())
+    if not m:
+        raise RefError(f"branch {line!r}: expected +N (non-negative instructions skipped)")
+    return op, int(m.group(1), 10)
 
 
 # ---- program generation ---------------------------------------------------------------------------
@@ -464,18 +472,74 @@ class RefError(Exception):
     pass
 
 
+def _split_args(line, rest):
+    if not rest.strip():
+        return []
+    args = [a.strip() for a in rest.split(",")]
+    if any(not a for a in args):
+        raise RefError(f"{line!r}: empty operand")
+    return args
+
+
+def _expect_args(line, args, count):
+    if len(args) != count:
+        raise RefError(f"{line!r}: expected {count} operand(s), got {len(args)}")
+
+
+def _parse_int(tok):
+    try:
+        return int(tok, 0)
+    except ValueError as e:
+        raise RefError(f"invalid integer operand {tok!r}") from e
+
+
+def _parse_simm16(tok):
+    v = _parse_int(tok.strip())
+    if not -0x8000 <= v <= 0xFFFF:
+        raise RefError(f"SIMM16 operand out of range: {tok!r}")
+    return v
+
+
+def _parse_sgpr(tok):
+    tok = tok.strip()
+    m = _SGPR_RE.fullmatch(tok)
+    if not m:
+        raise RefError(f"expected 32-bit SGPR, got {tok!r}")
+    return int(m.group(1), 10)
+
+
+def _parse_sgpr_pair(tok):
+    tok = tok.strip()
+    m = _SGPR_PAIR_RE.fullmatch(tok)
+    if not m:
+        raise RefError(f"expected 64-bit SGPR pair, got {tok!r}")
+    lo, hi = int(m.group(1), 10), int(m.group(2), 10)
+    if hi != lo + 1:
+        raise RefError(f"expected consecutive SGPR pair s[N:N+1], got {tok!r}")
+    return lo
+
+
+def _parse_vgpr(tok):
+    tok = tok.strip()
+    m = _VGPR_RE.fullmatch(tok)
+    if not m:
+        raise RefError(f"expected VGPR, got {tok!r}")
+    return int(m.group(1), 10)
+
+
 def _parse_src(tok, sgpr, width):
     tok = tok.strip()
     if tok.startswith("s["):
-        lo = int(tok[2:tok.index(":")])
+        lo = _parse_sgpr_pair(tok)
         if width == 32:
             raise RefError(f"pair {tok} in a 32-bit position")
         return sgpr.get(lo, 0) | sgpr.get(lo + 1, 0) << 32
     if tok.startswith("s"):
+        idx = _parse_sgpr(tok)
         if width == 64:
             raise RefError(f"{tok} in a 64-bit position")
-        return sgpr.get(int(tok[1:]), 0)
-    v = int(tok, 0)
+        return sgpr.get(idx, 0)
+    v = _parse_int(tok)
     if width == 64:
         # inline constants are sign-extended; a 32-bit literal is zero-extended (not generated here)
         return v & M64 if -16 <= v <= 64 else v & M32
@@ -485,88 +549,109 @@ def _parse_src(tok, sgpr, width):
 def _write(sgpr, tok, value, width):
     tok = tok.strip()
     if width == 64:
-        lo = int(tok[2:tok.index(":")])
+        lo = _parse_sgpr_pair(tok)
         sgpr[lo], sgpr[lo + 1] = value & M32, (value >> 32) & M32
     else:
-        sgpr[int(tok[1:])] = value & M32
+        sgpr[_parse_sgpr(tok)] = value & M32
 
 
 def reference(lines):
     """Run the scalar program; returns the four exported words."""
     sgpr, scc, vgpr, m0 = {}, 0, {}, 0
     skip = 0
-    for line in lines:
+    for i, line in enumerate(lines):
         if skip:
             skip -= 1
             continue
         br = branch_skip(line)
         if br:
+            if i + 1 + br[1] > len(lines):
+                raise RefError(f"branch {line!r} past the end of the program")
             # SOPP: if SCC == 0 (scc0) / SCC == 1 (scc1) then PC = PC + SIMM16 * 4 + 4; SCC is not written.
             if scc == (0 if br[0] == "s_cbranch_scc0" else 1):
                 skip = br[1]
             continue
-        op, _, rest = line.partition(" ")
-        args = [a.strip() for a in rest.split(", ")] if rest else []
+        op, _, rest = line.strip().partition(" ")
+        args = _split_args(line, rest)
         if op == "v_mov_b32":
-            vgpr[int(args[0][1:])] = _parse_src(args[1], sgpr, 32)
+            _expect_args(line, args, 2)
+            vgpr[_parse_vgpr(args[0])] = _parse_src(args[1], sgpr, 32)
             continue
-        if op == "s_mov_b32" and args[0] == "m0":
+        if op == "s_mov_b32" and args and args[0] == "m0":
+            _expect_args(line, args, 2)
             m0 = _parse_src(args[1], sgpr, 32)
             continue
         if op not in OPS:
             raise RefError(f"{op} is not modelled")
         form, fn = OPS[op]
         if form == "sop2":
+            _expect_args(line, args, 3)
             r, c = fn(_parse_src(args[1], sgpr, 32), _parse_src(args[2], sgpr, 32), scc)
             _write(sgpr, args[0], r, 32)
         elif form == "sop2_64":
+            _expect_args(line, args, 3)
             r, c = fn(_parse_src(args[1], sgpr, 64), _parse_src(args[2], sgpr, 64), scc)
             _write(sgpr, args[0], r, 64)
         elif form == "sop2_64s":
+            _expect_args(line, args, 3)
             r, c = fn(_parse_src(args[1], sgpr, 64), _parse_src(args[2], sgpr, 32), scc)
             _write(sgpr, args[0], r, 64)
         elif form == "sop2_bfm64":
+            _expect_args(line, args, 3)
             r, c = fn(_parse_src(args[1], sgpr, 32), _parse_src(args[2], sgpr, 32), scc)
             _write(sgpr, args[0], r, 64)
         elif form == "sop1":
+            _expect_args(line, args, 2)
             r, c = fn(_parse_src(args[1], sgpr, 32), None, scc)
             _write(sgpr, args[0], r, 32)
         elif form == "sop1_rmw":
+            _expect_args(line, args, 2)
             r, c = fn(_parse_src(args[1], sgpr, 32), None, scc, _parse_src(args[0], sgpr, 32))
             _write(sgpr, args[0], r, 32)
         elif form == "sop1_64":
+            _expect_args(line, args, 2)
             r, c = fn(_parse_src(args[1], sgpr, 64), None, scc)
             _write(sgpr, args[0], r, 64)
         elif form == "sop1_64_rmw":
+            _expect_args(line, args, 2)
             r, c = fn(_parse_src(args[1], sgpr, 32), None, scc, _parse_src(args[0], sgpr, 64))
             _write(sgpr, args[0], r, 64)
         elif form == "sop1_64_rmw64":
+            _expect_args(line, args, 2)
             r, c = fn(_parse_src(args[1], sgpr, 64), None, scc, _parse_src(args[0], sgpr, 64))
             _write(sgpr, args[0], r, 64)
         elif form in MOVREL_FORMS:
+            _expect_args(line, args, 2)
             n = 2 if form == "movrels_64" else 1
-            base = int(args[1][2:args[1].index(":")] if n == 2 else args[1][1:]) + m0
+            base = (_parse_sgpr_pair(args[1]) if n == 2 else _parse_sgpr(args[1])) + m0
             if base < REGS[0] or base + n - 1 > REGS[-1]:
                 raise RefError(f"{line!r}: SGPR {base} (S0 + M0) is outside the seeded s{REGS[0]}..s{REGS[-1]}")
             r, c = fn(sum(sgpr.get(base + w, 0) << (32 * w) for w in range(n)), None, scc)
             _write(sgpr, args[0], r, 32 * n)
         elif form == "sop1_32to64":
+            _expect_args(line, args, 2)
             r, c = fn(_parse_src(args[1], sgpr, 32), None, scc)
             _write(sgpr, args[0], r, 64)
         elif form == "sop1_64to32":
+            _expect_args(line, args, 2)
             r, c = fn(_parse_src(args[1], sgpr, 64), None, scc)
             _write(sgpr, args[0], r, 32)
         elif form == "sopc":
+            _expect_args(line, args, 2)
             _, c = fn(_parse_src(args[0], sgpr, 32), _parse_src(args[1], sgpr, 32), scc)
         elif form == "sopc_64":
+            _expect_args(line, args, 2)
             _, c = fn(_parse_src(args[0], sgpr, 64), _parse_src(args[1], sgpr, 64), scc)
         elif form == "cmpk":
-            _, c = fn(_parse_src(args[0], sgpr, 32), int(args[1], 0), scc)
+            _expect_args(line, args, 2)
+            _, c = fn(_parse_src(args[0], sgpr, 32), _parse_simm16(args[1]), scc)
         elif form == "movk":
-            r, c = fn(None, int(args[1], 0), scc)
+            _expect_args(line, args, 2)
+            r, c = fn(None, _parse_simm16(args[1]), scc)
             _write(sgpr, args[0], r, 32)
         elif form == "sopk":
-            r, c = fn(_parse_src(args[0], sgpr, 32), int(args[1], 0), scc)
+            _expect_args(line, args, 2)
+            r, c = fn(_parse_src(args[0], sgpr, 32), _parse_simm16(args[1]), scc)
             _write(sgpr, args[0], r, 32)
         else:
             raise RefError(f"form {form}")
@@ -580,19 +665,21 @@ def reference(lines):
 def _is_literal(tok):
     """A 32-bit source that needs a literal dword: not a register or an integer inline constant (-16..64)."""
     tok = tok.strip()
-    if tok[0] in "sv":
+    if not tok:
+        raise RefError("empty operand")
+    if tok == "m0" or tok[0] in "sv":
         return False
-    return not -16 <= s32(int(tok, 0)) <= 64
+    return not -16 <= s32(_parse_int(tok)) <= 64
 
 
 def insn_size(line):
     """Encoded bytes of one generated line: 4, or 8 with a literal (a SOPK immediate sits in SIMM16)."""
-    op, _, rest = line.partition(" ")
+    op, _, rest = line.strip().partition(" ")
     if op == "exp":
         return 8
     if op in SCC_BRANCHES or op == "s_endpgm" or (op in OPS and OPS[op][0] in ("sopk", "movk", "cmpk")):
         return 4
-    args = rest.split(", ") if rest else []
+    args = _split_args(line, rest)
     srcs = args if op in OPS and OPS[op][0] in ("sopc", "sopc_64") else args[1:]
     return 8 if any(_is_literal(a) for a in srcs) else 4
 

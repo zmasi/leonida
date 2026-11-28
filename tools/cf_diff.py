@@ -502,7 +502,7 @@ def _spirv_val(spv, tmp):
         f.write(spv)
     for cmd in (["spirv-as", sa, "-o", sv, "--target-env", "vulkan1.2"],
                 ["spirv-val", "--target-env", "vulkan1.2", sv]):
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode:
             return (cmd[0] + ": " + (r.stderr or r.stdout).strip().splitlines()[0]) if (r.stderr or r.stdout) \
                 else f"{cmd[0]} exited with {r.returncode}"
@@ -628,58 +628,68 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.show and a.program is None:
         ap.error("--show requires --program")
+    if a.minimize and a.program is None:
+        ap.error("--minimize requires --program")
+    if a.program is not None and a.program < 0:
+        ap.error("--program must be nonnegative")
+    if a.depth < 0:
+        ap.error("--depth must be nonnegative")
     if a.programs < 1:
         ap.error("--programs must be at least 1")
+    global SPIRV_VAL
+    prev_spirv_val = SPIRV_VAL
     if a.spirv_val:
         missing = [t for t in ("spirv-as", "spirv-val") if not shutil.which(t)]
         if missing:
-            print(f"--spirv-val needs {' and '.join(missing)} on PATH")
+            print(f"--spirv-val needs {' and '.join(missing)} on PATH", file=sys.stderr)
             return 2
-        global SPIRV_VAL
         SPIRV_VAL = True
-    if a.self_test:
-        return 0 if self_test() else 1
-    waves = (32, 64) if a.wave == "both" else (int(a.wave),)
-    structured = not a.dispatch_loop
-    if a.program is not None:
-        rc = 0
-        matched = 0
-        for wave in waves:
-            body = program_for(a.seed, a.program, wave, a.depth)
-            status, detail = run_case(f"ps_cf_{a.program:04d}_w{wave}", body, wave, structured)
-            print(f"program {a.program} wave{wave}: {status} {detail}")
-            matched += status == "match"
-            if status == "mismatch":
-                rc = 1
-                if a.minimize:
-                    body = minimize(body, wave, structured)
-                    print("reduced:", run_case("ps_cf_min", body, wave, structured)[1])
-            if a.show or a.minimize:
-                print(listing_text(build(body, wave), f"ps_cf_{a.program:04d}_w{wave}"))
-        if not rc and not matched:   # same order as the suite: a mismatch (1) outranks "nothing was compared" (2)
+    try:
+        if a.self_test:
+            return 0 if self_test() else 1
+        waves = (32, 64) if a.wave == "both" else (int(a.wave),)
+        structured = not a.dispatch_loop
+        if a.program is not None:
+            rc = 0
+            matched = 0
+            for wave in waves:
+                body = program_for(a.seed, a.program, wave, a.depth)
+                status, detail = run_case(f"ps_cf_{a.program:04d}_w{wave}", body, wave, structured)
+                print(f"program {a.program} wave{wave}: {status} {detail}")
+                matched += status == "match"
+                if status == "mismatch":
+                    rc = 1
+                    if a.minimize:
+                        body = minimize(body, wave, structured)
+                        print("reduced:", run_case("ps_cf_min", body, wave, structured)[1])
+                if a.show or a.minimize:
+                    print(listing_text(build(body, wave), f"ps_cf_{a.program:04d}_w{wave}"))
+            if not rc and not matched:   # same order as the suite: a mismatch (1) outranks "nothing was compared" (2)
+                print("no program ran: every one was skipped")
+                return 2
+            return rc
+        counts, failures = run_suite(a.programs, a.seed, waves, structured, a.depth)
+        skips = sum(counts["skip"].values())
+        form = "dispatch loop" if a.dispatch_loop else "structured"
+        print(f"{a.programs} programs x wave {'/'.join(map(str, waves))} (seed {a.seed}, {form}): "
+              f"{counts['pass']} pass, {counts['mismatch']} mismatch, {skips} skipped, "
+              f"{counts['harness-error']} harness errors")
+        for reason, n in sorted(counts["skip"].items(), key=lambda kv: -kv[1]):
+            print(f"  skip x{n}: {reason}")
+        for i, wave, detail in failures[:10]:
+            print(f"  program {i} wave{wave}: {detail}")
+        if len(failures) > 10:
+            print(f"  ... {len(failures) - 10} more")
+        if counts["harness-error"]:
+            return 2
+        if counts["mismatch"]:
+            return 1
+        if not counts["pass"]:
             print("no program ran: every one was skipped")
             return 2
-        return rc
-    counts, failures = run_suite(a.programs, a.seed, waves, structured, a.depth)
-    skips = sum(counts["skip"].values())
-    form = "dispatch loop" if a.dispatch_loop else "structured"
-    print(f"{a.programs} programs x wave {'/'.join(map(str, waves))} (seed {a.seed}, {form}): "
-          f"{counts['pass']} pass, {counts['mismatch']} mismatch, {skips} skipped, "
-          f"{counts['harness-error']} harness errors")
-    for reason, n in sorted(counts["skip"].items(), key=lambda kv: -kv[1]):
-        print(f"  skip x{n}: {reason}")
-    for i, wave, detail in failures[:10]:
-        print(f"  program {i} wave{wave}: {detail}")
-    if len(failures) > 10:
-        print(f"  ... {len(failures) - 10} more")
-    if counts["harness-error"]:
-        return 2
-    if counts["mismatch"]:
-        return 1
-    if not counts["pass"]:
-        print("no program ran: every one was skipped")
-        return 2
-    return 0
+        return 0
+    finally:
+        SPIRV_VAL = prev_spirv_val
 
 
 if __name__ == "__main__":

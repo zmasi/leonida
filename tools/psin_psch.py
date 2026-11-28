@@ -26,15 +26,18 @@ import json
 import os
 import struct
 import sys
+import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing sibling helpers.
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
+import file_mode  # noqa: E402
 import gamedata_index as gi  # noqa: E402
 import gamedata_maps as gm  # noqa: E402
 import psin_index  # noqa: E402
+import replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 ARRAY_ELEMENT = psin_index.ARRAY_ELEMENT
@@ -96,8 +99,9 @@ def decode_pmap(payload: bytes, blob: bytes, first_section: int) -> dict:
             raise ValueError(
                 f"PMAP block {cur_id} at {cur_start:#x} overlaps block {prev_id} ({prev_start:#x}..{prev_end:#x})"
             )
-    exact_end = (blocks[-1]["offset"] + blocks[-1]["length"]) == first_section
-    if not exact_end and ((blocks[-1]["offset"] + blocks[-1]["length"] + 15) & ~15) != first_section:
+    last_end = max(b["offset"] + b["length"] for b in blocks)
+    exact_end = last_end == first_section
+    if not exact_end and ((last_end + 15) & ~15) != first_section:
         raise ValueError("last PMAP block does not end at first_section")
 
     return {
@@ -205,8 +209,17 @@ def decode_stns(payload: bytes) -> dict:
 def check_psch_schema(pmap: dict, psch: dict) -> list[str]:
     """Validate PMAP block sizes/root and PSCH member bounds and local descriptors."""
     errors = []
-    struct_by_hash = {s["hash"]: s for s in psch["structs"]}
-    enum_hashes = {e["hash"] for e in psch["enums"]}
+    struct_by_hash = {}
+    for s in psch["structs"]:
+        if s["hash"] in struct_by_hash:
+            errors.append(f"duplicate PSCH struct hash {s['hash']:08x}")
+        else:
+            struct_by_hash[s["hash"]] = s
+    enum_hashes = set()
+    for e in psch["enums"]:
+        if e["hash"] in enum_hashes:
+            errors.append(f"duplicate PSCH enum hash {e['hash']:08x}")
+        enum_hashes.add(e["hash"])
 
     root_block = pmap["blocks"][pmap["root_block_id"] - 1]
     if root_block["hash"] not in struct_by_hash:
@@ -224,16 +237,16 @@ def check_psch_schema(pmap: dict, psch: dict) -> list[str]:
                 errors.append(f"struct {s['hash']:08x} member {idx} offset {m['offset']} >= size {s['size']}")
             if m["type"] == PSCH_TYPE_ARRAY:
                 elem_idx = m["ref"] & 0xFFFF
-                if elem_idx >= len(members) or members[elem_idx]["hash"] != ARRAY_ELEMENT:
+                if elem_idx == idx or elem_idx >= len(members) or members[elem_idx]["hash"] != ARRAY_ELEMENT:
                     errors.append(f"struct {s['hash']:08x} array member {idx} bad descriptor {elem_idx}")
             elif m["type"] == PSCH_TYPE_ENUM and m["ref"] not in enum_hashes:
                 errors.append(f"struct {s['hash']:08x} enum member {idx} missing enum {m['ref']:08x}")
             elif m["type"] == PSCH_TYPE_MAP:
                 k_idx = m["ref"] & 0xFFFF
                 v_idx = m["ref"] >> 16
-                if k_idx >= len(members) or members[k_idx]["hash"] != ARRAY_ELEMENT:
+                if k_idx == idx or k_idx >= len(members) or members[k_idx]["hash"] != ARRAY_ELEMENT:
                     errors.append(f"struct {s['hash']:08x} map member {idx} bad key descriptor {k_idx}")
-                if v_idx >= len(members) or members[v_idx]["hash"] != ARRAY_ELEMENT:
+                if v_idx == idx or v_idx >= len(members) or members[v_idx]["hash"] != ARRAY_ELEMENT:
                     errors.append(f"struct {s['hash']:08x} map member {idx} bad value descriptor {v_idx}")
 
     return errors
@@ -325,6 +338,11 @@ def parse_psch_container(blob: bytes) -> dict:
     }
 
 
+def _has_psin_head(row: dict) -> bool:
+    head = row.get("head")
+    return isinstance(head, str) and head.lower().startswith("5053494e")
+
+
 def scan_target(target: str, carve_dir: str | None = None) -> dict:
     """Collect and summarize all PMAP/PSCH containers in a file, carve folder or .rpf archive."""
     if os.path.isfile(target):
@@ -336,7 +354,7 @@ def scan_target(target: str, carve_dir: str | None = None) -> dict:
                 rows = source.rows
                 blobs = []
                 for r in rows:
-                    if not r.get("head", "").startswith("5053494e"):
+                    if not _has_psin_head(r):
                         continue
                     data = source.read(r)
                     if is_psch_container(data):
@@ -354,7 +372,7 @@ def scan_target(target: str, carve_dir: str | None = None) -> dict:
             source = gi.DirectorySource(target)
             blobs = []
             for r in source.rows:
-                if not r.get("head", "").startswith("5053494e"):
+                if not _has_psin_head(r):
                     continue
                 data = source.read(r)
                 if is_psch_container(data):
@@ -452,14 +470,13 @@ def scan_target(target: str, carve_dir: str | None = None) -> dict:
 
 
 def check_report_path(out_path: str, target: str, carve_dir: str | None = None,
-                      rows: list[dict] | None = None) -> None:
+                      rows: list[dict] | None = None,
+                      carve_rows: list[dict] | None = None) -> None:
     """Refuse a --json destination that is a directory or collides with any input file."""
     if os.path.isdir(out_path):
         raise ValueError(f"--json is a directory: {out_path}")
     if carve_dir:
-        idx = os.path.join(carve_dir, "index.json")
-        if same_report_path(out_path, carve_dir) or same_report_path(out_path, idx):
-            raise ValueError(f"--json would overwrite the input {carve_dir}")
+        gm.check_report_path(out_path, carve_dir, rows=carve_rows)
     if os.path.isdir(target):
         if os.path.isfile(os.path.join(target, "index.json")):
             gm.check_report_path(out_path, target, rows=rows)
@@ -471,6 +488,35 @@ def check_report_path(out_path: str, target: str, carve_dir: str | None = None,
                     raise ValueError(f"--json would overwrite the input {name}")
     elif same_report_path(out_path, target):
         raise ValueError(f"--json would overwrite the input {target}")
+
+
+def _write_json(path: str, payload: dict) -> None:
+    text = json.dumps(payload, indent=1, allow_nan=False) + "\n"
+    gm._make_parent(path)
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path) or "."
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=parent,
+            prefix=f".{os.path.basename(abs_path)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(text)
+        os.chmod(tmp_path, file_mode.published_mode(abs_path))
+        replace_retry.replace(tmp_path, abs_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def main(argv=None) -> int:
@@ -485,12 +531,19 @@ def main(argv=None) -> int:
         return 2
     try:
         if a.json:
+            check_report_path(a.json, a.target, a.carve_dir)
             rows = (
                 gm._read_index_rows(a.target)
                 if os.path.isdir(a.target) and os.path.isfile(os.path.join(a.target, "index.json"))
                 else None
             )
-            check_report_path(a.json, a.target, a.carve_dir, rows=rows)
+            carve_rows = (
+                gm._read_index_rows(a.carve_dir)
+                if a.carve_dir and os.path.isdir(a.carve_dir) and os.path.isfile(os.path.join(a.carve_dir, "index.json"))
+                else None
+            )
+            if rows is not None or carve_rows is not None:
+                check_report_path(a.json, a.target, a.carve_dir, rows=rows, carve_rows=carve_rows)
         summary = scan_target(a.target, carve_dir=a.carve_dir)
     except (OSError, ValueError, KeyError, TypeError, struct.error, RuntimeError) as e:
         print("error:", e, file=sys.stderr)
@@ -521,11 +574,9 @@ def main(argv=None) -> int:
 
     if a.json:
         try:
-            gm._make_parent(a.json)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(summary, f, indent=1)
-        except OSError as e:
-            print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            _write_json(a.json, summary)
+        except (OSError, ValueError) as e:
+            print(f"error: cannot write {a.json}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
             return 1
         print("wrote", a.json)
 

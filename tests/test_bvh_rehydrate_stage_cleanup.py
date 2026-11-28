@@ -35,6 +35,45 @@ class PublishCleanupTest(unittest.TestCase):
             with open(dest, "rb") as f:
                 self.assertEqual(f.read(), b"old")
 
+    @unittest.skipUnless(os.name == "posix", "permission bits are POSIX")
+    def test_replaced_output_keeps_0640(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "out.bin")
+            with open(dest, "wb") as f:
+                f.write(b"old")
+            os.chmod(dest, 0o640)
+            R._publish(dest, b"new")
+            self.assertEqual(os.stat(dest).st_mode & 0o777, 0o640)
+            with open(dest, "rb") as f:
+                self.assertEqual(f.read(), b"new")
+
+    @unittest.skipUnless(os.name == "posix", "permission bits are POSIX")
+    def test_read_only_destination_is_replaced_and_stays_read_only(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "out.bin")
+            with open(dest, "wb") as f:
+                f.write(b"old")
+            os.chmod(dest, 0o444)
+            R._publish(dest, b"new")
+            self.assertEqual(os.stat(dest).st_mode & 0o777, 0o444)
+            with open(dest, "rb") as f:
+                self.assertEqual(f.read(), b"new")
+
+    @unittest.skipUnless(os.name == "posix", "permission bits are POSIX")
+    def test_failed_replace_over_read_only_destination_keeps_real_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            dest = os.path.join(d, "out.bin")
+            with open(dest, "wb") as f:
+                f.write(b"old")
+            os.chmod(dest, 0o444)
+            self.addCleanup(lambda: os.path.exists(dest) and os.chmod(dest, 0o600))
+            with mock.patch.object(R.os, "replace", side_effect=OSError("replace denied")):
+                with self.assertRaisesRegex(OSError, "replace denied"):
+                    R._publish(dest, b"new")
+            self.assertEqual([n for n in os.listdir(d) if n.startswith(".bvh_rehydrate-")], [])
+            with open(dest, "rb") as f:
+                self.assertEqual(f.read(), b"old")
+
 
 if __name__ == "__main__":
     unittest.main()

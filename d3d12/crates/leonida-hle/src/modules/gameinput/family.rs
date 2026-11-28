@@ -7,12 +7,16 @@
 //! - only deliberate input changes the answer: a button going down, a trigger rising past 0.3, a stick leaving a
 //!   radius of 0.35, a key going down. Held buttons, drift inside the radius and noise never count;
 //! - a device's first reading is its baseline, so connecting a pad with a button held changes nothing;
-//! - after a change the next waits `LEONIDA_PROMPTS_SWITCH_MS` (300 ms): input from another family inside that time
-//!   is ignored, not queued, so two devices used at once cannot make the answer flicker;
+//! - a change is immediate: the first deliberate input of another family switches, however long the one before
+//!   was in use. Only the change after it waits, `LEONIDA_PROMPTS_SWITCH_MS` (300 ms) from that switch: input from
+//!   another family inside that time is ignored, not queued, so two devices used at once cannot make the answer
+//!   flicker faster than that;
 //! - `LEONIDA_PROMPTS` forces a family (`xbox`, `playstation` or `ps5`/`ps4`/`ps3`, `keyboard`); `auto` follows
 //!   the devices. Tracking goes on underneath.
 //!
-//! Before the first deliberate input the answer is Xbox, or PlayStation when a Sony pad is present.
+//! Before the first deliberate input the answer is what is connected ([`at_start`]): PlayStation with a Sony pad,
+//! Xbox with any other pad, and the keyboard and mouse with no pad at all. The title reads its glyph movie once,
+//! a few seconds after it starts, so this is what a player who never touches a pad sees.
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use std::time::Duration;
 
@@ -74,6 +78,18 @@ pub fn generation() -> u32 {
 /// Whether `LEONIDA_PROMPTS` forces the answer.
 pub fn forced() -> bool {
     FORCED.load(Ordering::Relaxed) != 0
+}
+
+/// The family before any deliberate input, from what is connected when the runtime first looks, and why (for
+/// the log). A Sony pad counts before another pad, as it did; with no pad at all the player is at the keyboard.
+pub(super) fn at_start(sony_pad: bool, other_pad: bool) -> (Family, &'static str) {
+    if sony_pad {
+        (Family::PlayStation, "a Sony pad is connected")
+    } else if other_pad {
+        (Family::Xbox, "a pad is connected, no input yet")
+    } else {
+        (Family::KeyboardMouse, "no pad is connected")
+    }
 }
 
 /// Sticks and triggers: what counts as pushed.
@@ -197,7 +213,7 @@ impl Tracker {
         self.forced.unwrap_or(self.current)
     }
 
-    /// Before the first change: PlayStation when a Sony pad is present. Not a change that starts the guard.
+    /// Before the first change: the family [`at_start`] gives. Not a change that starts the guard.
     pub(super) fn start_with(&mut self, family: Family) {
         if self.changed.is_none() {
             self.current = family;
@@ -335,6 +351,56 @@ mod tests {
         assert_eq!(t.active(), Family::PlayStation);
         assert!(!t.note(Family::PlayStation, ms(1300)), "a second device of the family in use changes nothing");
         assert!(t.note(Family::Xbox, ms(1300)), "300 ms after the change");
+        assert_eq!(t.active(), Family::Xbox);
+    }
+
+    #[test]
+    fn a_switch_after_a_quiet_spell_is_immediate() {
+        let mut t = Tracker::new(None, ms(300));
+        t.start_with(Family::KeyboardMouse);
+        // The very first input of another family.
+        assert!(t.note(Family::Xbox, ms(0)));
+        // Hours on the pad, then one key: at once, whatever the pad did a millisecond before.
+        assert!(!t.note(Family::Xbox, ms(7_200_000)));
+        assert!(t.note(Family::KeyboardMouse, ms(7_200_001)));
+        assert_eq!(t.active(), Family::KeyboardMouse);
+        // Exactly the guard after that switch is no longer inside it.
+        assert!(t.note(Family::PlayStation, ms(7_200_301)));
+        // Input of the family in use does not restart the guard: 300 ms after the switch, not after the last key.
+        assert!(!t.note(Family::PlayStation, ms(7_200_600)));
+        assert!(t.note(Family::Xbox, ms(7_200_601)));
+    }
+
+    #[test]
+    fn two_devices_at_once_change_the_answer_at_most_once_a_guard() {
+        let mut t = Tracker::new(None, ms(300));
+        let mut changes = 0;
+        // A pad and a keyboard both in use, an input every 10 ms, for 3 s.
+        for step in 0..300u64 {
+            let family = if step % 2 == 0 { Family::KeyboardMouse } else { Family::Xbox };
+            changes += u32::from(t.note(family, ms(1000 + step * 10)));
+        }
+        assert!((9..=11).contains(&changes), "{changes} changes in 3 s");
+        // With the guard off every input of the other family switches.
+        let mut t = Tracker::new(None, ms(0));
+        assert!(t.note(Family::KeyboardMouse, ms(1)));
+        assert!(t.note(Family::Xbox, ms(1)));
+    }
+
+    #[test]
+    fn what_is_connected_decides_before_any_input() {
+        assert_eq!(at_start(false, false).0, Family::KeyboardMouse, "no pad at all: the keyboard");
+        assert_eq!(at_start(false, true).0, Family::Xbox);
+        assert_eq!(at_start(true, false).0, Family::PlayStation);
+        assert_eq!(at_start(true, true).0, Family::PlayStation, "a Sony pad counts before another pad");
+        // It is a start, not a change: the first input of another family is not held back by it.
+        let mut t = Tracker::new(None, ms(300));
+        t.start_with(at_start(false, false).0);
+        assert_eq!(t.active(), Family::KeyboardMouse);
+        assert!(t.note(Family::Xbox, ms(5)));
+        // Forcing a family wins over what is connected.
+        let mut t = Tracker::new(Some(Family::Xbox), ms(300));
+        t.start_with(at_start(false, false).0);
         assert_eq!(t.active(), Family::Xbox);
     }
 

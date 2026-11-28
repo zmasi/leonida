@@ -6,14 +6,17 @@ using NTSTATUS = LONG;
 #endif
 #include <bcrypt.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <thread>
 
 #include "shims.h"
 
 namespace rt::bcrypt_rng {
 void set_host_rng_enabled_for_test(bool enabled);
+void swap_host_functions_for_test(void** open, void** close, void** gen);
 }  // namespace rt::bcrypt_rng
 
 namespace {
@@ -154,6 +157,72 @@ void test_seeded_determinism(bool seeded) {
 
 }  // namespace
 
+// BCryptCloseAlgorithmProvider while a BCryptGenRandom on the same handle is still in the host (kevincommits' finding
+// in #1608, item 3). The close used to unlink the handle and close the host handle at once, under the host call's
+// feet. It must wait for the call to return. Fake host functions: the generate call blocks until released, and the
+// close records whether a call was still running.
+std::atomic<int> g_fake_in_gen{0};
+std::atomic<int> g_fake_in_gen_at_close{-1};
+HANDLE g_fake_entered = nullptr;
+HANDLE g_fake_release = nullptr;
+int g_fake_alg = 0;
+
+NTSTATUS WINAPI fake_open(BCRYPT_ALG_HANDLE* h, LPCWSTR, LPCWSTR, ULONG) {
+    *h = &g_fake_alg;
+    return kStatusSuccess;
+}
+NTSTATUS WINAPI fake_close(BCRYPT_ALG_HANDLE, ULONG) {
+    g_fake_in_gen_at_close = g_fake_in_gen.load();
+    return kStatusSuccess;
+}
+NTSTATUS WINAPI fake_gen(BCRYPT_ALG_HANDLE, PUCHAR buffer, ULONG count, ULONG) {
+    ++g_fake_in_gen;
+    SetEvent(g_fake_entered);
+    WaitForSingleObject(g_fake_release, 2000);
+    std::memset(buffer, 0x5a, count);
+    --g_fake_in_gen;
+    return kStatusSuccess;
+}
+
+void test_close_waits_for_gen_random(bool seeded) {
+    if (seeded) return;  // the seeded mode never calls the host
+    auto open_alg = resolve<OpenAlgFn>("BCryptOpenAlgorithmProvider");
+    auto gen_random = resolve<GenRandomFn>("BCryptGenRandom");
+    auto close_alg = resolve<CloseAlgFn>("BCryptCloseAlgorithmProvider");
+    void* o = reinterpret_cast<void*>(&fake_open);
+    void* c = reinterpret_cast<void*>(&fake_close);
+    void* g = reinterpret_cast<void*>(&fake_gen);
+    rt::bcrypt_rng::swap_host_functions_for_test(&o, &c, &g);
+    g_fake_entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    g_fake_release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+
+    BCRYPT_ALG_HANDLE h = nullptr;
+    check(open_alg(&h, BCRYPT_RNG_ALGORITHM, nullptr, 0) == kStatusSuccess && h, "open an RNG handle (fake host)");
+    UCHAR bytes[16] = {};
+    NTSTATUS gen_status = kStatusUnsuccessful;
+    std::thread generator([&] { gen_status = gen_random(h, bytes, sizeof(bytes), 0); });
+    check(WaitForSingleObject(g_fake_entered, 2000) == WAIT_OBJECT_0, "BCryptGenRandom is inside the host call");
+    std::atomic<bool> closed{false};
+    NTSTATUS close_status = kStatusUnsuccessful;
+    std::thread closer([&] {
+        close_status = close_alg(h, 0);
+        closed = true;
+    });
+    Sleep(200);
+    check(!closed.load(), "BCryptCloseAlgorithmProvider waits while BCryptGenRandom uses the handle");
+    SetEvent(g_fake_release);
+    generator.join();
+    closer.join();
+    check(g_fake_in_gen_at_close.load() == 0, "the host handle is closed only after the host call returned");
+    check(gen_status == kStatusSuccess && bytes[0] == 0x5a && close_status == kStatusSuccess,
+          "both calls succeed");
+    check(gen_random(h, bytes, sizeof(bytes), 0) == kStatusInvalidHandle, "the closed handle is refused afterwards");
+
+    rt::bcrypt_rng::swap_host_functions_for_test(&o, &c, &g);
+    CloseHandle(g_fake_entered);
+    CloseHandle(g_fake_release);
+}
+
 int main(int argc, char** argv) {
     bool seeded = false;
     for (int i = 1; i < argc; ++i) {
@@ -163,6 +232,7 @@ int main(int argc, char** argv) {
     test_provider_handles_and_validation();
     test_fail_closed_when_host_rng_unavailable(seeded);
     test_seeded_determinism(seeded);
+    test_close_waits_for_gen_random(seeded);
     std::printf("%d check(s), %d failure(s)\n", g_checks, g_failures);
     return g_failures ? 1 : 0;
 }

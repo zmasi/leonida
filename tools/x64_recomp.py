@@ -91,6 +91,18 @@ _GROUP4 = ("inc", "dec", None, None, None, None, None, None)
 _GROUP5 = ("inc", "dec", "call", "callf", "jmp", "jmpf", "push", None)
 _GROUP8 = (None, None, None, None, "bt", "bts", "btr", "btc")
 _GROUP15 = ("fxsave", "fxrstor", "ldmxcsr", "stmxcsr", "xsave", "xrstor", "xsaveopt", "fence")
+# 0F 01 /r: memory forms select by the ModRM reg field; the register forms are whole
+# ModRM bytes (0F 01 C1 is VMCALL, 0F 01 D0 is XGETBV, 0F 01 FC is CLZERO, ...).
+_GROUP7 = ("sgdt", "sidt", "lgdt", "lidt", "smsw", None, "lmsw", "invlpg")
+_GROUP7_REG = {
+    0xC1: "vmcall", 0xC2: "vmlaunch", 0xC3: "vmresume", 0xC4: "vmxoff",
+    0xC8: "monitor", 0xC9: "mwait", 0xCA: "clac", 0xCB: "stac",
+    0xD0: "xgetbv", 0xD1: "xsetbv", 0xD4: "vmfunc", 0xD5: "xend", 0xD6: "xtest",
+    0xD8: "vmrun", 0xD9: "vmmcall", 0xDA: "vmload", 0xDB: "vmsave",
+    0xDC: "stgi", 0xDD: "clgi", 0xDE: "skinit", 0xDF: "invlpga",
+    0xEE: "rdpkru", 0xEF: "wrpkru",
+    0xF8: "swapgs", 0xF9: "rdtscp", 0xFA: "monitorx", 0xFB: "mwaitx", 0xFC: "clzero",
+}
 
 PREFIXES = {0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65}
 SEG_PREFIX = {0x2E: "cs", 0x36: "ss", 0x3E: "ds", 0x26: "es", 0x64: "fs", 0x65: "gs"}
@@ -133,7 +145,7 @@ PRIMARY.update({
     0xCA: ("retf", "invalid"), 0xCB: ("retf", "invalid"),
     0xCC: ("int3", ""), 0xCD: ("int", "Ib"), 0xCE: ("into", "invalid"), 0xCF: ("iret", ""),
     0xD0: ("grp2", "Eb 1"), 0xD1: ("grp2", "Ev 1"), 0xD2: ("grp2", "Eb c"), 0xD3: ("grp2", "Ev c"),
-    0xD4: ("aam", "invalid"), 0xD5: ("aad", "invalid"), 0xD6: ("salc", "invalid"), 0xD7: ("xlat", "sys"),
+    0xD4: ("aam", "invalid"), 0xD5: ("aad", "invalid"), 0xD6: ("salc", "invalid"), 0xD7: ("xlat", ""),
     0xE0: ("loopne", "Jb"), 0xE1: ("loope", "Jb"), 0xE2: ("loop", "Jb"), 0xE3: ("jcxz", "Jb"),
     0xE4: ("in", "sys"), 0xE5: ("in", "sys"), 0xE6: ("out", "sys"), 0xE7: ("out", "sys"),
     0xE8: ("call", "Jz"), 0xE9: ("jmp", "Jz"), 0xEA: ("jmpf", "invalid"), 0xEB: ("jmp", "Jb"),
@@ -160,6 +172,7 @@ for _i in range(8):
     PRIMARY[0xD8 + _i] = ("x87", "E")
 
 OF = {
+    0x01: ("grp7", "E"),
     0x05: ("syscall", "sys"), 0x07: ("sysret", "sys"), 0x0B: ("ud2", ""),
     0x0D: ("nop", "Ev"), 0x1E: ("endbr", "Eb"), 0x1F: ("nop", "Ev"),
     0x31: ("rdtsc", "sys"), 0x32: ("rdmsr", "sys"), 0x33: ("rdpmc", "sys"),
@@ -253,9 +266,9 @@ class DecodeError(Exception):
 
 
 def _vsize(opsize, rexw):
-    if opsize:
-        return 2
-    return 8 if rexw else 4
+    if rexw:
+        return 8
+    return 2 if opsize else 4
 
 
 def _size_of(letter, opsize, rexw):
@@ -374,7 +387,7 @@ def _finish(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte):
         elif t == "S":
             ops.append(("seg", reg_field, 0))
         elif t == "Q":
-            v, pos = _read_imm(buf, pos, end, 8, signed=False)
+            v, pos = _read_imm(buf, pos, end, 4 if ins.addrsize else 8, signed=False)
             ops.append(("m", {"base": None, "index": None, "scale": 0, "disp": 0,
                               "rip": False, "size": _size_of(s, opsize, rexw),
                               "seg": ins.seg, "abs": v, "moffs": True}))
@@ -385,8 +398,12 @@ def _finish(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte):
     ins.ops = tuple(ops)
     ins.size = pos - start
     for o in ins.ops:
-        if o[0] == "m" and o[1]["rip"]:
-            o[1]["abs"] = ins.addr + ins.size + o[1]["disp"]
+        if o[0] == "m":
+            if ins.addrsize:
+                o[1]["addrsize"] = 4
+            if o[1]["rip"]:
+                abs_a = ins.addr + ins.size + o[1]["disp"]
+                o[1]["abs"] = abs_a & 0xFFFFFFFF if ins.addrsize else abs_a
     _classify(ins, mnem, opcode_byte & 0xF, state)
     return ins
 
@@ -454,6 +471,8 @@ def _classify(ins, mnem, cc_index, state):
     elif mnem in ("push", "pushseg", "pushf"):
         ins.kind = "push"
         ins.flags_r = FLAG_READERS.get(mnem, "")
+    elif mnem in ("movbe", "crc32"):
+        ins.kind = "misc"
     elif mnem in ("pop", "popseg", "popf"):
         ins.kind = "pop"
         ins.flags_w = "NZCVPA" if mnem == "popf" else ""
@@ -477,6 +496,8 @@ def _classify(ins, mnem, cc_index, state):
         ins.kind = "nop"
         if mnem == "nop" and ins.rep == "f3":
             ins.mnem = "pause"
+    elif mnem in ("xlat", "enter"):
+        ins.kind = "misc"
     elif mnem in ("clc", "stc", "cmc"):
         ins.kind = "alu"
         ins.flags_w = "C"
@@ -569,7 +590,7 @@ def decode_one(buf, pos, end, addr):
     ins.rexw, ins.has_rex = rexw, has_rex
     ins.addrsize = addrsize
 
-    state = {"opsize": opsize, "rexw": rexw, "rexr": rexr, "rexx": rexx, "rexb": rexb,
+    state = {"opsize": 0 if rexw else opsize, "rexw": rexw, "rexr": rexr, "rexx": rexx, "rexb": rexb,
              "has_rex": has_rex, "vex": vex}
 
     op = b0
@@ -588,6 +609,10 @@ def decode_one(buf, pos, end, addr):
             ins.unknown, ins.mnem = True, f"vexmap{omap}"
             ins.size = pos - start
             return ins
+        if not vex["evex"] and omap in (2, 3):
+            bmi = _decode_vex_bmi(buf, pos, end, ins, start, vex, op, addr)
+            if bmi is not None:
+                return bmi
         return _finish(buf, pos, end, ins, start, f"v{op:02x}", spec[1], state, addr, opcode_byte)
 
     if op == 0x0F:
@@ -601,7 +626,23 @@ def decode_one(buf, pos, end, addr):
                 raise DecodeError("truncated 0F38")
             opcode_byte = buf[pos]
             pos += 1
-            spec = ("simd", "V W")
+            if opcode_byte in (0xF0, 0xF1):
+                if rep == "f2":
+                    dst_s = "Gq" if rexw else "Gd"
+                    if opcode_byte == 0xF0:
+                        spec = ("crc32", f"{dst_s} Eb")
+                    else:
+                        src_s = "Eq" if rexw else ("Ew" if opsize else "Ed")
+                        spec = ("crc32", f"{dst_s} {src_s}")
+                elif rep == "" and pos < end and (buf[pos] >> 6) != 3:
+                    sz_c = "q" if rexw else ("w" if opsize else "d")
+                    spec = ("movbe", f"G{sz_c} M{sz_c}" if opcode_byte == 0xF0 else f"M{sz_c} G{sz_c}")
+                else:
+                    _, _, pos, _ = _modrm(buf, pos, end, rexr, rexx, rexb, has_rex)
+                    ins.unknown, ins.mnem, ins.size = True, f"op0f38_{opcode_byte:02x}", pos - start
+                    return ins
+            else:
+                spec = ("simd", "V W")
         elif op == 0x3A:
             if pos >= end:
                 raise DecodeError("truncated 0F3A")
@@ -632,7 +673,7 @@ def decode_one(buf, pos, end, addr):
 
     if mnem == "invalid" or opspec in ("invalid", "sys"):
         pass  # still decoded below so operands/length are right where known
-    if mnem in ("grp1", "grp2", "grp3", "grp4", "grp5", "grp8", "grppop", "grpmov", "grp15"):
+    if mnem in ("grp1", "grp2", "grp3", "grp4", "grp5", "grp7", "grp8", "grppop", "grpmov", "grp15"):
         return _finish_group(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte)
     if mnem in ("invalid",):
         ins.mnem, ins.kind, ins.error = "invalid", "invalid", "invalid opcode"
@@ -679,6 +720,16 @@ def _finish_group(buf, pos, end, ins, start, group, opspec, state, addr, opcode_
         ins.mnem, ins.size = mnem, pos - start
         ins.kind = "nop" if mnem in ("fence", "xsaveopt") else "sys"
         return ins
+    elif group == "grp7":
+        if mod == 3:
+            mnem = _GROUP7_REG.get(buf[pos - 1])
+            if mnem is None:
+                mnem = "smsw" if reg7 == 4 else "lmsw" if reg7 == 6 else "sys"
+        else:
+            mnem = _GROUP7[reg7] or "sys"
+        ins.mnem, ins.size = mnem, pos - start
+        ins.kind = "sys"
+        return ins
     elif group == "grppop":
         if reg7 != 0:
             ins.unknown, ins.mnem, ins.size = True, f"grp1a_{reg7}", pos - start
@@ -722,9 +773,82 @@ def _finish_group(buf, pos, end, ins, start, group, opspec, state, addr, opcode_
     ins.ops = tuple(ops)
     ins.size = pos - start
     for o in ins.ops:
+        if o[0] == "m":
+            if ins.addrsize:
+                o[1]["addrsize"] = 4
+            if o[1]["rip"]:
+                abs_a = ins.addr + ins.size + o[1]["disp"]
+                o[1]["abs"] = abs_a & 0xFFFFFFFF if ins.addrsize else abs_a
+    _classify(ins, mnem, opcode_byte & 0xF, state)
+    return ins
+
+
+_BMI_FLAGS = {
+    "andn": "NZCV",
+    "blsr": "NZCV",
+    "blsmsk": "NZCV",
+    "blsi": "NZCV",
+    "bextr": "NZCV",
+    "bzhi": "NZCV",
+}
+FLAG_WRITERS.update(_BMI_FLAGS)
+
+
+def _decode_vex_bmi(buf, pos, end, ins, start, vex, op, addr):
+    """Decode VEX.LZ BMI1 (andn/blsr/blsmsk/blsi/bextr) and BMI2 (bzhi/pext/pdep/mulx/shlx/sarx/shrx/rorx)."""
+    # All 13 BMI1/BMI2 VEX encodings use 3-byte C4 (map 2 or 3) with VEX.L == 0.
+    if (buf[pos - 2] >> 2) & 1:
+        return None
+    omap, pp, vvvv = vex["map"], vex["pp"], vex["vvvv"]
+    sz = 8 if vex["w"] else 4
+
+    if omap == 2:
+        if op == 0xF2 and pp == 0:
+            kind_op = "andn"
+        elif op == 0xF3 and pp == 0:
+            kind_op = "grp_f3"
+        elif op == 0xF5 and pp in (0, 2, 3):
+            kind_op = {0: "bzhi", 2: "pext", 3: "pdep"}[pp]
+        elif op == 0xF6 and pp == 3:
+            kind_op = "mulx"
+        elif op == 0xF7 and pp in (0, 1, 2, 3):
+            kind_op = {0: "bextr", 1: "shlx", 2: "sarx", 3: "shrx"}[pp]
+        else:
+            return None
+    elif omap == 3 and op == 0xF0 and pp == 3 and vvvv == 0:
+        kind_op = "rorx"
+    else:
+        return None
+
+    reg_field, rm_make, pos, _ = _modrm(buf, pos, end, vex["r"], vex["x"], vex["b"], True)
+    if kind_op == "grp_f3":
+        reg7 = reg_field & 7
+        mnem = {1: "blsr", 2: "blsmsk", 3: "blsi"}.get(reg7)
+        if mnem is None:
+            ins.unknown, ins.mnem, ins.size = True, f"vex_f3_{reg7}", pos - start
+            return ins
+        ops = (("r", vvvv, sz), rm_make(sz))
+    elif kind_op == "rorx":
+        imm, pos = _read_imm(buf, pos, end, 1, signed=False)
+        mnem = "rorx"
+        ops = (("r", reg_field, sz), rm_make(sz), ("i", imm, 1))
+    elif kind_op in ("andn", "pdep", "pext", "mulx"):
+        mnem = kind_op
+        ops = (("r", reg_field, sz), ("r", vvvv, sz), rm_make(sz))
+    else:
+        mnem = kind_op
+        ops = (("r", reg_field, sz), rm_make(sz), ("r", vvvv, sz))
+
+    ins.mnem = mnem
+    ins.ops = ops
+    ins.size = pos - start
+    ins.rexw = vex["w"]
+    for o in ins.ops:
         if o[0] == "m" and o[1]["rip"]:
             o[1]["abs"] = ins.addr + ins.size + o[1]["disp"]
-    _classify(ins, mnem, opcode_byte & 0xF, state)
+    ins.kind = "bmi"
+    ins.flags_w = _BMI_FLAGS.get(mnem, "")
+    ins.flags_r = ""
     return ins
 
 
@@ -884,6 +1008,8 @@ class Asm:
         start = len(self.words)
         if not nz:
             self.movz(rd, 0)
+        elif not nzc:
+            self.movn(rd, 0)
         elif len(nzc) < len(nz):
             self.movn(rd, chunks[nzc[0]] ^ 0xFFFF, nzc[0])
             for i in nzc[1:]:
@@ -1059,6 +1185,9 @@ class Asm:
     def rorv(self, rd, rn, rm, sf=1):
         self.emit((0x9AC02C00 if sf else 0x1AC02C00) | rm << 16 | rn << 5 | rd)
 
+    def rev16(self, rd, rn, sf=0):
+        self.emit((0xDAC00400 if sf else 0x5AC00400) | rn << 5 | rd)
+
     # multiply/divide
     def madd(self, rd, rn, rm, ra, sf=1):
         self.emit((0x9B000000 if sf else 0x1B000000) | rm << 16 | ra << 10 | rn << 5 | rd)
@@ -1102,6 +1231,15 @@ class Asm:
         base = {1: 0x39000000, 2: 0x79000000, 4: 0xB9000000, 8: 0xF9000000}[size]
         assert 0 <= off < 4096 * size and off % size == 0
         self.emit(base | (off // size) << 10 | rn << 5 | rt)
+
+    def ldaxr(self, rt, rn, size=8):
+        base = {1: 0x085FFC00, 2: 0x485FFC00, 4: 0x885FFC00, 8: 0xC85FFC00}[size]
+        self.emit(base | rn << 5 | rt)
+
+    def stlxr(self, rs, rt, rn, size=8):
+        assert rs != rt and rs != rn
+        base = {1: 0x0800FC00, 2: 0x4800FC00, 4: 0x8800FC00, 8: 0xC800FC00}[size]
+        self.emit(base | rs << 16 | rn << 5 | rt)
 
     def ldur(self, rt, rn, off, size=8):
         base = {1: 0x38400000, 2: 0x78400000, 4: 0xB8400000, 8: 0xF8400000}[size]
@@ -1354,6 +1492,41 @@ class FunctionTranslator:
     def _op_size(self, op):
         return op[1]["size"] if op[0] == "m" else op[2]
 
+    def _emit_xlat(self, ins):
+        """Emit xlat/xlatb (0xD7): AL := byte ptr [RBX/EBX + zero_extend(AL)], no flags."""
+        a = self.asm
+        a.uxtb(T0, GMAP[0])
+        a.add_r(ADDR_T, GMAP[3], T0, sf=0 if ins.addrsize else 1)
+        a.ldr(T0, ADDR_T, 0, size=1)
+        a.bfi(GMAP[0], T0, 0, 8)
+
+    def _emit_enter(self, ins):
+        """Emit enter imm16, imm8 (0xC8): create nested stack frame, no flags."""
+        a = self.asm
+        alloc = ins.ops[0][1] & 0xFFFF
+        nesting = ins.ops[1][1] & 0x1F
+        rsp, rbp = GMAP[4], GMAP[5]
+        a.str_pre(rbp, rsp, -8)
+        a.mov(T0, rsp)
+        if nesting > 0:
+            if nesting > 1:
+                a.movz(T1, nesting - 1, 0, sf=0)
+                loop_lbl = self._skip_lbl()
+                a.label(loop_lbl)
+                a.sub(rbp, rbp, 8)
+                a.ldr(T2, rbp, 0, size=8)
+                a.str_pre(T2, rsp, -8)
+                a.sub(T1, T1, 1, sf=0)
+                a.cbnz(T1, loop_lbl, sf=0)
+            a.str_pre(T0, rsp, -8)
+        a.mov(rbp, T0)
+        if alloc:
+            if alloc < 4096:
+                a.sub(rsp, rsp, alloc)
+            else:
+                a.li(T1, alloc)
+                a.sub_r(rsp, rsp, T1)
+
     def _load(self, ins, op, dst, as_size=None):
         a = self.asm
         size = as_size or self._op_size(op)
@@ -1407,44 +1580,423 @@ class FunctionTranslator:
         else:
             raise UnhandledInsn(ins, f"store {op}")
 
+    _LOCK_ALU_OPS = frozenset({
+        "add", "adc", "and", "sub", "sbb", "or", "xor", "inc", "dec", "neg", "not",
+    })
+
+    def _emit_lock_alu(self, ins):
+        """Emit LOCK-prefixed memory RMW ALU ops using ARMv8.0 LDAXR/STLXR loops.
+
+        The LL/SC loop computes only the new value using non-flag-setting instructions
+        so incoming CF (for adc/sbb, captured into GTMP before the loop) and prior
+        NZCV (for not, inc/dec CF preservation, and retries) stay intact across retries.
+        Flags are computed once after the atomic store commits.
+        """
+        a = self.asm
+        m = ins.mnem
+        dst = ins.ops[0]
+        sz = self._op_size(dst)
+        sf = 1 if sz == 8 else 0
+        mask = (1 << (sz * 8)) - 1 if sz < 8 else 0xFFFFFFFFFFFFFFFF
+        need = self.needed.get(ins.addr, set())
+        mat = ins.addr in self.mat
+        flaggy = m != "not" and (bool(need) or mat)
+
+        # Load source operand into T1 BEFORE computing EA (T1 stays read-only across retries).
+        if len(ins.ops) == 2:
+            src = ins.ops[1]
+            if src[0] == "i":
+                v = src[1] & mask
+                if v == 0xFFFFFFFFFFFFFFFF:
+                    a.movn(T1, 0)
+                else:
+                    a.li(T1, v)
+            else:
+                self._load(ins, src, T1)
+        elif m in ("inc", "dec"):
+            a.movz(T1, 1, 0, sf=0)
+
+        # Compute EA into ADDR_T BEFORE capturing incoming CF into GTMP (_mem_addr may clobber GTMP).
+        self._mem_addr(dst[1], ADDR_T)
+
+        # For adc/sbb, capture original incoming x86 CF (0 or 1) into GTMP before retries.
+        if m in ("adc", "sbb"):
+            prod = self.arm_path.get(ins.addr)
+            if prod is not None:
+                if prod.mnem in LOGIC_KIND:
+                    a.movz(GTMP, 0, 0, sf=0)
+                else:
+                    a.mrs_nzcv(GTMP)
+                    a.ubfx(GTMP, GTMP, 29, 1)
+                    if prod.mnem in SUB_KIND:
+                        a.eor_i(GTMP, GTMP, 1, sf=0)
+            else:
+                a.ldr(GTMP, CTX_REG, CTX_EFLAGS, size=4)
+                a.and_i(GTMP, GTMP, EF_CF, sf=0)
+
+        def _compute_value():
+            if m == "add":
+                a.add_r(T2, T0, T1, sf=sf)
+            elif m == "sub":
+                a.sub_r(T2, T0, T1, sf=sf)
+            elif m == "and":
+                a.and_r(T2, T0, T1, sf=sf)
+            elif m == "or":
+                a.orr_r(T2, T0, T1, sf=sf)
+            elif m == "xor":
+                a.eor_r(T2, T0, T1, sf=sf)
+            elif m == "inc":
+                a.add(T2, T0, 1, sf=sf)
+            elif m == "dec":
+                a.sub(T2, T0, 1, sf=sf)
+            elif m == "neg":
+                a.sub_r(T2, 31, T0, sf=sf)
+            elif m == "not":
+                a.mvn(T2, T0, sf=sf)
+            elif m == "adc":
+                a.add_r(T2, T0, T1, sf=sf)
+                a.add_r(T2, T2, GTMP, sf=sf)
+            else:  # sbb
+                a.sub_r(T2, T0, T1, sf=sf)
+                a.sub_r(T2, T2, GTMP, sf=sf)
+
+        retry_lbl = self._skip_lbl()
+        if sz > 1:
+            unaligned_lbl = self._skip_lbl()
+            done_lbl = self._skip_lbl()
+            # Guard ARMv8.0 LDAXR/STLXR alignment without touching NZCV.
+            a.and_i(T0, ADDR_T, sz - 1)
+            a.cbnz(T0, unaligned_lbl)
+
+            a.label(retry_lbl)
+            a.ldaxr(T0, ADDR_T, size=sz)
+            _compute_value()
+            a.stlxr(T3, T2, ADDR_T, size=sz)
+            a.cbnz(T3, retry_lbl, sf=0)
+            a.b(done_lbl)
+
+            a.label(unaligned_lbl)
+            a.ldr(T0, ADDR_T, 0, size=sz)
+            _compute_value()
+            a.str(T2, ADDR_T, 0, size=sz)
+            a.label(done_lbl)
+        else:
+            a.label(retry_lbl)
+            a.ldaxr(T0, ADDR_T, size=1)
+            _compute_value()
+            a.stlxr(T3, T2, ADDR_T, size=1)
+            a.cbnz(T3, retry_lbl, sf=0)
+
+        if not flaggy:
+            return
+
+        if sz == 1:
+            a.uxtb(T2, T2)
+        elif sz == 2:
+            a.uxth(T2, T2)
+
+        if "A" in need or mat:
+            if m == "neg":
+                a.stur(31, CTX_REG, CTX_A, size=8)
+                a.stur(T0, CTX_REG, CTX_B, size=8)
+            else:
+                a.stur(T0, CTX_REG, CTX_A, size=8)
+                a.stur(T1, CTX_REG, CTX_B, size=8)
+        self._stash_res(ins, T2)
+
+        sh = (32 - sz * 8) if sz < 4 else 0
+        if m in ("and", "or", "xor"):
+            if sh:
+                a.lsl(T2, T2, sh, sf=0)
+            a.ands_r(31, T2, T2, sf=sf)
+            self._maybe_mkflags(ins)
+            return
+
+        if m in ("add", "sub"):
+            if sh:
+                a.lsl(T0, T0, sh, sf=0)
+                a.lsl(T1, T1, sh, sf=0)
+            (a.adds_r if m == "add" else a.subs_r)(31, T0, T1, sf=sf)
+            self._maybe_mkflags(ins)
+            return
+
+        if m == "neg":
+            if sh:
+                a.lsl(T0, T0, sh, sf=0)
+            a.subs_r(31, 31, T0, sf=sf)
+            self._maybe_mkflags(ins)
+            return
+
+        if m in ("inc", "dec"):
+            a.mrs_nzcv(GTMP)
+            a.ubfx(GTMP, GTMP, 29, 1)
+            if sh:
+                a.lsl(T0, T0, sh, sf=0)
+                a.movz(T1, 1 << (sh - 16), 1, sf=0)
+                (a.adds_r if m == "inc" else a.subs_r)(31, T0, T1, sf=0)
+            else:
+                (a.adds if m == "inc" else a.subs)(31, T0, 1, sf=sf)
+            a.mrs_nzcv(T3)
+            a.bfi(T3, GTMP, 29, 1)
+            a.msr_nzcv(T3)
+            if mat:
+                a.ldur(GTMP, CTX_REG, CTX_EFLAGS, size=8)
+                self._mkflags(0)
+                a.ldur(T0, CTX_REG, CTX_EFLAGS, size=8)
+                a.bfi(T0, GTMP, 0, 1)
+                a.stur(T0, CTX_REG, CTX_EFLAGS, size=8)
+            return
+
+        # adc / sbb: GTMP holds incoming x86 CF (0 or 1).
+        if sh:
+            a.lsl(T0, T0, sh, sf=0)
+            a.lsl(T1, T1, sh, sf=0)
+            a.sub_r(T3, 31, GTMP, sf=0)          # 0 if cf==0 else 0xFFFFFFFF
+            a.lsr(T3, T3, 32 - sh, sf=0)         # low sh bits filled iff cf==1
+            if m == "adc":
+                a.orr_r(T0, T0, T3, sf=0)
+                a.lsl(T3, GTMP, 29)
+                a.msr_nzcv(T3)
+                a.adcs(31, T0, T1, sf=0)
+            else:
+                a.orr_r(T1, T1, T3, sf=0)
+                a.eor_i(T3, GTMP, 1, sf=0)
+                a.lsl(T3, T3, 29)
+                a.msr_nzcv(T3)
+                a.sbcs(31, T0, T1, sf=0)
+        else:
+            if m == "adc":
+                a.lsl(T3, GTMP, 29)
+                a.msr_nzcv(T3)
+                a.adcs(31, T0, T1, sf=sf)
+            else:
+                a.eor_i(T3, GTMP, 1, sf=0)
+                a.lsl(T3, T3, 29)
+                a.msr_nzcv(T3)
+                a.sbcs(31, T0, T1, sf=sf)
+        self._maybe_mkflags(ins)
+
     def _mem_addr(self, m, rd):
         a = self.asm
         disp = m["disp"]
+        sf = 0 if m.get("addrsize") == 4 else 1
         if m["rip"] or m.get("moffs") or (m["base"] is None and m["index"] is None):
-            a.li(rd, (m["abs"] if m["abs"] is not None else disp) & 0xFFFFFFFFFFFFFFFF)
+            v = m["abs"] if m["abs"] is not None else disp
+            a.li(rd, v & (0xFFFFFFFF if not sf else 0xFFFFFFFFFFFFFFFF))
             return
         base, idx = m["base"], m["index"]
         if idx is None:
             gb = GMAP[base]
             if disp == 0:
-                if gb != rd:
-                    a.mov(rd, gb)
+                if not sf or gb != rd:
+                    a.mov(rd, gb, sf=sf)
             elif -256 <= disp <= 255:
-                a.add(rd, gb, disp)
+                a.add(rd, gb, disp, sf=sf)
             elif 0 <= disp < 4096:
-                a.add(rd, gb, disp)
+                a.add(rd, gb, disp, sf=sf)
             elif -4096 < disp < 0:
-                a.sub(rd, gb, -disp)
+                a.sub(rd, gb, -disp, sf=sf)
             else:
-                a.li(rd, disp)
-                a.add_r(rd, rd, gb)
+                a.li(rd, disp if sf else (disp & 0xFFFFFFFF))
+                a.add_r(rd, rd, gb, sf=sf)
             return
         if base is not None:
-            a.add_r(rd, GMAP[base], GMAP[idx], sf=1, shift=0, imm6=m["scale"])
-            if disp:
-                if -4096 < disp < 4096:
-                    a.add(rd, rd, disp)
-                else:
-                    a.li(GTMP, disp)
-                    a.add_r(rd, rd, GTMP)
+            a.add_r(rd, GMAP[base], GMAP[idx], sf=sf, shift=0, imm6=m["scale"])
         else:
-            a.lsl(rd, GMAP[idx], m["scale"])
-            if disp:
-                if -4096 < disp < 4096:
-                    a.add(rd, rd, disp)
-                else:
-                    a.li(GTMP, disp)
-                    a.add_r(rd, rd, GTMP)
+            a.lsl(rd, GMAP[idx], m["scale"], sf=sf)
+        if disp:
+            if -4096 < disp < 4096:
+                a.add(rd, rd, disp, sf=sf)
+            else:
+                a.li(GTMP, disp if sf else (disp & 0xFFFFFFFF))
+                a.add_r(rd, rd, GTMP, sf=sf)
+
+    def _emit_bmi(self, ins):
+        """Emit BMI1 (andn/blsr/blsmsk/blsi/bextr) and BMI2 (bzhi/shlx/sarx/shrx/rorx/mulx/pdep/pext)."""
+        a = self.asm
+        m = ins.mnem
+        sz = self._op_size(ins.ops[0])
+        sf = 1 if sz == 8 else 0
+        w = 64 if sf else 32
+        need = self.needed.get(ins.addr, set())
+        mat = ins.addr in self.mat
+
+        if m == "andn":
+            dst, src1, src2 = ins.ops
+            self._load(ins, src2, T0)
+            a.mov(T1, GMAP[src1[1]], sf=sf)
+            a.bic_r(T2, T0, T1, sf=sf)
+            a.mov(GMAP[dst[1]], T2, sf=sf)
+            if need or mat:
+                a.ands_r(31, T2, T2, sf=sf)
+                if mat:
+                    self._stash_res(ins, T2)
+                    self._mkflags(0)
+            return
+
+        if m in ("blsr", "blsmsk", "blsi"):
+            dst, src = ins.ops
+            self._load(ins, src, T0)
+            if m == "blsr":
+                a.sub(T1, T0, 1, sf=sf)
+                a.and_r(T2, T0, T1, sf=sf)
+            elif m == "blsmsk":
+                a.sub(T1, T0, 1, sf=sf)
+                a.eor_r(T2, T0, T1, sf=sf)
+            else:
+                a.sub_r(T1, 31, T0, sf=sf)
+                a.and_r(T2, T0, T1, sf=sf)
+            a.mov(GMAP[dst[1]], T2, sf=sf)
+            if need or mat:
+                a.ands_r(31, T2, T2, sf=sf)
+                if "C" in need or mat:
+                    a.mrs_nzcv(T1)
+                    a.cmp(T0, 0, sf=sf)
+                    a.cset(T3, "ne" if m == "blsi" else "eq", sf=0)
+                    a.bfi(T1, T3, 29, 1)
+                    a.msr_nzcv(T1)
+                if mat:
+                    self._stash_res(ins, T2)
+                    self._mkflags(0)
+            return
+
+        if m == "bextr":
+            dst, src, ctrl = ins.ops
+            self._load(ins, src, T0)
+            g_ctrl = GMAP[ctrl[1]]
+            a.uxtb(T1, g_ctrl)
+            a.ubfx(T3, g_ctrl, 8, 8, sf=0)
+            zero_lbl, join_lbl = self._skip_lbl(), self._skip_lbl()
+            a.cmp(T1, w, sf=0)
+            a.bcond("cs", zero_lbl)
+            a.cbz(T3, zero_lbl, sf=0)
+            a.lsrv(T2, T0, T1, sf=sf)
+            a.cmp(T3, w, sf=0)
+            a.bcond("cs", join_lbl)
+            a.movz(GTMP, 1, 0, sf=sf)
+            a.lslv(GTMP, GTMP, T3, sf=sf)
+            a.sub(GTMP, GTMP, 1, sf=sf)
+            a.and_r(T2, T2, GTMP, sf=sf)
+            a.b(join_lbl)
+            a.label(zero_lbl)
+            a.movz(T2, 0, 0, sf=1)
+            a.label(join_lbl)
+            a.mov(GMAP[dst[1]], T2, sf=sf)
+            if need or mat:
+                a.ands_r(31, T2, T2, sf=sf)
+                if mat:
+                    self._stash_res(ins, T2)
+                    self._mkflags(0)
+            return
+
+        if m == "bzhi":
+            dst, src, idx = ins.ops
+            self._load(ins, src, T0)
+            a.uxtb(T1, GMAP[idx[1]])
+            full_lbl, join_lbl = self._skip_lbl(), self._skip_lbl()
+            a.cmp(T1, w, sf=0)
+            a.bcond("cs", full_lbl)
+            a.movz(T3, 1, 0, sf=sf)
+            a.lslv(T3, T3, T1, sf=sf)
+            a.sub(T3, T3, 1, sf=sf)
+            a.and_r(T2, T0, T3, sf=sf)
+            a.movz(GTMP, 0, 0, sf=0)
+            a.b(join_lbl)
+            a.label(full_lbl)
+            a.mov(T2, T0, sf=sf)
+            a.movz(GTMP, 1, 0, sf=0)
+            a.label(join_lbl)
+            a.mov(GMAP[dst[1]], T2, sf=sf)
+            if need or mat:
+                a.ands_r(31, T2, T2, sf=sf)
+                if "C" in need or mat:
+                    a.mrs_nzcv(T1)
+                    a.bfi(T1, GTMP, 29, 1)
+                    a.msr_nzcv(T1)
+                if mat:
+                    self._stash_res(ins, T2)
+                    self._mkflags(0)
+            return
+
+        if m in ("shlx", "sarx", "shrx"):
+            dst, src, cnt = ins.ops
+            self._load(ins, src, T0)
+            g_dst, g_cnt = GMAP[dst[1]], GMAP[cnt[1]]
+            if m == "shlx":
+                a.lslv(g_dst, T0, g_cnt, sf=sf)
+            elif m == "sarx":
+                a.asrv(g_dst, T0, g_cnt, sf=sf)
+            else:
+                a.lsrv(g_dst, T0, g_cnt, sf=sf)
+            return
+
+        if m == "rorx":
+            dst, src, imm_op = ins.ops
+            self._load(ins, src, T0)
+            c = imm_op[1] & (w - 1)
+            if c == 0:
+                a.mov(GMAP[dst[1]], T0, sf=sf)
+            else:
+                a.ror(GMAP[dst[1]], T0, c, sf=sf)
+            return
+
+        if m == "mulx":
+            hi, lo, src = ins.ops
+            self._load(ins, src, T0)
+            if sf:
+                a.mul(T1, GMAP[2], T0, sf=1)
+                a.umulh(T2, GMAP[2], T0)
+            else:
+                a.umaddl(T1, GMAP[2], T0, 31)
+                a.lsr(T2, T1, 32, sf=1)
+            a.mov(GMAP[lo[1]], T1, sf=sf)
+            a.mov(GMAP[hi[1]], T2, sf=sf)
+            return
+
+        if m == "pdep":
+            dst, src, mask = ins.ops
+            self._load(ins, mask, T0)
+            a.mov(T1, GMAP[src[1]], sf=sf)
+            a.movz(T2, 0, 0, sf=1)
+            loop_lbl, done_lbl = self._skip_lbl(), self._skip_lbl()
+            a.label(loop_lbl)
+            a.cbz(T0, done_lbl, sf=sf)
+            a.sub_r(T3, 31, T0, sf=sf)
+            a.and_r(T3, T0, T3, sf=sf)
+            a.and_i(GTMP, T1, 1, sf=1)
+            a.sub_r(GTMP, 31, GTMP, sf=1)
+            a.and_r(GTMP, GTMP, T3, sf=sf)
+            a.orr_r(T2, T2, GTMP, sf=sf)
+            a.lsr(T1, T1, 1, sf=sf)
+            a.eor_r(T0, T0, T3, sf=sf)
+            a.b(loop_lbl)
+            a.label(done_lbl)
+            a.mov(GMAP[dst[1]], T2, sf=sf)
+            return
+
+        if m == "pext":
+            dst, src, mask = ins.ops
+            self._load(ins, mask, T0)
+            a.mov(T1, GMAP[src[1]], sf=sf)
+            a.movz(T2, 0, 0, sf=1)
+            a.movz(ADDR_T, 1, 0, sf=1)
+            loop_lbl, skip_lbl, done_lbl = self._skip_lbl(), self._skip_lbl(), self._skip_lbl()
+            a.label(loop_lbl)
+            a.cbz(T0, done_lbl, sf=sf)
+            a.sub_r(T3, 31, T0, sf=sf)
+            a.and_r(T3, T0, T3, sf=sf)
+            a.and_r(GTMP, T1, T3, sf=sf)
+            a.cbz(GTMP, skip_lbl, sf=sf)
+            a.orr_r(T2, T2, ADDR_T, sf=sf)
+            a.label(skip_lbl)
+            a.lsl(ADDR_T, ADDR_T, 1, sf=sf)
+            a.eor_r(T0, T0, T3, sf=sf)
+            a.b(loop_lbl)
+            a.label(done_lbl)
+            a.mov(GMAP[dst[1]], T2, sf=sf)
+            return
+
+        raise UnhandledInsn(ins, f"bmi {m}")
 
     def _stash_res(self, ins, res_reg):
         need = self.needed.get(ins.addr, set())
@@ -1511,27 +2063,31 @@ class FunctionTranslator:
 
     def _parity_jcc(self, ins, lbl):
         a = self.asm
-        a.ldur(T0, CTX_REG, CTX_RES, size=8)
-        a.eor_shift(T0, T0, T0, 1, 4, sf=0)
-        a.eor_shift(T0, T0, T0, 1, 2, sf=0)
-        a.eor_shift(T0, T0, T0, 1, 1, sf=0)
-        a.tst_i(T0, 1, sf=0)
-        a.bcond("eq" if ins.cc == "p" else "ne", lbl)
+        prod = self.arm_path.get(ins.addr)
+        if prod is None or prod.mnem in ("popf", "sahf") or prod.addr in self.mat:
+            a.ldr(T2, CTX_REG, CTX_EFLAGS, size=4)
+            (a.tbnz if ins.cc == "p" else a.tbz)(T2, 2, lbl)
+            return
+        a.ldur(T2, CTX_REG, CTX_RES, size=8)
+        a.eor_shift(T2, T2, T2, 1, 4, sf=0)
+        a.eor_shift(T2, T2, T2, 1, 2, sf=0)
+        a.eor_shift(T2, T2, T2, 1, 1, sf=0)
+        (a.tbz if ins.cc == "p" else a.tbnz)(T2, 0, lbl)
 
     def _ctx_jcc(self, cc, lbl):
         a = self.asm
-        a.ldr(T0, CTX_REG, CTX_EFLAGS, size=4)
-        self._ctx_jcc_reg(cc, T0, lbl)
+        a.ldr(T2, CTX_REG, CTX_EFLAGS, size=4)
+        self._ctx_jcc_reg(cc, T2, lbl)
 
     def _ctx_jcc_reg(self, cc, w, lbl):
         a = self.asm
-        simple = {"e": (EF_ZF, "ne"), "ne": (EF_ZF, "eq"), "b": (EF_CF, "ne"),
-                  "ae": (EF_CF, "eq"), "s": (EF_SF, "ne"), "ns": (EF_SF, "eq"),
-                  "o": (EF_OF, "ne"), "no": (EF_OF, "eq"), "p": (EF_PF, "ne"),
-                  "np": (EF_PF, "eq")}
+        simple = {"e": (6, True), "ne": (6, False), "b": (0, True),
+                  "ae": (0, False), "s": (7, True), "ns": (7, False),
+                  "o": (11, True), "no": (11, False), "p": (2, True),
+                  "np": (2, False)}
         if cc in simple:
-            a.tst_i(w, simple[cc][0], sf=0)
-            a.bcond(simple[cc][1], lbl)
+            bit, want_set = simple[cc]
+            (a.tbnz if want_set else a.tbz)(w, bit, lbl)
             return
         if cc in ("be", "a"):
             a.tst_i(w, EF_CF | EF_ZF, sf=0)
@@ -1553,6 +2109,49 @@ class FunctionTranslator:
                 a.label(skip)
             return
         raise UnhandledInsn(None, f"ctx cc {cc}")  # type: ignore
+
+    def _emit_movbe(self, ins):
+        if len(ins.ops) != 2 or not (
+            (ins.ops[0][0] == "r" and ins.ops[1][0] == "m")
+            or (ins.ops[0][0] == "m" and ins.ops[1][0] == "r")
+        ):
+            raise UnhandledInsn(ins, "invalid movbe operands")
+        a = self.asm
+        dst, src = ins.ops
+        sz = self._op_size(dst)
+        self._load(ins, src, T0)
+        if sz == 2:
+            a.rev16(T0, T0, sf=0)
+        elif sz in (4, 8):
+            a.rev(T0, T0, 1 if sz == 8 else 0)
+        else:
+            raise UnhandledInsn(ins, f"movbe size {sz}")
+        self._store(ins, dst, T0)
+
+    def _emit_crc32(self, ins):
+        if len(ins.ops) != 2 or ins.ops[0][0] != "r":
+            raise UnhandledInsn(ins, "invalid crc32 operands")
+        a = self.asm
+        dst, src = ins.ops
+        src_sz = self._op_size(src)
+        if src_sz not in (1, 2, 4, 8):
+            raise UnhandledInsn(ins, f"crc32 size {src_sz}")
+        g = GMAP[dst[1]]
+        self._load(ins, src, T1)
+        a.mov(T0, g, sf=0)
+        a.eor_r(T0, T0, T1, sf=1)
+        a.li(T1, 0x82F63B78)
+        a.movz(T2, src_sz * 8, 0, sf=0)
+        loop_lbl = self._skip_lbl()
+        a.label(loop_lbl)
+        a.and_i(T3, T0, 1, sf=1)
+        a.sub_r(T3, 31, T3, sf=1)
+        a.and_r(T3, T3, T1, sf=1)
+        a.lsr(T0, T0, 1, sf=1)
+        a.eor_r(T0, T0, T3, sf=1)
+        a.sub(T2, T2, 1, sf=0)
+        a.cbnz(T2, loop_lbl, sf=0)
+        a.mov(g, T0, sf=0)
 
     # -- integer ops -------------------------------------------------------------
     def _emit_alu(self, ins):
@@ -1600,11 +2199,11 @@ class FunctionTranslator:
         sz = self._op_size(dst)
         need = self.needed.get(ins.addr, set())
         flaggy = bool(need) or ins.addr in self.mat
-        self._load(ins, src, T1)
+        self._load(ins, src, T1, as_size=sz)
         self._load(ins, dst, T0, as_size=sz)
         # partial-width ops compute in a widened temp to get correct N/Z at sz;
         # stash unshifted operands first for lazy AF
-        if "A" in need:
+        if "A" in need or ins.addr in self.mat:
             a.stur(T0, CTX_REG, CTX_A, size=8)
             a.stur(T1, CTX_REG, CTX_B, size=8)
         sh = (32 - sz * 8) if sz < 4 else 0
@@ -1648,14 +2247,9 @@ class FunctionTranslator:
 
     def _maybe_mkflags(self, ins):
         if ins.addr in self.mat:
-            # the stored word needs x86-polarity CF; NZCV still holds arm-polarity for
-            # subtract-kind producers, so normalize C in NZCV before snapshotting.
-            if ins.mnem in SUB_KIND:
-                a = self.asm
-                a.mrs_nzcv(GTMP)
-                a.eor_i(GTMP, GTMP, 0x20000000)
-                a.msr_nzcv(GTMP)
-            kind = 2 if ins.mnem in LOGIC_KIND else 0
+            # rt_mkflags preserves live ARM NZCV (needed by same-block consumers
+            # on arm_path) and converts SUB_KIND borrow polarity when kind == 1.
+            kind = 2 if ins.mnem in LOGIC_KIND else (1 if ins.mnem in SUB_KIND else 0)
             self._mkflags(kind)
 
     def _emit_cmp(self, ins):
@@ -1664,7 +2258,7 @@ class FunctionTranslator:
         dst, src = ins.ops
         sz = self._op_size(dst)
         need = self.needed.get(ins.addr, set())
-        self._load(ins, src, T1)
+        self._load(ins, src, T1, as_size=sz)
         self._load(ins, dst, T0, as_size=sz)
         # stash unshifted result/operands before widening for flag semantics
         if "P" in need or "A" in need or ins.addr in self.mat:
@@ -1673,7 +2267,7 @@ class FunctionTranslator:
             else:
                 a.and_r(T2, T0, T1, 1)
             a.stur(T2, CTX_REG, CTX_RES, size=8)
-            if "A" in need:
+            if "A" in need or ins.addr in self.mat:
                 a.stur(T0, CTX_REG, CTX_A, size=8)
                 a.stur(T1, CTX_REG, CTX_B, size=8)
         sh = (32 - sz * 8) if sz < 4 else 0
@@ -1692,43 +2286,71 @@ class FunctionTranslator:
         a = self.asm
         op = ins.ops[0]
         sz = self._op_size(op)
+        sf = 1 if sz == 8 else 0
         need = self.needed.get(ins.addr, set())
-        keep_c = "C" in need or ins.addr in self.mat
+        flaggy = bool(need) or ins.addr in self.mat
         self._load(ins, op, T0)
+        if flaggy and ("A" in need or ins.addr in self.mat):
+            a.stur(T0, CTX_REG, CTX_A, size=8)
+            a.movz(T1, 1, 0, sf=0)
+            a.stur(T1, CTX_REG, CTX_B, size=8)
         sh = (32 - sz * 8) if sz < 4 else 0
+        if not flaggy:
+            (a.add if ins.mnem == "inc" else a.sub)(T0, T0, 1, sf)
+            if sz == 1:
+                a.uxtb(T0, T0)
+            elif sz == 2:
+                a.uxth(T0, T0)
+            self._store(ins, op, T0)
+            return
         if sh:
             a.lsl(T0, T0, sh, sf=0)
-        if keep_c:
-            a.mrs_nzcv(GTMP)
-        (a.adds if ins.mnem == "inc" else a.subs)(T0, T0, 1, 1 if sz == 8 else 0)
-        if keep_c:
-            a.mrs_nzcv(T3)
-            a.bfi(T3, GTMP, 29, 1)
-            a.msr_nzcv(T3)
+            a.movz(T1, 1 << (sh - 16), 1, sf=0)
+        a.mrs_nzcv(GTMP)
+        if sh:
+            (a.adds_r if ins.mnem == "inc" else a.subs_r)(T0, T0, T1, sf=0)
+        else:
+            (a.adds if ins.mnem == "inc" else a.subs)(T0, T0, 1, sf)
+        a.mrs_nzcv(T3)
+        a.ubfx(GTMP, GTMP, 29, 1)
+        a.bfi(T3, GTMP, 29, 1)
+        a.msr_nzcv(T3)
         if sh:
             a.lsr(T0, T0, sh, sf=0)
         self._store(ins, op, T0)
         self._stash_res(ins, T0)
-        self._maybe_mkflags(ins)
+        if ins.addr in self.mat:
+            # Preserve ctx.eflags CF (bit 0) and do not invert ARM C (dec does not write CF).
+            a.ldur(GTMP, CTX_REG, CTX_EFLAGS, size=8)
+            self._mkflags(0)
+            a.ldur(T0, CTX_REG, CTX_EFLAGS, size=8)
+            a.bfi(T0, GTMP, 0, 1)
+            a.stur(T0, CTX_REG, CTX_EFLAGS, size=8)
 
     def _emit_negnot(self, ins):
         a = self.asm
         op = ins.ops[0]
         sz = self._op_size(op)
+        sf = 1 if sz == 8 else 0
         self._load(ins, op, T0)
-        sh = (32 - sz * 8) if sz < 4 else 0
-        if ins.mnem == "neg":
-            if sh:
-                a.lsl(T0, T0, sh, sf=0)
-            a.subs_r(T0, 31, T0, 1 if sz == 8 else 0)
-            if sh:
-                a.lsr(T0, T0, sh, sf=0)
-        else:
-            a.mvn(T0, T0, 1 if sz == 8 else 0)
+        if ins.mnem == "not":
+            a.mvn(T0, T0, sf)
             if sz == 1:
                 a.uxtb(T0, T0)
             elif sz == 2:
                 a.uxth(T0, T0)
+            self._store(ins, op, T0)
+            return
+        need = self.needed.get(ins.addr, set())
+        if "A" in need or ins.addr in self.mat:
+            a.stur(31, CTX_REG, CTX_A, size=8)
+            a.stur(T0, CTX_REG, CTX_B, size=8)
+        sh = (32 - sz * 8) if sz < 4 else 0
+        if sh:
+            a.lsl(T0, T0, sh, sf=0)
+        a.subs_r(T0, 31, T0, sf)
+        if sh:
+            a.lsr(T0, T0, sh, sf=0)
         self._store(ins, op, T0)
         self._stash_res(ins, T0)
         self._maybe_mkflags(ins)
@@ -1760,7 +2382,14 @@ class FunctionTranslator:
                 a.mrs_nzcv(T1)
                 a.bfi(T1, T0, 29, 1)
                 a.msr_nzcv(T1)
-        self._maybe_mkflags(ins)
+        if ins.addr in self.mat:
+            # Update only EF_CF (bit 0) of ctx.eflags from ARM NZCV bit 29 without
+            # clobbering SF/ZF/OF/PF/AF via rt_mkflags.
+            a.mrs_nzcv(T0)
+            a.ubfx(T0, T0, 29, 1)
+            a.ldr(T1, CTX_REG, CTX_EFLAGS, size=4)
+            a.bfi(T1, T0, 0, 1)
+            a.str(T1, CTX_REG, CTX_EFLAGS, size=4)
 
     def _emit_adcsbb(self, ins):
         a = self.asm
@@ -1796,18 +2425,12 @@ class FunctionTranslator:
         a = self.asm
         m = ins.mnem
         dst, src = ins.ops
-        if m == "mov":
-            if dst[0] == "r" and src[0] == "i" and dst[2] == 8 and src[2] == 4:
-                # C7 /0 form: the imm32 sign-extends into the 64-bit destination
-                v = src[1]
-                a.li(T0, v - (1 << 32) if v & 0x80000000 else v)
-                self._store(ins, dst, T0)
-                return
+        if m in ("mov", "movnti"):
             if dst[0] == "r" and src[0] == "r" and dst[2] == src[2] == 8:
                 if GMAP[dst[1]] != GMAP[src[1]]:
                     a.mov(GMAP[dst[1]], GMAP[src[1]])
                 return
-            self._load(ins, src, T0)
+            self._load(ins, src, T0, as_size=self._op_size(dst))
             self._store(ins, dst, T0)
         elif m == "movzx":
             self._load(ins, src, T0)
@@ -1847,11 +2470,23 @@ class FunctionTranslator:
         m = ins.mnem
         if m == "push":
             op = ins.ops[0]
-            self._load(ins, op, T0, as_size=8)
-            a.str_pre(T0, rsp, -8)
+            sz = 2 if (ins.opsize and not ins.rexw) else 8
+            self._load(ins, op, T0, as_size=sz)
+            a.str_pre(T0, rsp, -sz, size=sz)
         elif m == "pop":
-            a.ldr_post(T0, rsp, 8)
-            self._store(ins, ins.ops[0], T0)
+            op = ins.ops[0]
+            sz = 2 if (ins.opsize and not ins.rexw) else 8
+            a.ldr_post(T0, rsp, sz, size=sz)
+            if sz == 2:
+                if op[0] == "r":
+                    a.bfi(GMAP[op[1]], T0, 0, 16)
+                elif op[0] == "m":
+                    self._mem_addr(op[1], ADDR_T)
+                    a.str(T0, ADDR_T, 0, size=2)
+                else:
+                    raise UnhandledInsn(ins, f"pop16 {op}")
+            else:
+                self._store(ins, op, T0)
         elif m == "pushf":
             self._mkflags(0)
             a.ldur(T0, CTX_REG, CTX_EFLAGS, size=8)
@@ -1889,19 +2524,20 @@ class FunctionTranslator:
         a = self.asm
         m = ins.mnem
         if m == "cbtw":
-            if ins.opsize:
+            if ins.rexw:
+                a.sxtw(GMAP[0], GMAP[0])
+            elif ins.opsize:
                 a.sxtb(T0, GMAP[0], sf=0)
                 a.bfi(GMAP[0], T0, 0, 16)
-            elif ins.rexw:
-                a.sxtw(GMAP[0], GMAP[0])
             else:
                 a.sxth(GMAP[0], GMAP[0], sf=0)
         elif m == "cwtd":
-            if ins.opsize:
-                a.sxth(T0, GMAP[0], sf=0)
-                a.bfi(GMAP[2], T0, 0, 16)
-            elif ins.rexw:
+            if ins.rexw:
                 a.asr(GMAP[2], GMAP[0], 63)
+            elif ins.opsize:
+                a.sxth(T0, GMAP[0], sf=0)
+                a.asr(T0, T0, 16, sf=0)
+                a.bfi(GMAP[2], T0, 0, 16)
             else:
                 a.asr(GMAP[2], GMAP[0], 31, sf=0)
         else:
@@ -1924,28 +2560,65 @@ class FunctionTranslator:
             if cval == 0:
                 return
             self._load(ins, dst, T0)
+            if m == "sar" and width < 32:
+                (a.sxtb if width == 8 else a.sxth)(T0, T0, sf=0)
             a.mov(T2, T0)  # original for CF
             if m in ("shl", "sal"):
-                a.lsl(T0, T0, cval, sf)
+                if cval >= width:
+                    a.movz(T0, 0, 0, sf=0)
+                else:
+                    a.lsl(T0, T0, cval, sf)
+                    if width == 8:
+                        a.uxtb(T0, T0)
+                    elif width == 16:
+                        a.uxth(T0, T0)
             elif m == "shr":
-                a.lsr(T0, T0, cval, sf)
+                if cval >= width:
+                    a.movz(T0, 0, 0, sf=0)
+                else:
+                    a.lsr(T0, T0, cval, sf)
             elif m == "sar":
                 a.asr(T0, T0, cval, sf)
-            elif m == "ror":
-                a.ror(T0, T0, cval % width or width, sf)
-            elif m == "rol":
-                a.ror(T0, T0, width - (cval % width or width), sf)
+                if width == 8:
+                    a.uxtb(T0, T0)
+                elif width == 16:
+                    a.uxth(T0, T0)
+            elif m in ("rol", "ror"):
+                r = cval % width
+                if r != 0:
+                    if width < 32:
+                        if width == 8:
+                            a.orr_r(T0, T0, T0, sf=0, shift=0, imm6=8)
+                        a.orr_r(T0, T0, T0, sf=0, shift=0, imm6=16)
+                        a.ror(T0, T0, r if m == "ror" else width - r, sf=0)
+                        (a.uxtb if width == 8 else a.uxth)(T0, T0)
+                    else:
+                        a.ror(T0, T0, r if m == "ror" else width - r, sf)
             self._store(ins, dst, T0)
             if flaggy:
-                res = GMAP[dst[1]] if dst[0] == "r" and self._op_size(dst) >= 4 else T0
-                a.tst_r(res, res, sf)
-                if need_c:
-                    self._shift_cf_imm(ins, m, cval, width)
-            self._stash_res(ins, T0)
-            self._maybe_mkflags(ins)
+                if m in ("rol", "ror"):
+                    if need_c:
+                        self._shift_cf_imm(ins, m, cval, width)
+                        if ins.addr in self.mat:
+                            a.ldur(T1, CTX_REG, CTX_EFLAGS, size=8)
+                            a.bfi(T1, T3, 0, 1)
+                            a.stur(T1, CTX_REG, CTX_EFLAGS, size=8)
+                else:
+                    if width < 32:
+                        (a.sxtb if width == 8 else a.sxth)(T3, T0, sf=0)
+                        a.tst_r(T3, T3, sf=0)
+                    else:
+                        res = GMAP[dst[1]] if dst[0] == "r" else T0
+                        a.tst_r(res, res, sf)
+                    if need_c:
+                        self._shift_cf_imm(ins, m, cval, width)
+                    self._stash_res(ins, T0)
+                    self._maybe_mkflags(ins)
             return
         # variable count in cl
         self._load(ins, dst, T0)
+        if m == "sar" and width < 32:
+            (a.sxtb if width == 8 else a.sxth)(T0, T0, sf=0)
         a.mov(T2, T0)
         a.mov(T1, GMAP[1], sf=0)
         a.and_i(T1, T1, 0x3F if width == 64 else 0x1F, sf=0)
@@ -1956,24 +2629,56 @@ class FunctionTranslator:
         a.cbz(T1, skip, sf=0)
         if m in ("shl", "sal"):
             a.lslv(T0, T0, T1, sf)
+            if width == 8:
+                a.uxtb(T0, T0)
+            elif width == 16:
+                a.uxth(T0, T0)
         elif m == "shr":
             a.lsrv(T0, T0, T1, sf)
         elif m == "sar":
             a.asrv(T0, T0, T1, sf)
-        elif m == "ror":
-            a.rorv(T0, T0, T1, sf)
-        elif m == "rol":
-            a.movz(T3, width, 0, sf=0)
-            a.sub_r(T3, T3, T1, sf=0)
-            a.rorv(T0, T0, T3, sf)
+            if width == 8:
+                a.uxtb(T0, T0)
+            elif width == 16:
+                a.uxth(T0, T0)
+        elif m in ("rol", "ror"):
+            if width < 32:
+                if width == 8:
+                    a.orr_r(T0, T0, T0, sf=0, shift=0, imm6=8)
+                a.orr_r(T0, T0, T0, sf=0, shift=0, imm6=16)
+                if m == "ror":
+                    a.rorv(T0, T0, T1, sf=0)
+                else:
+                    a.movz(T3, 32, 0, sf=0)
+                    a.sub_r(T3, T3, T1, sf=0)
+                    a.rorv(T0, T0, T3, sf=0)
+                (a.uxtb if width == 8 else a.uxth)(T0, T0)
+            elif m == "ror":
+                a.rorv(T0, T0, T1, sf)
+            else:
+                a.movz(T3, width, 0, sf=0)
+                a.sub_r(T3, T3, T1, sf=0)
+                a.rorv(T0, T0, T3, sf)
         self._store(ins, dst, T0)
         if flaggy:
-            res = GMAP[dst[1]] if dst[0] == "r" and self._op_size(dst) >= 4 else T0
-            a.tst_r(res, res, sf)
-            if need_c:
-                self._shift_cf_var(ins, m, width)
-        self._stash_res(ins, T0)
-        self._maybe_mkflags(ins)
+            if m in ("rol", "ror"):
+                if need_c:
+                    self._shift_cf_var(ins, m, width)
+                    if ins.addr in self.mat:
+                        a.ldur(T1, CTX_REG, CTX_EFLAGS, size=8)
+                        a.bfi(T1, T3, 0, 1)
+                        a.stur(T1, CTX_REG, CTX_EFLAGS, size=8)
+            else:
+                if width < 32:
+                    (a.sxtb if width == 8 else a.sxth)(T3, T0, sf=0)
+                    a.tst_r(T3, T3, sf=0)
+                else:
+                    res = GMAP[dst[1]] if dst[0] == "r" else T0
+                    a.tst_r(res, res, sf)
+                if need_c:
+                    self._shift_cf_var(ins, m, width)
+                self._stash_res(ins, T0)
+                self._maybe_mkflags(ins)
         a.label(skip)
 
     def _set_cf(self, bit_reg):
@@ -1985,32 +2690,39 @@ class FunctionTranslator:
 
     def _shift_cf_imm(self, ins, m, cval, width):
         a = self.asm
-        if cval >= width:
-            a.movz(T3, 0, 0, sf=0)
-        elif m in ("shl", "sal"):
-            a.ubfx(T3, T2, width - cval, 1, sf=0)
-        elif m in ("shr", "sar"):
-            a.ubfx(T3, T2, cval - 1, 1, sf=0)
-        elif m == "rol":
+        sf = 1 if width == 64 else 0
+        if m == "rol":
             a.and_i(T3, T0, 1, sf=0)
         elif m == "ror":
-            a.ubfx(T3, T0, width - 1, 1, sf=0)
+            a.ubfx(T3, T0, width - 1, 1, sf)
+        elif m == "sar":
+            a.ubfx(T3, T2, min(cval - 1, width - 1), 1, sf)
+        elif cval > width:
+            a.movz(T3, 0, 0, sf=0)
+        elif m in ("shl", "sal"):
+            a.ubfx(T3, T2, width - cval, 1, sf)
+        elif m == "shr":
+            a.ubfx(T3, T2, cval - 1, 1, sf)
         self._set_cf(T3)
 
     def _shift_cf_var(self, ins, m, width):
         a = self.asm
+        sf = 1 if width == 64 else 0
         # count in T1, original in T2, result in T0
         if m in ("shl", "sal"):
             a.movz(T3, width, 0, sf=0)
             a.sub_r(T3, T3, T1, sf=0)
-            a.lsrv(T3, T2, T3, sf=0)
-        elif m in ("shr", "sar"):
+            a.lsrv(T3, T2, T3, sf)
+        elif m == "shr":
             a.sub(T3, T1, 1, sf=0)
-            a.lsrv(T3, T2, T3, sf=0)
+            a.lsrv(T3, T2, T3, sf)
+        elif m == "sar":
+            a.sub(T3, T1, 1, sf=0)
+            a.asrv(T3, T2, T3, sf)
         elif m == "rol":
             a.mov(T3, T0, sf=0)
         elif m == "ror":
-            a.lsr(T3, T0, width - 1, sf=0)
+            a.lsr(T3, T0, width - 1, sf)
         a.and_i(T3, T3, 1, sf=0)
         self._set_cf(T3)
 
@@ -2018,78 +2730,321 @@ class FunctionTranslator:
         a = self.asm
         m = ins.mnem
         need = self.needed.get(ins.addr, set())
+        want_cv = "C" in need or "V" in need or ins.addr in self.mat
+
+        def emit_cv(ovf_reg):
+            a.mrs_nzcv(GTMP)
+            a.and_i(GTMP, GTMP, 0xC0000000)   # keep N,Z; clear C,V
+            a.bfi(GTMP, ovf_reg, 28, 1)       # V
+            a.bfi(GTMP, ovf_reg, 29, 1)       # C
+            a.msr_nzcv(GTMP)
+            self._maybe_mkflags(ins)
+
         if m == "imul" and len(ins.ops) >= 2:
             dst, src = ins.ops[0], ins.ops[1]
             sz = self._op_size(dst)
-            sf = 1 if sz == 8 else 0
             self._load(ins, src, T0)
             if len(ins.ops) > 2:
-                a.li(T1, ins.ops[2][1])
+                imm = ins.ops[2][1] & 0xFFFFFFFFFFFFFFFF
+                if imm == 0xFFFFFFFFFFFFFFFF:
+                    a.movn(T1, 0)
+                else:
+                    a.li(T1, imm)
             else:
                 self._load(ins, dst, T1)
-            a.mul(T0, T1, T0, sf)
-            self._store(ins, dst, T0)
-            if "C" in need or "V" in need or ins.addr in self.mat:
-                # CF=OF = (high half of product != sign extension of result)
-                if sf:
-                    a.smulh(T2, T1, T0)
-                else:
-                    a.smaddl(T2, T1, T0, 31)
-                    a.asr(T2, T2, 32)
-                res = GMAP[dst[1]] if dst[0] == "r" else T0
-                a.asr(T3, res, 63 if sf else 31, sf)
-                a.cmp_r(T2, T3, sf)          # eq -> no overflow -> C=V=0
-                a.cset(T3, "eq", sf=0)
-                a.eor_i(T3, T3, 1, sf=0)     # T3 = overflow
-                a.mrs_nzcv(GTMP)
-                a.and_i(GTMP, GTMP, 0xC0000000)   # keep N,Z
-                a.bfi(GTMP, T3, 28, 1)            # V
-                a.bfi(GTMP, T3, 29, 1)            # C
-                a.msr_nzcv(GTMP)
+            if sz == 2:
+                a.sxth(T0, T0, sf=0)
+                a.sxth(T1, T1, sf=0)
+                a.mul(T2, T1, T0, sf=0)
+                self._store(ins, dst, T2)
+                if want_cv:
+                    a.sxth(T3, T2, sf=0)
+                    a.cmp_r(T2, T3, sf=0)
+                    a.cset(T3, "ne", sf=0)
+                    emit_cv(T3)
+            elif sz == 4:
+                a.smaddl(T2, T1, T0, 31)
+                self._store(ins, dst, T2)
+                if want_cv:
+                    a.sxtw(T3, T2)
+                    a.cmp_r(T2, T3, sf=1)
+                    a.cset(T3, "ne", sf=0)
+                    emit_cv(T3)
+            elif sz == 8:
+                a.mul(T2, T1, T0, sf=1)
+                if want_cv:
+                    a.smulh(T3, T1, T0)
+                self._store(ins, dst, T2)
+                if want_cv:
+                    a.asr(GTMP, T2, 63, sf=1)
+                    a.cmp_r(T3, GTMP, sf=1)
+                    a.cset(T3, "ne", sf=0)
+                    emit_cv(T3)
+            else:
+                raise UnhandledInsn(ins, f"imul size {sz}")
             return
         if m in ("mul", "imul") and len(ins.ops) == 1:
             src = ins.ops[0]
             sz = self._op_size(src)
-            if sz == 8:
-                self._load(ins, src, T0)
-                (a.umulh if m == "mul" else a.smulh)(GMAP[2], GMAP[0], T0)
-                a.mul(GMAP[0], GMAP[0], T0)
+            self._load(ins, src, T0)
+            if sz == 1:
+                if m == "mul":
+                    a.uxtb(T1, GMAP[0])
+                    a.mul(T2, T1, T0, sf=0)
+                    a.bfi(GMAP[0], T2, 0, 16)
+                    if want_cv:
+                        a.ubfx(T3, T2, 8, 8, sf=0)
+                        a.cmp(T3, 0, sf=0)
+                        a.cset(T3, "ne", sf=0)
+                        emit_cv(T3)
+                else:
+                    a.sxtb(T0, T0, sf=0)
+                    a.sxtb(T1, GMAP[0], sf=0)
+                    a.mul(T2, T1, T0, sf=0)
+                    a.bfi(GMAP[0], T2, 0, 16)
+                    if want_cv:
+                        a.sxtb(T3, T2, sf=0)
+                        a.cmp_r(T2, T3, sf=0)
+                        a.cset(T3, "ne", sf=0)
+                        emit_cv(T3)
+            elif sz == 2:
+                if m == "mul":
+                    a.uxth(T1, GMAP[0])
+                    a.mul(T2, T1, T0, sf=0)
+                    a.bfi(GMAP[0], T2, 0, 16)
+                    a.lsr(T3, T2, 16, sf=0)
+                    a.bfi(GMAP[2], T3, 0, 16)
+                    if want_cv:
+                        a.cmp(T3, 0, sf=0)
+                        a.cset(T3, "ne", sf=0)
+                        emit_cv(T3)
+                else:
+                    a.sxth(T0, T0, sf=0)
+                    a.sxth(T1, GMAP[0], sf=0)
+                    a.mul(T2, T1, T0, sf=0)
+                    a.bfi(GMAP[0], T2, 0, 16)
+                    a.lsr(T3, T2, 16, sf=0)
+                    a.bfi(GMAP[2], T3, 0, 16)
+                    if want_cv:
+                        a.sxth(T3, T2, sf=0)
+                        a.cmp_r(T2, T3, sf=0)
+                        a.cset(T3, "ne", sf=0)
+                        emit_cv(T3)
             elif sz == 4:
-                self._load(ins, src, T0)
                 (a.umaddl if m == "mul" else a.smaddl)(T1, GMAP[0], T0, 31)
                 a.mov(GMAP[0], T1, sf=0)
                 a.lsr(GMAP[2], T1, 32)
+                if want_cv:
+                    if m == "mul":
+                        a.cmp(GMAP[2], 0, sf=0)
+                    else:
+                        a.asr(T3, GMAP[0], 31, sf=0)
+                        a.cmp_r(GMAP[2], T3, sf=0)
+                    a.cset(T3, "ne", sf=0)
+                    emit_cv(T3)
+            elif sz == 8:
+                (a.umulh if m == "mul" else a.smulh)(T2, GMAP[0], T0)
+                a.mul(GMAP[0], GMAP[0], T0, sf=1)
+                a.mov(GMAP[2], T2, sf=1)
+                if want_cv:
+                    if m == "mul":
+                        a.cmp(GMAP[2], 0, sf=1)
+                    else:
+                        a.asr(T3, GMAP[0], 63, sf=1)
+                        a.cmp_r(GMAP[2], T3, sf=1)
+                    a.cset(T3, "ne", sf=0)
+                    emit_cv(T3)
             else:
                 raise UnhandledInsn(ins, f"{m} size {sz}")
-            if "C" in need or "V" in need or ins.addr in self.mat:
-                res = GMAP[2]
-                a.cmp(res, 0, 1 if sz == 8 else 0)
-                a.cset(T3, "ne", sf=0)
-                a.mrs_nzcv(GTMP)
-                a.and_i(GTMP, GTMP, 0xC0000000)
-                a.bfi(GTMP, T3, 28, 1)
-                a.bfi(GTMP, T3, 29, 1)
-                a.msr_nzcv(GTMP)
             return
         if m in ("div", "idiv") and len(ins.ops) == 1:
             src = ins.ops[0]
             sz = self._op_size(src)
-            if sz != 4:
-                raise UnhandledInsn(ins, f"{m} size {sz} (128-bit dividend)")
             self._load(ins, src, T1)
-            if m == "idiv":
-                a.sxtw(T1, T1)
-            ok = self._skip_lbl()
-            a.cbnz(T1, ok, sf=1)
-            a.brk(0xD1)
-            a.label(ok)
-            # dividend = edx:eax
-            a.mov(T0, GMAP[0], sf=0)
-            a.orr_r(T0, T0, GMAP[2], sf=1, shift=0, imm6=32)
-            (a.udiv if m == "div" else a.sdiv)(T2, T0, T1, sf=1)
-            a.msub(T3, T2, T1, T0, sf=1)
-            a.mov(GMAP[0], T2, sf=0)
-            a.mov(GMAP[2], T3, sf=0)
+            if sz == 1:
+                if m == "idiv":
+                    a.sxtb(T1, T1, sf=0)
+                    a.sxth(T0, GMAP[0], sf=0)
+                else:
+                    a.uxth(T0, GMAP[0])
+                ok_nz, ok_ovf = self._skip_lbl(), self._skip_lbl()
+                a.cbnz(T1, ok_nz, sf=0)
+                a.brk(0xD1)
+                a.label(ok_nz)
+                (a.udiv if m == "div" else a.sdiv)(T2, T0, T1, sf=0)
+                if m == "div":
+                    a.lsr(GTMP, T2, 8, sf=0)
+                    a.cbz(GTMP, ok_ovf, sf=0)
+                else:
+                    a.sxtb(GTMP, T2, sf=0)
+                    a.cmp_r(T2, GTMP, sf=0)
+                    a.bcond("eq", ok_ovf)
+                a.brk(0xD2)
+                a.label(ok_ovf)
+                a.msub(T3, T2, T1, T0, sf=0)
+                a.bfi(GMAP[0], T2, 0, 8)
+                a.bfi(GMAP[0], T3, 8, 8)
+            elif sz == 2:
+                if m == "idiv":
+                    a.sxth(T1, T1, sf=0)
+                ok_nz, ok_ovf = self._skip_lbl(), self._skip_lbl()
+                a.cbnz(T1, ok_nz, sf=0)
+                a.brk(0xD1)
+                a.label(ok_nz)
+                a.uxth(T0, GMAP[0])
+                a.bfi(T0, GMAP[2], 16, 16)
+                (a.udiv if m == "div" else a.sdiv)(T2, T0, T1, sf=0)
+                if m == "div":
+                    a.lsr(GTMP, T2, 16, sf=0)
+                    a.cbz(GTMP, ok_ovf, sf=0)
+                else:
+                    a.sxth(GTMP, T2, sf=0)
+                    a.cmp_r(T2, GTMP, sf=0)
+                    a.bcond("eq", ok_ovf)
+                a.brk(0xD2)
+                a.label(ok_ovf)
+                a.msub(T3, T2, T1, T0, sf=0)
+                a.bfi(GMAP[0], T2, 0, 16)
+                a.bfi(GMAP[2], T3, 0, 16)
+            elif sz == 4:
+                if m == "idiv":
+                    a.sxtw(T1, T1)
+                ok_nz, ok_ovf = self._skip_lbl(), self._skip_lbl()
+                a.cbnz(T1, ok_nz, sf=1)
+                a.brk(0xD1)
+                a.label(ok_nz)
+                # dividend = edx:eax
+                a.mov(T0, GMAP[0], sf=0)
+                a.orr_r(T0, T0, GMAP[2], sf=1, shift=0, imm6=32)
+                (a.udiv if m == "div" else a.sdiv)(T2, T0, T1, sf=1)
+                if m == "div":
+                    a.lsr(GTMP, T2, 32, sf=1)
+                    a.cbz(GTMP, ok_ovf, sf=1)
+                else:
+                    a.sxtw(GTMP, T2)
+                    a.cmp_r(T2, GTMP, sf=1)
+                    a.bcond("eq", ok_ovf)
+                a.brk(0xD2)
+                a.label(ok_ovf)
+                a.msub(T3, T2, T1, T0, sf=1)
+                a.mov(GMAP[0], T2, sf=0)
+                a.mov(GMAP[2], T3, sf=0)
+            elif sz == 8:
+                ok_nz = self._skip_lbl()
+                a.cbnz(T1, ok_nz, sf=1)
+                a.brk(0xD1)
+                a.label(ok_nz)
+                slow, done = self._skip_lbl(), self._skip_lbl()
+                if m == "div":
+                    # Fast path when rdx == 0 (plain 64 / 64 unsigned division).
+                    a.cbnz(GMAP[2], slow, sf=1)
+                    a.udiv(T2, GMAP[0], T1, sf=1)
+                    a.msub(T3, T2, T1, GMAP[0], sf=1)
+                    a.mov(GMAP[0], T2, sf=1)
+                    a.mov(GMAP[2], T3, sf=1)
+                    a.b(done)
+                    # Full 128-by-64 unsigned restoring division: T2:T0 / T1.
+                    a.label(slow)
+                    a.mov(T0, GMAP[0], sf=1)
+                    a.mov(T2, GMAP[2], sf=1)
+                    ok_ovf = self._skip_lbl()
+                    a.cmp_r(T2, T1, sf=1)
+                    a.bcond("cc", ok_ovf)
+                    a.brk(0xD2)
+                    a.label(ok_ovf)
+                    a.movz(T3, 64, 0, sf=0)
+                    loop, do_sub, no_sub = self._skip_lbl(), self._skip_lbl(), self._skip_lbl()
+                    a.label(loop)
+                    a.lsr(GTMP, T2, 63, sf=1)
+                    a.lsl(T2, T2, 1, sf=1)
+                    a.orr_r(T2, T2, T0, sf=1, shift=1, imm6=63)
+                    a.lsl(T0, T0, 1, sf=1)
+                    a.cbnz(GTMP, do_sub, sf=1)
+                    a.cmp_r(T2, T1, sf=1)
+                    a.bcond("cc", no_sub)
+                    a.label(do_sub)
+                    a.sub_r(T2, T2, T1, sf=1)
+                    a.orr_i(T0, T0, 1, sf=1)
+                    a.label(no_sub)
+                    a.subs(T3, T3, 1, sf=0)
+                    a.bcond("ne", loop)
+                    a.mov(GMAP[0], T0, sf=1)
+                    a.mov(GMAP[2], T2, sf=1)
+                    a.label(done)
+                else:
+                    # Fast path when rdx == (rax >> 63) and divisor != -1 (handles cqo; idiv r64).
+                    a.asr(T0, GMAP[0], 63, sf=1)
+                    a.cmp_r(GMAP[2], T0, sf=1)
+                    a.bcond("ne", slow)
+                    a.adds(GTMP, T1, 1, sf=1)
+                    a.bcond("eq", slow)
+                    a.sdiv(T2, GMAP[0], T1, sf=1)
+                    a.msub(T3, T2, T1, GMAP[0], sf=1)
+                    a.mov(GMAP[0], T2, sf=1)
+                    a.mov(GMAP[2], T3, sf=1)
+                    a.b(done)
+                    # Full 128-by-64 signed division: T3[7:0]=64, T3[8]=sign(dividend), T3[9]=sign(divisor).
+                    a.label(slow)
+                    a.mov(T0, GMAP[0], sf=1)
+                    a.mov(T2, GMAP[2], sf=1)
+                    a.lsr(T3, T2, 63, sf=1)
+                    a.lsl(T3, T3, 8, sf=1)
+                    a.lsr(GTMP, T1, 63, sf=1)
+                    a.orr_r(T3, T3, GTMP, sf=1, shift=0, imm6=9)
+                    a.add(T3, T3, 64, sf=1)
+                    pos_divd, pos_divr = self._skip_lbl(), self._skip_lbl()
+                    a.tbz(T2, 63, pos_divd)
+                    a.subs_r(T0, 31, T0, sf=1)
+                    a.sbcs(T2, 31, T2, sf=1)
+                    a.label(pos_divd)
+                    a.tbz(T1, 63, pos_divr)
+                    a.sub_r(T1, 31, T1, sf=1)
+                    a.label(pos_divr)
+                    ok_uovf = self._skip_lbl()
+                    a.cmp_r(T2, T1, sf=1)
+                    a.bcond("cc", ok_uovf)
+                    a.brk(0xD2)
+                    a.label(ok_uovf)
+                    loop, do_sub, no_sub = self._skip_lbl(), self._skip_lbl(), self._skip_lbl()
+                    a.label(loop)
+                    a.lsr(GTMP, T2, 63, sf=1)
+                    a.lsl(T2, T2, 1, sf=1)
+                    a.orr_r(T2, T2, T0, sf=1, shift=1, imm6=63)
+                    a.lsl(T0, T0, 1, sf=1)
+                    a.cbnz(GTMP, do_sub, sf=1)
+                    a.cmp_r(T2, T1, sf=1)
+                    a.bcond("cc", no_sub)
+                    a.label(do_sub)
+                    a.sub_r(T2, T2, T1, sf=1)
+                    a.orr_i(T0, T0, 1, sf=1)
+                    a.label(no_sub)
+                    a.sub(T3, T3, 1, sf=1)
+                    a.tst_i(T3, 0xFF, sf=0)
+                    a.bcond("ne", loop)
+                    # Quotient sign = bit8 ^ bit9; max unsigned magnitude is 2^63-1 (pos) or 2^63 (neg).
+                    a.lsr(GTMP, T3, 8, sf=1)
+                    a.eor_shift(GTMP, GTMP, GTMP, 1, 1, sf=0)
+                    a.and_i(GTMP, GTMP, 1, sf=0)
+                    a.movn(T1, 0, 0, sf=1)
+                    a.lsr(T1, T1, 1, sf=1)
+                    a.add_r(T1, T1, GTMP, sf=1)
+                    ok_sovf = self._skip_lbl()
+                    a.cmp_r(T0, T1, sf=1)
+                    a.bcond("ls", ok_sovf)
+                    a.brk(0xD2)
+                    a.label(ok_sovf)
+                    skip_neg_q, skip_neg_r = self._skip_lbl(), self._skip_lbl()
+                    a.cbz(GTMP, skip_neg_q, sf=0)
+                    a.sub_r(T0, 31, T0, sf=1)
+                    a.label(skip_neg_q)
+                    a.tbz(T3, 8, skip_neg_r)
+                    a.sub_r(T2, 31, T2, sf=1)
+                    a.label(skip_neg_r)
+                    a.mov(GMAP[0], T0, sf=1)
+                    a.mov(GMAP[2], T2, sf=1)
+                    a.label(done)
+            else:
+                raise UnhandledInsn(ins, f"{m} size {sz}")
             return
         raise UnhandledInsn(ins, f"{m} form")
 
@@ -2179,37 +3134,50 @@ class FunctionTranslator:
                 a.b("rt_dispatch")
             return
         if ins.cc == "jcxz":
-            a.cbz(GMAP[1], self._target_lbl(ins.ops[0][1]), sf=0)
+            a.cbz(GMAP[1], self._target_lbl(ins.ops[0][1]), sf=0 if ins.addrsize else 1)
             return
         if ins.cc in ("loop", "loope", "loopne"):
-            a.sub(GMAP[1], GMAP[1], 1)
+            sf = 0 if ins.addrsize else 1
+            lbl = self._target_lbl(ins.ops[0][1])
+            a.sub(GMAP[1], GMAP[1], 1, sf)
             if ins.cc == "loop":
-                a.cbnz(GMAP[1], self._target_lbl(ins.ops[0][1]))
+                a.cbnz(GMAP[1], lbl, sf)
             else:
                 skip = self._skip_lbl()
-                a.cbz(GMAP[1], skip)
-                a.bcond("eq" if ins.cc == "loope" else "ne",
-                        self._target_lbl(ins.ops[0][1]))
+                a.cbz(GMAP[1], skip, sf)
+                prod = self.arm_path.get(ins.addr)
+                if prod is not None and "Z" in FLAG_WRITERS.get(prod.mnem, ""):
+                    a.bcond("eq" if ins.cc == "loope" else "ne", lbl)
+                else:
+                    self._ctx_jcc("e" if ins.cc == "loope" else "ne", lbl)
                 a.label(skip)
             return
         self._emit_jcc(ins)
 
     def _emit_call(self, ins):
         a = self.asm
-        a.li(T0, ins.addr + ins.size)
-        a.str_pre(T0, GMAP[4], -8)
         op = ins.ops[0]
         if op[0] == "a" and op[1] in self.by_addr:
+            a.li(T0, ins.addr + ins.size)
+            a.str_pre(T0, GMAP[4], -8)
             a.b(self._lbl(op[1]))
         else:
-            self._load(ins, op, ADDR_T)
+            self._load(ins, op, ADDR_T, as_size=8)
+            a.li(T0, ins.addr + ins.size)
+            a.str_pre(T0, GMAP[4], -8)
             a.b("rt_dispatch")
 
     def _emit_ret(self, ins):
         a = self.asm
         a.ldr_post(ADDR_T, GMAP[4], 8)
         if ins.ops and ins.ops[0][0] == "i":
-            a.add(GMAP[4], GMAP[4], ins.ops[1] & 0xFFFF)
+            imm = ins.ops[0][1] & 0xFFFF
+            if imm:
+                if imm < 4096:
+                    a.add(GMAP[4], GMAP[4], imm)
+                else:
+                    a.li(T0, imm)
+                    a.add_r(GMAP[4], GMAP[4], T0)
         a.b("rt_dispatch")
 
     def _emit_leave(self, ins):
@@ -2221,10 +3189,16 @@ class FunctionTranslator:
         k, m = ins.kind, ins.mnem
         if k == "mov":
             self._emit_mov(ins)
+        elif k == "alu" and ins.lock and ins.ops and ins.ops[0][0] == "m" and m in self._LOCK_ALU_OPS:
+            self._emit_lock_alu(ins)
         elif k == "lea":
             self._emit_lea(ins)
         elif k == "alu":
             self._emit_alu(ins)
+        elif m == "movbe":
+            self._emit_movbe(ins)
+        elif m == "crc32":
+            self._emit_crc32(ins)
         elif k in ("push", "pop"):
             self._emit_pushpop(ins)
         elif k == "xchg":
@@ -2243,6 +3217,8 @@ class FunctionTranslator:
             self._emit_branch(ins)
         elif k == "call":
             self._emit_call(ins)
+        elif k == "bmi":
+            self._emit_bmi(ins)
         elif k == "ret":
             self._emit_ret(ins)
         elif k == "leave":
@@ -2257,6 +3233,10 @@ class FunctionTranslator:
             raise UnhandledInsn(ins, "std/DF=1")
         elif k == "nop":
             pass
+        elif m == "xlat":
+            self._emit_xlat(ins)
+        elif m == "enter":
+            self._emit_enter(ins)
         else:
             raise UnhandledInsn(ins, f"kind {k}")
 
@@ -2382,6 +3362,8 @@ def emit_rt(a: Asm, table_va, bare_metal=False, ctx_va=None):
     a.lsl(3, 3, 6)
     a.orr_r(2, 2, 3)
     a.ubfx(3, 1, 28, 1)
+    a.cmp(0, 2, sf=0)
+    a.csel(3, 31, 3, "eq", sf=0) # kind==logic -> OF=0
     a.lsl(3, 3, 11)
     a.orr_r(2, 2, 3)
     a.ubfx(3, 1, 29, 1)          # arm C
@@ -2406,7 +3388,7 @@ def emit_rt(a: Asm, table_va, bare_metal=False, ctx_va=None):
     a.eor_r(3, 3, 4)
     a.and_i(3, 3, 0x10, sf=0)
     a.orr_r(2, 2, 3)
-    a.str(2, CTX_REG, CTX_EFLAGS, size=4)
+    a.str(2, CTX_REG, CTX_EFLAGS, size=8)
     a.msr_nzcv(5)
     a.ret(LINK)
     if bare_metal:

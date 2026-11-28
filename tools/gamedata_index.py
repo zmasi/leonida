@@ -35,6 +35,8 @@ from collections import defaultdict
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_file  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -177,7 +179,7 @@ def magic_name(data: bytes) -> str:
     return ""
 
 
-CARVED_STREAM = re.compile(r"[0-9a-f]{12}\.(?:bin|bk2)")
+CARVED_STREAM = re.compile(r"[0-9a-fA-F]{12}\.(?:bin|bk2)", re.IGNORECASE)
 
 
 def carved_stream(address: str, directory: str):
@@ -186,10 +188,20 @@ def carved_stream(address: str, directory: str):
     rpf9_carve.py writes one `<offset:012x>.bin` (or `.bk2`) per stream beside its index.json, so it is an input,
     not a place for a report; guarding only index.json left `--json`/`--csv` free to replace a carved stream.
     """
-    if not CARVED_STREAM.fullmatch(os.path.basename(address)):
-        return None
-    candidate = os.path.join(directory, os.path.basename(address))
-    return candidate if os.path.isfile(candidate) and same_report_path(address, candidate) else None
+    base = os.path.basename(address)
+    if CARVED_STREAM.fullmatch(base):
+        candidate = os.path.join(directory, base.lower())
+        if os.path.isfile(candidate) and same_report_path(address, candidate):
+            return candidate
+    if os.path.isfile(address):
+        try:
+            with os.scandir(directory) as entries:
+                for entry in entries:
+                    if CARVED_STREAM.fullmatch(entry.name) and entry.is_file() and same_report_path(address, entry.path):
+                        return entry.path
+        except OSError:
+            pass
+    return None
 
 
 class DirectorySource:
@@ -221,18 +233,24 @@ class ArchiveSource:
     def __init__(self, archive: str, index_dir: str | None = None):
         self.archive = archive
         self._tmp = None
-        if index_dir is None:
-            self._tmp = tempfile.TemporaryDirectory(prefix="gamedata-index-")
-            index_dir = self._tmp.name
-            r = subprocess.run([sys.executable, "-I", CARVER, archive, index_dir, "--index-only"],
-                               capture_output=True, text=True, encoding="utf-8", errors="replace")
-            if r.returncode != 0:
-                raise RuntimeError((r.stdout + r.stderr).strip() or "rpf9_carve.py failed")
-        with open(os.path.join(index_dir, "index.json"), encoding="utf-8-sig") as f:
-            self.index = json.load(f)
-        self.rows = sorted(self.index["files"], key=lambda r: r["off"])
-        self._fh = open(archive, "rb")
-        self._map = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        self._fh = None
+        self._map = None
+        try:
+            if index_dir is None:
+                self._tmp = tempfile.TemporaryDirectory(prefix="gamedata-index-")
+                index_dir = self._tmp.name
+                r = subprocess.run([sys.executable, "-I", CARVER, archive, index_dir, "--index-only"],
+                                   capture_output=True, text=True, encoding="utf-8", errors="replace")
+                if r.returncode != 0:
+                    raise RuntimeError((r.stdout + r.stderr).strip() or "rpf9_carve.py failed")
+            with open(os.path.join(index_dir, "index.json"), encoding="utf-8-sig") as f:
+                self.index = json.load(f)
+            self.rows = sorted(self.index["files"], key=lambda r: r["off"])
+            self._fh = open(archive, "rb")
+            self._map = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        except BaseException:
+            self.close()
+            raise
 
     def read(self, row: dict) -> bytes:
         if row.get("type") == "bink2":
@@ -249,10 +267,15 @@ class ArchiveSource:
         return self.index.get("summary", {})
 
     def close(self) -> None:
-        self._map.close()
-        self._fh.close()
+        if self._map is not None:
+            self._map.close()
+            self._map = None
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
         if self._tmp is not None:
             self._tmp.cleanup()
+            self._tmp = None
 
 
 def build_rows(rows: list, source) -> list:
@@ -272,7 +295,7 @@ def build_rows(rows: list, source) -> list:
             while j < n and not xml_complete(root, blob):
                 nxt = source.read(rows[j])
                 nk = stream_kind(nxt, rows[j])
-                if nk in ("decl", "bink2", "rbf0", "psin", "other", "binary"):
+                if nk in ("decl", "bink2", "rbf0", "psin", "other") or (nk == "binary" and not _utf8_text(nxt)):
                     break
                 blob += nxt
                 if not root:  # the opening name or its delimiter may span streams
@@ -393,7 +416,7 @@ def summarize(rows: list, source_summary: dict, target: str) -> dict:
         "inflated": sum(r["size"] for r in rows),
         "zero_padding": source_summary.get("zero_padding"),
         "unread_bytes": source_summary.get("unread_bytes"),
-        "types": {k: dict(v) for k, v in sorted(by_type.items(), key=lambda kv: -kv[1]["inflated"])},
+        "types": {k: dict(v) for k, v in sorted(by_type.items(), key=lambda kv: (-kv[1]["inflated"], kv[0]))},
         "xml_documents": sum(1 for r in xml if r["complete"]),
         "xml_with_header": sum(1 for r in xml if r["header"]),
         "xml_tail_only": sum(1 for r in xml if r["complete"] and not r["header"]),
@@ -410,24 +433,60 @@ def _make_parent(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
-def write_csv(path: str, rows: list) -> None:
+def _atomic_write(path: str, newline: str, writer) -> None:
     _make_parent(path)
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path) or "."
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline=newline, dir=parent,
+            prefix=".gamedata-index-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp_path = f.name
+            writer(f)
+        os.chmod(tmp_path, published_mode(abs_path))
+        replace_file(tmp_path, abs_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
+def write_csv(path: str, rows: list) -> None:
     fields = ["offset", "offset_hex", "stored", "size", "type", "root", "detail", "chunks",
               "complete", "header"]
-    with open(path, "w", newline="", encoding="utf-8") as f:
+
+    def _dump(f):
         w = csv.DictWriter(f, fieldnames=fields, lineterminator="\n")
         w.writeheader()
         w.writerows(rows)
 
+    _atomic_write(path, "", _dump)
 
-def main() -> int:
+
+def write_json(path: str, summary: dict, rows: list) -> None:
+    def _dump(f):
+        json.dump({"summary": summary, "rows": rows}, f, indent=1, allow_nan=False)
+        f.write("\n")
+
+    _atomic_write(path, "\n", _dump)
+
+
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("target", help="carve directory or .rpf archive")
     ap.add_argument("--carve-dir", help="existing rpf9_carve.py index.json directory for an .rpf")
     ap.add_argument("--csv", help="write one row per payload to this CSV")
     ap.add_argument("--json", help="write the summary and rows to this JSON")
-    a = ap.parse_args()
-    if a.csv and a.json and same_report_path(a.csv, a.json):
+    a = ap.parse_args(argv)
+    for flag, path in (("--json", a.json), ("--csv", a.csv)):
+        if path is not None and not path.strip():
+            ap.error(f"{flag} path must not be empty")
+    if a.csv is not None and a.json is not None and same_report_path(a.csv, a.json):
         ap.error("--csv and --json must use different paths")
 
     if not os.path.exists(a.target):
@@ -437,7 +496,7 @@ def main() -> int:
     if a.carve_dir:
         protected.append(os.path.join(a.carve_dir, "index.json"))
     for flag, path in (("--json", a.json), ("--csv", a.csv)):
-        if path:
+        if path is not None:
             if os.path.isdir(path):
                 ap.error(f"{flag} is a directory: {path}")
             for input_path in protected:
@@ -462,7 +521,7 @@ def main() -> int:
         print(f"ERROR: {e.filename} is missing. Give a carve folder from rpf9_carve.py or an .rpf archive.",
               file=sys.stderr)
         return 2
-    except (OSError, ValueError, KeyError, TypeError) as e:
+    except (OSError, ValueError, KeyError, TypeError, RecursionError) as e:
         where = getattr(e, "filename", None) or a.target
         print(f"ERROR: cannot read {where}: {getattr(e, 'strerror', None) or e!r}", file=sys.stderr)
         return 2
@@ -470,17 +529,15 @@ def main() -> int:
         if isinstance(source, ArchiveSource):
             source.close()
 
-    if a.csv:
+    if a.csv is not None:
         try:
             write_csv(a.csv, rows)
         except OSError as e:
             print(f"ERROR: cannot write {a.csv}: {e.strerror or e}", file=sys.stderr)
             return 2
-    if a.json:
+    if a.json is not None:
         try:
-            _make_parent(a.json)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"summary": summary, "rows": rows}, f, indent=1)
+            write_json(a.json, summary, rows)
         except OSError as e:
             print(f"ERROR: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2

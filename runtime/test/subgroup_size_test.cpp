@@ -237,6 +237,73 @@ int main() {
         CHECK(decide_subgroup_size(entry("ps", false), caps).outcome == SubgroupOutcome::unavailable);
     }
 
+    // --- Malformed or half-zero [min_size, max_size] ranges ---------------------------------------------------------
+    {
+        // Half-zero range (min_size == 0, max_size == 64): lower bound is unset, so requiredSubgroupSize must not be
+        // chained (VUID -requiredSubgroupSize-02761); fall back to default_size or unavailable.
+        SubgroupSizeCaps caps = amd();
+        caps.min_size = 0;
+        caps.max_size = 64;
+        caps.default_size = 64;
+        auto r = decide_subgroup_size(entry("cs", true), caps);
+        CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0 && r.flags == 0);
+        r = decide_subgroup_size(entry("cs", false), caps);
+        CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0 && r.flags == 0);
+        r = decide_subgroup_size(entry("ps", false), caps);
+        CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0 && r.flags == 0);
+
+        // Same half-zero range with default_size == 32: wave64 cannot be required, wave32 falls back to default.
+        caps.default_size = 32;
+        r = decide_subgroup_size(entry("cs", true), caps);
+        CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0 && r.flags == 0);
+        r = decide_subgroup_size(entry("cs", false), caps);
+        CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0 && r.flags == 0);
+
+        // Half-zero range with default_size == 0: neither a default nor a valid [min, max] range is known.
+        caps.default_size = 0;
+        r = decide_subgroup_size(entry("cs", true), caps);
+        CHECK(r.outcome == SubgroupOutcome::unknown_device && r.size == 0 && r.flags == 0);
+        r = decide_subgroup_size(entry("cs", false), caps);
+        CHECK(r.outcome == SubgroupOutcome::unknown_device && r.size == 0 && r.flags == 0);
+
+        // Mirror half-zero (min_size == 32, max_size == 0) and inverted range (min_size > max_size).
+        caps = amd();
+        caps.default_size = 0;
+        caps.min_size = 32;
+        caps.max_size = 0;
+        CHECK(decide_subgroup_size(entry("cs", false), caps).outcome == SubgroupOutcome::unknown_device);
+        caps.min_size = 64;
+        caps.max_size = 32;
+        CHECK(decide_subgroup_size(entry("cs", true), caps).outcome == SubgroupOutcome::unknown_device);
+        caps.default_size = 64;
+        CHECK(decide_subgroup_size(entry("cs", true), caps).outcome == SubgroupOutcome::device_default);
+        CHECK(decide_subgroup_size(entry("cs", false), caps).outcome == SubgroupOutcome::unavailable);
+
+        // Non-power-of-two bounds violate VkPhysicalDeviceSubgroupSizeControlProperties and must not be trusted.
+        caps = amd();
+        caps.min_size = 24;
+        caps.max_size = 64;
+        caps.default_size = 64;
+        r = decide_subgroup_size(entry("cs", false), caps);
+        CHECK(r.outcome == SubgroupOutcome::unavailable && r.size == 0 && r.flags == 0);
+        r = decide_subgroup_size(entry("cs", true), caps);
+        CHECK(r.outcome == SubgroupOutcome::device_default && r.size == 0 && r.flags == 0);
+        caps.min_size = caps.max_size = 48;
+        ShaderEntry odd = entry("cs", true);
+        odd.subgroup_size = 48;
+        CHECK(decide_subgroup_size(odd, caps).outcome == SubgroupOutcome::unavailable);
+
+        // Control: a valid power-of-two range with default_size == 0 still requires sizes within [min, max].
+        caps = amd();
+        caps.default_size = 0;
+        r = decide_subgroup_size(entry("cs", true), caps);
+        CHECK(r.outcome == SubgroupOutcome::required && r.size == 64);
+        r = decide_subgroup_size(entry("cs", false), caps);
+        CHECK(r.outcome == SubgroupOutcome::required && r.size == 32);
+        odd.subgroup_size = 16;
+        CHECK(decide_subgroup_size(odd, caps).outcome == SubgroupOutcome::unavailable);
+    }
+
     // --- The create-info chain -------------------------------------------------------------------------------------
     {
         const SubgroupSizeCaps caps = amd();

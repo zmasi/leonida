@@ -2,7 +2,7 @@
 
 > [!NOTE]
 > La version anglaise de [`CONTRIBUTING.md`](../../../CONTRIBUTING.md) **fait foi**. Cette traduction est
-> synchronisée avec le commit `1ab957b3`. En cas de différence, suivez l'anglais.
+> synchronisée avec le commit `364754de`. En cas de différence, suivez l'anglais.
 
 Merci de votre aide. Quelques règles permettent au projet de rester hébergeable :
 
@@ -93,3 +93,14 @@ un **ancien** numéro et ne mène plus nulle part, y compris les deux vers lesqu
 - Lancez les tests du traducteur avec `python -I scripts/run_semantic_tests.py tests/semantic` (voir
   `tests/semantic/README.md`). Une nouvelle règle du traducteur doit venir avec une petite fixture `.asm` écrite à la
   main et les mots de sortie attendus.
+
+## Pull requests
+
+- Un seul sujet par pull request, basée sur la version actuelle de `main`. La suite du travail va dans une nouvelle
+  pull request, pas dans une pull request déjà ouverte.
+- Remplissez le [modèle](../../../.github/pull_request_template.md) : la réservation, `Depends on:`, `Fixes: #N` pour
+  une issue qu'elle ferme, ce que vous avez testé, `GPUs tested:` (fabricant, modèle, pilote et système) et si elle a
+  été faite avec l'aide d'une IA.
+- Une pull request en conflit avec `main` reçoit l'étiquette `needs rebase` (`tools/pr_conflict_label.py`, lancé à
+  chaque push sur `main` et toutes les heures). Rebasez-la vous-même sur `main` ; l'étiquette disparaît dans l'heure
+  une fois qu'elle fusionne proprement. Les relectures commencent par les pull requests qui fusionnent proprement.

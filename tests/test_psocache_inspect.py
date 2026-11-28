@@ -270,6 +270,115 @@ class PsocacheInspectTest(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertNotIn("Traceback", p.stderr)
 
+    def test_entry_pointing_past_meta_blob_does_not_crash_or_read_code_blob(self):
+        meta_index_off = HEADER + GRAPHICS * 0x70 + COMPUTE * 0x18
+        meta_off = meta_index_off + META_INDEX * 8 + SHADER_INDEX * 8
+        code_off = meta_off + META_SIZE
+
+        # Subtest 1: entry pointing past EOF must report an out-of-range span, not raise struct.error.
+        oob_eof = bytearray(build())
+        struct.pack_into("<2I", oob_eof, meta_index_off, 0xFFFFFFFF, 32)
+        p_eof = os.path.join(self.tmp.name, "oob_eof.cache")
+        with open(p_eof, "wb") as f:
+            f.write(oob_eof)
+        r_eof = psocache_inspect.inspect(p_eof, with_meta=True, entry=0)
+        self.assertEqual(r_eof["verdict"], "disagrees with the model")
+        self.assertEqual(len(r_eof["meta_entry"]), 1)
+        self.assertIn("points past", r_eof["meta_entry"][0])
+        cli = run(p_eof, "--meta", "--entry", "0")
+        self.assertEqual(cli.returncode, 1, cli.stderr)
+        self.assertIn("points past", cli.stdout)
+        self.assertNotIn("Traceback", cli.stderr)
+
+        # Subtest 2: entry spilling across meta_blob into code_blob must not decode code bytes as chunks.
+        oob_spill = bytearray(build())
+        struct.pack_into("<8I", oob_spill, code_off, 0x41, 0x300, 0, 0, 0, 0, 0, 0)
+        struct.pack_into("<2I", oob_spill, meta_index_off + 8, META_SIZE, 32)
+        p_spill = os.path.join(self.tmp.name, "oob_spill.cache")
+        with open(p_spill, "wb") as f:
+            f.write(oob_spill)
+        r_spill = psocache_inspect.inspect(p_spill, with_meta=True, entry=1)
+        self.assertIn("points past", r_spill["meta_entry"][0])
+        self.assertFalse(any("0x41 kind=0x300" in line for line in r_spill["meta_entry"]))
+
+    def test_entry_rejected_when_meta_truncated_or_bad_arguments(self):
+        with open(self.path, "r+b") as f:
+            f.truncate(HEADER + GRAPHICS * 0x70 + COMPUTE * 0x18 + 8)
+        with self.assertRaisesRegex(ValueError, "meta_index or meta_blob does not fit"):
+            psocache_inspect.inspect(self.path, entry=0)
+        cli = run(self.path, "--entry", "0")
+        self.assertEqual(cli.returncode, 2)
+        self.assertNotIn("Traceback", cli.stderr)
+
+        for kwargs in ({"entry": -1}, {"entry": True}, {"limit": True}, {"limit": False}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    psocache_inspect.inspect(self.path, **kwargs)
+
+    def test_references_checked_when_meta_index_is_empty(self):
+        # 1 graphics + 1 compute record referencing meta index 0 while meta_index count is 0.
+        size = HEADER + 0x70 + 0x18
+        data = bytearray(size)
+        data[0:4] = b"PS\x00\x09"
+        data[0x04:0x09] = b"test\x00"
+        data[0x24:0x27] = b"v1\x00"
+        struct.pack_into("<4I", data, 0x50, 1, 1, 0, 0)
+        struct.pack_into("<2I", data, 0x60, 0, 0)
+        # Graphics record: one non-hole reference (0 at +8), five 0xFFFFFFFF holes.
+        struct.pack_into("<2I", data, HEADER + 8, 0, 0xFFFFFFFF)
+        struct.pack_into("<4I", data, HEADER + 0x50, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+        # Compute record: four references to 0 (all out of range for a 0-entry meta index).
+        p_bad = os.path.join(self.tmp.name, "zero_meta_bad.cache")
+        with open(p_bad, "wb") as f:
+            f.write(data)
+        r = psocache_inspect.inspect(p_bad)
+        self.assertEqual(
+            r["references"],
+            {"limit": 0, "graphics_out_of_range": 1, "compute_out_of_range": 4},
+        )
+        self.assertEqual(r["verdict"], "disagrees with the model")
+        self.assertEqual(run(p_bad).returncode, 1)
+
+        # Graphics record with only 0xFFFFFFFF holes and 0 compute records holds even with 0 meta entries.
+        hole_data = bytearray(HEADER + 0x70)
+        hole_data[0:4] = b"PS\x00\x09"
+        hole_data[0x04:0x09] = b"test\x00"
+        hole_data[0x24:0x27] = b"v1\x00"
+        struct.pack_into("<4I", hole_data, 0x50, 1, 0, 0, 0)
+        struct.pack_into("<2I", hole_data, 0x60, 0, 0)
+        struct.pack_into("<2I", hole_data, HEADER + 8, 0xFFFFFFFF, 0xFFFFFFFF)
+        struct.pack_into("<4I", hole_data, HEADER + 0x50, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF)
+        p_ok = os.path.join(self.tmp.name, "zero_meta_holes.cache")
+        with open(p_ok, "wb") as f:
+            f.write(hole_data)
+        r_ok = psocache_inspect.inspect(p_ok)
+        self.assertEqual(
+            r_ok["references"],
+            {"limit": 0, "graphics_out_of_range": 0, "compute_out_of_range": 0},
+        )
+        self.assertEqual(r_ok["verdict"], "model holds")
+
+    def test_unterminated_header_strings_bounded_to_slots(self):
+        for off, stop, fill in ((0x04, 0x24, b"A"), (0x24, 0x48, b"B")):
+            with self.subTest(offset=hex(off)):
+                data = bytearray(build())
+                data[off:stop] = fill * (stop - off)
+                path = os.path.join(self.tmp.name, f"unterm_{off:x}.cache")
+                with open(path, "wb") as f:
+                    f.write(data)
+                r = psocache_inspect.inspect(path)
+                entry = next(s for s in r["header_strings"] if s["offset"] == off)
+                self.assertEqual(entry["length"], 0)
+                self.assertEqual(r["verdict"], "disagrees with the model")
+                self.assertTrue(any(f"0x{off:x}" in prob and "NUL" in prob for prob in r["problems"]))
+
+    def test_parse_chunks_rejects_out_of_bounds_span(self):
+        buf = struct.pack("<8I", 0x41, 0x300, 0, 0, 0, 0, 0, 0)
+        self.assertEqual(psocache_inspect.parse_chunks(buf, 0, 0, 64), (None, None))
+        self.assertEqual(psocache_inspect.parse_chunks(buf, 0, -4, 32), (None, None))
+        self.assertEqual(psocache_inspect.parse_chunks(buf, -1, 0, 32), (None, None))
+        self.assertIsNone(psocache_inspect.entry_chunks(buf, 0, 0, 64))
+
 
 if __name__ == "__main__":
     unittest.main()

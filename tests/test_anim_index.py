@@ -254,6 +254,32 @@ class RigParseTest(unittest.TestCase):
         self.assertEqual((r["offset"], r["occurrences"], r["distinct"], r["hashes_present"]),
                          (0x123, 2, 2, 1))
 
+    def test_fd_string_rejects_truncated_payload(self):
+        truncated = b"\xfd\xff" + struct.pack("<I", 20) + b"anim/rig/x"
+        self.assertIsNone(anim_index._fd_string(truncated, 0))
+        exact = b"\xfd\xff" + struct.pack("<I", 11) + b"anim/rig/x\x00"
+        self.assertEqual(anim_index._fd_string(exact, 0), "anim/rig/x")
+
+    def test_parse_rbf0_does_not_pair_rig_across_sources_or_rigsets(self):
+        # Rigset 1 has an orphan source with no rig before rigset 2; rigset 2 has an orphan
+        # source followed by a complete (source, rig, group) entry. Neither orphan may steal
+        # the later rig.
+        b = bytearray(b"RBF0" + struct.pack("<H", 0xFFFB) + struct.pack("<I", 1)
+                      + _u16s(b"rage__crRigSetManager") + b"\x00")
+        b += b"\x03\x60" + _u16s(b"anim/rigset/synthetic/first")
+        b += _fd(b"canonical@source") + b"\xff" * 6
+        b += b"\x03\x60" + _u16s(b"anim/rigset/synthetic/second")
+        b += _fd(b"generated@source") + b"\x00" * 4
+        b += _entry(b"pipelined@source", b"anim/rig/pipelined/source/synthetic/two", b"facial")
+        b += b"\xff" * 6
+        parsed = anim_index.parse_rbf0(bytes(b))
+        self.assertEqual(parsed["summary"]["rigsets"], 2)
+        self.assertEqual(parsed["summary"]["entries"], 1)
+        self.assertEqual(parsed["rigsets"][0]["entries"], [])
+        self.assertEqual(len(parsed["rigsets"][1]["entries"]), 1)
+        self.assertEqual(parsed["rigsets"][1]["entries"][0]["source"], "pipelined@source")
+        self.assertEqual(parsed["rigsets"][1]["entries"][0]["rig"], "anim/rig/pipelined/source/synthetic/two")
+
 
 class ArchiveTest(unittest.TestCase):
     def setUp(self):
@@ -521,6 +547,61 @@ class ArchiveTest(unittest.TestCase):
             self.assertTrue(created[0].closed)
             os.remove(self.rpf)
             self.assertFalse(os.path.exists(self.rpf))
+
+    def test_scan_rpf_rejects_nonpositive_limit_and_bool_bounds(self):
+        for kwargs in ({"limit": 0}, {"limit": -5}, {"limit": True}, {"limit": False}, {"start": True}):
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(ValueError):
+                    anim_index.scan_rpf(self.rpf, **kwargs)
+
+    def test_cli_rigs_failure_preserves_existing_index_output(self):
+        out = os.path.join(self.root, "existing_index.json")
+        rigs = os.path.join(self.root, "existing_rigs.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write('{"keep_index": true}')
+        with open(rigs, "w", encoding="utf-8") as f:
+            f.write('{"keep_rigs": true}')
+        p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--rigs", rigs, "--quiet"],
+                           capture_output=True, text=True, errors="replace")
+        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"keep_index": True})
+        with open(rigs, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"keep_rigs": True})
+
+    def test_write_output_is_atomic_and_rejects_trailing_separator(self):
+        rows, summary = anim_index.scan_rpf(self.rpf)
+        out = os.path.join(self.root, "atomic.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write('{"before": true}')
+        before_files = set(os.listdir(self.root))
+        with mock.patch.object(anim_index.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                anim_index.write_output(out, rows, summary)
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"before": True})
+        self.assertEqual(set(os.listdir(self.root)), before_files)
+
+        trailing = out + os.sep
+        with self.assertRaises(IsADirectoryError):
+            anim_index.write_output(trailing, rows, summary)
+        p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, trailing, "--quiet"],
+                           capture_output=True, text=True, errors="replace")
+        self.assertEqual(p.returncode, 2, p.stderr)
+        self.assertIn("is a folder", p.stderr)
+
+    def test_unreadable_source_dir_with_existing_out_has_no_traceback(self):
+        carve = os.path.join(self.root, "locked_carve")
+        os.makedirs(carve)
+        out = os.path.join(self.root, "out.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write("{}")
+        err = PermissionError(13, "Permission denied", carve)
+        with mock.patch.object(sys, "argv", ["anim_index.py", carve, out, "--quiet"]), \
+                mock.patch.object(anim_index.os, "listdir", side_effect=err):
+            with self.assertRaises(SystemExit) as cm:
+                anim_index.main()
+        self.assertIn("Permission denied", str(cm.exception))
 
 
 class RigArchiveTest(unittest.TestCase):

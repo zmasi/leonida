@@ -13,7 +13,8 @@ import re
 import sys
 import unittest
 from collections import Counter
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -371,6 +372,67 @@ class Translated(unittest.TestCase):
             self.assertIn("expected 0x00000000, actual 0x3f800000", d.check(lines))
         finally:
             d.translate_listing = real
+
+
+class CliGuards(unittest.TestCase):
+    def _run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["div_fixup_diff.py", *argv]), \
+                redirect_stdout(out), redirect_stderr(err):
+            try:
+                rc = d.main()
+            except SystemExit as exc:
+                rc = exc.code
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_invalid_counts_and_empty_runs_are_rejected(self):
+        for argv, needle in (
+            (["--no-sweep", "--programs", "-1"], "--programs"),
+            (["--no-sweep", "--programs", "1", "--max-ops", "0"], "--max-ops"),
+            (["--no-sweep", "--programs", "1", "--max-ops", "-2"], "--max-ops"),
+            (["--no-sweep", "--programs", "0"], "nothing to run"),
+        ):
+            with self.subTest(argv=argv):
+                rc, _, err = self._run_main(argv)
+                self.assertEqual(rc, 2)
+                self.assertIn(needle, err)
+
+    def test_all_unjudged_run_exits_two(self):
+        with mock.patch.object(d, "run_one", return_value=("unjudged", "synthetic unjudged")):
+            rc, _, err = self._run_main(["--no-sweep", "--programs", "2", "--ops", "v_div_fixup_f32"])
+        self.assertEqual(rc, 2)
+        self.assertIn("no judged program ran", err)
+
+    def test_ops_validation_and_deduplication(self):
+        for bad_ops in ("", "   ", ",", "v_div_fixup_f32,", ",v_div_fixup_f32"):
+            with self.subTest(ops=bad_ops):
+                rc, _, err = self._run_main(["--no-sweep", "--programs", "1", "--ops", bad_ops])
+                self.assertEqual(rc, 2)
+                self.assertIn("--ops", err)
+
+        seen_ops = []
+
+        def fake_suite(programs, seed, max_ops=6, ops=None):
+            seen_ops.append(ops)
+            return {"pass": 1, "mismatch": 0, "skip": Counter(), "unjudged": Counter(),
+                    "ops": Counter({"v_div_fixup_f32": 1}), "events": {}}, None
+
+        with mock.patch.object(d, "run_suite", side_effect=fake_suite):
+            rc, _, _ = self._run_main(["--no-sweep", "--programs", "1", "--ops", "v_div_fixup_f32, v_div_fixup_f32"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen_ops, [["v_div_fixup_f32"]])
+
+    def test_run_suite_validates_bounds_and_main_accepts_argv(self):
+        for bad_programs in (-1, True):
+            with self.subTest(programs=bad_programs), self.assertRaises(ValueError):
+                d.run_suite(bad_programs, 1)
+        for bad_max_ops in (0, -1, True):
+            with self.subTest(max_ops=bad_max_ops), self.assertRaises(ValueError):
+                d.run_suite(1, 1, max_ops=bad_max_ops)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(d.main(["--list-ops"]), 0)
+        self.assertIn("v_div_fixup_f32", out.getvalue())
 
 
 if __name__ == "__main__":

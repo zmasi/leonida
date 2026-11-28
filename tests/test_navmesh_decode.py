@@ -463,6 +463,11 @@ class NavmeshDecodeTest(unittest.TestCase):
         self.assertEqual(doc["carver_streams"]["tiny_continuations"], 2)
         self.assertEqual(doc["carver_streams"]["tiny_orphans"], 1)
         self.assertEqual(len(csv_rows), 16)
+        # Second directory: 96-byte header, two 160-byte nodes, 304-byte region,
+        # two 16-byte block records and the 24-byte block map, all in Stream 0.
+        self.assertEqual(csv_rows[1]["first_stream_bytes"], "4096")
+        self.assertEqual(csv_rows[1]["runtime_data_end"], "776")
+        self.assertEqual(csv_rows[4]["runtime_data_end"], "")
         for cls, table in doc["checks"].items():
             for name, counts in table.items():
                 self.assertEqual(counts["fail"], 0, f"{cls}.{name} failed: {counts}")
@@ -558,13 +563,17 @@ class NavmeshDecodeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             arc = os.path.join(tmp, "bad.rpf")
             make_rpf(arc, streams)
-            doc = nd.scan(arc, deep=True)
+            rows = []
+            doc = nd.scan(arc, deep=True, rows=rows)
+            self.assertNotIn("runtime_data_end", rows[1])  # out-of-bounds instance block
             json.dumps(doc, allow_nan=False)
 
             # Separate archives for MAX_STREAMS-capped resources so they cannot swallow other test fixtures.
             arc_cap_0drp = os.path.join(tmp, "cap_0drp.rpf")
             make_rpf(arc_cap_0drp, build_0drp(total_size=0x2000, bad_bm_streams=100) + [bytes(64)] * (nd.MAX_STREAMS + 2))
-            doc_cap_0drp = nd.scan(arc_cap_0drp, deep=True)
+            capped_rows = []
+            doc_cap_0drp = nd.scan(arc_cap_0drp, deep=True, rows=capped_rows)
+            self.assertNotIn("runtime_data_end", capped_rows[0])  # incomplete block map
 
             arc_cap_psin = os.path.join(tmp, "cap_psin.rpf")
             big_psin = b"PSIN" + struct.pack(">I", 0x2000) + struct.pack("<II", 256, 0x100) + bytes(64)

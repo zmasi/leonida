@@ -40,7 +40,10 @@ import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+from file_mode import published_mode  # noqa: E402
 import psocache_inspect  # noqa: E402
+from replace_retry import replace as replace_file  # noqa: E402
+from report_paths import case_insensitive_volume, same_report_path  # noqa: E402
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 MAGIC = psocache_inspect.MAGIC
@@ -142,10 +145,10 @@ def assemble(m, size, first, total):
     pos = used
     while len(data) < total:
         gap = 0
-        while pos < size and m[pos] == 0 and gap < MAX_GAP:
+        while pos < size and m[pos] == 0 and gap <= MAX_GAP:
             pos += 1
             gap += 1
-        if gap >= MAX_GAP or not ZHDR.match(m, pos):
+        if gap > MAX_GAP or pos >= size or not ZHDR.match(m, pos):
             raise ValueError(
                 "only %d of %d declared bytes are in contiguous streams"
                 % (len(data), total)
@@ -164,33 +167,85 @@ def assemble(m, size, first, total):
 
 
 def inside_tempdir(path):
+    if not isinstance(path, (str, os.PathLike)) or not os.fspath(path).strip():
+        return False
     root = os.path.realpath(tempfile.gettempdir())
     target = os.path.realpath(os.path.abspath(path))
-    return target.startswith(root + os.sep)
+    root_norm = os.path.normcase(root)
+    target_norm = os.path.normcase(target)
+    if sys.platform == "darwin" and case_insensitive_volume(root):
+        root_norm = root_norm.casefold()
+        target_norm = target_norm.casefold()
+    try:
+        return (
+            os.path.commonpath([root_norm, target_norm]) == root_norm
+            and target_norm != root_norm
+        )
+    except ValueError:
+        return False
 
 
 def archives(source):
     if os.path.isdir(source):
+        try:
+            names = sorted(os.listdir(source))
+        except OSError as e:
+            raise ValueError(
+                "source folder cannot be listed: %s" % (e.strerror or "I/O error")
+            ) from None
         return [
             os.path.join(source, name)
-            for name in sorted(os.listdir(source))
+            for name in names
             if os.path.isfile(os.path.join(source, name))
         ]
     return [source]
+
+
+def _write_bytes_atomic(path, data):
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path) or "."
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=parent, prefix=".psocache-", suffix=".tmp", delete=False
+        ) as f:
+            tmp_path = f.name
+            f.write(data)
+        os.chmod(tmp_path, published_mode(abs_path))
+        replace_file(tmp_path, abs_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def extract(
     source, out, budget=DEFAULT_BUDGET, max_streams=DEFAULT_MAX_STREAMS, quiet=False
 ):
     """Find, carve and validate the cache. Returns ``(archive_index, report, search)`` or raises NotFound."""
+    if budget < 1:
+        raise ValueError("--budget must be at least 1")
+    if max_streams < 1:
+        raise ValueError("--max-streams must be at least 1")
     if not inside_tempdir(out):
         raise ValueError("--out must be a file inside the temporary directory")
+    if os.path.isdir(out):
+        raise ValueError("--out is a directory, not a file")
+    parent = os.path.dirname(os.path.abspath(out)) or "."
+    if not os.path.isdir(parent):
+        raise ValueError("--out parent directory does not exist")
     paths = archives(source)
+    if same_report_path(source, out) or any(same_report_path(p, out) for p in paths):
+        raise ValueError("--out must not overwrite a source archive")
     left = budget
     spent = 0
     streams = 0
+    found = None
     for index, path in enumerate(paths, 1):
-        if left <= 0:
+        if left <= 0 or streams >= max_streams:
             break
         try:
             fh = open(path, "rb")
@@ -220,6 +275,11 @@ def extract(
                         )
                     continue
                 used, header = inflate(m, search["offset"], size, keep_all=True)
+                if header is None:
+                    raise ValueError(
+                        "archive #%d at stream offset 0x%x: candidate stream does not inflate"
+                        % (index, search["offset"])
+                    )
                 total = declared_total(header)
                 if total is None:
                     raise ValueError(
@@ -236,14 +296,17 @@ def extract(
                         "archive #%d at stream offset 0x%x: %s"
                         % (index, search["offset"], e)
                     )
-                with open(out, "wb") as f:
-                    f.write(data)
-                report = psocache_inspect.inspect(out)
-                return (
-                    index,
-                    report,
-                    {"size": size, **search, "archive_stream_offset": search["offset"]},
-                )
+                found = (index, size, search, data)
+                break
+    if found is not None:
+        index, size, search, data = found
+        _write_bytes_atomic(out, data)
+        report = psocache_inspect.inspect(out)
+        return (
+            index,
+            report,
+            {"size": size, **search, "archive_stream_offset": search["offset"]},
+        )
     raise NotFound(
         "no cache found: %d archives, %d streams, %d compressed bytes examined"
         % (len(paths), streams, spent)

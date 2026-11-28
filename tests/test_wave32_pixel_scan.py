@@ -11,10 +11,12 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 sys.path.insert(0, str(Path(__file__).resolve().parent / "semantic"))
 import fssm_header  # noqa: E402
+import report_paths  # noqa: E402
 import shader_ir  # noqa: E402
 import support  # noqa: E402
 import wave32_pixel_scan as scan  # noqa: E402
@@ -277,6 +279,57 @@ class ScanTests(unittest.TestCase):
                 self.assertEqual(self._scan_lines(lines), {"vote": 1})
                 spv = support.translate_lines(f"ps_preserve_{idx}", lines)
                 self.assertIn("OpGroupNonUniform", spv)
+
+    def test_output_must_not_overwrite_a_listing_via_same_report_path(self):
+        self.assertIs(scan.same_report_path, report_paths.same_report_path)
+        with tempfile.TemporaryDirectory() as src:
+            name, text = PS_LANE_ID
+            listing = os.path.join(src, name)
+            with open(listing, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            alias = os.path.join(src, ".", name)
+            with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()) as err:
+                scan.main([src, "--out", alias])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("must not overwrite", err.getvalue())
+            with open(listing, encoding="utf-8") as f:
+                self.assertEqual(f.read(), text)
+
+            folded = os.path.join(src, name.upper())
+            with mock.patch.object(scan, "same_report_path", return_value=True) as mocked:
+                with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):
+                    scan.main([src, "--out", folded])
+            self.assertEqual(cm.exception.code, 2)
+            mocked.assert_called_once_with(folded, listing)
+
+    def test_output_write_oserror_and_invalid_paths_return_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "disasm")
+            os.mkdir(src)
+            name, text = PS_LANE_ID
+            with open(os.path.join(src, name), "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+
+            for bad_out in (tmp, os.path.join(tmp, "missing_dir", "out.json")):
+                with self.subTest(bad_out=bad_out):
+                    with self.assertRaises(SystemExit) as cm, contextlib.redirect_stderr(io.StringIO()):
+                        scan.main([src, "--out", bad_out])
+                    self.assertEqual(cm.exception.code, 2)
+
+            out = os.path.join(tmp, "blocked.json")
+            real_open = open
+
+            def fail_write(path, *args, **kwargs):
+                if path == out:
+                    raise OSError(13, "Permission denied")
+                return real_open(path, *args, **kwargs)
+
+            with mock.patch("builtins.open", side_effect=fail_write):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                    code = scan.main([src, "--out", out])
+            self.assertEqual(code, 2)
+            self.assertIn("ERROR: cannot write", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
 
 
 if __name__ == "__main__":

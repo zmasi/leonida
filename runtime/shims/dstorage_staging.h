@@ -17,12 +17,19 @@ inline uint64_t staging_bytes(const dsx::DSTORAGE_REQUEST& r) {
     const auto o = r.Options.AsUINT64;
     const bool bc = options::bcpack(o) != 0;
     uint64_t input = r.SourceSize, peak = 0;
-    const auto pages = [](uint64_t size, unsigned offset) {
-        return size ? size + sizeof(uint64_t) * (1 + (size - 1 + offset) / 65536) : 0;
+    const auto add_sat = [](uint64_t a, uint64_t b) {
+        return a > UINT64_MAX - b ? UINT64_MAX : a + b;
+    };
+    const auto pages = [add_sat](uint64_t size, unsigned offset) -> uint64_t {
+        if (!size) return 0;
+        const uint64_t span = add_sat(size - 1, offset);
+        const uint64_t count = 1 + span / 65536;
+        const uint64_t table = count > UINT64_MAX / sizeof(uint64_t) ? UINT64_MAX : sizeof(uint64_t) * count;
+        return add_sat(size, table);
     };
     if (o & options::kSourcePages) peak = pages(input, r.SourcePageOffset);
     const auto stage = [&](uint64_t output) {
-        peak = (std::max)(peak, input + output);
+        peak = (std::max)(peak, add_sat(input, output));
         input = output;
     };
     if (options::zlib(o)) stage(bc ? r.IntermediateSize : r.DestinationSize);
@@ -44,49 +51,71 @@ public:
         Lease& operator=(const Lease&) = delete;
 
         bool try_pair(uint64_t bytes) {
+            if (held_) return false;
             std::lock_guard lock(pool_.mutex_);
             if (pool_.helpers_ >= 2 || pool_.next_ != pool_.serving_ ||
                 bytes > limit || pool_.used_ > limit - bytes) return false;
             ++pool_.helpers_;
             pair_ = true;
+            held_ = true;
             take(bytes);
             return true;
         }
         void acquire(uint64_t bytes) {
+            if (held_) release();
             if (!bytes) return;
-            std::unique_lock lock(pool_.mutex_);
-            const uint64_t ticket = pool_.next_++;
-            pool_.changed_.wait(lock, [&] {
-                return ticket == pool_.serving_ && (!pool_.used_ ||
-                       (bytes <= limit && pool_.used_ <= limit - bytes));
-            });
-            take(bytes);
-            ++pool_.serving_;
-            if (pool_.next_ != pool_.serving_) pool_.changed_.notify_all();
-        }
-        ~Lease() {
-            if (!bytes_ && !pair_) return;
-            std::lock_guard lock(pool_.mutex_);
-            pool_.used_ -= bytes_;
-            if (pair_) --pool_.helpers_;
-            if (!pool_.used_ && pool_.drained_ < pool_.peak_) {
-                pool_.drained_ = pool_.peak_;
-                if (trace_enabled()) std::fprintf(stderr, "[rt] ds-staging idle_bytes=0 peak_bytes=%llu\n", pool_.peak_);
+            bool notify = false;
+            {
+                std::unique_lock lock(pool_.mutex_);
+                const uint64_t ticket = pool_.next_++;
+                pool_.changed_.wait(lock, [&] {
+                    return ticket == pool_.serving_ && (!pool_.used_ ||
+                           (bytes <= limit && pool_.used_ <= limit - bytes));
+                });
+                held_ = true;
+                take(bytes);
+                ++pool_.serving_;
+                notify = pool_.next_ != pool_.serving_;
             }
-            if (pool_.next_ != pool_.serving_) pool_.changed_.notify_all();
+            if (notify) pool_.changed_.notify_all();
         }
+        void release() {
+            if (!held_) return;
+            bool notify = false;
+            {
+                std::lock_guard lock(pool_.mutex_);
+                pool_.used_ -= bytes_;
+                if (pair_) --pool_.helpers_;
+                bytes_ = 0;
+                pair_ = false;
+                held_ = false;
+                if (!pool_.used_ && pool_.drained_ < pool_.peak_) {
+                    pool_.drained_ = pool_.peak_;
+                    if (trace_enabled())
+                        std::fprintf(stderr, "[rt] ds-staging idle_bytes=0 peak_bytes=%llu\n",
+                                     static_cast<unsigned long long>(pool_.peak_));
+                }
+                notify = pool_.next_ != pool_.serving_;
+            }
+            if (notify) pool_.changed_.notify_all();
+        }
+        ~Lease() { release(); }
     private:
         void take(uint64_t bytes) {
             bytes_ = bytes;
             pool_.used_ += bytes;
             if (pool_.used_ > pool_.peak_) {
                 pool_.peak_ = pool_.used_;
-                if (trace_enabled()) std::fprintf(stderr, "[rt] ds-staging peak_bytes=%llu limit_bytes=%llu\n", pool_.peak_, limit);
+                if (trace_enabled())
+                    std::fprintf(stderr, "[rt] ds-staging peak_bytes=%llu limit_bytes=%llu\n",
+                                 static_cast<unsigned long long>(pool_.peak_),
+                                 static_cast<unsigned long long>(limit));
             }
         }
         StagingPool& pool_;
         uint64_t bytes_{};
         bool pair_{};
+        bool held_{};
     };
 
 private:

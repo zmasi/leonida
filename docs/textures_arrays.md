@@ -251,6 +251,39 @@ seekable file, the converter reads the header and the selected plane.
 For uncompressed data, a declared top-level row pitch applies to each layer
 or slice. Lower mips use tightly packed rows, as written by the project exporter.
 
+### Preview conversions and limits (`tools/dds_png.py`)
+
+`tools/dds_png.py` always writes an 8-bit straight-alpha RGBA PNG. Its decoder covers
+legacy/DX10 32-bit RGB/RGBA (including `R10G10B10A2` typeless/UNORM/UINT and arbitrary
+contiguous 32-bit bitmasks), legacy 24-bit `BGR8`/`RGB8`, packed 16-bit `B5G6R5_UNORM` and
+`B5G5R5A1_UNORM`, 8-bit `R8`/`R8G8` (`UNORM`/`SNORM`/`UINT`/`SINT`), `R16_UNORM`,
+`A8_UNORM`, 64-bit `R16G16B16A16` (`UNORM`/`SNORM`/`FLOAT`), `R16_FLOAT`, `R32_FLOAT`,
+`R11G11B10_FLOAT`, `R9G9B9E5_SHAREDEXP`, and block-compressed `BC1`–`BC5` plus all eight
+modes of `BC7` (reserved mode byte `0` decodes as transparent black).
+
+- **`R9G9B9E5_SHAREDEXP` (DXGI 67)**: each 9-bit mantissa decodes as
+  `mantissa * 2^(exponent - 24)`, clamps RGB linearly to `[0, 1]` with half-up rounding to
+  8-bit (no tone mapping or sRGB transfer), and sets opaque alpha (`255`).
+- **Floating-point formats (`R16_FLOAT`, `R32_FLOAT`, `R16G16B16A16_FLOAT`, `R11G11B10_FLOAT`)**:
+  linear values clamp to `[0, 1]` and round half up (`+inf` saturates to `255`; `-inf`,
+  negative values, and `NaN` map to `0`). Single-channel formats fill red with `G = B = 0`
+  and `A = 255`; `R16G16B16A16_FLOAT` keeps its alpha channel; `R11G11B10_FLOAT` uses opaque
+  alpha.
+- **`SNORM` formats**: `R8_SNORM`, `R8G8_SNORM`, `BC4_SNORM`, and `BC5_SNORM` map `[-1, 1]`
+  to `[0, 255]` with both `-128` and `-127` representing `-1.0`. `R16G16B16A16_SNORM`
+  (DXGI 13) maps all four channels from `[-1, 1]` to `[0, 255]` with both `-32768` and
+  `-32767` representing `-1.0`.
+- **Integer and typeless formats**: `R8_UINT`/`R8G8_UINT` keep the stored byte in red (and
+  green) with `B = 0` and `A = 255`; `R8_SINT`/`R8G8_SINT` bias `[-128, 127]` by `+128` into
+  `[0, 255]`. `R10G10B10A2_UINT` and `R10G10B10A2_TYPELESS` scale each 10-/2-bit field from
+  its bit width like `R10G10B10A2_UNORM`.
+- **Premultiplied alpha and sRGB**: `DXT2`, `DXT4`, and premultiplied DX10 images are
+  unpremultiplied to straight alpha. Tagged sRGB DXGI formats unpremultiply and `--max-size`
+  downscale in linear light, while the output PNG stores sRGB bytes.
+- **Limits**: `BC6H` (DXGI 94/95/96) is not supported by `tools/dds_png.py` and raises
+  `DdsError`. HDR values outside `[0, 1]` on floating-point and shared-exponent textures clip
+  rather than tone-map.
+
 ## Reproduce
 
 ```powershell

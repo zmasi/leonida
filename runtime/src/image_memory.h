@@ -35,9 +35,10 @@ public:
         if (!size || !alignment || size > size_) return false;
         for (auto it = by_size_.lower_bound({size, 0}); it != by_size_.end(); ++it) {
             const auto [piece_size, piece] = *it;
-            const std::uint64_t start = (piece + alignment - 1) / alignment * alignment;
-            const std::uint64_t lead = start - piece;
+            const std::uint64_t rem = piece % alignment;
+            const std::uint64_t lead = rem ? alignment - rem : 0;
             if (lead > piece_size || size > piece_size - lead) continue;
+            const std::uint64_t start = piece + lead;
             erase(piece, piece_size);
             insert(piece, lead);
             insert(start + size, piece_size - lead - size);
@@ -52,17 +53,21 @@ public:
 
     // Gives back a range allocate() returned.
     void release(std::uint64_t offset, std::uint64_t size) {
+        if (!size) return;
         in_use_ -= size;
-        if (const auto next = by_offset_.lower_bound(offset); next != by_offset_.end() && offset + size == next->first) {
-            const std::uint64_t next_size = next->second;
-            erase(next->first, next_size);
+        auto it = by_offset_.lower_bound(offset);
+        if (it != by_offset_.end() && offset + size == it->first) {
+            const std::uint64_t next_size = it->second;
+            by_size_.erase({next_size, it->first});
+            it = by_offset_.erase(it);
             size += next_size;
         }
-        if (auto previous = by_offset_.lower_bound(offset); previous != by_offset_.begin()) {
-            previous = std::prev(previous);
+        if (it != by_offset_.begin()) {
+            const auto previous = std::prev(it);
             const auto [start, previous_size] = *previous;
             if (start + previous_size == offset) {
-                erase(start, previous_size);
+                by_size_.erase({previous_size, start});
+                by_offset_.erase(previous);
                 offset = start;
                 size += previous_size;
             }
@@ -143,34 +148,49 @@ public:
     }
 
     // A range of a block of `type`, in a new block of `block_bytes` when no block has room. Null when the driver has no
-    // room for that block; the caller then makes its own allocation.
+    // room for that block; the caller then makes its own allocation. Driver callbacks (`allocate_` / `free_`) always
+    // run outside `mutex_` so slow kernel allocations never block concurrent releases or allocations on other blocks.
     std::unique_ptr<Range> allocate(std::uint32_t type, std::uint64_t size, std::uint64_t alignment,
                                     std::uint64_t block_bytes) {
-        std::lock_guard lock(mutex_);
-        Type& pool = types_[type];
+        if (!size || !alignment) return nullptr;
         std::uint64_t offset = 0;
         bool reused = false;
-        for (const auto& block : pool.blocks) {
-            if (block->ranges.largest() < size || !block->ranges.allocate(size, alignment, offset, reused)) continue;
-            ++ranges_;
-            return std::unique_ptr<Range>(new Range(*this, block.get(), block->memory, offset, size, reused));
+        std::unique_lock lock(mutex_);
+        {
+            Type& pool = types_[type];
+            for (const auto& block : pool.blocks) {
+                if (block->ranges.largest() < size || !block->ranges.allocate(size, alignment, offset, reused)) continue;
+                ++ranges_;
+                return std::unique_ptr<Range>(new Range(*this, block.get(), block->memory, offset, size, reused));
+            }
+            // A failed driver allocation is slow, and a full heap stays full until something is given back: do not ask
+            // for another block at every texture until a range is released, or that many textures later.
+            if (size > block_bytes || (pool.skip && pool.skip--)) return nullptr;
         }
-        // A failed driver allocation is slow, and a full heap stays full until something is given back: do not ask for
-        // another block at every texture until a range is released, or that many textures later.
-        if (size > block_bytes || (pool.skip && pool.skip--)) return nullptr;
+        lock.unlock();
         const Memory memory = allocate_(type, block_bytes);
         if (!memory) {
-            pool.skip = kRetryAfter;
+            lock.lock();
+            types_[type].skip = kRetryAfter;
             return nullptr;
         }
-        auto block = std::make_unique<Block>(type, memory, block_bytes);
+        std::unique_ptr<Block> block;
+        try {
+            block = std::make_unique<Block>(type, memory, block_bytes);
+        } catch (...) {
+            free_(memory);
+            throw;
+        }
         if (!block->ranges.allocate(size, alignment, offset, reused)) {
             free_(memory);
             return nullptr;
         }
+        lock.lock();
+        Type& pool = types_[type];
         ++ranges_;
+        Block* raw = block.get();
         pool.blocks.push_back(std::move(block));
-        return std::unique_ptr<Range>(new Range(*this, pool.blocks.back().get(), memory, offset, size, reused));
+        return std::unique_ptr<Range>(new Range(*this, raw, memory, offset, size, reused));
     }
 
     Stats stats() const {

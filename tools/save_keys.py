@@ -31,6 +31,11 @@ import struct
 import sys
 import zlib
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from report_paths import same_report_path  # noqa: E402
+
 KEY = re.compile(rb'"\$0x([0-9a-fA-F]{8})"')
 # A whole run of identifier characters. With a bound inside the pattern ({1,80}) a longer name was cut after 81
 # characters and the search went on in what was left, so one 89-character name became two names nobody wrote
@@ -193,14 +198,15 @@ def iter_inputs(paths):
 
 
 def out_problem(out, inputs, dicts):
-    """Why --out can't be written, checked before any work: it is one of the files read (the report would replace
-    the user's dictionary or a save), or its folder does not exist. "" when it is fine."""
+    """Why --out can't be written, checked before any work: it is a directory, one of the files read (the report
+    would replace the user's dictionary or a save), or its folder does not exist. "" when it is fine."""
+    if os.path.isdir(out):
+        return f"--out {out} is a directory, not a file"
     if not os.path.isdir(os.path.dirname(os.path.abspath(out))):
         return f"the folder for --out {out} does not exist"
-    if os.path.exists(out):
-        for p in list(input_files(inputs)) + list(dicts):
-            if os.path.exists(p) and os.path.samefile(out, p):   # samefile: a hard link or another spelling counts
-                return f"--out {out} is also an input ({p}); refusing to overwrite it"
+    for p in list(input_files(inputs)) + list(dicts):
+        if same_report_path(out, p):
+            return f"--out {out} is also an input ({p}); refusing to overwrite it"
     return ""
 
 

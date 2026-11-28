@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <cstdio>
 #include <string>
 #include <thread>
@@ -160,6 +161,14 @@ int main() {
     CHECK(has(text, "8.4 fps") && has(text, "now: refreshing textures for 3 s") && has(text, "copies 3.5"));
     CHECK(has(text, "853 built, 3 building (nnn") && has(text, "3029 drawn, 38363 skipped"));
     for (const auto& line : text) CHECK(line.size() < 160);
+    // Regression: large or non-finite phase_for must not invoke float-to-int overflow UB.
+    s.phase = sp::textures;
+    s.phase_for = 1e12;
+    text = dov::lines(s, 147);
+    CHECK(has(text, "now: refreshing textures for 1000000000000 s"));
+    s.phase_for = std::numeric_limits<double>::infinity();
+    text = dov::lines(s, 147);
+    CHECK(has(text, "now: refreshing textures") && !has(text, "for inf"));
     if (const int failed = check_memory_figures()) return failed;
     std::puts("dev_overlay_test: ok");
     return 0;

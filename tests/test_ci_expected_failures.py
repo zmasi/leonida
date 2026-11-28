@@ -37,7 +37,7 @@ class Judge(unittest.TestCase):
     def test_runner_failure_without_names_fails(self):
         code, lines = cef.judge([], 2, ["ps_ssharp"])
         self.assertEqual(code, 1)
-        self.assertIn("::error::the test runner exited with 2 without naming a failed test", lines)
+        self.assertEqual(lines, ["::error::the test runner exited with 2 without naming a failed test"])
 
     def test_interrupted_run_cannot_pass_on_a_partial_failure_list(self):
         for status in (-15, 143):

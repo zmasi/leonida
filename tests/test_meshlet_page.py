@@ -938,6 +938,38 @@ class CliTests(unittest.TestCase):
             with open(out2, encoding="utf-8") as fh:
                 self.assertEqual(json.load(fh)["totals"]["pages"], 3)
 
+    def test_invalid_archive_header_is_refused_before_writing_a_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "invalid.rpf")
+            report = os.path.join(tmp, "report.json")
+            for header, reason in (
+                (b"", "not an RPF9 archive"),
+                (b"9FPR", "not an RPF9 archive"),
+                (b"nope" + struct.pack("<I", 8), "not an RPF9 archive"),
+                (b"9FPR" + struct.pack("<I", 7), "data start is outside the archive"),
+                (b"RPF9" + struct.pack("<I", 9), "data start is outside the archive"),
+            ):
+                with self.subTest(header=header):
+                    with open(source, "wb") as fh:
+                        fh.write(header)
+                    result = self.run_tool(source, "--json", report, "--quiet")
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(source, result.stderr)
+                    self.assertIn(reason, result.stderr)
+                    self.assertNotIn("Traceback", result.stderr)
+                    self.assertFalse(os.path.exists(report))
+
+    def test_header_only_archive_can_have_zero_pages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "empty.rpf")
+            report = os.path.join(tmp, "report.json")
+            with open(source, "wb") as fh:
+                fh.write(b"RPF9" + struct.pack("<I", 8))
+            result = self.run_tool(source, "--json", report, "--quiet")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(report, encoding="utf-8") as fh:
+                self.assertEqual(json.load(fh)["totals"]["pages"], 0)
+
     def test_page_report_write_failure_is_reported(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "page.bin")

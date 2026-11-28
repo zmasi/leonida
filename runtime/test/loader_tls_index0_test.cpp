@@ -534,6 +534,9 @@ __declspec(noinline) int scenario_noreserve(const fs::path& exe) {
           "without reserve_tls_index0 the executable gets a helper index");
     check(_tls_index == 0, "and this EXE keeps module TLS index 0");
     check(ga_exports(m).tls_index() == m.tls_index, "the executable's _tls_index holds that helper index");
+    // Set in initialize_tls before the slot owner is published (RT-LOADER-RUNTIME-SCOPE-AND-TLS-SLOT).
+    check(m.tls_ga_slot != rt::kNoTlsIndex && m.tls_ga_sites > 0,
+          "its index-0 (/GA) reads are rewritten to a TlsAlloc slot, as it does not hold index 0");
     return 0;
 }
 

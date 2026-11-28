@@ -115,6 +115,78 @@ def test_vs_input_survey():
         r = cli(d, "--json", idx)
         with open(idx) as f:
             check(r.returncode == 2 and f.read() == "[]", "--json equal to index.json is refused and leaves it alone")
+
+        # traversal filenames, UTF-8 BOM, directory/disasm --json collisions, and read-only cleanup
+        outside = os.path.join(tmp, "escape.s")
+        with open(outside, "w", encoding="utf-8") as f:
+            f.write("\texp prim v0, off, off, off done\n")
+        for bad_name in ("../escape.dxbc", r"..\escape.dxbc", "sub/a.dxbc", "..", "."):
+            with open(idx, "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"stage": "vs", "file": bad_name}], f)
+            r = cli(d)
+            check(r.returncode == 2 and "Traceback" not in r.stderr and len(r.stderr.strip().splitlines()) == 1,
+                  f"index.json traversal {bad_name!r}: one error line, exit 2")
+
+        disasm_dir = os.path.join(d, "disasm")
+        os.mkdir(disasm_dir)
+        a_s = os.path.join(disasm_dir, "a_vs.s")
+        with open(a_s, "w", encoding="utf-8", newline="\n") as f:
+            f.write(LISTINGS["a_vs"])
+        with open(idx, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + b'[{"stage": "vs", "file": "a_vs.dxbc"}]')
+        r = cli(d)
+        check(r.returncode == 0 and "1 vertex shaders" in r.stdout, "UTF-8 BOM index.json succeeds")
+
+        # Rewrite without BOM so the remaining checks exercise survey() and --json handling on unpatched code too.
+        with open(idx, "w", encoding="utf-8", newline="\n") as f:
+            f.write('[{"stage": "vs", "file": "a_vs.dxbc"}]')
+
+        out_folder = os.path.join(tmp, "out_folder")
+        os.mkdir(out_folder)
+        r = cli(d, "--json", out_folder)
+        check(r.returncode == 2 and "is a directory" in r.stderr and "Traceback" not in r.stderr
+              and len(r.stderr.strip().splitlines()) == 1, "--json directory: one error line, exit 2")
+
+        r = cli(d, "--json", a_s)
+        with open(a_s, encoding="utf-8") as f:
+            check(r.returncode == 2 and "would overwrite" in r.stderr and f.read() == LISTINGS["a_vs"],
+                  "--json equal to surveyed .s is refused and leaves it alone")
+
+        from unittest import mock
+        ro_json = os.path.join(tmp, "ro.json")
+        previous = '{"previous": true}\n'
+        with open(ro_json, "w", encoding="utf-8", newline="\n") as f:
+            f.write(previous)
+        with mock.patch.object(V.json, "dump", side_effect=OSError("disk full")), \
+                mock.patch.object(sys, "argv", ["vs_input_survey.py", d, "--json", ro_json]):
+            rc = V.main()
+        with open(ro_json, encoding="utf-8") as f:
+            check(rc == 2 and f.read() == previous, "mid-write failure preserves previous --json")
+        check([n for n in os.listdir(tmp) if n.startswith(".vs_input_survey-")] == [],
+              "mid-write failure leaves no staging files")
+
+        os.chmod(ro_json, 0o444)
+        try:
+            with mock.patch.object(os, "replace", side_effect=PermissionError("replace denied")), \
+                    mock.patch.object(sys, "argv", ["vs_input_survey.py", d, "--json", ro_json]):
+                rc = V.main()
+            with open(ro_json, encoding="utf-8") as f:
+                check(rc == 2 and f.read() == previous, "failed replace over read-only --json keeps previous")
+            check([n for n in os.listdir(tmp) if n.startswith(".vs_input_survey-")] == [],
+                  "failed replace over read-only --json cleans staging file")
+            if os.name == "nt":
+                r = cli(d, "--json", ro_json)
+                with open(ro_json, encoding="utf-8") as f:
+                    check(r.returncode == 2 and "Traceback" not in r.stderr and f.read() == previous,
+                          "Windows read-only --json fails cleanly and keeps previous")
+                check([n for n in os.listdir(tmp) if n.startswith(".vs_input_survey-")] == [],
+                      "Windows read-only --json failure cleans staging file")
+        finally:
+            for entry in os.listdir(tmp):
+                try:
+                    os.chmod(os.path.join(tmp, entry), 0o600)
+                except OSError:
+                    pass
     assert failures == 0, f"{failures} vs_input_survey check(s) failed"
 
 

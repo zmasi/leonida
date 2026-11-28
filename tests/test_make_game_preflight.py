@@ -657,6 +657,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
             ("explicit native mode", {"spirv/wave64_emulate.txt": "on"}, {}, False, False),
             ("interrupted unpack", {"dxbc/fssm_index.json": None}, {}, False, False),
             ("interrupted translation", {"spirv/index.json": None}, {}, False, False),
+            ("empty translation", {"spirv/index.json": "{}"}, {}, False, False),
             ("old disassembly layout", {}, {}, True, False),
         )
         fingerprint = make_game.translation_sources_digest()
@@ -667,7 +668,7 @@ class PreflightPrerequisiteTest(PreflightTestBase):
                     "dxbc/index.json": '[{"file": "shader.dxbc"}]',
                     "dxbc/fssm_index.json": '[{"name": "shader"}]',
                     "dxbc/disasm.done": "test llvm-mc 21",
-                    "spirv/index.json": "{}",
+                    "spirv/index.json": '{"shader":{"stage":"ps"}}',
                     "spirv/translation_sources.sha256": fingerprint,
                     "spirv/wave64_emulate.txt": "off",
                     **changed,

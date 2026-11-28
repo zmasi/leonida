@@ -31,6 +31,7 @@ import sys
 import tempfile
 import time
 import zlib
+from contextlib import suppress
 
 # -I keeps the script directory off sys.path; add it back so the sibling helpers are importable.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -296,7 +297,9 @@ def write_output(path, rows, summary):
 
     The stage lives in a private TemporaryDirectory under the destination's parent, so os.replace
     only ever renames within one filesystem. A late failure closes the stage and leaves any prior
-    report byte-for-byte intact. The destination is resolved first, so a report path that is a
+    report byte-for-byte intact; the staged file is made deletable first, so a read-only report on
+    Windows cannot strand the stage or mask the error with a cleanup failure. The destination is
+    resolved first, so a report path that is a
     symlink is published through to its target the way open(..., "w") did before. Because os.replace
     unlinks the previous report file only at the destination name, other hard links to it keep the
     previous contents.
@@ -304,8 +307,9 @@ def write_output(path, rows, summary):
     ext = os.path.splitext(path)[1].lower()
     dest = os.path.realpath(path)
     parent = os.path.dirname(dest)
-    with tempfile.TemporaryDirectory(dir=parent) as staging:
-        staged = os.path.join(staging, "story_index" + ext)
+    stage_dir = tempfile.TemporaryDirectory(dir=parent)
+    try:
+        staged = os.path.join(stage_dir.name, "story_index" + ext)
         if ext == ".json":
             with open(staged, "w", encoding="utf-8", newline="\n") as f:
                 json.dump({"summary": summary, "files": rows}, f, indent=1)
@@ -320,6 +324,13 @@ def write_output(path, rows, summary):
         # (an existing report's, or what open() would have made for a new file) so perms are stable.
         os.chmod(staged, published_mode(dest))
         os.replace(staged, dest)
+    finally:
+        # On a failed replace the staged file carries the destination's bits, which a read-only report
+        # makes read-only: Windows then refuses the delete and the cleanup error masks the real one.
+        # Make it deletable first and let one delete failure go, so the caller reports the replace.
+        with suppress(OSError):
+            os.chmod(staged, 0o600)
+        stage_dir.cleanup()
 
 
 def byte_count(text):

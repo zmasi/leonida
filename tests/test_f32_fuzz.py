@@ -81,6 +81,18 @@ class HarnessTests(unittest.TestCase):
                 status, detail = ff.check(op, vals, [(0, {})], True, mods)
                 self.assertEqual(status, "match", detail)
 
+    def test_legacy_mul_omod_turns_an_underflowed_minus_zero_into_plus_zero(self):
+        # f32_fuzz --programs 1500 --seed 53, program 246: the product underflows to -0 and mul:2 makes it +0 under
+        # the game MODE, which the translator models for v_mul_legacy_f32 (docs/design.md); the model said -0.
+        vals = [0] * 9
+        vals[1], vals[3] = 0x1DA20776, 0x819D422D
+        srcs = [(1, {}), (3, {})]
+        for mods in (["mul:2"], ["mul:4"], ["div:2"]):
+            with self.subTest(mods=mods):
+                self.assertEqual(ff.check("v_mul_legacy_f32", vals, srcs, True, mods), ("match", None))
+        self.assertEqual(ff.model("v_mul_legacy_f32", vals, srcs, ["mul:2"])[0], 0x80000000)  # hw side unchanged
+        self.assertEqual(ff.check("v_mul_f32", vals, srcs, True, ["mul:2"]), ("match", None))  # keeps -0
+
     def test_undefined_spirv_is_its_own_class(self):
         vals = [0] + [0] * 8                                 # v_rcp_f32 of +0: hardware +inf, OpFDiv by zero
         status, _ = ff.check("v_rcp_f32", vals, [(0, {})], False, [])

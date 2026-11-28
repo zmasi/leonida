@@ -19,6 +19,16 @@ import json
 import os
 import re
 import sys
+import tempfile
+
+# -I keeps the script directory off sys.path, so add it explicitly before importing sibling helpers.
+TOOLS = os.path.dirname(os.path.abspath(__file__))
+if TOOLS not in sys.path:
+    sys.path.insert(0, TOOLS)
+
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 # A whole printable run, however long (one linear scan: a single character class, no nested quantifiers).
 STR = re.compile(rb"[A-Za-z_][A-Za-z0-9_./:\\-]{2,}")
@@ -73,6 +83,36 @@ def _raise_scan_error(error):
     raise error
 
 
+def _write_json_atomic(path: str, payload: dict) -> None:
+    """Write ``payload`` to ``path`` via a sibling temp file, preserving mode and retrying transient locks."""
+    dest = os.path.realpath(path)
+    parent = os.path.dirname(dest) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".hashdict-", suffix=".json")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, published_mode(dest))
+        replace_retry(tmp, dest)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("carve", nargs="?")
@@ -92,7 +132,7 @@ def main():
             except ValueError:
                 ap.error(f"--lookup: {h!r} is not a hexadecimal hash")
         try:
-            with open(a.lookup[0], encoding="utf-8") as f:
+            with open(a.lookup[0], encoding="utf-8-sig") as f:
                 d = json.load(f)
         except (OSError, ValueError) as e:
             print(f"ERROR: cannot read the dictionary {a.lookup[0]}: {getattr(e, 'strerror', None) or e}",
@@ -109,6 +149,12 @@ def main():
     if not os.path.isdir(a.carve):
         what = "is not a folder" if os.path.exists(a.carve) else "does not exist"
         print(f"ERROR: the carve folder {a.carve} {what}", file=sys.stderr)
+        return 2
+    if not a.out.strip():
+        print("ERROR: --out path must not be empty", file=sys.stderr)
+        return 2
+    if a.out.endswith(("/", "\\")) or (os.sep and a.out.endswith(os.sep)) or os.path.isdir(a.out):
+        print(f"ERROR: --out {a.out} is a directory", file=sys.stderr)
         return 2
     for extra in a.extra:
         if not os.path.exists(extra):
@@ -131,19 +177,15 @@ def main():
             ap.error(f"--archives: {', '.join(unknown)} not found in {a.carve} "
                      f"(archives there: {', '.join(found) or 'none'})")
     # The dictionary is written after the harvest: an --out naming one of the inputs would replace it.
-    # samefile also catches a case-only difference on Windows and macOS's default volume.
-    if os.path.exists(a.out):
-        inputs = [x for x in a.extra if os.path.isfile(x)]
-        inputs += [os.path.join(d, "index.json") for _, d in archives]
-        for x in inputs:
-            try:
-                same = os.path.isfile(x) and os.path.samefile(a.out, x)
-            except OSError:
-                same = False
-            if same:
-                print(f"ERROR: --out {a.out} is one of the inputs ({x}); choose another output file",
-                      file=sys.stderr)
-                return 2
+    # same_report_path also catches hard links and case-only aliases on case-folding volumes before --out exists.
+    inputs = [x for x in a.extra if os.path.isfile(x)]
+    inputs += [os.path.join(d, "index.json") for _, d in archives
+               if os.path.isfile(os.path.join(d, "index.json"))]
+    for x in inputs:
+        if same_report_path(a.out, x):
+            print(f"ERROR: --out {a.out} is one of the inputs ({x}); choose another output file",
+                  file=sys.stderr)
+            return 2
     # A report can also alias a harvested <offset>.bin, including through a hard link.
     # Snapshot its file identity once; compare against the input's already-open handle
     # rather than statting every carve path (there may be millions of entries).
@@ -231,9 +273,7 @@ def main():
         d.setdefault(f"{joaat(s):08x}", s)
     # Other tools create the output parent too: a long harvest must not be lost to a missing folder.
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(d, f)
+        _write_json_atomic(a.out, d)
     except OSError as e:
         print(f"ERROR: cannot write {a.out}: {e}", file=sys.stderr)
         return 2

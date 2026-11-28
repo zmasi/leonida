@@ -348,6 +348,47 @@ runpy.run_path(sys.argv.pop(1), run_name="__main__")
             rows = json.load(f)
         self.assertEqual(len(rows), 1)
 
+    def test_devnull_non_regular_out_writes_directly(self):
+        self.write("a.rpf", archive_bytes())
+        out = io.StringIO()
+        err = io.StringIO()
+        argv = ["rpf_probe.py", self.game, "--out", os.devnull]
+        with mock.patch("sys.argv", argv), contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = probe.main()
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("1 archives", out.getvalue())
+
+    def test_empty_whitespace_and_trailing_sep_out_refused_before_scanning(self):
+        self.write("a.rpf", archive_bytes())
+        trailing = os.path.join(self.tmp, "new_folder") + os.sep
+        with tempfile.TemporaryDirectory() as cwd:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(cwd)
+                for game_dir, bad_out in [(self.game, ""), (self.game, "   "), (self.game, trailing), ("   ", self.out)]:
+                    with self.subTest(game_dir=game_dir, out=bad_out):
+                        err = io.StringIO()
+                        argv = ["rpf_probe.py", game_dir, "--out", bad_out]
+                        with (mock.patch("sys.argv", argv),
+                              mock.patch.object(probe, "probe", wraps=probe.probe) as probe_fn,
+                              contextlib.redirect_stderr(err)):
+                            code = probe.main()
+                        self.assertEqual(code, 2)
+                        probe_fn.assert_not_called()
+                        self.assertIn("ERROR:", err.getvalue())
+                self.assertEqual(os.listdir(cwd), [])
+                self.assertFalse(os.path.exists(os.path.join(self.tmp, "new_folder")))
+            finally:
+                os.chdir(old_cwd)
+
+    def test_report_ends_with_newline_and_rejects_nan(self):
+        self.write("a.rpf", archive_bytes())
+        self.run_main()
+        with open(self.out, encoding="utf-8") as f:
+            self.assertTrue(f.read().endswith("\n"))
+        with self.assertRaises(ValueError):
+            probe._write_json_report(self.out, [{"head_entropy": float("nan")}])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,21 +22,21 @@ PE_INSPECT_STUB = (
     "report = Path(sys.argv[-1]) / (Path(sys.argv[1]).name + '.json')\n"
     "report.write_text('{\"imports\":[],\"sections\":[]}', encoding='utf-8', newline='\\n')\n"
 )
-# Stubs for the three tools first_look.ps1 runs after pe_inspect.  Each one
-# accepts its real arguments (argparse would reject unknown flags) but does
-# nothing.  A missing stub makes python exit 2 ("can't open file"), which
-# becomes $LASTEXITCODE and propagates through the script's `exit
-# $dryRunExitCode` path, failing the test on assertEqual(code, 0).
-GDK_RUNTIME_CALLS_STUB = "import sys\n"
-FIND_HASH_LOOKUP_STUB = (
+# The other report tools first_look.ps1 runs (TEST-1421): each records its call in tools_called.txt and writes the file
+# its --out / --json names, so a missing tool's exit code doesn't become $LASTEXITCODE before the dry run.
+REPORT_TOOL_STUB = (
     "from pathlib import Path\n"
     "import sys\n"
-    "for a in sys.argv:\n"
-    "    if a.endswith('.json'):\n"
-    "        Path(a).parent.mkdir(parents=True, exist_ok=True)\n"
-    "        Path(a).write_text('{}', encoding='utf-8', newline='\\n')\n"
+    "args = sys.argv[1:]\n"
+    "with Path(__file__).resolve().parents[1].joinpath('tools_called.txt').open('a', encoding='utf-8', newline='\\n') as log:\n"
+    "    log.write(Path(__file__).name + '\\n')\n"
+    "for flag in ('--json', '--out'):\n"
+    "    if flag in args:\n"
+    "        target = Path(args[args.index(flag) + 1])\n"
+    "        if target.suffix:\n"
+    "            target.write_text('{}' if target.suffix == '.json' else '', encoding='utf-8', newline='\\n')\n"
 )
-EXE_CHECKLIST_STUB = "import sys\n"
+REPORT_TOOLS = ("gdk_runtime_calls.py", "find_hash_lookup.py", "exe_checklist.py")
 # The build script leaves a marker; the loader is replaced by an alias that echoes its arguments.
 BUILD_STUB = r"""
 Set-Content -LiteralPath (Join-Path $PSScriptRoot 'built.txt') -Value 'built'
@@ -64,9 +64,8 @@ class FirstLookRebuildTest(unittest.TestCase):
             shutil.copyfile(SCRIPT, root / "scripts" / SCRIPT.name)
             (root / "scripts" / "build_runtime.ps1").write_text(BUILD_STUB, encoding="utf-8")
             (root / "tools" / "pe_inspect.py").write_text(PE_INSPECT_STUB, encoding="utf-8", newline="\n")
-            (root / "tools" / "gdk_runtime_calls.py").write_text(GDK_RUNTIME_CALLS_STUB, encoding="utf-8", newline="\n")
-            (root / "tools" / "find_hash_lookup.py").write_text(FIND_HASH_LOOKUP_STUB, encoding="utf-8", newline="\n")
-            (root / "tools" / "exe_checklist.py").write_text(EXE_CHECKLIST_STUB, encoding="utf-8", newline="\n")
+            for tool in REPORT_TOOLS:
+                (root / "tools" / tool).write_text(REPORT_TOOL_STUB, encoding="utf-8", newline="\n")
             (root / "fixture.exe").write_bytes(b"MZ")
             (root / "loader.cmd").write_text("@echo off\necho %*\nexit /b 0\n", encoding="ascii")
             loader = root / "runtime" / "build" / "gta6rt.exe"
@@ -89,6 +88,9 @@ class FirstLookRebuildTest(unittest.TestCase):
             run = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
                                   "-Command", RUN], cwd=root, env=env, capture_output=True, text=True, timeout=60)
             dry_run = (root / "reports" / "exe" / "fixture" / "dryrun.txt").is_file()
+            called = root / "tools_called.txt"
+            self.assertEqual(called.read_text(encoding="utf-8").split() if called.is_file() else [], list(REPORT_TOOLS),
+                             run.stdout + run.stderr)
             return (root / "scripts" / "built.txt").is_file(), dry_run, run.returncode, run.stdout + run.stderr
 
     def test_a_loader_older_than_the_sources_is_rebuilt(self):

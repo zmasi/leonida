@@ -1,7 +1,9 @@
 """Check SPIR-V lowering and output modifiers for v_rcp_f64, v_rsq_f64 and v_sqrt_f64.
 
 LLVM defines all three as VOP1Inst<..., VOP_F64_F64>, whose VOP3 (_e64) form carries input modifiers
-(abs, neg) and output modifiers (mul:2, mul:4, div:2, then clamp to [0, 1]).
+(abs, neg) and output modifiers (mul:2, mul:4, div:2, clamp). Only clamp is lowered: RDNA2 ignores the omod of
+these ops while f64 denormals are kept, the MODE this translator assumes (docs/design.md, "v_add_f64 output
+modifiers").
 """
 
 import re
@@ -60,17 +62,19 @@ class F64TranscendentalsTest(unittest.TestCase):
         return result(rf"OpBitcast %double {pair}")
 
     def test_v_rcp_rsq_sqrt_f64_lowering_and_modifiers(self):
+        # clamp is emitted as GLSL.std.450 FClamp; no omod is emitted, because RDNA2 ignores it here
+        # (docs/design.md, "v_add_f64 output modifiers").
         ops = (
-            ("v_rcp_f64_e32", "", r"OpFDiv %double %\w+ %\w+", None, False),
-            ("v_rsq_f64_e32", "", r"OpExtInst %double %glsl InverseSqrt %\w+", None, False),
-            ("v_sqrt_f64_e32", "", r"OpExtInst %double %glsl Sqrt %\w+", None, False),
-            ("v_rcp_f64_e64", "mul:2", r"OpFDiv %double %\w+ %\w+", 2.0, False),
-            ("v_rsq_f64_e64", "clamp div:2", r"OpExtInst %double %glsl InverseSqrt %\w+", 0.5, True),
-            ("v_sqrt_f64_e64", "clamp mul:4", r"OpExtInst %double %glsl Sqrt %\w+", 4.0, True),
+            ("v_rcp_f64_e32", "", r"OpFDiv %double %\w+ %\w+", False),
+            ("v_rsq_f64_e32", "", r"OpExtInst %double %glsl InverseSqrt %\w+", False),
+            ("v_sqrt_f64_e32", "", r"OpExtInst %double %glsl Sqrt %\w+", False),
+            ("v_rcp_f64_e64", "mul:2", r"OpFDiv %double %\w+ %\w+", False),
+            ("v_rsq_f64_e64", "clamp div:2", r"OpExtInst %double %glsl InverseSqrt %\w+", True),
+            ("v_sqrt_f64_e64", "clamp mul:4", r"OpExtInst %double %glsl Sqrt %\w+", True),
         )
         prefix = load_double(0, 1, 4.0)
         with tempfile.TemporaryDirectory() as directory:
-            for op, mods, pattern, scale, clamp in ops:
+            for op, mods, pattern, clamp in ops:
                 with self.subTest(op=op, mods=mods):
                     line = f"{op} v[4:5], v[0:1] {mods}".rstrip()
                     spv = translate_listing(Path(directory), f"{prefix}\n{line}")
@@ -78,13 +82,7 @@ class F64TranscendentalsTest(unittest.TestCase):
                     m = re.search(rf"^ *(%\w+) = {pattern}$", spv, re.M)
                     self.assertIsNotNone(m, f"Missing {pattern} in:\n{spv}")
                     val = m.group(1)
-                    if scale is not None:
-                        scale_id = self._double_const_id(spv, scale)
-                        m_mul = re.search(rf"^ *(%\w+) = OpFMul %double {val} {scale_id}$", spv, re.M)
-                        self.assertIsNotNone(m_mul, f"Missing OpFMul by {scale} ({scale_id})")
-                        val = m_mul.group(1)
-                    else:
-                        self.assertNotRegex(spv, r"OpFMul %double")
+                    self.assertNotRegex(spv, r"OpFMul %double")
                     if clamp:
                         zero_id = self._double_const_id(spv, 0.0)
                         one_id = self._double_const_id(spv, 1.0)

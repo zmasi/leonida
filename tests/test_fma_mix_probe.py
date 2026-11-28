@@ -167,6 +167,111 @@ class Command(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("vk_compute_test is not built", buf.getvalue())
 
+    def test_empty_and_malformed_cli_flags_are_rejected(self):
+        import contextlib
+        import io
+        for argv in (
+            ["--oracle", ""],
+            ["--oracle", "   "],
+            ["--oracle", "hw,"],
+            ["--oracle", ",translator"],
+            ["--hw-arch", ""],
+            ["--hw-arch", "   "],
+            ["--build", ""],
+            ["--build", "   "],
+        ):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    probe.main(argv)
+                self.assertEqual(cm.exception.code, 2)
+
+    def test_hw_oracle_malformed_results_unavailable_and_unsupported_translator(self):
+        import contextlib
+        import io
+        from unittest import mock
+        from hw_oracle import runner
+
+        class StubOracle:
+            arch = "gfx1036"
+            device = "fake gfx1036"
+
+            def __init__(self, run_fn):
+                self._run_fn = run_fn
+                self.closed = False
+
+            def run(self, kernels, words=1):
+                return self._run_fn(kernels)
+
+            def close(self):
+                self.closed = True
+
+        # Wrong count, empty word list, None, and bool entry all return harness error (2) and close oracle.
+        for label, bad_fn in (
+            ("short", lambda ks: [[0]] * (len(ks) - 1)),
+            ("long", lambda ks: [[0]] * (len(ks) + 1)),
+            ("empty_words", lambda ks: [[] for _ in ks]),
+            ("none_entry", lambda ks: [None for _ in ks]),
+            ("bool_word", lambda ks: [[True] for _ in ks]),
+        ):
+            with self.subTest(case=label):
+                oracle = StubOracle(bad_fn)
+                buf = io.StringIO()
+                with mock.patch.object(runner, "open_oracle", return_value=oracle), \
+                        mock.patch.object(probe, "run_translator", return_value=[word(c, BY_HAND[c.name][0]) for c in probe.CASES]), \
+                        contextlib.redirect_stdout(buf):
+                    rc = probe.main(["--oracle", "hw"])
+                self.assertEqual(rc, 2, buf.getvalue())
+                self.assertIn("harness error:", buf.getvalue())
+                self.assertTrue(oracle.closed)
+
+        # runner.Unavailable raised inside oracle.run() exits 77 cleanly and closes oracle.
+        def raise_unavail(_ks):
+            raise runner.Unavailable("mode unsupported")
+
+        oracle = StubOracle(raise_unavail)
+        buf = io.StringIO()
+        with mock.patch.object(runner, "open_oracle", return_value=oracle), \
+                mock.patch.object(probe, "run_translator", return_value=[word(c, BY_HAND[c.name][0]) for c in probe.CASES]), \
+                contextlib.redirect_stdout(buf):
+            rc = probe.main(["--oracle", "hw"])
+        self.assertEqual(rc, 77, buf.getvalue())
+        self.assertIn("hardware oracle unavailable: mode unsupported", buf.getvalue())
+        self.assertTrue(oracle.closed)
+
+        # rdna2spirv.Unsupported exits 2 cleanly instead of unhandled traceback.
+        buf = io.StringIO()
+        with mock.patch.object(probe, "run_translator", side_effect=probe.rdna2spirv.Unsupported("bad op")), \
+                contextlib.redirect_stdout(buf):
+            rc = probe.main([])
+        self.assertEqual(rc, 2, buf.getvalue())
+        self.assertIn("harness error: bad op", buf.getvalue())
+
+    def test_half_masks_32bit_word_and_run_vulkan_uses_errors_replace(self):
+        from unittest import mock
+
+        b = probe.CASES[1]  # mixhi
+        w = word(b, 0x3C02)
+        self.assertEqual(probe.half(b, w | (1 << 32)), 0x3C02)
+
+        with tempfile.TemporaryDirectory() as build_dir:
+            exe = os.path.join(build_dir, "vk_compute_test" + (".exe" if os.name == "nt" else ""))
+            with open(exe, "wb") as f:
+                f.write(b"")
+            seen_kwargs = []
+
+            def fake_run(cmd, **kwargs):
+                seen_kwargs.append(kwargs)
+                if cmd[0] == "spirv-as":
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                vals = [word(c, BY_HAND[c.name][0]) for c in probe.CASES]
+                return mock.Mock(returncode=0, stdout="out[0..7] = " + " ".join(map(str, vals)) + "\n", stderr="")
+
+            with mock.patch.object(probe.subprocess, "run", side_effect=fake_run), \
+                    mock.patch.object(probe, "translate_cs", return_value="; spv\n"):
+                out = probe.run_vulkan(build_dir)
+            self.assertEqual(len(out), len(probe.CASES))
+            self.assertEqual([k.get("errors") for k in seen_kwargs], ["replace", "replace"])
+
 
 if __name__ == "__main__":
     unittest.main()

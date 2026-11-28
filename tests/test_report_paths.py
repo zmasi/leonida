@@ -60,6 +60,7 @@ class SamePathTests(unittest.TestCase):
         # Simulate a name rule folding two spellings that the directory keeps distinct.
         with mock.patch.object(report_paths, "_resolved_key", return_value="report.json"):
             self.assertFalse(report_paths.same_report_path(first, second))
+            self.assertIsNone(report_paths.find_report_path_collision([first], [second]))
 
     def test_paths_that_do_not_exist_yet(self):
         self.assertTrue(report_paths.same_report_path(self.p("new", "x.json"), self.p("new", "..", "new", "x.json")))
@@ -79,6 +80,7 @@ class SamePathTests(unittest.TestCase):
             with self.subTest(first=first, second=second):
                 self.assertFalse(report_paths.same_report_path(self.p(first), self.p(second)))
                 self.assertFalse(report_paths.same_report_path(self.p(second), self.p(first)))
+                self.assertIsNone(report_paths.find_report_path_collision([self.p(first)], [self.p(second)]))
         self.assertEqual(os.listdir(self.dir), ["Existing.json"])
 
     def test_one_missing_one_present_is_not_an_error(self):
@@ -131,6 +133,8 @@ class MacVolumeTests(unittest.TestCase):
             self.assertEqual(report_paths.path_key("/tmp/leonida_x/café.json"),
                              report_paths.path_key("/tmp/leonida_x/café.json"))
             self.assertTrue(report_paths.same_report_path("/tmp/leonida_x/R.json", "/tmp/leonida_x/r.json"))
+            first, second = "/tmp/leonida_x/café.json", "/tmp/leonida_x/café.json"
+            self.assertEqual(report_paths.find_report_path_collision([first], [second]), (second, first, True))
 
     def test_macos_case_sensitive_volume_keeps_case(self):
         with self.darwin(1):
@@ -191,9 +195,19 @@ class FoldingVolumeTests(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.p("reports"))), [])
 
     def test_a_folder_that_does_not_exist_is_not_created(self):
-        self.assertFalse(report_paths.same_name_on_folding_volume(self.p("missing", "R.json"),
-                                                                  self.p("missing", "r.json")))
+        self.assertEqual(report_paths.same_name_on_folding_volume(self.p("missing", "R.json"),
+                                                                  self.p("missing", "r.json")),
+                         self.volume_folds_case())
         self.assertFalse(os.path.exists(self.p("missing")))
+
+    def test_nested_output_aliases_are_checked_before_the_folders_exist(self):
+        first = self.p("New", "reports", "R.json")
+        second = self.p("new", "Reports", "r.JSON")
+        # Force the generic volume-probe path, even on hosts where normcase already folds these names.
+        with mock.patch.object(report_paths, "_resolved_key", side_effect=os.path.realpath):
+            self.assertEqual(report_paths.same_report_path(first, second), self.volume_folds_case())
+            self.assertFalse(report_paths.same_report_path(first, self.p("other", "Reports", "r.JSON")))
+        self.assertEqual(os.listdir(self.dir), ["probe.tmp"])
 
     def test_same_report_path_asks_the_volume_when_the_name_rules_disagree(self):
         # The name rules say "different"; the volume has the last word on a pair that differs only by case.
@@ -201,6 +215,13 @@ class FoldingVolumeTests(unittest.TestCase):
                 mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe:
             self.assertTrue(report_paths.same_report_path(self.p("R.json"), self.p("r.json")))
         probe.assert_called_once_with(os.path.realpath(self.p("R.json")), os.path.realpath(self.p("r.json")))
+
+    def test_indexed_check_asks_the_volume_when_the_name_keys_disagree(self):
+        first, second = self.p("R.json"), self.p("r.json")
+        with mock.patch.object(report_paths, "_resolved_key", side_effect=os.path.realpath), \
+                mock.patch.object(report_paths, "_same_resolved_name", return_value=True) as probe:
+            self.assertEqual(report_paths.find_report_path_collision([first], [second]), (second, first, True))
+        probe.assert_called_once_with(os.path.realpath(second), os.path.realpath(first))
 
     def test_each_path_is_resolved_once_per_call(self):
         # #6220's review: the key and the volume probe both want the resolved names, so resolving each path

@@ -11,11 +11,14 @@ SHADER-339) and so does the translator since SHADER-363:
   0x3c004101 (i16)  x ~ 7.8280e-3; exact 256.5 + 1.5e-5 (under half an f32 ulp, 2^-16): once -> 257; f32 256.5, even -> 256
   0x3b008081 (u16)  x ~ 1.9608e-3; exact 128.5 + 7.6e-6 (under 2^-17): once -> 129; f32 128.5, even -> 128
 """
+import contextlib
+import io
 import os
 import struct
 import sys
 import unittest
 from fractions import Fraction
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.dont_write_bytecode = True
@@ -71,6 +74,103 @@ class Translator(unittest.TestCase):
             self.assertEqual(w, BY_HAND[(op, word)][0], (op, hex(word)))     # low half: single rounding; high: NaN -> 0
         for w in got[len(BY_HAND):]:
             self.assertEqual(w, 0)
+
+
+class CliAndOracleTests(unittest.TestCase):
+    def test_empty_and_malformed_cli_flags_are_rejected(self):
+        for argv in (
+            ["--oracle", ""],
+            ["--oracle", "   "],
+            ["--oracle", "hw,"],
+            ["--oracle", ",translator"],
+            ["--oracle", "gpu"],
+            ["--hw-arch", ""],
+            ["--hw-arch", "   "],
+        ):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    probe.main(argv)
+                self.assertEqual(cm.exception.code, 2)
+
+    def test_malformed_oracle_results_unavailable_and_runtime_error(self):
+        from hw_oracle import runner
+
+        class StubOracle:
+            device = "fake"
+            arch = "gfx1036"
+
+            def __init__(self, run_fn):
+                self._run_fn = run_fn
+                self.closed = False
+
+            def run(self, kernels, words=1):
+                return self._run_fn(kernels)
+
+            def close(self):
+                self.closed = True
+
+        n = len(probe.cases())
+        fake_want = [0] * n
+
+        # Empty/short/long/malformed oracle outputs must NOT false-pass or crash.
+        for label, bad_fn in (
+            ("empty", lambda _ks: []),
+            ("short", lambda ks: [[0]] * (len(ks) - 1)),
+            ("long", lambda ks: [[0]] * (len(ks) + 1)),
+            ("none_batch", lambda _ks: None),
+            ("empty_words", lambda ks: [[] for _ in ks]),
+            ("none_entry", lambda ks: [None for _ in ks]),
+            ("bool_word", lambda ks: [[True] for _ in ks]),
+        ):
+            with self.subTest(case=label):
+                oracle = StubOracle(bad_fn)
+                out = io.StringIO()
+                with mock.patch.object(runner, "open_oracle", return_value=oracle), \
+                        mock.patch.object(probe, "run_translator", return_value=fake_want), \
+                        contextlib.redirect_stdout(out):
+                    rc = probe.main(["--oracle", "hw"])
+                self.assertEqual(rc, 2, out.getvalue())
+                self.assertIn("harness error:", out.getvalue())
+                self.assertTrue(oracle.closed)
+
+        # String rejection entry exits 2 cleanly and closes oracle.
+        oracle = StubOracle(lambda ks: ["assembler rejected"] * len(ks))
+        out = io.StringIO()
+        with mock.patch.object(runner, "open_oracle", return_value=oracle), \
+                mock.patch.object(probe, "run_translator", return_value=fake_want), \
+                contextlib.redirect_stdout(out):
+            rc = probe.main(["--oracle", "hw"])
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("assembler rejected", out.getvalue())
+        self.assertTrue(oracle.closed)
+
+        # runner.Unavailable during oracle.run() exits 77 cleanly and closes oracle.
+        def raise_unavail(_ks):
+            raise runner.Unavailable("mode unsupported on device")
+
+        oracle = StubOracle(raise_unavail)
+        out = io.StringIO()
+        with mock.patch.object(runner, "open_oracle", return_value=oracle), \
+                mock.patch.object(probe, "run_translator", return_value=fake_want), \
+                contextlib.redirect_stdout(out):
+            rc = probe.main(["--oracle", "hw"])
+        self.assertEqual(rc, 77, out.getvalue())
+        self.assertIn("hardware oracle unavailable: mode unsupported on device", out.getvalue())
+        self.assertTrue(oracle.closed)
+
+        # RuntimeError during oracle.run() exits 2 cleanly and closes oracle.
+        def raise_runtime(_ks):
+            raise RuntimeError("gpu hung")
+
+        oracle = StubOracle(raise_runtime)
+        out = io.StringIO()
+        with mock.patch.object(runner, "open_oracle", return_value=oracle), \
+                mock.patch.object(probe, "run_translator", return_value=fake_want), \
+                contextlib.redirect_stdout(out):
+            rc = probe.main(["--oracle", "hw"])
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("harness error: gpu hung", out.getvalue())
+        self.assertTrue(oracle.closed)
 
 
 if __name__ == "__main__":

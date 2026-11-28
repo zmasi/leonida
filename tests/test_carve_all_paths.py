@@ -228,6 +228,56 @@ class CarveAllGamePathTest(unittest.TestCase):
             self.assertNotIn("carving", result.stdout)
             self.assertEqual(coverage.read_bytes(), b"[]\n")
 
+    def test_directory_named_rpf_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            game, out, tools = root / "game", root / "out", root / "tools"
+            game.mkdir()
+            (game / "fake.rpf").mkdir()
+            (game / "real.rpf").write_bytes(b"x")
+            (out / "real").mkdir(parents=True)
+            (out / "real" / "index.json").write_text(json.dumps(INDEX), encoding="utf-8")
+            marker = root / "python_called.txt"
+            (tools / "python.cmd").parent.mkdir(exist_ok=True)
+            (tools / "python.cmd").write_bytes(f'@echo called > "{marker}"\r\n@exit /b 9\r\n'.encode("ascii"))
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                 "-Game", str(game), "-Out", str(out)],
+                env={**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"]},
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(marker.exists())
+            row = json.loads((out / "coverage.json").read_text(encoding="utf-8-sig"))
+            self.assertEqual(row["archive"], "real.rpf")
+
+    def test_empty_game_folder_creates_bracketed_out_and_writes_valid_empty_json_array(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            game = Path(tmp, "game")
+            out = Path(tmp, "out [empty]")
+            game.mkdir()
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                 "-Game", str(game), "-Out", str(out)],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(json.loads((out / "coverage.json").read_text(encoding="utf-8-sig")), [])
+            self.assertEqual([p.name for p in out.iterdir()], ["coverage.json"])
+
+    def test_game_path_pointing_to_file_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            not_a_dir = Path(tmp, "file.rpf")
+            not_a_dir.write_bytes(b"x")
+            out = Path(tmp, "out")
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT),
+                 "-Game", str(not_a_dir), "-Out", str(out)],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("not a directory", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

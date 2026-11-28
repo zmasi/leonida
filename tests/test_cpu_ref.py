@@ -577,6 +577,103 @@ class CpuRefTest(unittest.TestCase):
                 self.assertIn("0..63", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
 
+    def test_multi_dword_vgpr_source_is_rejected(self):
+        for body in (
+            "v_mov_b32 v0, v[1:2]\ns_endpgm",
+            "v_add_f32 v0, v[1:2], v3\ns_endpgm",
+            "v_cndmask_b32_e64 v0, v[1:2], v3, s0\ns_endpgm",
+        ):
+            with self.subTest(body=body.splitlines()[0]):
+                with self.assertRaisesRegex(cpu_ref.Unsupported, "multi-dword VGPR source"):
+                    self.execute(body)
+
+    def test_empty_exec_still_validates_vector_operands(self):
+        # Valid vector ops under exec=0 remain silent no-ops and do not touch dst.
+        ok = self.execute("v_mov_b32 v0, 7\ns_endpgm", lanes=64, exec=0)
+        self.assertNotIn(0, ok["registers"]["vgpr"])
+
+        # Invalid destinations, sources, or conditions must still raise Unsupported under exec=0.
+        for body in (
+            "v_mov_b32 s0, v1\ns_endpgm",
+            "v_mov_b32 v0, m0\ns_endpgm",
+            "v_add_f32 v0, v[1:2], v3\ns_endpgm",
+            "v_cndmask_b32_e64 v0, v1, v2, m0\ns_endpgm",
+        ):
+            for inputs in ({"exec": 0}, {"lanes": 64, "exec": 0}):
+                with self.subTest(body=body.splitlines()[0], inputs=inputs):
+                    with self.assertRaises(cpu_ref.Unsupported):
+                        self.execute(body, **inputs)
+
+    def test_unsupported_operand_reports_instruction_pc(self):
+        info = {
+            "name": "pc_gap",
+            "code_start": 0,
+            "insns": [
+                {
+                    "op": "v_mov_b32",
+                    "args": [{"k": "vgpr", "r": 0, "n": 1}, {"k": "imm", "v": 1}],
+                    "mods": [],
+                    "pc": 0x0,
+                },
+                {
+                    "op": "v_mov_b32",
+                    "args": [{"k": "vgpr", "r": 1, "n": 1}, {"k": "special", "t": "m0"}],
+                    "mods": [],
+                    "pc": 0x10,
+                },
+                {"op": "s_endpgm", "args": [], "mods": [], "pc": 0x14},
+            ],
+        }
+        with self.assertRaises(cpu_ref.Unsupported) as cm:
+            cpu_ref.Machine(info).run()
+        self.assertEqual(cm.exception.pc, 0x10)
+        self.assertIn("pc 0x10", str(cm.exception))
+
+        # Direct Machine.step() also updates self.pc before operand checks.
+        machine = cpu_ref.Machine(info)
+        with self.assertRaises(cpu_ref.Unsupported) as cm_step:
+            machine.step(info["insns"][1])
+        self.assertEqual(cm_step.exception.pc, 0x10)
+
+    def test_invalid_scalar_destination_does_not_clobber_scc(self):
+        for op, args in (
+            ("s_add_u32", [{"k": "vgpr", "r": 0, "n": 1}, {"k": "imm", "v": 0xFFFFFFFF}, {"k": "imm", "v": 1}]),
+            ("s_lshl_b32", [{"k": "vgpr", "r": 0, "n": 1}, {"k": "imm", "v": 1}, {"k": "imm", "v": 0}]),
+            ("s_lshr_b32", [{"k": "vgpr", "r": 0, "n": 1}, {"k": "imm", "v": 2}, {"k": "imm", "v": 1}]),
+        ):
+            with self.subTest(op=op):
+                machine = cpu_ref.Machine({"name": "scc", "code_start": 0, "insns": []}, {"scc": 0})
+                with self.assertRaises(cpu_ref.Unsupported):
+                    machine.step({"op": op, "args": args, "mods": [], "pc": 0x4})
+                self.assertEqual(machine.scc, 0)
+
+    def test_cli_rejects_lane_with_64_lanes_and_negative_register_indices(self):
+        path = self.write("s_endpgm")
+        for extra in (
+            ["--lanes", "64", "--lane", "0"],
+            ["--lanes", "64", "--lane", "5"],
+            ["--sgpr", "-1=0"],
+            ["--vgpr", "-2=0"],
+        ):
+            with self.subTest(extra=extra):
+                result = subprocess.run([sys.executable, "-I", cpu_ref.__file__, path, *extra],
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertNotIn("Traceback", result.stderr)
+
+        for bad in (
+            {"sgpr": {-1: 0}},
+            {"vgpr": {-1: 0}},
+            {"sgpr": {True: 0}},
+            {"lanes": True},
+            {"lane": False},
+            {"max_steps": True},
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    cpu_ref.run(path, bad)
+
 
 if __name__ == "__main__":
     unittest.main()

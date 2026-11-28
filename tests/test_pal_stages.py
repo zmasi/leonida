@@ -254,6 +254,65 @@ class TestCli(unittest.TestCase):
         doc = json.loads(out.getvalue())
         self.assertIsNone(doc["blobs"][0]["stage"])
 
+    def test_case_folded_stage_lookup_and_ambiguous_case_collision(self):
+        self.assertEqual(pal_stages.lookup_stage({"Shader": "ps"}, "shader"), "ps")
+        self.assertIsNone(pal_stages.lookup_stage({"Shader": "ps", "shader": "vs"}, "SHADER"))
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "shader.fssm"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"file": "Shader.dxbc", "stage": "ps"}], f)
+            result = subprocess.run([sys.executable, "-I", TOOL, folder, "--json"], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        doc = json.loads(result.stdout)
+        self.assertEqual(doc["blobs"][0]["stage"], "ps")
+        self.assertEqual(doc["tally"]["stage_matches"], 1)
+
+    def test_distinguishes_no_inspected_blob_in_index_from_missing_index(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "shader.fssm"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            out_no_idx = io.StringIO()
+            with contextlib.redirect_stdout(out_no_idx):
+                rc1 = pal_stages.main([folder])
+            self.assertEqual(rc1, 0)
+            self.assertIn("no index.json found", out_no_idx.getvalue())
+
+            with open(os.path.join(folder, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump([{"file": "other.dxbc", "stage": "vs"}], f)
+            out_mismatch = io.StringIO()
+            with contextlib.redirect_stdout(out_mismatch):
+                rc2 = pal_stages.main([folder])
+            self.assertEqual(rc2, 0)
+            self.assertIn("no inspected blob in index.json", out_mismatch.getvalue())
+
+    def test_stage_index_oserror_falls_back_to_empty_and_non_file_or_dir_exits_2(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "shader.fssm"), "wb") as f:
+                f.write(blob([(1, 5)]))
+            out = io.StringIO()
+            with unittest.mock.patch.object(pal_stages.fssm_header, "stage_index", side_effect=OSError("io fail")), \
+                    contextlib.redirect_stdout(out):
+                rc = pal_stages.main([folder, "--json"])
+            self.assertEqual(rc, 0)
+            self.assertIsNone(json.loads(out.getvalue())["blobs"][0]["stage"])
+
+            special = os.path.join(folder, "special")
+            with open(special, "wb") as f:
+                f.write(b"x")
+            err = io.StringIO()
+            with unittest.mock.patch.object(pal_stages.os.path, "exists", return_value=True), \
+                    unittest.mock.patch.object(pal_stages.os.path, "isfile", return_value=False), \
+                    unittest.mock.patch.object(pal_stages.os.path, "isdir", return_value=False), \
+                    contextlib.redirect_stderr(err):
+                rc_bad = pal_stages.main([special])
+            self.assertEqual(rc_bad, 2)
+            self.assertIn("not a file or directory", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,7 @@ static RETRY_UPLOAD_AT: AtomicU64 = AtomicU64::new(0);
 
 pub(crate) fn allocation_error(error: &windows::core::Error) {
     if error.code() == windows::Win32::Foundation::E_OUTOFMEMORY {
+        count(SAID_FAILED);
         RETRY_UPLOAD_AT.fetch_max(crate::host::coarse_ms().saturating_add(500), Ordering::Relaxed);
     }
 }
@@ -73,10 +74,85 @@ fn has_growth_reserve(commit: u64, bake: bool) -> bool {
 /// still letting bindless textures and one-shot material bakes upload.
 pub(crate) fn admit_texture_pass(bake: bool) -> bool {
     let now = crate::host::coarse_ms();
+    count(SAID_PASSES);
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
+        count(SAID_PASSES_REFUSED_FAILURE);
         return false;
     }
-    has_upload_reserve(sample_commit(now), bake)
+    let admitted = has_upload_reserve(sample_commit(now), bake);
+    if !admitted {
+        count(SAID_PASSES_REFUSED_RESERVE);
+    }
+    admitted
+}
+
+/// What this module said since the start, for the memory lines ([`line`]):
+/// looks once a second ([`refresh`]), those under pressure, those of them
+/// with commit above where pressure by commit begins (4 GiB: the pressure was
+/// physical memory's), those with commit under [`critical_commit`]'s 1.5 GiB;
+/// texture passes asked for and refused for a failed allocation and for the
+/// reserve ([`admit_texture_pass`]); new staging buffers asked for and
+/// refused likewise ([`allow_staging_growth`]); allocations that failed for
+/// want of memory; questions whether commit is critical and how often it was.
+static SAID: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
+const SAID_LOOKS: usize = 0;
+const SAID_PRESSURED: usize = 1;
+const SAID_PRESSURED_PHYSICAL: usize = 2;
+const SAID_LOOKS_CRITICAL: usize = 3;
+const SAID_PASSES: usize = 4;
+const SAID_PASSES_REFUSED_FAILURE: usize = 5;
+const SAID_PASSES_REFUSED_RESERVE: usize = 6;
+const SAID_GROWTH: usize = 7;
+const SAID_GROWTH_REFUSED_FAILURE: usize = 8;
+const SAID_GROWTH_REFUSED_RESERVE: usize = 9;
+const SAID_FAILED: usize = 10;
+const SAID_CRITICAL_ASKED: usize = 11;
+const SAID_CRITICAL: usize = 12;
+/// The least physical memory free and the least commit left that [`refresh`]
+/// has seen.
+static LEAST: [AtomicU64; 2] = [const { AtomicU64::new(u64::MAX) }; 2];
+
+fn count(what: usize) {
+    SAID[what].fetch_add(1, Ordering::Relaxed);
+}
+
+/// The memory lines' line of what this module said since the start
+/// ([`SAID`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn line() {
+    let n: Vec<u64> = SAID.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    let least = |i: usize| match LEAST[i].load(Ordering::Relaxed) {
+        u64::MAX => 0,
+        bytes => bytes >> 20,
+    };
+    tracing::info!(
+        "memory, the PC's (residency), since the start: {} looks a second apart, {} under pressure ({} of them with more than 4 GiB left to commit: \
+         by physical memory alone), {} with less than 1.5 GiB left to commit; the least seen: {} MB of physical memory free, {} MB left to commit; \
+         texture passes asked for {}, refused {} after a failed allocation and {} for the reserve; new staging buffers ahead asked for {}, refused {} \
+         and {}; allocations failed for want of memory {}; commit critical in {} of {} questions; now {} (LEONIDA_COMMIT_FLOOR: {})",
+        n[SAID_LOOKS],
+        n[SAID_PRESSURED],
+        n[SAID_PRESSURED_PHYSICAL],
+        n[SAID_LOOKS_CRITICAL],
+        least(0),
+        least(1),
+        n[SAID_PASSES],
+        n[SAID_PASSES_REFUSED_FAILURE],
+        n[SAID_PASSES_REFUSED_RESERVE],
+        n[SAID_GROWTH],
+        n[SAID_GROWTH_REFUSED_FAILURE],
+        n[SAID_GROWTH_REFUSED_RESERVE],
+        n[SAID_FAILED],
+        n[SAID_CRITICAL],
+        n[SAID_CRITICAL_ASKED],
+        if pressured() { "under pressure" } else { "not under pressure" },
+        crate::resource::commit_floor_note(),
+    );
+}
+
+/// The commit the system has left, sampled at most 32 ms ago.
+pub(crate) fn available_commit() -> u64 {
+    sample_commit(crate::host::coarse_ms())
 }
 
 /// Whether the staging allocator may commit a brand-new OS upload buffer
@@ -84,10 +160,16 @@ pub(crate) fn admit_texture_pass(bake: bool) -> bool {
 /// whenever `admit_texture_pass` is true).
 pub(crate) fn allow_staging_growth(bake: bool) -> bool {
     let now = crate::host::coarse_ms();
+    count(SAID_GROWTH);
     if now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) {
+        count(SAID_GROWTH_REFUSED_FAILURE);
         return false;
     }
-    has_growth_reserve(sample_commit(now), bake)
+    let allowed = has_growth_reserve(sample_commit(now), bake);
+    if !allowed {
+        count(SAID_GROWTH_REFUSED_RESERVE);
+    }
+    allowed
 }
 
 pub(crate) fn limited_host_ram() -> bool {
@@ -110,6 +192,18 @@ pub(crate) fn refresh() {
     HEADROOM.store(physical.min(commit), Ordering::Relaxed);
     let was = pressured();
     let pressure = next_pressure(was, physical, commit);
+    count(SAID_LOOKS);
+    if pressure {
+        count(SAID_PRESSURED);
+        if commit > 4 * GIB {
+            count(SAID_PRESSURED_PHYSICAL);
+        }
+    }
+    if commit < 1536 * MIB {
+        count(SAID_LOOKS_CRITICAL);
+    }
+    LEAST[0].fetch_min(physical, Ordering::Relaxed);
+    LEAST[1].fetch_min(commit, Ordering::Relaxed);
     if pressure != was {
         PRESSURED.store(pressure, Ordering::Relaxed);
         if pressure {
@@ -143,7 +237,12 @@ pub(crate) fn pressured() -> bool {
 /// just failed with `E_OUTOFMEMORY`, requiring emergency throttling.
 pub(crate) fn critical_commit() -> bool {
     let now = crate::host::coarse_ms();
-    now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB
+    let critical = now < RETRY_UPLOAD_AT.load(Ordering::Relaxed) || sample_commit(now) < 1536 * MIB;
+    count(SAID_CRITICAL_ASKED);
+    if critical {
+        count(SAID_CRITICAL);
+    }
+    critical
 }
 
 /// A soft per-frame admission limit. A single texture can cross it. The

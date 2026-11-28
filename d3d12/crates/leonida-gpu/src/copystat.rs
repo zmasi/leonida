@@ -751,13 +751,22 @@ fn log_memory() {
     if let Some(h) = crate::host::host() {
         h.log_video_memory("with the memory line");
     }
+    // What the device itself holds of it, counted where it is made and
+    // where the device lets it go (`crate::census`): beside the system's
+    // numbers above and the owners' below.
+    crate::census::log();
     // What else holds memory: the map, on a thread of its own, with every
-    // sixth line; and what the shader table and the pipeline library keep.
+    // sixth line (and with it what the view heap's slots keep alive, which
+    // asks every slot); and what the shader table and the pipeline library
+    // keep.
     static LINES: AtomicU64 = AtomicU64::new(0);
     static WALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if memory_map() && LINES.fetch_add(1, Relaxed) % 6 == 5 && !WALKING.swap(true, Relaxed) {
+    if LINES.fetch_add(1, Relaxed) % 6 == 5 && !WALKING.swap(true, Relaxed) {
         let walk = std::thread::Builder::new().name("leonida-memory-map".into()).spawn(|| {
-            log_memory_map();
+            if memory_map() {
+                log_memory_map();
+            }
+            crate::census::log_slots();
             WALKING.store(false, Relaxed);
         });
         if walk.is_err() {
@@ -1396,7 +1405,12 @@ pub(crate) fn log(frames: f64) {
             text.join(", ")
         );
     }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
+    // (`LEONIDA_GPU_TIMING_KINDS=<n>`: so many of the heaviest are listed instead of forty.)
+    static LISTED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let listed = *LISTED.get_or_init(|| {
+        std::env::var("LEONIDA_GPU_TIMING_KINDS").ok().and_then(|v| v.trim().parse().ok()).filter(|n| *n > 0).unwrap_or(40)
+    });
+    for (what, (n, us, longest)) in by.into_iter().take(listed) {
         tracing::info!(
             "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
             us as f64 / 1e3 / frames,

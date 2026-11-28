@@ -163,10 +163,22 @@ class F16ToIntTests(unittest.TestCase):
         self.assertEqual(run("v_cvt_i16_f16_e64 v0, -v1", 0x4248), merge(OLD, -3 & 0xFFFF, 0))
         self.assertEqual(run("v_cvt_i16_f16_e64 v0, |v1|", 0xC248), merge(OLD, 3, 0))
 
-    def test_output_modifiers_are_rejected(self):
-        for line in ("v_cvt_u16_f16_e64 v0, v1 clamp", "v_cvt_i16_f16_e64 v0, v1 mul:2"):
-            with self.subTest(line=line), self.assertRaises(rdna2spirv.Unsupported):
-                run(line, 0x4248)
+    def test_output_modifiers_are_noop(self):
+        # Measured natively on AMD gfx1036 across all 4 HW_REG_MODE configs: VOP3 clamp/mul:*/div:*
+        # are hardware no-ops on integer-destination v_cvt_{i16,u16}_f16.
+        for op, h, want in (
+            ("v_cvt_i16_f16_e64", 0x4248, 3),
+            ("v_cvt_i16_f16_e64", 0xC248, -3 & 0xFFFF),
+            ("v_cvt_u16_f16_e64", 0x4248, 3),
+            ("v_cvt_u16_f16_e64", 0x7BFF, 65504),
+        ):
+            for mod in ("clamp", "mul:2", "mul:4", "div:2", "clamp mul:2"):
+                line = f"{op} v0, v1 {mod}"
+                with self.subTest(line=line, h=hex(h)):
+                    self.assertEqual(run(line, h), merge(OLD, want, 0))
+        for bad in ("v_cvt_u16_f16_e32 v0, v1 clamp", "v_cvt_i16_f16_e64 v0, v1 bogus:1"):
+            with self.subTest(line=bad), self.assertRaises(rdna2spirv.Unsupported):
+                run(bad, 0x4248)
 
 
 if __name__ == "__main__":

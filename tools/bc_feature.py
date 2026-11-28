@@ -34,6 +34,8 @@ def bc1_average(blocks: np.ndarray) -> np.ndarray:
     """blocks: (N, 8) uint8 -> (N, 3) float average colour of the 16 decoded pixels."""
     if blocks.ndim != 2 or blocks.shape[1] != 8:
         raise ValueError(f"bc1_average expects shape (N, 8), got {blocks.shape}")
+    if blocks.dtype != np.uint8:
+        raise ValueError(f"bc1_average expects dtype uint8, got {blocks.dtype}")
     return _color_average(blocks)
 
 
@@ -42,6 +44,8 @@ def block_average(blocks: np.ndarray, bpe: int) -> np.ndarray:
         raise ValueError(f"unsupported block size bpe={bpe} (expected 8 or 16)")
     if blocks.ndim != 2 or blocks.shape[1] != bpe:
         raise ValueError(f"block_average(bpe={bpe}) expects shape (N, {bpe}), got {blocks.shape}")
+    if blocks.dtype != np.uint8:
+        raise ValueError(f"block_average(bpe={bpe}) expects dtype uint8, got {blocks.dtype}")
     if bpe == 8:
         return bc1_average(blocks)
     # BC3 colour uses four entries regardless of endpoint order (EXT_texture_compression_s3tc).
@@ -50,5 +54,12 @@ def block_average(blocks: np.ndarray, bpe: int) -> np.ndarray:
 
 def smoothness(img: np.ndarray) -> float:
     """Neighbour difference relative to the image's own spread (lower = more coherent)."""
-    d = np.abs(np.diff(img, axis=0)).mean() + np.abs(np.diff(img, axis=1)).mean()
-    return float(d / (img.std() + 1e-6))
+    img = np.asarray(img)
+    if img.ndim < 2:
+        raise ValueError(f"smoothness expects at least 2 dimensions, got shape {img.shape}")
+    if img.size == 0:
+        raise ValueError(f"smoothness expects non-empty image, got shape {img.shape}")
+    img_f = img if np.issubdtype(img.dtype, np.floating) else img.astype(np.float32)
+    dy = float(np.abs(np.diff(img_f, axis=0)).mean()) if img_f.shape[0] > 1 else 0.0
+    dx = float(np.abs(np.diff(img_f, axis=1)).mean()) if img_f.shape[1] > 1 else 0.0
+    return float((dy + dx) / (float(img_f.std()) + 1e-6))

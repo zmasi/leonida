@@ -330,6 +330,17 @@ int main() {
     if (!failed) failed = test_tidy(dir);
     if (!failed) failed = test_entry_file(dir);
     if (!failed) failed = test_overlay(dir);
+    if (!failed) {
+        leonida::pipeline_journal::Hasher null_h;
+        const std::uint64_t before = null_h.digest();
+        null_h.bytes(nullptr, 16);
+        if (null_h.digest() != before) failed = 91;
+        const auto null_p = leonida::pipeline_journal::entry_path(dir, nullptr, 0x1234ull);
+        if (null_p.filename().string() != "entry-0000000000001234.bin") failed = 92;
+        const std::string long_kind(60, 'k');
+        const auto long_p = leonida::pipeline_journal::entry_path(dir, long_kind.c_str(), 0xabcdefull);
+        if (long_p.filename().string() != long_kind + "-0000000000abcdef.bin") failed = 93;
+    }
     fs::remove_all(dir, ec);
     if (failed) return failed;
     std::printf("pipeline_cache_journal_test: ok\n");

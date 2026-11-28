@@ -1084,5 +1084,117 @@ class TestVerifyCache(unittest.TestCase):
             self.assertNotIn(b"\r\n", f.read())
 
 
+class TestSaveVerifyCache(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.cache = os.path.join(self.tmp.name, "cache.json")
+        self.neighbor = self.cache + ".tmp"
+        self.previous = b'{"version": 1, "files": {}}\n'
+        self.unrelated = b"an unrelated file that must survive"
+        with open(self.cache, "wb") as f:
+            f.write(self.previous)
+        with open(self.neighbor, "wb") as f:
+            f.write(self.unrelated)
+        self.entries = {"synthetic": {"stamp": [1, 2, 3, 4, 5], "sha256": "a" * 64}}
+
+    def assert_files_preserved(self) -> None:
+        with open(self.cache, "rb") as f:
+            self.assertEqual(f.read(), self.previous)
+        with open(self.neighbor, "rb") as f:
+            self.assertEqual(f.read(), self.unrelated)
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["cache.json", "cache.json.tmp"])
+
+    def test_save_preserves_existing_tmp_neighbor(self) -> None:
+        mv.save_cache(self.cache, self.entries)
+        self.assertEqual(mv.load_cache(self.cache), self.entries)
+        with open(self.neighbor, "rb") as f:
+            self.assertEqual(f.read(), self.unrelated)
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["cache.json", "cache.json.tmp"])
+
+    def test_serialization_failure_preserves_cache_and_neighbor(self) -> None:
+        with self.assertRaises(TypeError):
+            mv.save_cache(self.cache, {"not_json": object()})
+        self.assert_files_preserved()
+
+    def test_replace_failure_preserves_cache_and_neighbor(self) -> None:
+        with patch.object(mv.os, "replace", side_effect=PermissionError("replace denied")):
+            with self.assertRaisesRegex(PermissionError, "replace denied"):
+                mv.save_cache(self.cache, self.entries)
+        self.assert_files_preserved()
+
+    def test_overlapping_saves_have_independent_staging_files(self) -> None:
+        real_replace = os.replace
+        staged = []
+        inner = {"other": {"stamp": [5, 4, 3, 2, 1], "sha256": "b" * 64}}
+
+        def interleave(source, destination):
+            staged.append(source)
+            if len(staged) == 1:
+                # Finish a second save while the first is staged but not published.
+                mv.save_cache(self.cache, inner)
+                self.assertEqual(mv.load_cache(self.cache), inner)
+            real_replace(source, destination)
+
+        with patch.object(mv.os, "replace", side_effect=interleave):
+            mv.save_cache(self.cache, self.entries)
+        self.assertEqual(len(set(staged)), 2)
+        self.assertEqual(mv.load_cache(self.cache), self.entries)
+        self.assertEqual(sorted(os.listdir(self.tmp.name)), ["cache.json", "cache.json.tmp"])
+
+    def test_manifest_at_old_staging_name_survives_verification(self) -> None:
+        game = os.path.join(self.tmp.name, "game")
+        os.mkdir(game)
+        payload = b"synthetic data"
+        path = os.path.join(game, "sample.bin")
+        with open(path, "wb") as f:
+            f.write(payload)
+        os.utime(path, (time.time() - 60,) * 2)
+        manifest = json.dumps({"files": {"sample.bin": {
+            "size": len(payload), "sha256": hashlib.sha256(payload).hexdigest(),
+        }}}).encode("utf-8")
+        with open(self.neighbor, "wb") as f:
+            f.write(manifest)
+        report = mv.verify_manifest(game, self.neighbor, cache_path=self.cache)
+        self.assertTrue(report.passed)
+        with open(self.neighbor, "rb") as f:
+            self.assertEqual(f.read(), manifest)
+        self.assertEqual(len(mv.load_cache(self.cache)), 1)
+
+    def test_posix_mode_is_applied_before_publication(self) -> None:
+        real_replace = os.replace
+        def publish(source, destination):
+            mode.assert_called_once_with(self.cache)
+            chmod.assert_called_once_with(source, 0o640)
+            real_replace(source, destination)
+
+        with patch.object(mv.os, "name", "posix"), \
+                patch.object(mv, "published_mode", return_value=0o640, create=True) as mode, \
+                patch.object(mv.os, "chmod") as chmod, \
+                patch.object(mv.os, "replace", side_effect=publish):
+            mv.save_cache(self.cache, self.entries)
+        self.assertEqual(mv.load_cache(self.cache), self.entries)
+
+    def test_mode_error_preserves_cache_and_removes_staging(self) -> None:
+        for operation in ("mode", "chmod"):
+            with self.subTest(operation=operation):
+                with patch.object(mv.os, "name", "posix"), \
+                        patch.object(mv, "published_mode", return_value=0o640, create=True) as mode, \
+                        patch.object(mv.os, "chmod") as chmod:
+                    (mode if operation == "mode" else chmod).side_effect = OSError("mode failed")
+                    with self.assertRaisesRegex(OSError, "mode failed"):
+                        mv.save_cache(self.cache, self.entries)
+                self.assert_files_preserved()
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission bits")
+    def test_permissions_of_existing_and_new_caches(self) -> None:
+        os.chmod(self.cache, 0o640)
+        mv.save_cache(self.cache, self.entries)
+        self.assertEqual(os.stat(self.cache).st_mode & 0o777, 0o640)
+        os.unlink(self.cache)
+        mv.save_cache(self.cache, self.entries)
+        self.assertEqual(os.stat(self.cache).st_mode & 0o777, os.stat(self.neighbor).st_mode & 0o777)
+
+
 if __name__ == "__main__":
     unittest.main()

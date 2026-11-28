@@ -309,7 +309,16 @@ def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
     with open(buffer_path, "rb") as handle:
         blob = handle.read()
 
-    base = int(vertex_buffer.get("gfx_off", 0) or 0)
+    raw_off = vertex_buffer.get("gfx_off", 0)
+    if raw_off is None:
+        base = 0
+    elif isinstance(raw_off, (bool, float)):
+        raise SkinError("vertex buffer offset is not an integer")
+    else:
+        try:
+            base = int(raw_off)
+        except (ValueError, TypeError, OverflowError) as exc:
+            raise SkinError("vertex buffer offset is not an integer") from exc
     if base < 0 or base > len(blob):
         raise SkinError("vertex buffer offset is outside its buffer")
 
@@ -335,8 +344,8 @@ def read_skin_streams(model_dir: str, model: dict, mesh: dict) -> dict:
         raise SkinError("JOINTS_1 and WEIGHTS_1 must be present together")
 
     vertex_count = mesh.get("vertex_count", model.get("vertex_count"))
-    if not isinstance(vertex_count, int) or vertex_count <= 0:
-        raise SkinError("mesh has no positive vertex_count")
+    if isinstance(vertex_count, bool) or not isinstance(vertex_count, int) or vertex_count <= 0:
+        raise SkinError("mesh has no positive integer vertex_count")
 
     rows = {}
     for slot in (6, 7, 8, 9):

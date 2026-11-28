@@ -1,8 +1,8 @@
 # Text: string tables and dialogue subtitles
 
 **Status: decoded.** Every string table the descriptor search finds in `data.rpf`, `story000.rpf` and
-`shared_minigame000.rpf` is read, and every dialogue line is joined to its subtitles. Labels are stored only as
-hashes. Dialogue labels are named by the conversation data; other labels are named only when a dictionary holds them.
+`shared_minigame000.rpf` is read, and dialogue records are joined to their available GXT subtitles. Labels are stored
+only as hashes. Dialogue labels are named by the conversation data; other labels are named only when a dictionary holds them.
 The tables have no language field, so the language is a guess (below).
 
 Measured on the Xbox Series 1.0.2.1 package on 2026-11-22. The outputs quote game text, so they are local work
@@ -162,6 +162,22 @@ keys reuse another mission's lines, so a key's root and its labels' prefix can d
 | 125,240 | 126,451 | 123,738 | 121,624 | 126,423 | 128,101 | 128,063 | 125,083 | 128,060 | 126,391 | 121,400 | 126,483 | 125,072 |
 
 About 7-12% of lines have no text in a given language: the label's hash is in none of that language's tables.
+
+### Captions drawn into video frames
+
+Some [Bink clips](movies.md) also contain English dialogue captions drawn into the image. A read-only audit of
+533 clips on Xbox Series 1.0.2.1 sampled video frames every 0.5 seconds and confirmed visible dialogue captions
+in 16 clips. A second pass on those clips sampled every two native frames (about 67 ms at 30 fps), for 3,929
+OCR samples. Visual review joined successive cards belonging to the same line and separated dialogue from overlays.
+
+The review reconstructed 81 complete caption occurrences. When compared with a local snapshot of 579,495
+English GXT entries, 42 were known text or reviewed variants, and 39 distinct complete lines across 13 clips
+had no corresponding text in that snapshot. The same 533 clips passed an independent final-frame check on the
+librempeg decoder. [Decoder revision and validation](https://github.com/librempeg/librempeg/pull/218#issuecomment-7146636607)
+
+Record the Bink stream identity, the source frame number used as evidence, and the first and last frames where
+the caption was observed. Derive clip-relative time from the source frame timing. The sampling interval limits
+the precision of the observed bounds. A GXT key or audio wave association requires independent evidence.
 
 ## Tables and label names
 

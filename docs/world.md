@@ -791,7 +791,10 @@ That is the pointer form of [psin.md](psin.md) and [ped_catalogues.md](ped_catal
 `packs.rpf`, the most blocks one has is 1,760. Every non-null array (`0x52`) and string (`0x42`) pointer there
 has bits 12-19 at zero, so a 12-bit reading would find the same block for each of them.
 Instance blocks are usually in the physical buffer, so the tool joins each resource's virtual and physical
-streams from its block map (+0x08 -> +8 virtual count, +9 physical count).
+streams from its block map (+0x08 -> +8 virtual count, +9 physical count). A list holds at most 65,535 instances
+(u16 count). The tool counts grass fields from strided byte columns and unpacks prop matrices in one pass.
+A matrix that fits in the buffer still counts when its trailing record padding is missing.
+`tools/world_build.py` and `tools/sandbox_scene.py` do not read these lists.
 
 Full run over `levels.rpf`, `story000.rpf` and `shared_minigame000.rpf` (stream occurrences, duplicates
 included):

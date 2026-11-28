@@ -66,8 +66,25 @@ class _Writer:
     def __init__(self, doc):
         self.wide = doc.get("layout") == "wide-64"
         self.out = bytearray(MAGIC + (PROLOGUE if self.wide else b""))
-        self.names = [d.get("name") for d in doc.get("descriptors") or []]
-        self.bad_names = {d["index"] for d in doc.get("descriptors") or [] if d.get("utf8_valid") is False}
+        raw_descriptors = doc.get("descriptors")
+        if raw_descriptors is not None and not isinstance(raw_descriptors, list):
+            raise EncodeError("descriptor", f"descriptors must be a list, got {type(raw_descriptors).__name__}")
+        self.names = {}
+        self.bad_names = set()
+        for pos, d in enumerate(raw_descriptors or []):
+            if not isinstance(d, dict):
+                raise EncodeError("descriptor", f"descriptor {pos} must be an object, got {type(d).__name__}")
+            idx = d.get("index", pos)
+            if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < 0xFD:
+                raise EncodeError("descriptor", f"descriptor index {idx!r} cannot be written")
+            if "name" in d:
+                name = d["name"]
+                _name_bytes(idx, name)
+                if idx in self.names and self.names[idx] != name:
+                    raise EncodeError("descriptor", f"descriptor {idx} is named both {self.names[idx]!r} and {name!r}")
+                self.names[idx] = name
+            if d.get("utf8_valid") is False:
+                self.bad_names.add(idx)
         self.emitted = 0
 
     def record(self, node, kind):
@@ -82,17 +99,14 @@ class _Writer:
             if index in self.bad_names:
                 raise EncodeError("utf8", f"descriptor {index} name had invalid UTF-8")
             raw = _name_bytes(index, name)
-            if index < len(self.names) and self.names[index] not in (None, name):
+            if index in self.names and self.names[index] != name:
                 raise EncodeError("descriptor", f"descriptor {index} is named both {self.names[index]!r} and {name!r}")
-            if index == len(self.names):
-                self.names.append(name)
-            else:
-                self.names[index] = name
+            self.names[index] = name
             if len(raw) > 0xFFFF:
                 raise EncodeError("length", f"descriptor {index} name is {len(raw)} bytes")
             self.out += struct.pack("<H", len(raw)) + raw
             self.emitted += 1
-        elif index < len(self.names) and self.names[index] not in (None, name):
+        elif index in self.names and self.names[index] != name:
             _name_bytes(index, name)
             raise EncodeError("descriptor", f"descriptor {index} is named both {self.names[index]!r} and {name!r}")
 
@@ -105,10 +119,10 @@ class _Writer:
                 raise EncodeError("value", f"float spelling {special!r}")
         if not isinstance(value, (int, float)) or isinstance(value, bool):
             raise EncodeError("value", f"float value {value!r}")
-        fval = float(value)
-        if math.isnan(fval):
-            raise EncodeError("nan", "a NaN float's bits are not in the tree")
         try:
+            fval = float(value)
+            if math.isnan(fval):
+                raise EncodeError("nan", "a NaN float's bits are not in the tree")
             return struct.pack("<d" if self.wide else "<f", fval)
         except OverflowError:
             raise EncodeError("value", f"float value {value!r} overflows {'double' if self.wide else 'float32'}") from None
@@ -131,8 +145,10 @@ class _Writer:
             self.record(node, 0x40)
             self.out += bits
         elif kind == "vec3":
-            specials = node.get("float_special") or [None, None, None]
-            if not isinstance(value, list) or len(value) != 3 or len(specials) != 3:
+            specials = node.get("float_special")
+            if specials is None:
+                specials = [None, None, None]
+            if not isinstance(value, list) or len(value) != 3 or not isinstance(specials, list) or len(specials) != 3:
                 raise EncodeError("value", f"vec3 value {value!r}")
             bits = b"".join(self.float_bits(v, s if v is None else None) for v, s in zip(value, specials))
             self.record(node, 0x50)
@@ -143,7 +159,11 @@ class _Writer:
             if not isinstance(value, str):
                 raise EncodeError("value", f"string value {value!r}")
             raw = value.encode("utf-8")
-            if len(raw) > 0xFFFF or ("byte_length" in node and len(raw) != node["byte_length"]):
+            if "byte_length" in node:
+                rec_len = node["byte_length"]
+                if type(rec_len) is not int or len(raw) != rec_len:
+                    raise EncodeError("length", f"string of {len(raw)} bytes, recorded {rec_len!r}")
+            if len(raw) > 0xFFFF:
                 raise EncodeError("length", f"string of {len(raw)} bytes, recorded {node.get('byte_length')}")
             self.record(node, 0x60)
             self.out += struct.pack("<H", len(raw)) + raw
@@ -157,29 +177,39 @@ class _Writer:
         if not isinstance(text, str):
             raise EncodeError("value", f"text value {text!r}")
         raw = text.encode("utf-8") + (b"\x00" if node.get("nul_terminated") else b"")
-        if len(raw) > 0xFFFFFFFF or ("length" in node and len(raw) != node["length"]):
+        if "length" in node:
+            rec_len = node["length"]
+            if type(rec_len) is not int or len(raw) != rec_len:
+                raise EncodeError("length", f"text of {len(raw)} bytes, recorded {rec_len!r}")
+        if len(raw) > 0xFFFFFFFF:
             raise EncodeError("length", f"text of {len(raw)} bytes, recorded {node.get('length')}")
         self.out += b"\xfd\xff" + struct.pack("<I", len(raw)) + raw
 
     def element(self, node):
         if node.get("attribute_order_violation"):
             raise EncodeError("order", f"element {node.get('name')!r} has a value attribute after its content")
-        attrs = node.get("attrs_declared", len(node.get("attributes", [])))
+        attributes = node.get("attributes", [])
+        if not isinstance(attributes, list) or any(not isinstance(c, dict) for c in attributes):
+            raise EncodeError("value", f"element {node.get('name')!r} attributes must be a list of objects")
+        content = node.get("content", [])
+        if not isinstance(content, list) or any(not isinstance(c, dict) for c in content):
+            raise EncodeError("value", f"element {node.get('name')!r} content must be a list of objects")
+        attrs = node.get("attrs_declared", len(attributes))
         if not isinstance(attrs, int) or isinstance(attrs, bool) or not 0 <= attrs <= 0xFFFF:
             raise EncodeError("value", f"attribute count {attrs!r}")
         # The header word says how many of the following value records are attributes. One record more would decode
         # as the element's first content value; with fewer, the next content value would decode as an attribute.
-        listed = len(node.get("attributes", []))
+        listed = len(attributes)
         if listed > attrs:
             raise EncodeError("value", f"element {node.get('name')!r} has {listed} attribute records, count {attrs}")
-        if listed < attrs and any(c.get("kind") == "value" for c in node.get("content", [])):
+        if listed < attrs and any(c.get("kind") == "value" for c in content):
             raise EncodeError("order", f"element {node.get('name')!r} is short of its {attrs} attributes and has a "
                                        "value in its content")
         self.record(node, 0x00)
         self.out += struct.pack("<HHH", 0, 0, attrs)
-        for child in node.get("attributes", []):
+        for child in attributes:
             self.value(child)
-        for child in node.get("content", []):
+        for child in content:
             kind = child.get("kind")
             if kind == "element":
                 self.element(child)
@@ -204,9 +234,6 @@ def encode(doc):
     if not isinstance(tree, dict) or tree.get("kind") != "element":
         raise EncodeError("status", "no root element")
     w = _Writer(doc)
-    for index, descriptor in enumerate(doc.get("descriptors") or []):
-        if "name" in descriptor:
-            _name_bytes(index, descriptor["name"])
     try:
         w.element(tree)
     except UnicodeEncodeError:
@@ -257,10 +284,12 @@ def check(source, limit=None):
 
 def write_all(report, out_dir):
     """Encode every resource of an rbf0_tree JSON report into out_dir. Returns (written, refused)."""
+    if not isinstance(out_dir, str) or not out_dir.strip():
+        raise SystemExit("output directory must not be empty")
     try:
-        with open(report, encoding="utf-8") as f:
+        with open(report, encoding="utf-8-sig") as f:
             data = json.load(f)
-    except (OSError, ValueError) as e:  # ValueError: bad JSON or non-UTF-8 bytes
+    except (OSError, ValueError, RecursionError) as e:  # ValueError: bad JSON or non-UTF-8 bytes
         raise SystemExit(f"{report}: cannot read report: {e}") from None
     if not isinstance(data, dict) or data.get("tool") != "rbf0_tree":
         raise SystemExit(f"{report}: not an rbf0_tree.py JSON report")
@@ -311,7 +340,7 @@ def main(argv=None):
             ap.error(f"{a.check}: no such file or directory")
         try:
             r = check(a.check, a.limit)
-        except rbf0_tree.SelectionError as e:
+        except (rbf0_tree.SelectionError, OSError) as e:
             ap.error(str(e))
         print(f"{r['resources']} resource(s): {r['exact']} exact, {r['different']} different, {r['refused']} refused")
         for reason, n in r["refused_by_reason"].items():
@@ -319,7 +348,7 @@ def main(argv=None):
         for layout, c in sorted(r["by_layout"].items()):
             print(f"  {layout}: {c['exact']} of {c['resources']} exact")
         return 1 if r["different"] or r["refused"] else 0
-    if not a.report or not a.out:
+    if not a.report or not a.out or not a.out.strip():
         ap.error("give --check SOURCE, or a report and an output directory")
     if a.limit is not None:
         ap.error("--limit only applies to --check")
@@ -328,7 +357,8 @@ def main(argv=None):
     written, refused = write_all(a.report, a.out)
     print(f"{written} resource(s) written, {len(refused)} refused")
     for offset, why in refused:
-        print(f"  0x{offset:x}: {why}" if isinstance(offset, int) else f"  {offset}: {why}")
+        is_int = isinstance(offset, int) and not isinstance(offset, bool)
+        print(f"  0x{offset:x}: {why}" if is_int else f"  {offset}: {why}")
     return 1 if refused else 0
 
 

@@ -165,11 +165,182 @@ static STAGING: Mutex<Option<HashMap<usize, Arc<Staging>>>> = Mutex::new(None);
 /// it out for a copy (the same bytes: the texels are as wide), the written
 /// texture's layout first.
 struct Through {
-    buffer: ID3D12Resource,
+    /// Made with the view, or for a pair copied from texture to texture ([`alias_direct`]) when
+    /// a copy first goes through it; `None` inside if the host had none to give then.
+    buffer: std::sync::OnceLock<Option<ID3D12Resource>>,
+    /// The buffer's size and name.
+    bytes: u64,
+    name: String,
+    /// Whether the host copies from the written texture's format to the view's ([`direct_pair`]).
+    direct: bool,
     parts: Vec<(
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
         D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
     )>,
+    /// For the copy's note and [`alias_line`]: width, height, parts and the two formats, and
+    /// the bytes a copy moves.
+    #[cfg(feature = "diagnostics")]
+    what: (String, u64),
+}
+
+/// The buffer of a [`Through`]: `bytes` long, named `name`.
+fn through_buffer(host: &crate::host::Host, bytes: u64, name: &str) -> Option<ID3D12Resource> {
+    let buffer = host.uav_buffer(bytes)?;
+    crate::host::name(&buffer, || name.to_owned());
+    Some(buffer)
+}
+
+/// Whether the host copies a texture of format `written` into one of format `read` texel for
+/// texel as they are, bits unchanged: of the pairs of other formats Direct3D has copied between
+/// since 10.1 ("format conversion": R32_UINT or R32_SINT and R9G9B9E5_SHAREDEXP, the 64-bit
+/// and 128-bit integer formats and the block-compressed ones) the first, which is what every
+/// aliased view of the title's is (R32_UINT written, 42, read as R9G9B9E5, 67: 59 views of 20
+/// sizes in a run of 2026-11-28).
+fn direct_pair(written: i32, read: i32) -> bool {
+    const R32_UINT: i32 = 42;
+    const R32_SINT: i32 = 43;
+    const R9G9B9E5: i32 = 67;
+    matches!(written, R32_UINT | R32_SINT) && read == R9G9B9E5
+}
+
+/// Whether the copy behind an aliased view goes from texture to texture where the host copies
+/// between the two formats ([`direct_pair`]), instead of through a buffer
+/// (`LEONIDA_ALIAS_DIRECT=1`; off by default: through the buffer, as before; `LEONIDA_AB` can
+/// name it). One copy of each part instead of two, no buffer of the texture's size on the card
+/// for each view, and two changes of state fewer a copy.
+fn alias_direct() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_ALIAS_DIRECT.get() {
+        return on;
+    }
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_ALIAS_DIRECT") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("LEONIDA_ALIAS_DIRECT"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`alias_direct`], for its thread only.
+    pub(crate) static TEST_ALIAS_DIRECT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Since the last frame-rate line, for [`alias_line`]: reads of aliased views that asked for
+/// their copy; those that needed none (the list had copied from this source and has not used
+/// it otherwise since); copies at a list's first read of the view with the source as the list
+/// found it, last read by the list, last written by it; and copies made again in a list with
+/// the source last read, last written.
+#[cfg(feature = "diagnostics")]
+static ALIAS_COUNTS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+/// With [`alias_counting`], since the last frame-rate line and by view: what it is, its copies,
+/// and its source's host texture.
+#[cfg(feature = "diagnostics")]
+static ALIAS_VIEWS: Mutex<Option<HashMap<usize, ((String, u64), u64, usize)>>> = Mutex::new(None);
+
+/// With [`alias_counting`], by source's host texture: how often a list moved it to a state the
+/// card writes it in (target, unordered access, copy or resolve destination) since the last
+/// frame-rate line.
+#[cfg(feature = "diagnostics")]
+static ALIAS_SOURCES: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+/// The host states the card writes a texture in.
+#[cfg(feature = "diagnostics")]
+const WRITTEN_STATES: u32 = 0x4 | 0x8 | 0x10 | 0x400 | 0x1000;
+
+/// Whether the copies behind aliased views are counted by view, with how often each source is
+/// written (`LEONIDA_ALIAS_COUNT=1`, diagnostics; off by default: a lock for every change of a
+/// texture's state to a written one).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn alias_counting() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::switch::on("LEONIDA_ALIAS_COUNT"))
+}
+
+/// A list moves host texture `texture` to the state `wanted` ([`HostList::transition`]): counted
+/// if it is the source of an aliased view and the state one the card writes in.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn alias_source_moved(texture: &ID3D12Resource, wanted: u32) {
+    use windows::core::Interface;
+    if wanted & WRITTEN_STATES == 0 || !alias_counting() {
+        return;
+    }
+    if let Some(map) = ALIAS_SOURCES.lock().unwrap_or_else(|e| e.into_inner()).as_mut()
+        && let Some(n) = map.get_mut(&(texture.as_raw() as usize))
+    {
+        *n += 1;
+    }
+}
+
+/// A read of the aliased view `placed` asked for its copy from `from` ([`alias`]): `new_source`
+/// and `before` as there.
+#[cfg(feature = "diagnostics")]
+fn alias_counted(placed: This, from: &ID3D12Resource, through: &Through, new_source: bool, before: Option<u32>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use windows::core::Interface;
+    let kind = match (new_source, before) {
+        (false, None) => 1,
+        (true, None) => 2,
+        (true, Some(b)) if b & WRITTEN_STATES == 0 => 3,
+        (true, Some(_)) => 4,
+        (false, Some(b)) if b & WRITTEN_STATES == 0 => 5,
+        (false, Some(_)) => 6,
+    };
+    ALIAS_COUNTS[0].fetch_add(1, Relaxed);
+    ALIAS_COUNTS[kind].fetch_add(1, Relaxed);
+    if kind == 1 || !alias_counting() {
+        return;
+    }
+    let source = from.as_raw() as usize;
+    {
+        let mut views = ALIAS_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+        let e = views
+            .get_or_insert_with(HashMap::new)
+            .entry(placed as usize)
+            .or_insert_with(|| (through.what.clone(), 0, source));
+        e.1 += 1;
+        e.2 = source;
+    }
+    ALIAS_SOURCES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).entry(source).or_insert(0);
+}
+
+/// For the frame-rate line: what became of the reads of aliased views ([`ALIAS_COUNTS`]), and
+/// with [`alias_counting`] the views copied most.
+#[cfg(feature = "diagnostics")]
+pub(crate) fn alias_line(frames: f64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let c: [f64; 7] = std::array::from_fn(|i| ALIAS_COUNTS[i].swap(0, Relaxed) as f64 / frames);
+    if c[0] == 0.0 {
+        return;
+    }
+    tracing::info!(
+        "aliased views per frame: {:.1} reads asked for their copy and {:.1} needed none (their list had it); copies at a list's first read: \
+         {:.1} with the source as the list found it, {:.1} with it last read by the list, {:.1} last written; copies again in a list: {:.1} \
+         with the source last read, {:.1} last written",
+        c[0], c[1], c[2], c[3], c[4], c[5], c[6]
+    );
+    if !alias_counting() {
+        return;
+    }
+    let views = ALIAS_VIEWS.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default();
+    let written: HashMap<usize, u64> = {
+        let mut sources = ALIAS_SOURCES.lock().unwrap_or_else(|e| e.into_inner());
+        sources.as_mut().map(|m| m.iter_mut().map(|(k, n)| (*k, std::mem::take(n))).collect()).unwrap_or_default()
+    };
+    let mut views: Vec<_> = views.into_iter().collect();
+    views.sort_by_key(|(_, (what, copies, _))| std::cmp::Reverse(copies * what.1));
+    let all: u64 = views.iter().map(|(_, (what, copies, _))| copies * what.1).sum();
+    tracing::info!("  aliased views copied: {} of them, {:.1} MiB a frame", views.len(), all as f64 / frames / 1048576.0);
+    for (view, ((what, bytes), copies, source)) in views.into_iter().take(40) {
+        tracing::info!(
+            "  aliased view {view:#x} {what} ({} KiB): {:.2} copies a frame; its source {source:#x} moved to a written state {:.2} times a frame",
+            bytes >> 10,
+            copies as f64 / frames,
+            written.get(&source).copied().unwrap_or(0) as f64 / frames
+        );
+    }
 }
 
 /// The most levels times layers [`alias`] copies (a cube of nine levels).
@@ -194,7 +365,6 @@ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 /// as [`upload`] does. False if the copy cannot be made: the caller fills
 /// the texture from title memory, as before.
 pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
-    const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
     // (All of its levels: the copy is level by level.)
@@ -263,15 +433,20 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 if bytes[0] == 0 || bytes[0] != bytes[1] || !alike {
                     return false;
                 }
-                let Some(buffer) = host.uav_buffer(bytes[0]) else {
-                    return false;
-                };
-                crate::host::name(&buffer, || {
-                    format!(
-                        "alias copy {}x{} f{} to f{}",
-                        of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
-                    )
-                });
+                let name = format!(
+                    "alias copy {}x{} f{} to f{}",
+                    of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
+                );
+                // (A pair copied from texture to texture ([`alias_direct`]) gets its buffer
+                // when a copy first goes through one.)
+                let direct = direct_pair(of_from.Format.0, of_to.Format.0);
+                let buffer = std::sync::OnceLock::new();
+                if !(direct && alias_direct()) {
+                    let Some(made) = through_buffer(host, bytes[0], &name) else {
+                        return false;
+                    };
+                    let _ = buffer.set(Some(made));
+                }
                 tracing::info!(
                     view = ?placed,
                     texture = ?source,
@@ -285,13 +460,32 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
                 let [of_written, of_read] = rows;
                 let through = Arc::new(Through {
                     buffer,
+                    bytes: bytes[0],
+                    name,
+                    direct,
                     parts: of_written.into_iter().zip(of_read).collect(),
+                    #[cfg(feature = "diagnostics")]
+                    what: (
+                        format!(
+                            "{}x{}x{parts}:f{}>f{}",
+                            of_from.Width, of_from.Height, of_from.Format.0, of_to.Format.0
+                        ),
+                        bytes[0],
+                    ),
                 });
                 map.insert(placed as usize, through.clone());
                 through
             }
         }
     };
+    // Timing experiment (`LEONIDA_AB=<s>,LEONIDA_EXP_NO_ALIAS_COPY`): no copy is recorded while it
+    // is on (the views show what they were last given), so a phase's frame time against the next
+    // one's says what the copies cost the card. For timing only: the light read through such
+    // views stands still while it is on.
+    #[cfg(feature = "diagnostics")]
+    if crate::ab::pick("LEONIDA_EXP_NO_ALIAS_COPY").unwrap_or(false) {
+        return true;
+    }
     // An upload from title memory can have already used this view. Only
     // a copy from the same GPU source can satisfy this read.
     list.first_use(placed as usize);
@@ -310,6 +504,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         unsafe { list.list.ResourceBarrier(&[barrier]) };
         before
     });
+    #[cfg(feature = "diagnostics")]
+    alias_counted(placed, from, &through, new_source, before);
     if !new_source && before.is_none() {
         return true;
     }
@@ -323,9 +519,34 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             SubresourceIndex: index as u32,
         },
     };
+    // Through the buffer, or from texture to texture ([`alias_direct`]; also where no buffer is
+    // to be had for a pair that can go so: every other pair got its buffer with its view).
+    let buffer = if through.direct && alias_direct() {
+        None
+    } else {
+        through.buffer.get_or_init(|| through_buffer(host, through.bytes, &through.name)).as_ref()
+    };
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| {
+        format!(
+            "alias {}:{} of {source:?} into {placed:?}",
+            if buffer.is_some() { "copy" } else { "direct" },
+            through.what.0
+        )
+    });
+    let Some(buffer) = buffer else {
+        // SAFETY: an open list and live textures, the source in the copy source state and the
+        // view's in the copy destination state; the two have the same parts of the same sizes.
+        unsafe {
+            for index in 0..through.parts.len() {
+                list.list.CopyTextureRegion(&part(to, index), 0, 0, 0, &part(from, index), None);
+            }
+        }
+        return alias_copied(list, source, before);
+    };
     let rows = |row: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT| D3D12_TEXTURE_COPY_LOCATION {
         // SAFETY: as above.
-        pResource: unsafe { std::mem::transmute_copy(&through.buffer) },
+        pResource: unsafe { std::mem::transmute_copy(buffer) },
         Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
         Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
             PlacedFootprint: *row,
@@ -336,27 +557,31 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
         D3D12_RESOURCE_STATE_COPY_SOURCE,
         D3D12_RESOURCE_STATE_COPY_DEST,
     );
-    #[cfg(feature = "diagnostics")]
-    list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
     // SAFETY: an open list and live resources; the buffer is as big as
     // the footprints and rests in the common state between copies.
     unsafe {
         list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, common, written)]);
+            .ResourceBarrier(&[crate::host::transition(buffer, common, written)]);
         for (index, (of_written, _)) in through.parts.iter().enumerate() {
             list.list
                 .CopyTextureRegion(&rows(of_written), 0, 0, 0, &part(from, index), None);
         }
         list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, written, read)]);
+            .ResourceBarrier(&[crate::host::transition(buffer, written, read)]);
         for (index, (_, of_read)) in through.parts.iter().enumerate() {
             list.list
                 .CopyTextureRegion(&part(to, index), 0, 0, 0, &rows(of_read), None);
         }
         list.list
-            .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
+            .ResourceBarrier(&[crate::host::transition(buffer, read, common)]);
     }
-    list.keep(&through.buffer);
+    list.keep(buffer);
+    alias_copied(list, source, before)
+}
+
+/// The end of [`alias`], its copy recorded: `before`, the state the list had `source` in.
+fn alias_copied(list: &HostList, source: This, before: Option<u32>) -> bool {
+    const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     // A draw that also writes the source (a view of it handled before
     // this one) needs it in that state again; the next read of the alias
     // then copies once more, as it must after a write.
@@ -1181,7 +1406,7 @@ fn fill_plane(
     bytes: usize,
     pitch: usize,
 ) {
-    let _pin = crate::watch::title_memory_reading();
+    let _pin = crate::watch::title_memory_reading_range(at, len);
     // SAFETY: the list owns this full upload allocation until its GPU work completes.
     let out = unsafe { std::slice::from_raw_parts_mut(dst as *mut u8, bytes) };
     let mip = &layout.mips[0];
@@ -1553,9 +1778,11 @@ impl Staging {
             let Some(mapped) = crate::watch::title_memory_reading_now() else {
                 return self.refresh_unlocked(last, size);
             };
-            mapped
+            crate::watch::RangeReading::Whole(mapped)
         } else {
-            waited(2, crate::watch::title_memory_reading)
+            // Only a change of mapping that touches this texture's memory is
+            // waited for (`LEONIDA_REMAP_SPANS=0`: every change, as before).
+            waited(2, || crate::watch::title_memory_reading_range(self.memory as usize, size))
         };
         if !committed(self.memory, size) {
             // Partly mapped: a streamed texture with only some mips' pages
@@ -2269,6 +2496,19 @@ fn staging(resource: This, copy: &crate::resource::HostTexture, first: u32) -> O
 mod prelude_upload_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering::Release};
+
+    /// Only the pair the title's aliased views have is copied from texture to texture: a
+    /// 32-bit integer texture read as R9G9B9E5. Any other pair keeps its buffer.
+    #[test]
+    fn only_r32_integers_read_as_shared_exponent_are_copied_directly() {
+        assert!(direct_pair(42, 67));
+        assert!(direct_pair(43, 67));
+        // (the other way round, the same format, a float written, another 32-bit format read)
+        assert!(!direct_pair(67, 42));
+        assert!(!direct_pair(42, 42));
+        assert!(!direct_pair(41, 67));
+        assert!(!direct_pair(42, 28));
+    }
 
     /// (After the tests of Belobug/VIctory-Belobug-AMD 5d6bd84.)
     #[test]

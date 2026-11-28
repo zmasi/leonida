@@ -33,12 +33,41 @@ struct InnerCoverageRequirements {
 
 // Inspect the actual module, not optional index metadata, before vkCreateShaderModule. Every valid use of
 // FullyCoveredEXT requires FragmentFullyCoveredEXT; PostDepthCoverage has an additional device property.
+// Per SPIR-V Logical Layout (§2.4), OpCapability (17) and OpExecutionMode (16) precede all debug,
+// annotation, type, constant, global variable, and function sections, so scanning stops at the first
+// post-execution-mode instruction rather than walking the full module body.
 inline InnerCoverageRequirements inner_coverage_requirements(std::span<const std::uint32_t> words) {
+    constexpr auto is_post_execution_mode = [](std::uint32_t op) noexcept {
+        switch (op) {
+            case 1:     // OpUndef
+            case 2:     // OpSourceContinued
+            case 3:     // OpSource
+            case 4:     // OpSourceExtension
+            case 5:     // OpName
+            case 6:     // OpMemberName
+            case 7:     // OpString
+            case 54:    // OpFunction
+            case 59:    // OpVariable
+            case 71:    // OpDecorate
+            case 72:    // OpMemberDecorate
+            case 73:    // OpDecorationGroup
+            case 74:    // OpGroupDecorate
+            case 75:    // OpGroupMemberDecorate
+            case 330:   // OpModuleProcessed
+            case 332:   // OpDecorateId
+            case 5632:  // OpDecorateString
+            case 5633:  // OpMemberDecorateString
+                return true;
+            default:
+                return (op >= 19 && op <= 39) || (op >= 41 && op <= 52);  // OpType* / OpConstant*
+        }
+    };
     InnerCoverageRequirements result;
     if (words.size() < 5 || words[0] != 0x07230203) return result;
     for (std::size_t i = 5; i < words.size();) {
         const auto count = words[i] >> 16, op = words[i] & 0xffff;
         if (!count || count > words.size() - i) return result;
+        if (is_post_execution_mode(op)) break;
         if (op == 17 && count >= 2 && words[i + 1] == 5265) result.fully_covered = true;
         if (op == 16 && count >= 3 && words[i + 2] == 4446) result.post_depth = true;
         i += count;

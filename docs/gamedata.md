@@ -554,9 +554,6 @@ resource; `Position = 0`, non-zero `PositionOffset` and `Shear`, `IntExtMode = 1
 `RotationMtx`/`TransformMtx` stay identity there too — confirming a loader must compose the volume transform from
 `Position`, `PositionOffset`, `Rotation`, `Shear`, and `Scale`. Runtime placement identity, resource-relative
 reference targets, and what `IntExtMode` and `BlendMode` select at runtime remain untested.
-Not measured here (hypothesis): with half the volumes at the origin, two profiles in use and no interpolation,
-this list looks like a sample or default set; the placed fog of the map is probably elsewhere (map resources
-or another archive).
 
 **`IntExtMode` and `BlendMode` against placement and interiors (ASSET-312).** Measured on the same 14 volumes
 (`common.rpf`, `CScatteringTransmittance__FogVolumeListData` at `0x64c000`) and on the interior positions of
@@ -893,9 +890,6 @@ records as JSON from a carve (the CLI prints summary counts; the JSON is game da
 python -I tools/gamedata_reader.py <work>/carve/common --root time_data --out <scratch>
 ```
 
-Not measured here (hypothesis): how the two regions are chosen at runtime, what the two plain-modifier numbers
-are (GTA V reads them as a value pair blended by strength), and how `controlValue` maps onto game state.
-
 **The two plain-modifier numbers.** Measured over the 29,727 two-number variables of the plain modifiers
 (1,051 variable names, 3,257 modifiers with at least one such variable):
 
@@ -915,9 +909,6 @@ are (GTA V reads them as a value pair blended by strength), and how `controlValu
 So `0` is the most frequent stored value of the second number. What it means, and how the runtime blends the
 two numbers by strength, is not settled by these counts.
 
-Not measured here (hypothesis): the hour of each of the 13 samples (GTA V's are fixed in code), how the two
-regions are chosen at runtime, what the two plain-modifier numbers mean and how the runtime blends them (see
-above), and how `controlValue` maps onto game state.
 **Plain-modifier number pairs `(a, b)`** (`tools/timecycle_pairs.py`, measured over all **29,727** two-number
 elements in the 4,291 plain modifiers across all 49 `timecycle_modifier_data` documents):
 
@@ -948,9 +939,9 @@ Three patterns establish what the pair stores (matching RAGE's two-float `tcModD
    `b < 0`, `a` in `-1,000..5,000`, `b` in `-3..5,000`, `a == b` in 94, `a < b` in 89, `a > b` in 7), and
    `fog_isotropic_phase` (`a == b` in all `10/10`, `1.0..6.0`).
 
-Not measured here (hypothesis): the hour of each of the 13 samples (GTA V's are fixed in code), how the two
-regions are chosen at runtime, the exact runtime rule distinguishing `b == 0` from `b == 1` on the 343 variables
-where both occur, and how `controlValue` maps onto game state.
+Not measured here (hypothesis): how the two regions are chosen at runtime, the exact runtime rule distinguishing
+`b == 0` from `b == 1` on the 343 variables where both occur, and how `controlValue` maps onto game state.
+
 ## Vehicle and tyre XML documents
 
 Four roots account for 37 of the 45 documents (4,547,932 inflated bytes) in the vehicles/tyres category:
@@ -1034,17 +1025,6 @@ entry combines up to four nested parameter groups with 12 direct scalar `value=`
 | `roadPenalties`, `offRoadPenalties` | 40 / 40 each | identical 6-scalar schema: `fMaterialTractionLoss`, `fMaterialRollingDragGain`, `fMaterialSinkDragGain`, `fMaterialSurfaceDragGain`, `fWetTractionLoss`, `fWetDragGain` |
 | Direct scalars (required) | 40 / 40 each | `fLoadShapeVarianceScale`, `fDamageShapeVarianceScale`, `fDamageCoefficientScale`, `fOptimumTyreTemp` (all `100.0`), `fOptimumTyreTempRange` (all `100.0`), `fGripDropOffWithTemp` (`0.01..0.05`) |
 | Direct scalars (optional) | 36..39 / 40 | `fPuncturedTyreGripReduction`, `fBurstTyreGripReduction`, `fTractionStiffnessSpeedMult`, `fTractionStiffnessSpeedCap` (39 each); `fLoadStability` (37); `fLoadSensitivity` (36) |
-**Sample hours come from data.** One `time_data` document (root attributes `version` and `mode`) has exactly 13
-`sample` elements, each with `name`, `hour`, `uw_tc_mod` and `interpolation_type`, plus one `region`. The 13
-hours are integers from 0 to 22 in strictly increasing order, with gaps of 1 hour (7 times), 2 (twice), 3 (once)
-and 4 (twice); `interpolation_type` is `EASE_LINEAR_IN` on 9 samples and `EASE_QUARTIC_INOUT` on 4, and all 13
-`uw_tc_mod` values are the same name, which resolves to one of the 4,592 modifier names. The `region` name equals one of the two keyframe
-region names. So unlike GTA V, where the 13 sample times are compiled in, this build reads them (and the easing
-between them) from `time_data`; their count matches the 13 values of every keyframe variable.
-
-Not measured here (hypothesis): how the two regions are chosen at runtime, the exact runtime rule distinguishing
-`b == 0` from `b == 1` on the 343 plain-modifier variables where both occur (see *Plain-modifier number pairs*
-above), and how `controlValue` maps onto game state.
 
 ## Relationship to `data.rpf` and `script.rpf`
 
@@ -1223,7 +1203,6 @@ uses only 2. The reversed order (0 = B) would put the spots on the broad layer a
 The three mixed entries combine 0 and 2. Each tie is a name read against measured texture content, so this is
 measured, not confirmed against the shader that samples the mask.
 
-Not measured here (hypothesis): how `VehSpawnIntensities` are chosen at spawn.
 **Spawn intensities are keyed by vehicle class.** Measured on 2026-11-23 from one retail Xbox Series
 1.0.2.1 install with `tools/veh_spawn_intensities.py` (numbers and ranges only; the tool never prints
 entry names). The 31 entries are 30 generic vehicle-class tokens plus one entry whose rain fields differ

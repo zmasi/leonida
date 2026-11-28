@@ -493,8 +493,72 @@ class DriveMapTest(unittest.TestCase):
                 self.assertIn("[PASS] compiled_in_path", out.getvalue())
                 self.assertFalse(os.path.lexists(self.link))
 
+    def test_simultaneous_runners_cannot_borrow_a_temporary_drive(self):
+        probe = self.root / "shared_prefix_probe.py"
+        probe.write_text(
+            "import os, time\nfrom pathlib import Path\n"
+            "prefix = Path(os.environ['WINEPREFIX'])\n"
+            "mapped = prefix / 'dosdevices' / 'd:' / 'win' / 'root' / 'runtime/build/generated/cs.spv'\n"
+            "assert mapped.read_text(encoding='utf-8') == 'spirv'\n"
+            "if os.environ.get('HOLD_PREFIX') == '1':\n"
+            "    (prefix / 'ready').touch()\n"
+            "    deadline = time.monotonic() + 15\n"
+            "    while not (prefix / 'release').exists():\n"
+            "        if time.monotonic() > deadline: raise TimeoutError('waiting for release')\n"
+            "        time.sleep(0.01)\n"
+            "    assert mapped.read_text(encoding='utf-8') == 'spirv'\n",
+            encoding="utf-8", newline="\n",
+        )
+        listing = self.root / "shared_prefix.json"
+        listing.write_text(json.dumps({"tests": [ctest_entry("mapping", [f"{WINDOWS_ROOT}/{probe.name}"])]}),
+                           encoding="utf-8", newline="\n")
+        command = [sys.executable, "-I", str(SCRIPTS / "run_wine_tests.py"), "--tests", str(listing),
+                   "--windows-root", WINDOWS_ROOT, "--root", str(self.root), "--wine", sys.executable,
+                   "--require", "mapping", "--timeout", "18"]
+        # Python is passed by absolute path. An empty PATH prevents looking up the machine's wineserver.
+        env = dict(os.environ, PATH="", WINESERVER="", WINEPREFIX=str(self.prefix), HOLD_PREFIX="1")
+        alias = self.prefix.with_name("same-prefix")
+        alias.symlink_to(self.prefix, target_is_directory=True)
+        other = self.prefix.with_name("other-prefix")
+        (other / "dosdevices").mkdir(parents=True)
+
+        def run(prefix):
+            return subprocess.run(command, env=dict(env, WINEPREFIX=str(prefix), HOLD_PREFIX="0"),
+                                  capture_output=True, text=True, timeout=8)
+
+        with subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as owner:
+            try:
+                deadline = time.monotonic() + 5
+                while not (self.prefix / "ready").exists() and owner.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue((self.prefix / "ready").exists(), "owner never acquired the temporary mapping")
+                busy = run(alias)
+                self.assertEqual(busy.returncode, 2, busy.stdout + busy.stderr)
+                self.assertIn("already running", busy.stderr)
+                self.assertTrue(self.link.is_symlink())
+                independent = run(other)
+                self.assertEqual(independent.returncode, 0, independent.stdout + independent.stderr)
+            finally:
+                (self.prefix / "release").touch()
+                output, _ = owner.communicate(timeout=8)
+            self.assertEqual(owner.returncode, 0, output)
+        self.assertFalse(os.path.lexists(self.link))
+        retry = run(alias)
+        self.assertEqual(retry.returncode, 0, retry.stdout + retry.stderr)
+        self.assertFalse(os.path.lexists(self.link))
+
 
 class MainTest(unittest.TestCase):
+    def test_resource_lock_inventory_requires_strings(self):
+        with tempfile.TemporaryDirectory() as tmp, contextlib.redirect_stderr(io.StringIO()):
+            inventory = Path(tmp) / "ctest.json"
+            for value, accepted in ((None, False), (4, False), (False, False), ([{}], False),
+                                    (["gpu", 2], False), ("gpu", True), (["gpu", "display"], True), ([], True)):
+                with self.subTest(value=value):
+                    row = ctest_entry("fixture", None, {"RESOURCE_LOCK": value})
+                    inventory.write_text(json.dumps({"tests": [row]}), encoding="utf-8", newline="\n")
+                    self.assertEqual(rwt.read_tests(str(inventory)), [row] if accepted else None)
+
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
@@ -593,6 +657,20 @@ class MainTest(unittest.TestCase):
             code, _, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))])
         self.assertEqual(code, 0)
         self.assertEqual(log.read_text(encoding="utf-8").splitlines(), ["-p", "-w", "-p", "-k"])
+
+    def test_an_existing_persistent_server_is_warmed_but_not_stopped(self):
+        with mock.patch.object(rwt.KeptServer, "_run", side_effect=[2, 1]) as server, \
+                mock.patch.object(rwt.subprocess, "run") as warm:
+            kept = rwt.KeptServer("wineserver", [sys.executable])
+            with kept:
+                self.assertFalse(kept.started)
+                self.assertIn("used and left running", kept.note)
+        self.assertEqual(server.call_args_list, [mock.call("-p"), mock.call("-w", timeout=15.0)])
+        warm.assert_called_once()
+        self.assertEqual(warm.call_args.args[0], [sys.executable, "wineboot"])
+        self.assertIs(warm.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertIs(warm.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertEqual(warm.call_args.kwargs["timeout"], 120)
 
     def test_no_wineserver_is_one_line_and_the_run_goes_on(self):
         code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "ok")
@@ -900,6 +978,21 @@ class MainTest(unittest.TestCase):
                 with self.assertRaises(SystemExit) as ctx:
                     self.run_main([ctest_entry("ok", self.command("ok.py"))], "--timeout", text)
                 self.assertEqual(ctx.exception.code, 2)
+
+    def test_timeout_over_process_limit_is_rejected_before_launch(self):
+        entries = [ctest_entry("ok", self.command("ok.py"))]
+        with mock.patch.object(rwt, "run_test_process", side_effect=AssertionError("test was launched")):
+            for text in ("2147484", "1e100"):
+                with self.subTest(text=text):
+                    with self.assertRaises(SystemExit) as ctx:
+                        self.run_main(entries, "--timeout", text)
+                    self.assertEqual(ctx.exception.code, 2)
+
+    def test_largest_portable_timeout_runs_a_test(self):
+        entries = [ctest_entry("ok", self.command("ok.py"))]
+        code, out, _ = self.run_main(entries, "--timeout", "2147483", "--require", "ok")
+        self.assertEqual(code, 0, out)
+        self.assertIn("[PASS] ok", out)
 
     def test_a_blank_wine_is_a_usage_error(self):
         with self.assertRaises(SystemExit) as ctx:

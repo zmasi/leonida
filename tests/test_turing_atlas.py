@@ -150,6 +150,63 @@ class VulkanMatrixTests(unittest.TestCase):
         self.assertEqual(matrix["device"]["name"], "Discrete GPU 1")
         self.assertEqual(calls, [("vulkaninfo", "-j"), ("vulkaninfo", "--summary"), ("vulkaninfo", "-j=1")])
 
+    def test_utf8_bom_profile_and_invalid_device_name_or_type(self):
+        bom_doc = report()
+
+        def run_bom(cmd, cwd):
+            Path(cwd, "VP_VULKANINFO_bom.json").write_bytes(
+                b"\xef\xbb\xbf" + json.dumps(bom_doc).encode("utf-8")
+            )
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with patch.object(turing_atlas.shutil, "which", return_value="vulkaninfo"), \
+                patch.object(turing_atlas, "run", run_bom):
+            matrix = turing_atlas.vulkan_matrix()
+        self.assertEqual(matrix["vulkaninfo"], "ok")
+        self.assertEqual(matrix["device"]["name"], "Example GPU")
+
+        blank_name = report()
+        blank_name["capabilities"]["device"]["properties"]["VkPhysicalDeviceProperties"]["deviceName"] = "   "
+        self.assert_unknown(self.probe(blank_name))
+
+        bool_type = report()
+        bool_type["capabilities"]["device"]["properties"]["VkPhysicalDeviceProperties"].update({
+            "deviceName": "Bool Type GPU",
+            "vendorID": 0x1002,
+            "deviceType": True,
+        })
+        list_type = report()
+        list_type["capabilities"]["device"]["properties"]["VkPhysicalDeviceProperties"].update({
+            "deviceName": "List Type GPU",
+            "vendorID": 0x1002,
+            "deviceType": ["invalid"],
+        })
+        cpu_type = report()
+        cpu_type["capabilities"]["device"]["properties"]["VkPhysicalDeviceProperties"].update({
+            "deviceName": "Real CPU Device",
+            "vendorID": 0x1002,
+            "deviceType": 4,
+        })
+
+        def run_ranks(cmd, cwd):
+            Path(cwd, "VP_VULKANINFO_0_bool.json").write_text(json.dumps(bool_type), encoding="utf-8")
+            Path(cwd, "VP_VULKANINFO_1_list.json").write_text(json.dumps(list_type), encoding="utf-8")
+            Path(cwd, "VP_VULKANINFO_2_cpu.json").write_text(json.dumps(cpu_type), encoding="utf-8")
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with patch.object(turing_atlas.shutil, "which", return_value="vulkaninfo"), \
+                patch.object(turing_atlas, "run", run_ranks):
+            ranked = turing_atlas.vulkan_matrix()
+        self.assertEqual(ranked["device"]["name"], "Real CPU Device")
+
+    def test_deep_json_recursion_error_skipped(self):
+        with patch.object(turing_atlas.json, "load", side_effect=RecursionError("deep")):
+            self.assert_unknown(self.probe(report()))
+
+    def test_run_returns_none_on_permission_error(self):
+        with patch.object(turing_atlas.subprocess, "run", side_effect=PermissionError("denied")):
+            self.assertIsNone(turing_atlas.run(["vulkaninfo"]))
+
 
 
 
@@ -267,6 +324,63 @@ class ValidationGateTests(unittest.TestCase):
         code, err = self.main_with(tools=False)
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
+
+    def test_validate_cases_handles_none_stderr_and_missing_validator(self):
+        def run_none_stderr(cmd, **kw):
+            if cmd[0] == "spirv-as":
+                return subprocess.CompletedProcess(cmd, 1, "", None)
+            return None
+
+        with patch.object(turing_atlas.shutil, "which", return_value="tool"), \
+                patch.object(turing_atlas, "run", run_none_stderr):
+            cases = turing_atlas.validate_cases()
+        self.assertFalse(cases["compute32"]["assemble"])
+        self.assertEqual(cases["compute32"]["stderr"], "")
+
+        def run_missing_val(cmd, **kw):
+            if cmd[0] == "spirv-as":
+                return subprocess.CompletedProcess(cmd, 0, "", "")
+            return None
+
+        with patch.object(turing_atlas.shutil, "which", return_value="tool"), \
+                patch.object(turing_atlas, "run", run_missing_val):
+            cases2 = turing_atlas.validate_cases()
+        self.assertTrue(cases2["compute32"]["assemble"])
+        self.assertFalse(cases2["compute32"]["valid"])
+        self.assertEqual(cases2["compute32"]["stderr"], "missing")
+
+    def test_out_write_is_atomic_and_preserves_existing_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "atlas.json")
+            prior = '{"prior": true}\n'
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(prior)
+            real_open = open
+
+            class FailingWriter:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def write(self, _data):
+                    raise OSError("disk full")
+
+            def fail_write(path, mode="r", *args, **kwargs):
+                if "w" in mode and os.path.abspath(path) == os.path.abspath(out):
+                    real_open(path, "w", encoding="utf-8", newline="\n").close()
+                    return FailingWriter()
+                return real_open(path, mode, *args, **kwargs)
+
+            with patch("builtins.open", side_effect=fail_write), \
+                    patch.object(turing_atlas, "replace_retry", side_effect=OSError("disk full"), create=True):
+                code, err = self.main_with(tools=False, argv=["turing_atlas.py", "--out", out])
+            self.assertEqual(code, 2)
+            self.assertIn(f"cannot write {out}", err)
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), prior)
+            self.assertEqual(os.listdir(tmp), ["atlas.json"])
 
 
 if __name__ == "__main__":

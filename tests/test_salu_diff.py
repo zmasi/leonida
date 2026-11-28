@@ -105,6 +105,51 @@ class Reference(unittest.TestCase):
         self.assertEqual(run("s_pack_lh_b32_b16 s4, 0x12345678, 0xABCDEF01")[0], 0xABCD5678)
         self.assertEqual(run("s_pack_hh_b32_b16 s4, 0x12345678, 0xABCDEF01")[0], 0xABCD1234)
 
+    def test_operand_and_branch_validation_rejects_malformed_lines(self):
+        bad_lines = [
+            "s_cbranch_scc0 +-1",
+            "s_cbranch_scc1 + 1",
+            "s_cbranch_scc0 +abc",
+            "s_cbranch_scc1 +1, extra",
+            "s_add_u32 v4, 1, 2",
+            "s_mov_b32 v4, 5",
+            "v_mov_b32 s8, 5",
+            "s_mov_b64 s4, s[6:7]",
+            "s_mov_b64 s[4:6], s[6:7]",
+            "s_mov_b64 s[4:5], s[6:8]",
+            "s_mov_b32 s[4:5], 1",
+            "s_mov_b32 s4, v5",
+            "s_mov_b32 s4, m0",
+            "s_mov_b32 s4, 1, 2",
+            "s_mov_b32 m0, 1, 2",
+            "s_add_u32 s4, 1",
+            "s_add_u32 s4, 1, 2, 3",
+            "s_add_u32 s4, , 2",
+            "s_movrels_b32 s4, v5",
+            "s_movrels_b64 s[4:5], s[8:11]",
+            "s_addk_i32 s4, 0x10000",
+            "s_movk_i32 s4, -32769",
+            "s_cmpk_eq_u32 s4, s5",
+            "v_mov_b32 v8, s4, 1",
+        ]
+        for line in bad_lines:
+            with self.subTest(line=line), self.assertRaises(d.RefError):
+                run(line)
+
+        with self.assertRaises(d.RefError):
+            d.reference(["s_cmp_eq_u32 1, 1", "s_cbranch_scc1 +2", "s_mov_b32 s4, 7"])
+        with self.assertRaises(d.RefError):
+            d.reference(["s_cmp_eq_u32 0, 1", "s_cbranch_scc1 +2", "s_mov_b32 s4, 7"])
+        with self.assertRaises(d.RefError):
+            d._is_literal("")
+
+    def test_compact_comma_spacing_in_reference_and_insn_size(self):
+        self.assertEqual(run("s_add_u32 s4,1,2", "s_mov_b32 s5,0x12345")[:2], [3, 0x12345])
+        self.assertEqual(d.insn_size("s_add_u32 s4,s5,0x12345"), 8)
+        self.assertEqual(d.insn_size("s_cmp_eq_u32 s4,0x12345"), 8)
+        self.assertEqual(d.insn_size("s_cbranch_scc0 +0"), 4)
+        self.assertEqual(d.branch_skip("s_cbranch_scc0 +0"), ("s_cbranch_scc0", 0))
+
 
 class Translated(unittest.TestCase):
     def test_harness_canaries(self):

@@ -183,6 +183,19 @@ class TestScanAndWrite(unittest.TestCase):
              (60000, 1001, 59.94, 2.002)],
         )
 
+    def test_probe_skips_stream_truncated_after_indexing(self):
+        path = self.rpf(0, b"")
+        rows, _ = bink.scan_target(path)
+        row = rows[0]
+        with open(path, "rb+") as source:
+            source.truncate(row["offset"] + row["size"] - 1)
+        proc = subprocess.CompletedProcess(["ffprobe"], 0, '{"streams":[{"codec_type":"video","codec_name":"bink2"}]}')
+        with mock.patch.object(tempfile, "tempdir", self.dir), mock.patch.object(bink.subprocess, "run", return_value=proc) as run:
+            probed = bink.probe_row(row, "ffprobe")
+        self.assertEqual((probed["decodes"], probed["codec"], probed["probe_duration_s"]), ("no", "", ""))
+        run.assert_not_called()
+        self.assertFalse(any(name.startswith("bink_index_") for name in os.listdir(self.dir)))
+
     def test_probe_handles_failed_or_malformed_results(self):
         rows, _ = bink.scan_target(self.dir)
         valid_info = {"streams": [{"codec_type": "video", "codec_name": "bink2"}],
@@ -238,6 +251,63 @@ class TestScanAndWrite(unittest.TestCase):
                 bink.write_csv(path, [], probe=False)
         with open(path, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), previous)
+
+    def test_temp_stream_closes_fd_and_unlinks_on_fdopen_error(self):
+        src = os.path.join(self.dir, "one.bk2")
+        closed = []
+        real_close = os.close
+
+        def track_close(fd):
+            closed.append(fd)
+            real_close(fd)
+
+        with mock.patch("os.fdopen", side_effect=OSError("fdopen failure")), \
+             mock.patch("os.close", side_effect=track_close):
+            with self.assertRaises(OSError):
+                bink._temp_stream(src, 0, 100)
+        self.assertTrue(len(closed) > 0)
+
+    def test_temp_stream_cleanup_removes_file(self):
+        src = os.path.join(self.dir, "one.bk2")
+        name, cleanup = bink._temp_stream(src, 0, 100)
+        self.assertTrue(os.path.exists(name))
+        cleanup()
+        self.assertFalse(os.path.exists(name))
+
+    def test_publish_text_cleans_up_staged_file_when_replace_fails_even_if_readonly(self):
+        path = os.path.join(self.dir, "report.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write('{"initial": 1}\n')
+        os.chmod(path, 0o444)
+
+        real_unlink = os.unlink
+
+        def windows_strict_unlink(p):
+            mode = os.stat(p).st_mode
+            if not (mode & 0o200):
+                raise PermissionError(13, f"Access is denied: {p}")
+            return real_unlink(p)
+
+        with mock.patch.object(bink, "replace_retry", side_effect=OSError(13, "Permission denied")), \
+             mock.patch("os.unlink", side_effect=windows_strict_unlink):
+            with self.assertRaises(OSError):
+                bink.write_json(path, self.dir, [], {"streams": 0}, probe=False)
+
+        leftover = [f for f in os.listdir(self.dir) if f.startswith(".bink_index-")]
+        self.assertEqual(leftover, [])
+
+    def test_publish_text_applies_published_mode_on_windows(self):
+        path = os.path.join(self.dir, "report.csv")
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(p, mode):
+            chmod_calls.append((p, mode))
+            real_chmod(p, mode)
+
+        with mock.patch("os.name", "nt"), mock.patch("os.chmod", side_effect=track_chmod):
+            bink.write_csv(path, [], probe=False)
+        self.assertTrue(len(chmod_calls) > 0)
 
 
 class TestCommandLine(unittest.TestCase):

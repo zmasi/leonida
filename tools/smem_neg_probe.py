@@ -141,8 +141,14 @@ def main(argv=None):
             if bad_types:
                 print(f"wave{wave}: expected {n} int words, got {bad_types[0]} element")
                 return 2
-            got[wave] = list(res)
+            got[wave] = [w & 0xFFFFFFFF for w in res]
         print(f"device: {oracle.device} ({oracle.arch})")
+    except runner.Unavailable as e:
+        print(f"hardware oracle unavailable: {e}")
+        return 77
+    except RuntimeError as e:
+        print(f"harness error: {e}")
+        return 2
     finally:
         oracle.close()
     bad, i = 0, 0

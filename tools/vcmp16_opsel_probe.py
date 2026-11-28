@@ -163,17 +163,31 @@ def main(argv=None):
             words_expected = len(table) + len(controls)
             raw = oracle.run([asm.Kernel(kernel(table), wave=wave, threads=1, words=words_expected,
                                          raw=True, vgprs=16, sgprs=24)])
-            if not raw or raw[0] is None:
-                print(f"harness error: wave{wave}: no result from oracle")
+            if not isinstance(raw, (list, tuple)) or len(raw) != 1:
+                got_desc = len(raw) if isinstance(raw, (list, tuple)) else type(raw).__name__
+                print(f"harness error: wave{wave}: expected 1 oracle result, got {got_desc}")
                 return 2
             res = raw[0]
+            if res is None:
+                print(f"harness error: wave{wave}: no result from oracle")
+                return 2
             if isinstance(res, str):
                 print(f"wave{wave}: kernel rejected: {res}")
                 return 2
             if not isinstance(res, (list, tuple)) or len(res) != words_expected:
                 print(f"harness error: wave{wave}: expected {words_expected} words, got {len(res) if isinstance(res, (list, tuple)) else res!r}")
                 return 2
-            got[wave] = res
+            bad_types = [type(w).__name__ for w in res if isinstance(w, bool) or not isinstance(w, int)]
+            if bad_types:
+                print(f"harness error: wave{wave}: expected {words_expected} int words, got {bad_types[0]} element")
+                return 2
+            got[wave] = [w & 0xFFFFFFFF for w in res]
+    except runner.Unavailable as e:
+        print(f"hardware oracle unavailable: {e}")
+        return 77
+    except RuntimeError as e:
+        print(f"harness error: {e}")
+        return 2
     finally:
         oracle.close()
     # The control must show the hand-set bits working on a VOP3 op that takes op_sel; otherwise nothing is measured.

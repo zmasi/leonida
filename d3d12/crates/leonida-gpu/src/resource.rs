@@ -510,6 +510,8 @@ fn twin_texture(
         return None;
     };
     let _ = crate::host::resident(&host.device, &texture);
+    #[cfg(feature = "diagnostics")]
+    crate::census::made(&texture, "colour twins of depth textures");
     crate::host::name(&texture, || {
         format!("depth twin {}x{} f{}", d.width, d.height, d.format)
     });
@@ -571,6 +573,8 @@ fn twin_texture(
         }
         texture.map(|texture| {
             let _ = crate::host::resident(&host.device, &texture);
+            #[cfg(feature = "diagnostics")]
+            crate::census::made(&texture, "colour twins of depth textures");
             crate::host::name(&texture, || {
                 format!("depth plane twin {}x{} f{}", d.width, d.height, d.format)
             });
@@ -2228,26 +2232,22 @@ pub(crate) fn let_go_idle() {
     let from = if part == PART { FROM.load(Relaxed) } else { 0 };
     let mut looked = 0;
     let began = std::time::Instant::now();
-    for at in sweep_batch(&all, from, part, crate::toggled!("LEONIDA_SWEEP_WRAP")).chain(by_age.iter().map(|&(_, at)| at)) {
-        if bytes >= most {
-            break;
-        }
-        looked += 1;
-        if part == PART {
-            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
-        }
+    // Lets go of the host copy of the texture at `at` if it has been out of
+    // use for `ms` and `frames` and only its title texture holds it: its
+    // bytes, if it went.
+    let let_go = |at: usize, ms: u64, frames: u64| -> Option<u64> {
         // SAFETY: a texture leaves the table before it is freed, under the
         // lock held here (`Drop for Resource`).
         let r = unsafe { &*(at as *const Resource) };
         // (Without its lock first: most were used lately or have none.)
         let used = r.host.used.load(Relaxed);
-        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, idle_ms, IDLE_FRAMES) || crate::texture::host_wrote(at) {
-            continue;
+        if used == 0 || !fills(&r.desc) || !crate::host::long_ago(used, ms, frames) || crate::texture::host_wrote(at) {
+            return None;
         }
         let gone = {
             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
             let idle = made.as_ref().is_some_and(|(host, _)| {
-                crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES)
+                crate::host::long_ago(r.host.used.load(Relaxed), ms, frames)
                     && std::sync::Arc::strong_count(host) == 1
                     && crate::host::references(&host.texture) == 1
             });
@@ -2261,17 +2261,45 @@ pub(crate) fn let_go_idle() {
                 None
             }
         };
-        if let Some((host, _)) = gone {
-            r.host.gone.store(true, Relaxed);
-            KINDS[2].fetch_add(1, Relaxed);
-            KINDS[3].fetch_add(host.bytes, Relaxed);
-            went += 1;
-            bytes += host.bytes;
-            if first.is_none() {
-                first = Some(at);
-            }
-            crate::host::retire(host);
+        let (host, _) = gone?;
+        r.host.gone.store(true, Relaxed);
+        KINDS[2].fetch_add(1, Relaxed);
+        KINDS[3].fetch_add(host.bytes, Relaxed);
+        let bytes = host.bytes;
+        crate::host::retire(host);
+        Some(bytes)
+    };
+    for at in sweep_batch(&all, from, part, crate::toggled!("LEONIDA_SWEEP_WRAP")).chain(by_age.iter().map(|&(_, at)| at)) {
+        if bytes >= most {
+            break;
         }
+        looked += 1;
+        if part == PART {
+            FROM.store(if looked == PART { at + 1 } else { 0 }, Relaxed);
+        }
+        if let Some(gone) = let_go(at, idle_ms, IDLE_FRAMES) {
+            went += 1;
+            bytes += gone;
+            first.get_or_insert(at);
+        }
+    }
+    // With little left to commit ([`commit_floor`]): every copy out of use
+    // by the floor's shorter time goes too, whatever room the card has. None
+    // that a list or a slot holds, as above.
+    if let Some((ms, frames)) = commit_floor_times(commit_floor(), idle_ms, most, IDLE_FRAMES) {
+        let (mut copies, mut freed) = (0u64, 0u64);
+        for &at in all.iter() {
+            if let Some(gone) = let_go(at, ms, frames) {
+                copies += 1;
+                freed += gone;
+                first.get_or_insert(at);
+            }
+        }
+        went += copies;
+        bytes += freed;
+        COMMIT_FLOOR[0].fetch_add(1, Relaxed);
+        COMMIT_FLOOR[1].fetch_add(copies, Relaxed);
+        COMMIT_FLOOR[2].fetch_add(freed, Relaxed);
     }
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
@@ -2285,6 +2313,74 @@ pub(crate) fn let_go_idle() {
             )
         });
     }
+}
+
+/// Sweeps made with little left to commit ([`commit_floor`]), and the host
+/// copies they let go beyond what the card's rule lets go, and their bytes,
+/// since the start.
+#[cfg(windows)]
+static COMMIT_FLOOR: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// How long a host copy must be out of use to go while little is left to
+/// commit, and for how many frames at least.
+#[cfg(any(windows, test))]
+const FLOOR_IDLE_MS: u64 = 2_500;
+#[cfg(any(windows, test))]
+const FLOOR_IDLE_FRAMES: u64 = 60;
+
+/// Whether host copies of textures the title fills go sooner because the
+/// system has little left to commit: `LEONIDA_COMMIT_FLOOR=1` (off by
+/// default; `LEONIDA_AB` can name it), and less left than
+/// `LEONIDA_COMMIT_FLOOR_MB` megabytes (4096 where it is unset: where
+/// `crate::residency` begins to speak of pressure by commit).
+///
+/// A host texture is charged to the system's commit like any memory of the
+/// process, and [`let_go_idle`] kept the copies by the card's room alone: ten
+/// minutes while the card has room, however little the PC has left to commit.
+/// Under the floor, copies out of use for [`FLOOR_IDLE_MS`] and
+/// [`FLOOR_IDLE_FRAMES`] frames go as well ([`commit_floor_times`]); no copy
+/// is refused and none that a list or a descriptor slot holds goes, so no
+/// draw finds less than it did: a texture let go is made and uploaded again
+/// at its next use, which is what it costs. (After kylepelham/El1xr c24c0b2
+/// as 22f73d8 mended it: its first form refused new copies under the floor,
+/// and a scene went dark.)
+#[cfg(windows)]
+fn commit_floor() -> bool {
+    #[cfg(feature = "diagnostics")]
+    let picked = crate::ab::pick("LEONIDA_COMMIT_FLOOR");
+    #[cfg(not(feature = "diagnostics"))]
+    let picked = None;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static FLOOR: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let on = picked.unwrap_or_else(|| *ON.get_or_init(|| std::env::var_os("LEONIDA_COMMIT_FLOOR").is_some_and(|v| v == "1")));
+    on && crate::residency::available_commit()
+        < *FLOOR.get_or_init(|| {
+            std::env::var("LEONIDA_COMMIT_FLOOR_MB").ok().and_then(|mb| mb.trim().parse::<u64>().ok()).unwrap_or(4096) << 20
+        })
+}
+
+/// The idle time and frames of [`let_go_idle`]'s second look, `under` the
+/// commit floor: [`FLOOR_IDLE_MS`] and at least [`FLOOR_IDLE_FRAMES`] frames,
+/// whatever the system has left, so that a copy a draw used lately stays.
+/// None where the card's rule (`ms` and `frames` out of use, `most` bytes of
+/// them at most) already lets go of all that: it has no limit of bytes and
+/// its time is no longer.
+#[cfg(any(windows, test))]
+fn commit_floor_times(under: bool, ms: u64, most: u64, frames: u64) -> Option<(u64, u64)> {
+    (under && (ms > FLOOR_IDLE_MS || most != u64::MAX)).then_some((FLOOR_IDLE_MS, frames.max(FLOOR_IDLE_FRAMES)))
+}
+
+/// For the memory lines: what the commit floor did since the start
+/// ([`COMMIT_FLOOR`]).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn commit_floor_note() -> String {
+    use std::sync::atomic::Ordering::Relaxed;
+    format!(
+        "{} sweeps under the floor, {} host copies of textures let go by it ({} MB) that the card's rule kept",
+        COMMIT_FLOOR[0].load(Relaxed),
+        COMMIT_FLOOR[1].load(Relaxed),
+        COMMIT_FLOOR[2].load(Relaxed) >> 20
+    )
 }
 
 /// Whether textures whose host copy was made again after the sweep let it
@@ -2768,6 +2864,14 @@ fn host_texture_as(
         return Err(why);
     }
     let texture = texture.ok_or(NoTexture::Refused)?;
+    #[cfg(feature = "diagnostics")]
+    if reserved {
+        crate::census::made(&texture, "textures given memory level by level");
+    } else if fills(desc) {
+        crate::census::made(&texture, "textures the title fills, of their own");
+    } else {
+        crate::census::made(&texture, "textures the host renders to or writes");
+    }
     crate::host::name(&texture, || {
         format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
     });
@@ -4120,19 +4224,45 @@ mod tests {
     #[cfg(all(windows, feature = "diagnostics"))]
     #[test]
     fn alias_after_title_upload_copies_the_gpu_atlas() {
+        alias_shows_the_gpu_atlas(false, (3, 1, 1));
+    }
+
+    /// The same with the copy made from texture to texture (`LEONIDA_ALIAS_DIRECT=1`): the
+    /// host copies R32_UINT into R9G9B9E5 as it is, and the view's texture has the packed
+    /// texel bit for bit.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn an_alias_copied_from_texture_to_texture_has_the_gpu_atlas() {
+        alias_shows_the_gpu_atlas(true, (3, 1, 1));
+    }
+
+    /// And with every part of a texture of several layers and levels (the sky light cache has six
+    /// layers, the screen probes' atlas four levels) and of a volume (the cloud and sky tables).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn aliases_of_layers_levels_and_volumes_are_copied_from_texture_to_texture() {
+        alias_shows_the_gpu_atlas(true, (3, 6, 3));
+        alias_shows_the_gpu_atlas(true, (4, 4, 1));
+        alias_shows_the_gpu_atlas(false, (3, 6, 3));
+    }
+
+    /// A packed texel uploaded into a written R32_UINT texture is read back from the texture
+    /// of an R9G9B9E5 view placed in its memory, after an upload of that view from title
+    /// memory and its alias copy: through a buffer, or `direct`, from texture to texture.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    fn alias_shows_the_gpu_atlas(direct: bool, (dimension, depth_or_array_size, mips): (u32, u16, u16)) {
         use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Graphics::Direct3D12::*;
 
         let Some(host) = crate::host::host() else {
             return;
         };
+        crate::texture::TEST_ALIAS_DIRECT.set(Some(direct));
         let null = std::ptr::null();
         let mut source = null;
         let mut view = null;
-        let source_desc = ResourceDesc {
-            flags: 4,
-            ..texture(4, 4, 42, 1)
-        };
+        let shaped = |format: u32| ResourceDesc { dimension, depth_or_array_size, ..texture(8, 8, format, mips) };
+        let source_desc = ResourceDesc { flags: 4, ..shaped(42) };
         assert_eq!(
             create_committed(
                 null, &PROPERTIES, 0, &source_desc, 0, null.cast(), &RESOURCE_IIDS[0], &mut source,
@@ -4141,7 +4271,7 @@ mod tests {
         );
         assert_eq!(
             create_at_address(
-                null, resource(source).data() as u64, &texture(4, 4, 67, 1), 0,
+                null, resource(source).data() as u64, &shaped(67), 0,
                 null.cast(), &RESOURCE_IIDS[0], &mut view,
             ),
             S_OK
@@ -5016,6 +5146,29 @@ float4 lit() : SV_Target { return 1.0; }
         // Both over 88 %: the earlier deadline and the larger trim.
         let vram_over = crate::host::vram_keep(15_000 * MIB, 13_500 * MIB);
         assert_eq!(tighter_keep(vram_over, over), (over.0.min(vram_over.0), over.1.max(vram_over.1)));
+    }
+
+    /// With little left to commit, host copies go after 2.5 s and 60 frames
+    /// out of use instead of the card's ten minutes, and all of them where
+    /// the card's rule lets go of so many bytes only; never one used more
+    /// lately than that, and nothing changes above the floor.
+    /// (`LEONIDA_COMMIT_FLOOR`.)
+    #[test]
+    fn the_commit_floor_never_lets_go_of_a_copy_used_lately() {
+        const MIB: u64 = 1 << 20;
+        let (kept_ms, all) = crate::host::vram_keep(15_000 * MIB, 9_500 * MIB);
+        assert!(kept_ms > FLOOR_IDLE_MS && all == u64::MAX);
+        assert_eq!(commit_floor_times(false, kept_ms, all, 4), None);
+        assert_eq!(commit_floor_times(true, kept_ms, all, 4), Some((FLOOR_IDLE_MS, FLOOR_IDLE_FRAMES)));
+        assert_eq!(commit_floor_times(true, kept_ms, all, 200), Some((FLOOR_IDLE_MS, 200)));
+        // The card nearly full: its rule lets the longest idle go, to a limit of bytes.
+        let (short_ms, some) = crate::host::vram_keep(15_000 * MIB, 14_500 * MIB);
+        assert!(short_ms < FLOOR_IDLE_MS && some != u64::MAX);
+        assert_eq!(commit_floor_times(true, short_ms, some, 4), Some((FLOOR_IDLE_MS, FLOOR_IDLE_FRAMES)));
+        // A rule that lets all go sooner than the floor would: the floor adds nothing.
+        assert_eq!(commit_floor_times(true, 1_000, u64::MAX, 4), None);
+        assert_eq!(commit_floor_times(true, FLOOR_IDLE_MS, u64::MAX, 4), None);
+        assert!(FLOOR_IDLE_MS >= 2_500 && FLOOR_IDLE_FRAMES >= 60);
     }
 
     #[test]

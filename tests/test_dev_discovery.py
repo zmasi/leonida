@@ -92,6 +92,33 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertTrue(result.stderr)
 
+    def test_main_argv_redirected_stringio_and_whitespace_out(self):
+        import importlib.util
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+
+        spec = importlib.util.spec_from_file_location("leonida_dev_entry", ENTRY)
+        dev = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dev)
+
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = dev.main(["discover"])
+        self.assertEqual(rc, 0)
+        self.assertIn("boot-trace", out.getvalue())
+
+        out_json = io.StringIO()
+        with redirect_stdout(out_json):
+            rc = dev.main(["discover", "--json"])
+        self.assertEqual(rc, 0)
+        self.assertIn("tools", json.loads(out_json.getvalue()))
+
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+            dev.main(["guest-scene", "--out", "   "])
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("--out PATH is required", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

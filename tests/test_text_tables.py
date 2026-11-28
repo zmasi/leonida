@@ -12,6 +12,7 @@ import os
 import struct
 import tempfile
 import unittest
+from unittest import mock
 from unittest.mock import patch
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -353,6 +354,63 @@ class TestCli(unittest.TestCase):
             self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")],
                              "staging and backup files must not be left behind")
 
+    def test_failed_later_write_with_readonly_destination_cleans_up_staged_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "conv.pso"), CONV)
+            dialogue = os.path.join(tmp, "dialogue.csv")
+            old = "OLD GOOD REPORT\n"
+            with open(dialogue, "w", encoding="utf-8") as fh:
+                fh.write(old)
+            os.chmod(dialogue, 0o444)
+            tables = os.path.join(tmp, "tables.csv")
+            os.mkdir(tables)                        # a later output that cannot be written
+            with contextlib.redirect_stderr(io.StringIO()) as err:
+                self.assertEqual(T.main([src, "--dialogue", dialogue, "--tables", tables]), 2)
+            self.assertIn("cannot write", err.getvalue())
+            with open(dialogue, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), old)
+            self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")])
+
+    def test_successful_write_with_readonly_destination_cleans_up_backup_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "conv.pso"), CONV)
+            dialogue = os.path.join(tmp, "dialogue.csv")
+            with open(dialogue, "w", encoding="utf-8") as fh:
+                fh.write("OLD\n")
+            os.chmod(dialogue, 0o444)
+            self.assertEqual(T.main([src, "--dialogue", dialogue]), 0)
+            self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")])
+
+    def test_windows_readonly_file_removal_restores_write_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "conv.pso"), CONV)
+            dialogue = os.path.join(tmp, "dialogue.csv")
+            with open(dialogue, "w", encoding="utf-8") as fh:
+                fh.write("OLD\n")
+            os.chmod(dialogue, 0o444)
+            tables = os.path.join(tmp, "tables.csv")
+            os.mkdir(tables)
+
+            real_remove = os.remove
+
+            def windows_strict_remove(path):
+                mode = os.stat(path).st_mode
+                if not (mode & 0o200):
+                    raise PermissionError(13, f"Access is denied: {path}")
+                return real_remove(path)
+
+            with mock.patch("os.remove", side_effect=windows_strict_remove):
+                with contextlib.redirect_stderr(io.StringIO()) as err:
+                    self.assertEqual(T.main([src, "--dialogue", dialogue, "--tables", tables]), 2)
+                self.assertIn("cannot write", err.getvalue())
+            self.assertFalse([f for f in os.listdir(tmp) if f.startswith(".text_tables-")])
+
     def test_report_cannot_replace_the_carve_index(self):
         with tempfile.TemporaryDirectory() as tmp:
             source = os.path.join(tmp, "carve")
@@ -364,6 +422,46 @@ class TestCli(unittest.TestCase):
             self.assertIn("must not overwrite an input", err.getvalue())
             with open(index, "rb") as f:
                 self.assertEqual(f.read(), b'{"files": []}')
+
+    def test_report_cannot_replace_a_file_read_from_a_source_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.makedirs(os.path.join(src, "sub"))
+            resource = write(os.path.join(src, "a.bin"), make_resource(EN))
+            nested = write(os.path.join(src, "sub", "notes.txt"), b"keep")
+            for flag, target, old in (("--tables", nested, b"keep"), ("--strings", resource, make_resource(EN))):
+                with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as code:
+                    T.main([src, flag, target])
+                self.assertEqual(code.exception.code, 2)
+                self.assertIn(f"{flag} would overwrite the input", err.getvalue())
+                with open(target, "rb") as f:
+                    self.assertEqual(f.read(), old)
+
+    def test_new_report_inside_a_source_directory_is_still_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "a.bin"), make_resource(EN))
+            out = os.path.join(src, "tables.csv")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(T.main([src, "--tables", out]), 0)
+            self.assertTrue(os.path.isfile(out))
+
+    def test_report_cannot_replace_a_carved_stream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            data = make_resource(EN)
+            stream = write(os.path.join(carve, f"{0x1100:012x}.bin"), data)
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8") as fh:
+                json.dump({"files": [{"off": 0x1100, "stored": len(data), "size": len(data), "pre": "",
+                                      "head": data[:16].hex()}]}, fh)
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as code:
+                T.main([carve, "--dialogue", stream])
+            self.assertEqual(code.exception.code, 2)
+            self.assertIn("--dialogue would overwrite the input", err.getvalue())
+            with open(stream, "rb") as f:
+                self.assertEqual(f.read(), data)
 
     def test_two_outputs_naming_one_file_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:

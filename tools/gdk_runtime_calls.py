@@ -414,15 +414,25 @@ GUID_CONSTANT = re.compile(
     r"\s*\{([^}]*)\}\s*\}")
 
 
+def runtime_source_paths(path: str) -> list[str]:
+    """The paths of a shim source file, or of every xgameruntime*.cpp in a folder."""
+    if os.path.isdir(path):
+        names = sorted(n for n in os.listdir(path) if n.startswith("xgameruntime") and n.endswith(".cpp"))
+        return [os.path.join(path, n) for n in names]
+    if os.path.isfile(path):
+        return [path]
+    return []
+
+
 def read_runtime_source(path: str) -> str:
     """The text of a shim source file, or of every xgameruntime*.cpp in a folder (OSError when there is none)."""
     if os.path.isdir(path):
-        names = sorted(n for n in os.listdir(path) if n.startswith("xgameruntime") and n.endswith(".cpp"))
-        if not names:
+        paths = runtime_source_paths(path)
+        if not paths:
             raise FileNotFoundError(2, "no xgameruntime*.cpp in the folder", path)
         texts = []
-        for n in names:
-            with open(os.path.join(path, n), encoding="utf-8", errors="replace") as f:
+        for p in paths:
+            with open(p, encoding="utf-8", errors="replace") as f:
                 texts.append(f.read())
         return "\n".join(texts)
     with open(path, encoding="utf-8", errors="replace") as f:
@@ -1041,9 +1051,7 @@ def main(argv: list[str] | None = None) -> int:
         stem = os.path.join(a.out, name + ".gdk_calls")
         json_path = stem + ".json"
         txt_path = stem + ".txt"
-        inputs = list(a.image) + [a.table]
-        if os.path.isfile(a.runtime_source):
-            inputs.append(a.runtime_source)
+        inputs = list(a.image) + [a.table] + runtime_source_paths(a.runtime_source)
         collision = next(
             (out_path for out_path in (json_path, txt_path)
              if any(same_report_path(inp, out_path) for inp in inputs)),

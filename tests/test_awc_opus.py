@@ -692,6 +692,29 @@ class ExportBankTest(unittest.TestCase):
         self.assertEqual(audio[-1]["flags"] & 0x04, 0x04)
         self.assertEqual(sum(1 for p in audio for value in p["lacing"] if value < 255), 26)
 
+    def test_staged_writer_receives_ogg_pages_as_they_are_encoded(self):
+        produced = 0
+        consumed = 0
+        encode = awc.ogg_page
+
+        def page(*args):
+            nonlocal produced
+            produced += 1
+            return encode(*args)
+
+        def sink(path, parts):
+            nonlocal consumed
+            for part in parts:
+                consumed += 1
+                self.assertEqual(produced, consumed)
+                self.assertEqual(part[:4], b"OggS")
+
+        packets = [bytes([0x08]) + bytes(159)] * 100
+        with mock.patch.object(awc, "ogg_page", page), mock.patch.object(awc, "_write_file_parts", sink):
+            end = awc.write_ogg_opus("synthetic.ogg", packets, 1, 21)
+        self.assertEqual(end, 96000)
+        self.assertGreater(consumed, 3)
+
     def test_pre_skip_larger_than_the_stream_is_clamped(self):
         # Six 960-frame packets are 5760 samples; a pre-skip of 65535 would put the
         # EOS granule below the pre-skip and make the stream undecodable.
@@ -820,6 +843,117 @@ class StreamedMusicTest(unittest.TestCase):
                 _, music = awc.parse_awc(bank)
                 for collect in (True, False):
                     self.assertEqual(awc.music_channels(bank, *music[0], collect_packets=collect), [])
+
+    def test_interleaved_stereo_skip_and_block_sample_budget_trim_padding(self):
+        # Stereo 20 ms packets (TOC 0xFC) = 960 frames = 1920 interleaved samples each.
+        # Chunk 0 declares block_samples=3840 (2 stereo packets) with 1 trailing padding packet `pad`.
+        # Chunk 1 declares interleaved skip=1920 (repeating `y`, NOT `pad`) and block_samples=3840.
+        x, y, pad, z = b"\xfcx", b"\xfcy", b"\xfcp", b"\xfcz"
+        bank = bytearray(build_repeating_music_bank([
+            [(0, [x, y, pad])],
+            [(1920, [y, z])],
+        ], group_samples=[2 * 2880]))
+        _, music = awc.parse_awc(bank)
+        _, (data_offset, _) = music[0]
+        chunk_size = 2048 * 2
+        struct.pack_into("<I", bank, data_offset + 12, 3840)
+        struct.pack_into("<I", bank, data_offset + chunk_size + 12, 3840)
+        channels = awc.music_channels(bytes(bank), *music[0])
+        self.assertEqual(len(channels), 1)
+        self.assertEqual(channels[0][4], [x, y, z])
+        self.assertEqual((channels[0][1], channels[0][5]), (2880, 2))
+        metadata = awc.music_channels(bytes(bank), *music[0], collect_packets=False)
+        self.assertEqual(metadata, [(*channels[0][:4], [], 2)])
+
+    def test_short_block_deficit_continuation_and_partial_rejection(self):
+        # Chunk 0 budgets 3 stereo packets but supplies 2 (1920 frames, a 960-frame deficit).
+        # Chunk 1 declares skip=1920 (960 frames == prev_deficit -> net_skip=0, keep all packets).
+        x, y, z, w = b"\xfcx", b"\xfcy", b"\xfcz", b"\xfcw"
+        bank = bytearray(build_repeating_music_bank([
+            [(0, [x, y])],
+            [(1920, [z, w])],
+        ], group_samples=[2 * 3840]))
+        _, music = awc.parse_awc(bank)
+        _, (data_offset, _) = music[0]
+        chunk_size = 2048 * 2
+        struct.pack_into("<I", bank, data_offset + 12, 5760)
+        struct.pack_into("<I", bank, data_offset + chunk_size + 12, 3840)
+        channels = awc.music_channels(bytes(bank), *music[0])
+        self.assertEqual(len(channels), 1)
+        self.assertEqual(channels[0][4], [x, y, z, w])
+
+        # With skip=3840 (1920 frames; net_skip=960 after 960-frame deficit), drops exactly 1 packet (`z`).
+        struct.pack_into("<I", bank, data_offset + chunk_size + 8, 3840)
+        channels = awc.music_channels(bytes(bank), *music[0])
+        self.assertEqual(len(channels), 1)
+        self.assertEqual(channels[0][4], [x, y, w])
+
+        # Non-packet-boundary deficit skip (net_skip=480 when packet is 960 frames) still fails closed.
+        struct.pack_into("<I", bank, data_offset + chunk_size + 8, 2880)
+        self.assertEqual(awc.music_channels(bytes(bank), *music[0]), [])
+
+    def test_empty_budgeted_block_carries_its_full_deficit(self):
+        packet = b"\xfca"  # 960 stereo frames, or 1920 interleaved samples.
+        bank = bytearray(build_repeating_music_bank([
+            [(0, [packet])],
+            [(0, [])],
+            [(1920, [packet])],
+        ], group_samples=[3840]))
+        _, music = awc.parse_awc(bank)
+        _, (data_offset, _) = music[0]
+        empty_block = data_offset + 4096
+        struct.pack_into("<III", bank, empty_block + 4, 0, 0, 1920)
+        data = bytes(bank)
+        channels = awc.music_channels(data, *music[0])
+        self.assertEqual(channels, [(0x100, 1920, 48000, 0x0B, [packet, packet], 2)])
+        self.assertTrue(all(type(p) is bytes for p in channels[0][4]))
+        self.assertEqual(awc.music_channels(data, *music[0], collect_packets=False), [(0x100, 1920, 48000, 0x0B, [], 2)])
+
+    def test_empty_unbudgeted_block_preserves_the_prior_deficit(self):
+        a, b = b"\xfca", b"\xfcb"
+        bank = bytearray(build_repeating_music_bank([
+            [(0, [a])],
+            [(0, [])],
+            [(1920, [b])],
+        ], group_samples=[3840]))
+        _, music = awc.parse_awc(bank)
+        _, (data_offset, _) = music[0]
+        struct.pack_into("<I", bank, data_offset + 12, 3840)
+        data = bytes(bank)
+        self.assertEqual(awc.music_channels(data, *music[0]), [(0x100, 1920, 48000, 0x0B, [a, b], 2)])
+        self.assertEqual(awc.music_channels(data, *music[0], collect_packets=False), [(0x100, 1920, 48000, 0x0B, [], 2)])
+
+    def test_budget_scan_stops_at_the_reaching_packet(self):
+        a, b, c = b"\xfca", b"\xfcb", b"\xfcc"
+        with mock.patch.object(awc, "opus_samples", wraps=awc.opus_samples) as duration:
+            self.assertEqual(awc._trim_packets_to_budget([a, b, c], 960), ([a], 0))
+        duration.assert_called_once_with(a)
+
+    def test_music_metadata_does_not_retain_all_packet_payloads(self):
+        if tracemalloc.is_tracing():
+            self.skipTest("this allocation check needs its own tracing interval")
+        packet = b"\xfc" + bytes(1023)
+        block_count = 128
+        bank = build_repeating_music_bank([[(0, [packet])]] * block_count)
+        _, music = awc.parse_awc(bank)
+        _, (data_offset, _) = music[0]
+
+        class NoPacketSlices(bytes):
+            def __getitem__(self, key):
+                if isinstance(key, slice) and (key.stop is None or key.stop > data_offset + 2048):
+                    raise AssertionError("metadata scan sliced packet payload bytes")
+                return super().__getitem__(key)
+
+        data = NoPacketSlices(bank)
+        tracemalloc.start()
+        try:
+            channels = awc.music_channels(data, *music[0], collect_packets=False)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(len(channels), 1)
+        self.assertEqual(channels[0][4:], ([], 2))
+        self.assertLess(peak, len(packet) * block_count, f"peak {peak:,} retained packet payloads")
 
     def test_two_mono_groups_export_two_mono_oggs(self):
         counts, od = self.export([[0x78, 0x78], [0x78, 0x78]], 960)

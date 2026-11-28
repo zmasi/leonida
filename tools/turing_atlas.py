@@ -16,9 +16,14 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 
 CASES = {
@@ -115,7 +120,7 @@ OpReturn
 def run(cmd, **kw):
     try:
         return subprocess.run(cmd, capture_output=True, text=True, **kw)
-    except FileNotFoundError:
+    except OSError:
         return None
 
 
@@ -128,7 +133,9 @@ def _device_rank(pdev):
     }
     vendor = pdev.get("vendorID")
     native = 0 if vendor == 0x1414 else 10
-    return native + type_ranks.get(pdev.get("deviceType"), 0)
+    dtype = pdev.get("deviceType")
+    rank = type_ranks.get(dtype, 0) if type(dtype) in (int, str) else 0
+    return native + rank
 
 
 def _extract_profile(doc):
@@ -149,7 +156,7 @@ def _extract_profile(doc):
     if not all(isinstance(x, dict) for x in (pdev, v11, v13p, v13f, v11f)):
         return None
     name = pdev.get("deviceName")
-    if not isinstance(name, str) or not name:
+    if not isinstance(name, str) or not name.strip():
         return None
     return _device_rank(pdev), {
         "vulkaninfo": "ok",
@@ -198,9 +205,9 @@ def vulkan_matrix():
 
         for path in files:
             try:
-                with open(path, encoding="utf-8") as f:
+                with open(path, encoding="utf-8-sig") as f:
                     doc = json.load(f)
-            except (OSError, ValueError):
+            except (OSError, ValueError, RecursionError):
                 continue
             parsed = _extract_profile(doc)
             if parsed is not None and parsed[0] > best_rank:
@@ -224,12 +231,14 @@ def validate_cases():
                 f.write(asm)
             ra = run(["spirv-as", src, "-o", spv, "--target-env", "vulkan1.4"])
             if ra is None or ra.returncode != 0:
-                out[name] = {"assemble": False, "stderr": (ra.stderr if ra else "missing")[:300]}
+                err = "missing" if ra is None else (ra.stderr or "")
+                out[name] = {"assemble": False, "stderr": err[:300]}
                 continue
             rv = run(["spirv-val", "--target-env", "vulkan1.4", spv])
+            err = "missing" if rv is None else (rv.stderr or "")
             out[name] = {"assemble": True,
                          "valid": bool(rv and rv.returncode == 0),
-                         "stderr": ((rv.stderr if rv else "") or "")[:300]}
+                         "stderr": err[:300]}
     # A broken toolchain can reject everything and still reject the malformed control.
     compute = out["compute32"]
     compute["control_ok"] = compute.get("valid") is True
@@ -248,10 +257,42 @@ def validate_cases():
     return out
 
 
-def main():
+def _write_text_atomic(path, text):
+    """Publish complete text atomically, leaving any previous file intact on failure."""
+    destination = os.path.realpath(path)
+    out_dir = os.path.dirname(destination) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(destination, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return
+    if mode is not None:
+        os.close(os.open(destination, os.O_WRONLY))
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=out_dir, prefix=".turing_atlas-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            staged.write(text)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description="Turing bring-up atlas (no game data).")
     ap.add_argument("--out", default=None, help="write JSON atlas to FILE (default: stdout)")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.out is not None:
         if not a.out.strip():
             print("turing_atlas: error: --out must not be empty", file=sys.stderr)
@@ -268,14 +309,10 @@ def main():
         atlas["gpu"] = atlas["features"].get("device", {}).get("name")
     except AttributeError:
         pass
-    text = json.dumps(atlas, indent=2, sort_keys=True)
+    text = json.dumps(atlas, indent=2, sort_keys=True, allow_nan=False)
     if a.out:
         try:
-            folder = os.path.dirname(a.out)
-            if folder:
-                os.makedirs(folder, exist_ok=True)
-            with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-                f.write(text + "\n")
+            _write_text_atomic(a.out, text + "\n")
         except OSError as error:
             print(f"turing_atlas: error: cannot write {a.out}: {error.strerror or error}", file=sys.stderr)
             return 2

@@ -44,5 +44,26 @@ class MovkTest(unittest.TestCase):
         self.assertEqual(step({"op": "s_movk_i32", "args": [sgpr(4), sgpr(6)]}).get(4), None)
 
 
+class WideScalarDestinationTests(unittest.TestCase):
+    def test_wide_destinations_do_not_attach_scalar_tags_and_clear_prior_state(self):
+        wide4 = {"k": "sgpr", "r": 4, "n": 2}
+        cases = [
+            ("s_add_u32", [wide4, {"k": "imm", "v": 1}, {"k": "imm", "v": 2}]),
+            ("s_addc_u32", [wide4, {"k": "imm", "v": 0}, {"k": "imm", "v": 0}]),
+            ("s_min_i32", [wide4, {"k": "imm", "v": 1}, {"k": "imm", "v": 2}]),
+            ("s_lshl_b32", [wide4, sgpr(6), {"k": "imm", "v": 4}]),
+        ]
+        for op, args in cases:
+            with self.subTest(op=op):
+                sym = {4: ("const", 11), 5: ("const", 22)}
+                scale = {4: frozenset((16,)), 5: frozenset((32,))}
+                ptr_stride = {4: frozenset((8,)), 5: frozenset((16,))}
+                shader_meta._step_state(sym, scale, ptr_stride, {}, {"op": op, "args": args})
+                for r in (4, 5):
+                    self.assertNotIn(r, sym)
+                    self.assertNotIn(r, scale)
+                    self.assertNotIn(r, ptr_stride)
+
+
 if __name__ == "__main__":
     unittest.main()

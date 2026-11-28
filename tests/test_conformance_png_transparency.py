@@ -52,6 +52,38 @@ class TransparencyTest(unittest.TestCase):
         self.assertEqual(rgba.pixel_rgba(0, 0), (10, 20, 30, 0))
         self.assertEqual(C.compare_rasters(rgb, rgba).differing_pixels, 1)
 
+    def test_invalid_critical_chunk_structure_is_rejected(self):
+        path = self.png("structure.png")
+        header, image, trailer = C.split_png_chunks(path.read_bytes(), str(path))
+        palette = (b"PLTE", bytes((10, 20, 30)))
+        text = (b"tEXt", b"Label\0synthetic")
+        cases = (
+            ([header, header, image, trailer], "duplicate IHDR"),
+            ([header, image, (b"IEND", b"x")], "IEND must be empty"),
+            ([header, image, text, image, trailer], "IDAT chunks must be consecutive"),
+            ([header, (b"ABCD", b""), image, trailer], "unknown critical chunk"),
+            ([header, (b"1234", b""), image, trailer], "invalid PNG chunk type"),
+            ([header, (b"a1CD", b""), image, trailer], "invalid PNG chunk type"),
+            ([header, (b"ab\xffD", b""), image, trailer], "invalid PNG chunk type"),
+            ([header, palette, palette, image, trailer], "duplicate PLTE"),
+            ([header, image, palette, trailer], "invalid PLTE"),
+            ([header, (b"PLTE", b"x"), image, trailer], "invalid PLTE"),
+        )
+        for chunks, error in cases:
+            with self.subTest(error=error):
+                path.write_bytes(C.PNG_SIGNATURE + b"".join(C.make_chunk(k, v) for k, v in chunks))
+                with self.assertRaisesRegex(C.ToolError, error):
+                    C.read_png(str(path))
+
+    def test_consecutive_idat_and_optional_rgb_palette_are_supported(self):
+        path = self.png("split.png")
+        header, image, trailer = C.split_png_chunks(path.read_bytes(), str(path))
+        payload = image[1]
+        chunks = [header, (b"PLTE", bytes((10, 20, 30))), (b"tEXt", b"Label\0synthetic"),
+                  (b"IDAT", payload[:3]), (b"IDAT", b""), (b"IDAT", payload[3:]), trailer]
+        path.write_bytes(C.PNG_SIGNATURE + b"".join(C.make_chunk(k, v) for k, v in chunks))
+        self.assertEqual(C.read_png(str(path)).pixel_rgba(0, 0), (10, 20, 30, 255))
+
     def test_diff_refuses_transparency_in_either_input_without_a_heatmap(self):
         for transparent_side in ("reference", "candidate"):
             with self.subTest(side=transparent_side):

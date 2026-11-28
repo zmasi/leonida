@@ -406,6 +406,43 @@ class ImageTest(unittest.TestCase):
             self.assertEqual(f.read(), original)
         self.assertFalse(os.path.exists(os.path.join(aliased_dir, "thunks.dll.gdk_calls.txt")))
 
+    def test_main_refuses_out_that_overwrites_runtime_source_folder_file(self):
+        source_dir = os.path.join(self.tmp, "shims")
+        os.makedirs(source_dir, exist_ok=True)
+        shim_file = os.path.join(source_dir, "xgameruntime_user.cpp")
+        with open(shim_file, "w", encoding="utf-8") as f:
+            f.write("constexpr GUID kUserClass = {0x01acd177, 0x91f9, 0x4763, {0xa3, 0x8e, 0xcc, 0xbb, 0x55, 0xce, 0x32, 0xe0}};\n")
+        with open(shim_file, "rb") as f:
+            original = f.read()
+        aliased_dir = os.path.join(self.tmp, "out-source")
+        os.makedirs(aliased_dir, exist_ok=True)
+        aliased = os.path.join(aliased_dir, "thunks.dll.gdk_calls.json")
+        try:
+            os.link(shim_file, aliased)
+        except (OSError, NotImplementedError) as err:
+            self.skipTest(f"hard links unavailable: {err}")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            rc = grc.main([self.path, "--runtime-source", source_dir, "--out", aliased_dir])
+        self.assertEqual(rc, 1)
+        self.assertIn("would overwrite input file", stderr.getvalue())
+        with open(shim_file, "rb") as f:
+            self.assertEqual(f.read(), original)
+        self.assertFalse(os.path.exists(os.path.join(aliased_dir, "thunks.dll.gdk_calls.txt")))
+
+    def test_runtime_source_paths_directory_and_file(self):
+        folder = os.path.join(self.tmp, "probe_shims")
+        os.makedirs(folder, exist_ok=True)
+        p1 = os.path.join(folder, "xgameruntime_a.cpp")
+        p2 = os.path.join(folder, "xgameruntime_b.cpp")
+        p3 = os.path.join(folder, "other.cpp")
+        for p in (p1, p2, p3):
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("")
+        self.assertEqual(grc.runtime_source_paths(folder), [p1, p2])
+        self.assertEqual(grc.runtime_source_paths(p1), [p1])
+        self.assertEqual(grc.runtime_source_paths(os.path.join(folder, "nonexistent")), [])
+
     def test_the_default_source_is_every_runtime_shim(self):
         # The classes xgameruntime.cpp hands on to its sibling files count as served: XUserImpl, XGameSaveImpl and
         # XStoreImpl live in xgameruntime_user.cpp, _gamesave.cpp and _store.cpp.

@@ -263,5 +263,106 @@ class RestartTraces(unittest.TestCase):
             self.assertEqual(trace1.read_text(encoding="utf-8"), '{"attempt": 1}\n')
 
 
+class GuardsAndAtomicIO(unittest.TestCase):
+    def test_unwritable_transcript_does_not_spawn_title(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.object(xc.subprocess, "Popen", side_effect=AssertionError("should not spawn")):
+                with self.assertRaises(OSError):
+                    xc.run_title([sys.executable, "-c", "pass"], os.environ, tmp, xc.Run("synthetic"),
+                                 [], 1, None, Sink(), [], transcript=tmp)
+
+    def test_fractional_timeout_preserves_subsecond_reason(self):
+        script = "import time\nprint('[RUN] probe', flush=True)\ntime.sleep(5)\n"
+        run = xc.Run("synthetic")
+        with tempfile.TemporaryDirectory() as tmp:
+            hung = xc.run_title([sys.executable, "-I", "-c", script], os.environ, tmp, run,
+                                ["probe"], 0.5, None, Sink(), [])
+        self.assertEqual(hung, "probe")
+        self.assertEqual(run.checks["probe"]["reason"], "no output for 0.5 s")
+
+    def test_kill_tree_ignores_already_exited_process(self):
+        proc = mock.Mock(pid=12345)
+        proc.kill.side_effect = ProcessLookupError("already exited")
+        xc.kill_tree(proc)
+
+    def _make_fake_env(self, root):
+        xcl_dir = root / "xcl"
+        rel = xcl_dir / "target" / "release"
+        rel.mkdir(parents=True)
+        for name in ("xcl.exe", "xcl_testtitle.exe", "testgame_mw.dll"):
+            (rel / name).write_bytes(b"stub")
+        testgame = xcl_dir / "tests" / "data" / "testgame"
+        testgame.mkdir(parents=True)
+        (testgame / "marker.txt").write_text("clean", encoding="utf-8", newline="\n")
+        gta6rt = root / "gta6rt.exe"
+        gta6rt.write_bytes(b"stub")
+        return xcl_dir, gta6rt
+
+    def test_run_all_rejects_bad_out_and_paths_before_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xcl_dir, gta6rt = self._make_fake_env(root)
+            work = root / "work"
+            out_dir = root / "out_dir"
+            out_dir.mkdir()
+            cases = [
+                {"out": ""},
+                {"out": "   "},
+                {"out": str(out_dir)},
+                {"out": str(root / "folder") + os.sep},
+                {"work": "   "},
+            ]
+            with mock.patch.object(xc, "run_title", side_effect=AssertionError("should not run")):
+                for overrides in cases:
+                    with self.subTest(**overrides):
+                        ns = argparse.Namespace(
+                            xcl=str(xcl_dir), gta6rt=str(gta6rt), work=str(work),
+                            timeout=15.0, max_restarts=1, skip=[], cdb=None, out=None,
+                        )
+                        for k, v in overrides.items():
+                            setattr(ns, k, v)
+                        with self.assertRaises(SystemExit):
+                            xc.run_all(ns, Sink())
+
+    def test_run_all_report_write_is_atomic_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            xcl_dir, gta6rt = self._make_fake_env(root)
+            work = root / "work"
+            work.mkdir()
+            out = work / "report.json"
+            prior = '{"prior": true}\n'
+            out.write_text(prior, encoding="utf-8", newline="\n")
+            real_open = open
+
+            class FailingWriter:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    return False
+
+                def write(self, _data):
+                    raise OSError("disk full")
+
+            def fail_write(path, mode="r", *args, **kwargs):
+                if "w" in mode and os.path.abspath(str(path)) == os.path.abspath(str(out)):
+                    real_open(path, "w", encoding="utf-8", newline="\n").close()
+                    return FailingWriter()
+                return real_open(path, mode, *args, **kwargs)
+
+            args = argparse.Namespace(
+                xcl=str(xcl_dir), gta6rt=str(gta6rt), work=str(work),
+                timeout=15.0, max_restarts=0, skip=[], cdb=None, out=str(out),
+            )
+            with mock.patch.object(xc, "run_title", return_value=None), \
+                    mock.patch("builtins.open", side_effect=fail_write), \
+                    mock.patch.object(xc, "replace_retry", side_effect=OSError("disk full"), create=True):
+                with self.assertRaises(OSError):
+                    xc.run_all(args, Sink())
+            self.assertEqual(out.read_text(encoding="utf-8"), prior)
+            self.assertEqual([p.name for p in work.glob("*.tmp")], [])
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -490,6 +490,63 @@ class MalformedCarveIndex(unittest.TestCase):
         self.assertIn("row 0 needs an 'off'", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
+    def test_utf8_bom_index_json_loads_cleanly(self):
+        with tempfile.TemporaryDirectory() as root:
+            payload = pamh_payload(2, 2, [5, 6, 7, 8], [1, 2, 3, 4])
+            with open(os.path.join(root, "000000001000.bin"), "wb") as f:
+                f.write(payload)
+            idx_bytes = json.dumps({
+                "files": [{"off": 0x1000, "stored": len(payload), "size": len(payload), "head": payload[:16].hex()}]
+            }).encode("utf-8")
+            with open(os.path.join(root, "index.json"), "wb") as f:
+                f.write(b"\xef\xbb\xbf" + idx_bytes)
+            out_json = os.path.join(root, "report.json")
+            result = subprocess.run(
+                [sys.executable, "-I", TOOL, root, "--json", out_json],
+                capture_output=True, text=True, errors="replace",
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(out_json, "rb") as f:
+                raw = f.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertEqual(len(json.loads(raw.decode("utf-8"))["payloads"]), 1)
+
+    def test_index_rejects_bad_off_and_row_field_types(self):
+        for bad_off in (True, -1, "0x1000", None):
+            with self.subTest(bad_off=bad_off):
+                result = self.run_tool({"files": [{"off": bad_off, "stored": 12}]})
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("must be a non-negative integer", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(ValueError, "'head' must be a hex string"):
+                gamedata_maps._read_row(root, {"off": 0x1000, "head": 12345})
+            self.assertEqual(gamedata_maps._read_row(root, {"off": 0x1000, "head": None}), b"")
+
+            payload = pamh_payload(2, 2, [5, 6, 7, 8], [1, 2, 3, 4])
+            with open(os.path.join(root, "000000001000.bin"), "wb") as f:
+                f.write(payload)
+            rows_null = [{"off": 0x1000, "stored": None, "size": None, "head": payload[:16].hex()}]
+            parsed = gamedata_maps.read_payloads(root, rows=rows_null)
+            self.assertEqual(len(parsed), 1)
+            self.assertEqual(parsed[0]["stored"], 0)
+
+            with self.assertRaisesRegex(ValueError, "non-negative integer"):
+                gamedata_maps.read_payloads(root, rows=[{"off": 0x1000, "stored": True, "size": len(payload)}])
+
+    def test_atomic_json_write_rejects_nan_and_preserves_existing_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            out_path = os.path.join(root, "maps.json")
+            sentinel = '{"keep": true}\n'
+            with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(sentinel)
+            with self.assertRaises(ValueError):
+                gamedata_maps._write_json(out_path, {"bad": float("nan")})
+            with open(out_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), sentinel)
+            self.assertEqual(os.listdir(root), ["maps.json"])
+
 
 if __name__ == "__main__":
     unittest.main()

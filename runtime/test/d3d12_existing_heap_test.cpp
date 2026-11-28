@@ -87,7 +87,12 @@ int check(ID3D12Device* device, const char* who) {
     EXPECT_HR(device3->OpenExistingHeapFromAddress(nullptr, IID_PPV_ARGS(&heap.p)), E_INVALIDARG);
     EXPECT(heap.p == nullptr);
     EXPECT_HR(device3->OpenExistingHeapFromFileMapping(nullptr, IID_PPV_ARGS(&heap.p)), E_INVALIDARG);
-    EXPECT_HR(device3->OpenExistingHeapFromFileMapping(reinterpret_cast<HANDLE>(0x1234), IID_PPV_ARGS(&heap.p)),
+    // A low integer may name a live handle; -1 is the current-process pseudo-handle.
+    // Choose a negative value outside that range and verify the test precondition.
+    const HANDLE invalid_mapping = reinterpret_cast<HANDLE>(static_cast<INT_PTR>(-0x10000));
+    DWORD handle_flags = 0;
+    EXPECT(!GetHandleInformation(invalid_mapping, &handle_flags));
+    EXPECT_HR(device3->OpenExistingHeapFromFileMapping(invalid_mapping, IID_PPV_ARGS(&heap.p)),
               E_INVALIDARG);
     EXPECT(heap.p == nullptr);
     Ref<ID3D12Device5> device5;

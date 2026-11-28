@@ -126,6 +126,46 @@ class GamedataSps1AtomicTests(unittest.TestCase):
                 doc = json.load(f)
             self.assertEqual(doc["payloads"][0]["table"]["records"], 1)
 
+    def test_non_dir_json_ancestor_refused_before_reading_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = os.path.join(tmp, "sample.bin")
+            blocker = os.path.join(tmp, "file_blocker")
+            with open(bin_path, "wb") as f:
+                f.write(_sps1_blob([("alpha.sps", "alpha", 0)]))
+            with open(blocker, "wb") as f:
+                f.write(b"not a dir")
+            for bad_out in (os.path.join(blocker, "out.json"), os.path.join(blocker, "nested", "out.json")):
+                with self.subTest(bad_out=bad_out):
+                    err = io.StringIO()
+                    with mock.patch.object(gamedata_sps1, "read_payloads", side_effect=AssertionError("read target")), \
+                            contextlib.redirect_stderr(err):
+                        rc = gamedata_sps1.main([bin_path, "--json", bad_out])
+                    self.assertEqual(rc, 1)
+                    self.assertIn("error:", err.getvalue())
+
+    def test_directory_shaders_and_special_target_fail_upfront_exit_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bin_path = os.path.join(tmp, "sample.bin")
+            shader_dir = os.path.join(tmp, "shaders_dir")
+            os.makedirs(shader_dir)
+            with open(bin_path, "wb") as f:
+                f.write(_sps1_blob([("alpha.sps", "alpha", 0)]))
+            err = io.StringIO()
+            with mock.patch.object(gamedata_sps1, "read_payloads", side_effect=AssertionError("read target")), \
+                    contextlib.redirect_stderr(err):
+                rc = gamedata_sps1.main([bin_path, "--shaders", shader_dir])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", err.getvalue())
+
+            err2 = io.StringIO()
+            with mock.patch.object(gamedata_sps1.os.path, "exists", return_value=True), \
+                    mock.patch.object(gamedata_sps1.os.path, "isfile", return_value=False), \
+                    mock.patch.object(gamedata_sps1.os.path, "isdir", return_value=False), \
+                    contextlib.redirect_stderr(err2):
+                rc2 = gamedata_sps1.main([bin_path])
+            self.assertEqual(rc2, 2)
+            self.assertIn("ERROR:", err2.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

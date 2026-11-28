@@ -124,8 +124,11 @@ class F64RoundSpecialSources(unittest.TestCase):
             # Source modifiers first: floor of -(+subnormal) is -1 and ceil of |-subnormal| is 1.
             self.assertEqual(run_bits("v_floor_f64_e64 v[4:5], -v[0:1]", smallest), self.SIGN | self.ONE)
             self.assertEqual(run_bits("v_ceil_f64_e64 v[4:5], |v[0:1]|", smallest | self.SIGN), self.ONE)
-            # The output modifiers then work on that result: ceil of the smallest subnormal, doubled, is 2.
-            self.assertEqual(run_bits("v_ceil_f64_e64 v[4:5], v[0:1] mul:2", smallest), 0x4000000000000000)
+            # Of the output modifiers only `clamp` then works on that result (the omod is dropped, docs/design.md,
+            # "v_add_f64 output modifiers"): ceil of the smallest subnormal stays 1 under mul:2, and floor of the
+            # smallest negative one, -1, clamps to 0.
+            self.assertEqual(run_bits("v_ceil_f64_e64 v[4:5], v[0:1] mul:2", smallest), self.ONE)
+            self.assertEqual(run_bits("v_floor_f64_e64 v[4:5], v[0:1] clamp", smallest | self.SIGN), 0)
 
     def test_every_other_source_still_goes_through_the_driver_s_function(self):
         cases = (("v_trunc_f64", -0.75, -0.0), ("v_ceil_f64", -0.25, -0.0), ("v_rndne_f64", 2.5, 2.0),
@@ -165,6 +168,8 @@ class F64RoundTests(unittest.TestCase):
                 self.assertEqual(tuple(run_op(op, value)), words(want))
 
     def test_vop3_modifiers(self):
+        # clamp applies; mul:2/mul:4/div:2 do nothing on RDNA2 while f64 denormals are kept (docs/design.md,
+        # "v_add_f64 output modifiers"): trunc(|-2.75|) = 2.0 clamped to 1.0, floor(-(-2.75)) = 2.0 unscaled.
         low, high = words(-2.75)
         text = support.translate_lines("ps_f64_mod", [
             f"v_mov_b32 v0, {low:#x}", f"v_mov_b32 v1, {high:#x}",
@@ -172,7 +177,26 @@ class F64RoundTests(unittest.TestCase):
             "v_floor_f64_e64 v[4:5], -v[0:1] mul:2",
             "exp mrt0 v2, v3, v4, v5 done vm", "s_endpgm",
         ])
-        self.assertEqual(tuple(support.mrt0_words(text)), words(1.0) + words(4.0))
+        self.assertEqual(tuple(support.mrt0_words(text)), words(1.0) + words(2.0))
+
+    def test_vop3_modifiers_on_the_other_three(self):
+        # The case above puts an omod on v_floor_f64. A `mul:2` on each of the other three is what separates them
+        # from main: trunc(|-2.75|) = 2.0, ceil(-2.75) = -2.0, rndne(2.5) = 2.0, none of them scaled. A scale would
+        # give 4.0, -4.0 and 4.0, and clamp is left out so nothing hides the difference.
+        low, high = words(-2.75)
+        cases = (
+            ("v_trunc_f64_e64 v[2:3], |v[0:1]| mul:2", 2.0),
+            ("v_ceil_f64_e64 v[2:3], v[0:1] mul:2", -2.0),
+            ("v_rndne_f64_e64 v[2:3], 0x40040000 mul:4", 2.0),
+        )
+        for instruction, want in cases:
+            with self.subTest(instruction=instruction):
+                text = support.translate_lines("ps_f64_mod", [
+                    f"v_mov_b32 v0, {low:#x}", f"v_mov_b32 v1, {high:#x}",
+                    instruction,
+                    "exp mrt0 v2, v3 done vm", "s_endpgm",
+                ])
+                self.assertEqual(tuple(support.mrt0_words(text)), tuple(words(want)) + (0, 0))
 
     def test_rejects_bad_operand_forms(self):
         for instruction in ("v_floor_f64 v4, v[0:1]", "v_round_f64 v[4:5], v[0:1]",

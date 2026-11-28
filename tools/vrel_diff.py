@@ -257,6 +257,8 @@ class State:
         self.exec = (1 << wave) - 1
 
     def scalar(self, tok):
+        if not tok:
+            raise RefError("empty scalar operand")
         if tok == "m0":
             if self.m0 is None:
                 raise RefError("M0 read before it is written")
@@ -273,7 +275,7 @@ class State:
             raise RefError(f"source {tok}") from None
 
     def vreg(self, tok):
-        if tok[0] != "v" or not tok[1:].isdigit():
+        if not tok or tok[0] != "v" or not tok[1:].isdigit():
             raise RefError(f"not a VGPR: {tok}")
         return self.index(int(tok[1:]))
 
@@ -284,7 +286,7 @@ class State:
 
     def lanes(self, tok):
         """Per-lane values of a source."""
-        if tok[0] == "v" and tok[1:].isdigit():
+        if tok and tok[0] == "v" and tok[1:].isdigit():
             return list(self.v[self.vreg(tok)])
         return [self.scalar(tok)] * self.wave
 
@@ -301,7 +303,7 @@ class State:
             self.exec = (self.exec & ~M32) | val if self.wave == 64 else val
         elif dst == "exec_hi" and self.wave == 64:
             self.exec = (self.exec & M32) | (val << 32)
-        elif dst[0] == "s" and dst[1:].isdigit():
+        elif dst and dst[0] == "s" and dst[1:].isdigit():
             self.s[int(dst[1:])] = val
         else:
             raise RefError(f"scalar destination {dst}")
@@ -312,21 +314,33 @@ def step(st, line):
     args = [a.strip() for a in rest.split(",")] if rest.strip() else []
     base = op[:-4] if op.endswith(("_e32", "_e64")) else op
     if base == "s_mov_b32":
+        if len(args) != 2:
+            raise RefError(f"{op}: expected 2 operands, got {len(args)}")
         st.set_scalar(args[0], st.scalar(args[1]))
     elif base == "s_add_u32":
+        if len(args) != 3:
+            raise RefError(f"{op}: expected 3 operands, got {len(args)}")
         st.set_scalar(args[0], st.scalar(args[1]) + st.scalar(args[2]))
     elif base == "v_mbcnt_lo_u32_b32" and args[1:] == ["-1", "0"]:
         st.write(st.vreg(args[0]), [min(lane, 32) for lane in range(st.wave)])
-    elif base == "v_mbcnt_hi_u32_b32" and args[1] == "-1":
+    elif base == "v_mbcnt_hi_u32_b32" and len(args) == 3 and args[1] == "-1":
         add = st.lanes(args[2])
         st.write(st.vreg(args[0]), [max(lane - 32, 0) + add[lane] for lane in range(st.wave)])
     elif base in ("v_mov_b32", "v_mul_lo_u32", "v_xor_b32", "v_add_nc_u32"):
+        want_argc = 2 if base == "v_mov_b32" else 3
+        if len(args) != want_argc:
+            raise RefError(f"{op}: expected {want_argc} operands, got {len(args)}")
         srcs = [st.lanes(a) for a in args[1:]]
         f = {"v_mov_b32": lambda a: a[0], "v_mul_lo_u32": lambda a: a[0] * a[1], "v_xor_b32": lambda a: a[0] ^ a[1],
              "v_add_nc_u32": lambda a: a[0] + a[1]}[base]
         st.write(st.vreg(args[0]), [f([s[lane] for s in srcs]) for lane in range(st.wave)])
     elif base == "v_writelane_b32":
-        lane = int(args[2], 0) % st.wave
+        if len(args) != 3:
+            raise RefError(f"{op}: expected 3 operands, got {len(args)}")
+        try:
+            lane = int(args[2], 0) % st.wave
+        except ValueError:
+            raise RefError(f"{op}: bad lane {args[2]!r}") from None
         st.v[st.vreg(args[0])][lane] = st.scalar(args[1])
     elif base in OPS:
         rel(st, base, args)
@@ -335,8 +349,10 @@ def step(st, line):
 
 
 def rel(st, op, args):
+    if len(args) != 2:
+        raise RefError(f"{op}: expected 2 operands, got {len(args)}")
     d, s = args
-    if op != "v_movreld_b32" and not (s[0] == "v" and s[1:].isdigit()):
+    if op != "v_movreld_b32" and not (s and s[0] == "v" and s[1:].isdigit()):
         raise RefError(f"{op} takes a VGPR source")
     if op == "v_swap_b32":
         do = so = 0
@@ -411,9 +427,15 @@ def translated(lines, wave, name="ps_vrel"):
 
 def compare(want, got):
     """None when every lane's 32 words match, else the first difference."""
+    if not isinstance(got, (list, tuple)) or len(got) != len(want):
+        got_desc = len(got) if isinstance(got, (list, tuple)) else type(got).__name__
+        return f"lane count mismatch: expected {len(want)}, got {got_desc}"
     for lane, (w, g) in enumerate(zip(want, got)):
         if g is None:
             return f"lane {lane}: the translated program exported nothing"
+        if not isinstance(g, (list, tuple)) or len(g) != WINDOW:
+            got_desc = len(g) if isinstance(g, (list, tuple)) else type(g).__name__
+            return f"lane {lane}: expected {WINDOW} words, got {got_desc}"
         for r in range(WINDOW):
             if w[r] != g[r]:
                 return f"lane {lane} v{r}: reference 0x{w[r]:08x}, translated 0x{g[r]:08x}"
@@ -468,9 +490,10 @@ def events(prog):
                         else "inline float" if s in FLOATS else "literal" if s.startswith("0x") else "inline integer")
                 ev[f"v_movreld_b32 {kind} source"] += 1
             if base in TWO_FIELDS:
-                if st.m0 & 0xFC00FC00:
+                m0 = st.scalar("m0")
+                if m0 & 0xFC00FC00:
                     ev["ignored M0 bits set"] += 1
-                if int(d[1:]) + (st.m0 >> 16 & 0x3FF) == int(s[1:]) + (st.m0 & 0x3FF):
+                if st.vreg(d) + (m0 >> 16 & 0x3FF) == st.vreg(s) + (m0 & 0x3FF):
                     ev["one register on both sides"] += 1
             if st.exec != (1 << prog.wave) - 1:
                 ev["partial EXEC"] += 1
@@ -502,7 +525,11 @@ def run_suite(programs, seed, max_ops=8, ops=None, waves=(32,), run=None):
         counts["mismatch"] += 1
         if failure is None:
             small = shrink(prog, (lambda p: check(p, run)))
-            failure = (label, prog, small, check(small, run) or detail)
+            try:
+                small_detail = check(small, run) or detail
+            except Skip:
+                small_detail = detail
+            failure = (label, prog, small, small_detail)
     return counts, failure
 
 
@@ -585,8 +612,12 @@ def main(argv=None):
     if args.self_test:
         return 0 if self_test() else 1
     ops = None
-    if args.ops:
-        ops = [o.strip() for o in args.ops.split(",") if o.strip()]
+    if args.ops is not None:
+        tokens = [o.strip() for o in args.ops.split(",")]
+        if not any(tokens) or any(not o for o in tokens):
+            print("--ops must be a comma-separated list of opcodes (see --list-ops)", file=sys.stderr)
+            return 2
+        ops = list(dict.fromkeys(tokens))
         unknown = [o for o in ops if o not in OPS]
         if unknown:
             print(f"unknown op(s): {', '.join(unknown)} (see --list-ops)", file=sys.stderr)

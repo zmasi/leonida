@@ -149,14 +149,28 @@ def main(argv=None):
                 except ValueError as e:
                     print(f"{dim} wave{wave}: cannot build the kernel: {e}")
                     return 2
-                res = oracle.run([k])[0]
+                raw = oracle.run([k])
+                if not isinstance(raw, (list, tuple)) or len(raw) != 1:
+                    got_desc = len(raw) if isinstance(raw, (list, tuple)) else type(raw).__name__
+                    print(f"{dim} wave{wave}: expected 1 oracle result, got {got_desc}")
+                    return 2
+                res = raw[0]
                 if isinstance(res, str):
                     print(f"{dim} wave{wave}: kernel rejected: {res}")
                     return 2
-                if any(w == tsharp.POISON for w in res):
+                if not isinstance(res, (list, tuple)) or len(res) != len(rows):
+                    got_desc = len(res) if isinstance(res, (list, tuple)) else type(res).__name__
+                    print(f"{dim} wave{wave}: expected {len(rows)} words, got {got_desc}")
+                    return 2
+                bad_types = [type(w).__name__ for w in res if isinstance(w, bool) or not isinstance(w, int)]
+                if bad_types:
+                    print(f"{dim} wave{wave}: expected {len(rows)} int words, got {bad_types[0]} element")
+                    return 2
+                masked = [w & 0xFFFFFFFF for w in res]
+                if any(w == tsharp.POISON for w in masked):
                     print(f"{dim} wave{wave}: the texture did not land 256-byte aligned (POISON)")
                     return 2
-                got[wave] = [struct.unpack("<f", struct.pack("<I", w))[0] for w in res]
+                got[wave] = [struct.unpack("<f", struct.pack("<I", w))[0] for w in masked]
             for i, (name, _d, start, off) in enumerate(rows):
                 want = expected(dim, start, off)
                 g32, g64 = got[32][i], got[64][i]
@@ -165,6 +179,12 @@ def main(argv=None):
                 extra = "" if g32 == g64 else f" (wave64 {g64:.0f})"
                 print(f"{name:16} offset 0x{off:06x} hw {g32:6.0f}{extra:14} rule {want:6.0f}  {'ok' if ok else 'DIFFERS'}")
         return 1 if bad else 0
+    except runner.Unavailable as e:
+        print(f"hardware oracle unavailable: {e}")
+        return 77
+    except RuntimeError as e:
+        print(f"harness error: {e}")
+        return 2
     finally:
         oracle.close()
 

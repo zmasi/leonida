@@ -13,10 +13,13 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import zlib
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 # Constants from meshlet_page.py
@@ -24,6 +27,8 @@ BLOCK_MAGIC = 0x3063       # 63 30 00 00
 OTHER_BLOCK_MAGIC = 0x4042 # 42 40 00 00
 HEADER_SIZE = 0x60
 SLOT_COUNT = 23
+MAX_INFLATE = 64 << 20
+DECOMPRESS_CHUNK = 1 << 20
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
 
 def _u32(data, at):
@@ -66,7 +71,39 @@ def is_mesh_page(data):
     except Exception:
         return False
 
-def iter_archive_streams(path):
+def _inflate_bounded(m, offset, size, max_inflate):
+    """Inflate one zlib stream at `offset` inside `m`, aborting if output exceeds `max_inflate` bytes."""
+    d = zlib.decompressobj()
+    chunks = []
+    total = 0
+    p = offset
+    try:
+        while not d.eof and p < size:
+            block = m[p:min(p + DECOMPRESS_CHUNK, size)]
+            if not block:
+                break
+            p += len(block)
+            while block and not d.eof:
+                chunk = d.decompress(block, DECOMPRESS_CHUNK)
+                block = d.unconsumed_tail
+                if chunk:
+                    total += len(chunk)
+                    if total > max_inflate:
+                        return None, 0
+                    chunks.append(chunk)
+                if not block:
+                    break
+    except zlib.error:
+        return None, 0
+    if not d.eof:
+        return None, 0
+    used = p - offset - len(d.unused_data)
+    if used <= 0:
+        return None, 0
+    return b"".join(chunks), used
+
+
+def iter_archive_streams(path, max_inflate=MAX_INFLATE):
     """Yield (stream_offset, decompressed_data) for every zlib stream that is a mesh page."""
     with open(path, "rb") as fh:
         if not os.fstat(fh.fileno()).st_size:
@@ -82,26 +119,13 @@ def iter_archive_streams(path):
                 if not match:
                     break
                 s = match.start()
-                try:
-                    d = zlib.decompressobj()
-                    chunks = []
-                    p = s
-                    while not d.eof and p < size:
-                        block = m[p:p + (1 << 20)]
-                        chunks.append(d.decompress(block))
-                        p += len(block)
-                        if d.unused_data or d.eof:
-                            break
-                    out = b"".join(chunks) + d.flush()
-                except zlib.error:
-                    pos = s + 1
-                    continue
-                if not d.eof or len(out) < 64:
+                out, used = _inflate_bounded(m, s, size, max_inflate)
+                if out is None or len(out) < 64:
                     pos = s + 1
                     continue
                 if is_mesh_page(out):
                     yield f"0x{s:x}", out
-                pos = p - len(d.unused_data)
+                pos = s + used
         finally:
             m.close()
 
@@ -159,8 +183,10 @@ def parse_4240_block(data, at, stream_end):
     
     return record, at + HEADER_SIZE
 
-def process_archive(archive_path, limit=None):
+def process_archive(archive_path, limit=None, max_inflate=MAX_INFLATE):
     """Process an RPF9 archive and return stats on 4240 blocks."""
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise ValueError("limit must be at least 1")
     stats = {
         "archive": archive_path,
         "streams": 0,
@@ -175,8 +201,8 @@ def process_archive(archive_path, limit=None):
         "errors": 0,
     }
     
-    for stream_name, stream_data in iter_archive_streams(archive_path):
-        if limit and stats["streams"] >= limit:
+    for stream_name, stream_data in iter_archive_streams(archive_path, max_inflate=max_inflate):
+        if limit is not None and stats["streams"] >= limit:
             break
         stats["streams"] += 1
         
@@ -229,6 +255,9 @@ def process_archive(archive_path, limit=None):
                 stats["blocks_6330"] += 1
                 pos += HEADER_SIZE
             elif word & 0x80000000:
+                if pos + 12 > len(stream_data):
+                    pos += 4
+                    continue
                 head = _u32(stream_data, pos)
                 meshlets = head & 0x7FFFFFFF
                 triangles = _u32(stream_data, pos + 4)
@@ -239,13 +268,37 @@ def process_archive(archive_path, limit=None):
                 end = ref_at + 2 * refs
                 if end <= len(stream_data):
                     pos = end
+                    stats["groups"] += 1
                 else:
                     pos += 4
-                stats["groups"] += 1
             else:
                 pos += 4
     
     return stats
+
+def write_json(path, output):
+    """Atomically write LF-only JSON, preserving file permissions and cleaning up temp files on error."""
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target) or "."
+    os.makedirs(parent, exist_ok=True)
+    payload = (json.dumps(output, indent=2, allow_nan=False) + "\n").encode("utf-8")
+    fd, tmp_path = tempfile.mkstemp(prefix=".analyze_4240_full_", suffix=".tmp", dir=parent)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+        os.chmod(tmp_path, published_mode(target))
+        replace_retry(tmp_path, target)
+    except BaseException:
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
 
 def positive_int(text):
     """--limit: 0 is falsy and scanned everything, and a negative number scanned one stream."""
@@ -324,12 +377,8 @@ def main() -> int:
             s_copy["strides_from_slot0"] = {str(k): v for k, v in s["strides_from_slot0"].items()}
             s_copy["slot_tag_counts"] = {str(k): v for k, v in s["slot_tag_counts"].items()}
             output.append(s_copy)
-        parent = os.path.dirname(os.path.abspath(args.json))
         try:
-            if parent:      # every archive has been read by now; a missing folder used to lose the run
-                os.makedirs(parent, exist_ok=True)
-            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(output, f, indent=2)
+            write_json(args.json, output)
         except OSError as e:
             print(f"ERROR: cannot write {args.json}: {e.strerror or e}", file=sys.stderr)
             return 2

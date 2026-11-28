@@ -18,6 +18,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <chrono>
 #include <map>
 #include <condition_variable>
@@ -1279,13 +1280,42 @@ private:
                 char value[2]{};
                 return GetEnvironmentVariableA("LEONIDA_DSTORAGE_FAST_BCPACK", value, sizeof value) != 1 || value[0] != '0';
             }();
+            // LEONIDA_DSTORAGE_LOST_DIVISOR=N: a fitted BC6H/BC7 request may rebuild up to 1 in N of its blocks from
+            // a predictor the profile lacks (default 32; 1024 is the reference decoder's limit). Past it the request
+            // fails, as before. A few approximate blocks cost a few wrong 4x4 texels; a failed request leaves the
+            // whole destination untouched.
+            static const std::size_t lost_divisor = [] {
+                char value[16]{};
+                const DWORD n = GetEnvironmentVariableA("LEONIDA_DSTORAGE_LOST_DIVISOR", value, sizeof value);
+                if (n == 0 || n >= sizeof value) return std::size_t(32);
+                char* end = nullptr;
+                const unsigned long v = std::strtoul(value, &end, 10);
+                if (end == value || *end || v < 1) {
+                    log_once("lost-divisor", std::string("LEONIDA_DSTORAGE_LOST_DIVISOR=") + value +
+                                                 " is not a positive number: using 32");
+                    return std::size_t(32);
+                }
+                return std::size_t(v);
+            }();
             const char* failure = nullptr;
-            const auto quality = leonida::bcpack::decode(bc, data, scratch, allow_fitted, bc >= 6 ? bcpack_history() : nullptr, &failure, fast_entropy);
+            leonida::bcpack::Report report;
+            const auto quality = leonida::bcpack::decode(bc, data, scratch, allow_fitted, bc >= 6 ? bcpack_history() : nullptr,
+                                                         &failure, fast_entropy, lost_divisor, &report);
             e.timing.bcpack = Timing::elapsed(begin);
             if (quality == leonida::bcpack::Quality::failed) { e.reason = failure; return E_DSTORAGE_DECOMPRESSION_ERROR; }
             if (quality == leonida::bcpack::Quality::fitted) {
                 static const bool reported = (log_once("fitted", "using fitted BCPack predictors"), true);
                 (void)reported;
+                if (report.lost) {
+                    static std::atomic<std::uint64_t> requests{0}, blocks{0};
+                    const auto n = requests.fetch_add(1) + 1;
+                    const auto total = blocks.fetch_add(report.lost) + report.lost;
+                    if (n <= 8 || (n & (n - 1)) == 0)   // the first eight, then at powers of two
+                        std::fprintf(stderr, "[rt] dstorage: BC%u request approximated %zu of %zu blocks from predictors the "
+                                     "profile lacks (%llu requests, %llu blocks so far; LEONIDA_DSTORAGE_LOST_DIVISOR=%zu)\n",
+                                     bc, report.lost, report.blocks, static_cast<unsigned long long>(n),
+                                     static_cast<unsigned long long>(total), lost_divisor);
+                }
                 if (leonida::dstorage::trace_enabled())
                     std::fprintf(stderr, "[rt] ds-fitted bc=%u bytes=%u\n", bc, r.DestinationSize);
             }

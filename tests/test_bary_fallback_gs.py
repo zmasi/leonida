@@ -790,6 +790,65 @@ class TestMainAndCLI(unittest.TestCase):
             with self.assertRaises(ValueError):
                 bary_fallback_gs.gs_spvasm([0], bad)
 
+    def test_gs_spvasm_rejects_negative_bool_and_float_input_locations(self) -> None:
+        for bad in (-1, "-2", True, False, 1.5, None, "abc"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    bary_fallback_gs.gs_spvasm([bad], 5)
+
+    def test_index_rejects_path_traversal_shader_names(self) -> None:
+        for bad_name in ("../escape", "/abs_escape", "sub/ps", "sub\\ps", "..", "."):
+            with self.subTest(bad_name=bad_name), tempfile.TemporaryDirectory() as outer:
+                spirv_dir = os.path.join(outer, "spirv")
+                os.makedirs(spirv_dir)
+                with open(os.path.join(spirv_dir, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    json.dump({bad_name: {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}, f)
+                with self.assertRaisesRegex(ValueError, "invalid shader name"):
+                    bary_fallback_gs.write_for_index(spirv_dir)
+                self.assertEqual(os.listdir(outer), ["spirv"])
+
+    def test_main_rejects_malformed_fields_without_traceback(self) -> None:
+        bad_cases = [
+            (["--pair", "vs", "ps"], {"vs": {"stage": "vs", "capabilities": None}, "ps": {"stage": "ps", "bary_fallback_input": {"location": 1}}}),
+            (["--pair", "vs", "ps"], {"vs": {"stage": "vs", "capabilities": [1]}, "ps": {"stage": "ps", "bary_fallback_input": {"location": 1}}}),
+            ([], {"ps": {"stage": "ps", "inputs": [0], "bary_fallback_input": True}}),
+            ([], {"ps": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"other": 1}}}),
+            ([], {"ps": {"stage": "ps", "inputs": None, "bary_fallback_input": {"location": 1}}}),
+            ([], {"ps": {"stage": "ps", "inputs": "01", "bary_fallback_input": {"location": 1}}}),
+        ]
+        for extra_args, index in bad_cases:
+            with self.subTest(extra_args=extra_args, index=index), tempfile.TemporaryDirectory() as tmp:
+                with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(index, f)
+                code, out, err = self._call_main(["bary_fallback_gs.py", tmp, *extra_args])
+                self.assertEqual(code, 1)
+                self.assertEqual(out, "")
+                self.assertNotIn("Traceback", err)
+                self.assertNotEqual(err.strip(), "")
+
+    def test_utf8_bom_index_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            index_path = os.path.join(tmp, "index.json")
+            with open(index_path, "w", encoding="utf-8-sig", newline="\n") as f:
+                json.dump({"ps_bom": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}, f)
+            written = bary_fallback_gs.write_for_index(tmp)
+            self.assertEqual(written, [os.path.join(tmp, "ps_bom.bary_gs.spvasm")])
+
+    def test_write_for_index_atomic_preserves_existing_file_on_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"ps_a": {"stage": "ps", "inputs": [0], "bary_fallback_input": {"location": 1}}}, f)
+            target = os.path.join(tmp, "ps_a.bary_gs.spvasm")
+            with open(target, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; previous helper\n")
+            with mock.patch.object(bary_fallback_gs.os, "replace", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    bary_fallback_gs.write_for_index(tmp)
+            with open(target, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), "; previous helper\n")
+            leftovers = [name for name in os.listdir(tmp) if name.startswith(".bary-gs-")]
+            self.assertEqual(leftovers, [])
+
 
 if __name__ == "__main__":
     unittest.main()

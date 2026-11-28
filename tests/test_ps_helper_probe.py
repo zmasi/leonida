@@ -194,6 +194,35 @@ class CliAndJsonTests(unittest.TestCase):
             with open(real_path, encoding="utf-8") as f:
                 self.assertEqual(json.load(f)["device"], "mock-gpu")
 
+    def test_validate_json_path_and_upfront_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_parent = os.path.join(tmp, "file_not_dir")
+            with open(bad_parent, "w", encoding="utf-8", newline="\n") as f:
+                f.write("x")
+            for bad in ("", "   ", tmp, tmp + os.sep, os.path.join(bad_parent, "out.json")):
+                self.assertIsNotNone(H.validate_json_path(bad), bad)
+                err_buf = io.StringIO()
+                with mock.patch.object(H, "measure", side_effect=AssertionError("must not run")) as m, \
+                        contextlib.redirect_stderr(err_buf):
+                    rc = H.main(["--build", "dummy", "--json", bad])
+                self.assertEqual(rc, 2)
+                m.assert_not_called()
+
+    def test_atomic_json_write_and_replace_failure_preserves_existing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "report.json")
+            err = H.write_json_report(out, {"device": "ok", "checks": [], "words": {}})
+            self.assertIsNone(err)
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": true}\n')
+            with mock.patch.object(H, "replace_retry", side_effect=OSError("replace denied")):
+                err = H.write_json_report(out, {"device": "new"})
+            self.assertIsNotNone(err)
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": true}\n')
+
 
 @unittest.skipUnless(os.environ.get("LEONIDA_PS_ORACLE_BUILD"), "set LEONIDA_PS_ORACLE_BUILD to a runtime build "
                      "and select an AMD GPU (LEONIDA_VK_DEVICE) to measure helper lanes on hardware")

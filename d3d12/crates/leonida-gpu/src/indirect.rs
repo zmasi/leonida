@@ -101,6 +101,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint asked = 0;
     uint2 draw_counts = uint2(0, 0);
     uint3 groups = uint3(0, 0, 0);
+    // A dispatch record that asks for more groups in x than run (and is no unfilled slot): what
+    // it asked for, and the groups that do not run.
+    uint wide = 0;
+    uint wide_cut = 0;
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
@@ -124,11 +128,16 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
         uint3 g = src_args.Load3(src_at);
+        uint asked_x = g.x;
         // Up to WIDEST groups in x run as asked (`widest`).
         g = min(g, uint3(g.x <= WIDEST ? WIDEST : 65535u, 65535u, 65535u));
         // x * y fits 32 bits where it is looked at; the whole count may not.
         if ((g.y != 0 && g.x > GROUPS / g.y) || (g.z != 0 && g.x * g.y > GROUPS / g.z)) {
             g = uint3(0, 0, 0);
+        }
+        if (asked_x > g.x && asked_x <= (1u << 24)) {
+            wide = asked_x;
+            wide_cut = asked_x - g.x;
         }
         cost = g.x * g.y * g.z * 64u;
         groups = g;
@@ -217,6 +226,12 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     if (!active) {
         return;
     }
+    // Diagnostics, in the budget buffer's words 5 and 6.
+    if (wide > 0) {
+        uint was;
+        budget.InterlockedMax(20, wide, was);
+        budget.InterlockedAdd(24, wide_cut, was);
+    }
     bool over = fits[gi] == 0;
     if (kind <= 1) {
         if (over) {
@@ -292,21 +307,210 @@ fn make_for(device: &ID3D12Device) -> windows::core::Result<Clamp> {
 /// its last 1,905 tiles, the lowest of the picture. The console runs what it
 /// is asked (its dispatch counts are 32 bits), and so does an AMD card, whose
 /// dispatch packets and group numbers are the same; D3D12 does not look at
-/// indirect counts. Other cards stay at 65,535.
-fn widest(amd: bool) -> u32 {
+/// indirect counts.
+///
+/// Any other card is asked ([`runs_wide`]). Until 2026-11-27 they all stayed at 65,535: on an
+/// RTX 4060 Ti the first list asked for 85,856 to 86,544 groups at the save, so that its last
+/// 20,300 (2,540 tiles of 16 x 16 pixels, a sixth of the picture: its lower left, behind a
+/// stepped edge) got no final gather in any frame. That card runs every group of 65,536,
+/// 67,440, 86,000, 115,200, 262,144 and 2^20 once, each under its own number.
+fn widest(device: &ID3D12Device) -> u32 {
     let on = std::env::var_os("LEONIDA_INDIRECT_WIDE").is_none_or(|v| v != "0");
-    if amd && on { 1 << 20 } else { 65_535 }
+    if on && (amd(device) || runs_wide(device)) { WIDE } else { 65_535 }
 }
 
-/// Whether `device` is an AMD card's.
-pub(crate) fn amd(device: &ID3D12Device) -> bool {
+/// The groups in x of a dispatch a card that runs wide ones is given at most ([`widest`]).
+const WIDE: u32 = 1 << 20;
+
+/// The description of `device`'s adapter.
+fn adapter_of(device: &ID3D12Device) -> Option<windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_DESC1> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, IDXGIAdapter1, IDXGIFactory4};
     // SAFETY: plain queries.
     unsafe {
         CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
             .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(device.GetAdapterLuid()))
             .and_then(|a| a.GetDesc1())
-            .is_ok_and(|d| d.VendorId == 0x1002)
+            .ok()
+    }
+}
+
+/// Whether `device` is an AMD card's.
+pub(crate) fn amd(device: &ID3D12Device) -> bool {
+    adapter_of(device).is_some_and(|d| d.VendorId == 0x1002)
+}
+
+/// The program [`runs_wide`] asks a card with: one thread to a group, which counts itself and
+/// folds its group's number into a sum, an exclusive or and a maximum.
+const WIDE_PROBE: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer seen : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main(uint3 group : SV_GroupID) {
+    uint was;
+    seen.InterlockedAdd(0, 1, was);
+    seen.InterlockedAdd(4, group.x, was);
+    seen.InterlockedXor(8, group.x, was);
+    seen.InterlockedMax(12, group.x, was);
+}
+"#;
+
+/// What [`WIDE_PROBE`] leaves of a dispatch of `groups` in x of which every group ran once
+/// under its own number: the groups, the sum of their numbers (its low 32 bits), their
+/// exclusive or and the largest. Pure.
+fn wide_seen(groups: u32) -> [u32; 4] {
+    let Some(last) = groups.checked_sub(1) else {
+        return [0; 4];
+    };
+    let sum = u64::from(groups) * u64::from(last) / 2;
+    // (the exclusive or of 0 to `last` goes round in fours)
+    let xor = [last, 1, last.wrapping_add(1), 0][(last % 4) as usize];
+    [groups, sum as u32, xor, last]
+}
+
+/// Whether the card of `device` runs every group of an indirect dispatch of more than 65,535
+/// groups in x (of [`WIDE`], the most it is then given), each once and under its own number.
+/// D3D12 names 65,535 as the most of a dispatch and looks at no indirect count; what a card
+/// does with more is its driver's, so it is asked: once for each adapter of a run, with one
+/// dispatch of a program of ours on a queue of its own, when the clamp is made (with the run's
+/// first indirect execution). A software adapter is not asked, and a card that cannot be asked
+/// or runs anything else stays at 65,535.
+fn runs_wide(device: &ID3D12Device) -> bool {
+    static ASKED: std::sync::Mutex<Vec<((u32, i32), bool)>> = std::sync::Mutex::new(Vec::new());
+    let Some(adapter) = adapter_of(device) else {
+        return false;
+    };
+    if adapter.Flags & windows::Win32::Graphics::Dxgi::DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0 {
+        return false;
+    }
+    let key = (adapter.AdapterLuid.LowPart, adapter.AdapterLuid.HighPart);
+    let mut asked = ASKED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&(_, runs)) = asked.iter().find(|(k, _)| *k == key) {
+        return runs;
+    }
+    let started = std::time::Instant::now();
+    let seen = ask_wide(device, WIDE);
+    let runs = seen.as_ref().is_ok_and(|seen| *seen == wide_seen(WIDE));
+    let name = String::from_utf16_lossy(&adapter.Description);
+    tracing::info!(
+        card = name.trim_end_matches(char::from(0)),
+        runs,
+        asked = WIDE,
+        ?seen,
+        expected = ?wide_seen(WIDE),
+        ms = started.elapsed().as_secs_f64() * 1e3,
+        "the card was asked whether it runs an indirect dispatch of more than 65,535 groups in x (seen: the groups run, the sum of their numbers, their exclusive or, the largest); where it does not, such dispatches are cut to 65,535"
+    );
+    asked.push((key, runs));
+    runs
+}
+
+/// What [`WIDE_PROBE`] saw of one indirect dispatch of `groups` x 1 x 1 on `device`.
+fn ask_wide(device: &ID3D12Device, groups: u32) -> windows::core::Result<[u32; 4]> {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+    use windows::core::Interface;
+    let buffer = |heap: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| {
+        let heap = D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: 256,
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: flags,
+            ..Default::default()
+        };
+        let mut made: Option<ID3D12Resource> = None;
+        // SAFETY: plain creation of a small buffer.
+        unsafe { device.CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut made)? };
+        let made = made.ok_or_else(windows::core::Error::empty);
+        #[cfg(feature = "diagnostics")]
+        if let Ok(made) = &made {
+            crate::census::made(made, "buffers of the question about wide dispatches");
+        }
+        made
+    };
+    // SAFETY: the source and names live through the compile; the root signature is inside the
+    // shader; a queue, list and buffers of our own, which nothing else knows; the list is run
+    // and waited for before anything of it is read or given up.
+    unsafe {
+        let mut code: Option<ID3DBlob> = None;
+        D3DCompile(
+            WIDE_PROBE.as_ptr().cast(),
+            WIDE_PROBE.len(),
+            s!("wide"),
+            None,
+            None,
+            s!("main"),
+            s!("cs_5_1"),
+            0,
+            0,
+            &mut code,
+            None,
+        )?;
+        let code = code.ok_or_else(windows::core::Error::empty)?;
+        let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
+        let root: ID3D12RootSignature = device.CreateRootSignature(0, bytes)?;
+        let pso: ID3D12PipelineState = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+            pRootSignature: std::mem::transmute_copy(&root),
+            CS: D3D12_SHADER_BYTECODE { pShaderBytecode: bytes.as_ptr().cast(), BytecodeLength: bytes.len() },
+            ..Default::default()
+        })?;
+        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+            ..Default::default()
+        })?;
+        let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
+        let list: ID3D12GraphicsCommandList =
+            device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)?;
+        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+        let argument = D3D12_INDIRECT_ARGUMENT_DESC { Type: D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH, ..Default::default() };
+        let mut signature: Option<ID3D12CommandSignature> = None;
+        device.CreateCommandSignature(
+            &D3D12_COMMAND_SIGNATURE_DESC { ByteStride: 12, NumArgumentDescs: 1, pArgumentDescs: &argument, NodeMask: 0 },
+            None::<&ID3D12RootSignature>,
+            &mut signature,
+        )?;
+        let signature = signature.ok_or_else(windows::core::Error::empty)?;
+        // The record, and behind it the zeros that what is seen starts from.
+        let args = buffer(D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_GENERIC_READ)?;
+        let mut data = std::ptr::null_mut();
+        args.Map(0, None, Some(&mut data))?;
+        for (w, word) in [groups, 1, 1, 0, 0, 0, 0, 0].into_iter().enumerate() {
+            data.cast::<u32>().add(w).write_volatile(word);
+        }
+        args.Unmap(0, None);
+        let seen = buffer(D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COMMON)?;
+        let back = buffer(D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)?;
+        list.ResourceBarrier(&[transition(&seen, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+        list.CopyBufferRegion(&seen, 0, &args, 16, 16);
+        list.ResourceBarrier(&[transition(&seen, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+        list.SetComputeRootSignature(&root);
+        list.SetPipelineState(&pso);
+        list.SetComputeRootUnorderedAccessView(0, seen.GetGPUVirtualAddress());
+        list.ExecuteIndirect(&signature, 1, &args, 0, None, 0);
+        list.ResourceBarrier(&[transition(&seen, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+        list.CopyBufferRegion(&back, 0, &seen, 0, 16);
+        list.Close()?;
+        queue.ExecuteCommandLists(&[Some(list.cast()?)]);
+        queue.Signal(&fence, 1)?;
+        let started = std::time::Instant::now();
+        while fence.GetCompletedValue() < 1 {
+            device.GetDeviceRemovedReason()?;
+            if started.elapsed() > std::time::Duration::from_secs(10) {
+                // (what the list holds is still the card's to use: left alive)
+                std::mem::forget((root, pso, queue, allocator, list, signature, args, seen, back));
+                return Err(windows::core::Error::empty());
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+        let mut data = std::ptr::null_mut();
+        back.Map(0, None, Some(&mut data))?;
+        let words: [u32; 4] = std::array::from_fn(|w| data.cast::<u32>().add(w).read_volatile());
+        back.Unmap(0, None);
+        Ok(words)
     }
 }
 
@@ -323,7 +527,7 @@ fn rest() -> u32 {
 fn make_from(device: &ID3D12Device, source: &str) -> windows::core::Result<Clamp> {
     #[cfg(feature = "diagnostics")]
     let batched = source == batch::SOURCE;
-    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(amd(device)), rest());
+    let source = &format!("#define WIDEST {}u\n#define REST {}\n{source}", widest(device), rest());
     let mut code: Option<ID3DBlob> = None;
     let mut errors: Option<ID3DBlob> = None;
     // SAFETY: the source and names live through the call; out pointers ours.
@@ -670,6 +874,7 @@ pub(crate) fn open_batch(
     // A source there is none of is the first again, which no job names.
     let mut ids = [0u64; batch::SOURCES];
     let mut sources = [gpu(source.1)?; batch::SOURCES];
+    let mut read = vec![source.1];
     ids[0] = source.0;
     let others = recent.iter().filter(|r| r.0 != source.0).take(batch::SOURCES - 1);
     for (i, (id, buffer)) in others.enumerate() {
@@ -678,11 +883,29 @@ pub(crate) fn open_batch(
             // copies draws read (`Shadow::refresh`).
             list.keep(buffer);
             (ids[i + 1], sources[i + 1]) = (*id, at);
+            read.push(buffer);
         }
     }
+    // (Timing experiments, each a switch of `LEONIDA_AB`: `batch::Wait`.)
+    #[cfg(feature = "diagnostics")]
+    let wait = if crate::ab::pick("LEONIDA_EXP_BATCH_NO_WAIT") == Some(true) {
+        batch::Wait::None
+    } else if crate::ab::pick("LEONIDA_EXP_BATCH_WAIT_SOURCES") == Some(true) {
+        batch::Wait::For(&read)
+    } else {
+        batch::Wait::All
+    };
+    #[cfg(not(feature = "diagnostics"))]
+    let wait = {
+        let _ = &read;
+        batch::Wait::All
+    };
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
-    batch::record(c, &list.list, (&dst, before), budget, sources, jobs);
+    // (A command of its own for the timing run: its time was the next execution's.)
+    #[cfg(feature = "diagnostics")]
+    list.note_op(|| "clamp batch".to_owned());
+    batch::record(c, &list.list, (&dst, before), budget, sources, jobs, wait);
     // SAFETY: the list's own upload memory of that many bytes, 256-byte
     // aligned, until it is reset.
     Some((unsafe { batch::Table::new(at, base, ids) }, dst))
@@ -3038,9 +3261,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
         sig.unwrap()
     }
 
-    /// An AMD card runs every group of an indirect dispatch of more than
-    /// 65,535, each under its own number: the title's tile lists
-    /// ([`widest`]), clamped one by one and in a batch. Others are not asked.
+    /// A card that runs wide dispatches (an AMD card, or one that said so when asked: an RTX
+    /// 4060 Ti does) runs every group of an indirect dispatch of more than 65,535, each under
+    /// its own number: the title's tile lists ([`widest`]), clamped one by one and in a batch.
     #[test]
     fn card_runs_wide_indirect_dispatches() {
         const CS: &str = r#"
@@ -3059,7 +3282,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
         let Some(mut gpu) = WarpHarness::on(false) else {
             return;
         };
-        if !amd(&gpu.device) || widest(true) == 65_535 {
+        if widest(&gpu.device) == 65_535 {
             return;
         }
         let worker = compile_cs(&gpu.device, CS).expect("the worker must compile");
@@ -3083,7 +3306,7 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                         src_ptr.cast::<u32>().add(w).write_volatile(word);
                     }
                     if batched {
-                        batch::record(&pass, &gpu.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+                        batch::record(&pass, &gpu.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu, batch::Wait::All);
                         assert_eq!(batch::Table::new(table_ptr, 0, [1, 0, 0, 0]).place(1, 0, 2), Some(0));
                     } else {
                         let to = (&dst, D3D12_RESOURCE_STATE_COMMON);
@@ -3103,6 +3326,103 @@ void main(uint3 group : SV_GroupID, uint3 thread : SV_DispatchThreadID) {
                 assert_eq!([word(0), word(1), word(2)], [runs, runs - 1, runs - 1], "asked for {asked}, batched {batched}");
                 let wrong = (0..runs as usize).find(|&g| word(4 + g) != 1);
                 assert_eq!((wrong, word(4 + runs as usize)), (None, 0), "every group once, asked for {asked}");
+            }
+        }
+    }
+
+    /// What the program a card is asked with leaves when every group ran once under its own
+    /// number, and that a card that ran fewer, or the groups under folded numbers, is told apart.
+    #[test]
+    fn what_a_wide_dispatch_leaves_is_known() {
+        let slow = |groups: u32| {
+            let numbers = 0..groups;
+            [
+                groups,
+                numbers.clone().fold(0u32, u32::wrapping_add),
+                numbers.clone().fold(0, |a, g| a ^ g),
+                numbers.max().unwrap_or(0),
+            ]
+        };
+        for groups in [0, 1, 2, 3, 4, 5, 6, 7, 8, 65_535, 65_536, 86_544, 115_200, WIDE] {
+            assert_eq!(wide_seen(groups), slow(groups), "{groups} groups");
+        }
+        assert_eq!(wide_seen(WIDE), [1 << 20, 0xfff8_0000, 0, (1 << 20) - 1]);
+        // cut to 65,535; and 2^16 groups run 16 times under the same numbers
+        assert_ne!(wide_seen(WIDE), wide_seen(65_535));
+        let folded = wide_seen(65_536).map(|w| w.wrapping_mul(16));
+        assert_ne!(wide_seen(WIDE)[1..], [folded[1], 0, 65_535]);
+    }
+
+    /// The question itself, where there is a card: a dispatch any card runs is seen whole (1, 5
+    /// and 65,535 groups), a card that says it runs wide ones is given them and one that does
+    /// not is not, and the software adapter is not asked.
+    #[test]
+    fn a_card_is_asked_whether_it_runs_wide_dispatches() {
+        if let Some(warp) = WarpHarness::new() {
+            assert!(!runs_wide(&warp.device), "a software adapter is not asked");
+            assert_eq!(widest(&warp.device), 65_535);
+        }
+        let Some(gpu) = WarpHarness::on(false) else {
+            return;
+        };
+        for groups in [1, 5, 65_535] {
+            assert_eq!(ask_wide(&gpu.device, groups).ok(), Some(wide_seen(groups)), "{groups} groups");
+        }
+        let started = std::time::Instant::now();
+        let seen = ask_wide(&gpu.device, WIDE).ok();
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        let runs = runs_wide(&gpu.device);
+        eprintln!("asked for {WIDE} groups in x: seen {seen:?} in {ms:.1} ms, runs them: {runs}");
+        assert_eq!(runs, seen == Some(wide_seen(WIDE)));
+        assert_eq!(runs_wide(&gpu.device), runs, "asked once");
+        if std::env::var_os("LEONIDA_INDIRECT_WIDE").is_none() {
+            assert_eq!(widest(&gpu.device), if runs || amd(&gpu.device) { WIDE } else { 65_535 });
+        }
+    }
+
+    /// A dispatch record that asks for more groups in x than it is given is noted in the list's
+    /// budget words 5 and 6 (the most asked for, the groups that do not run), by the clamp of one
+    /// execution and by a batch's pass; a record that fits and a slot the title has not filled
+    /// note nothing. On the software adapter, which is given 65,535 at most.
+    #[test]
+    fn warp_a_cut_dispatch_is_noted() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
+        for (asked, noted) in [([86_000u32, 1, 1], [86_000u32, 20_465]), ([65_535, 1, 1], [0, 0]), ([u32::MAX, 1, 1], [0, 0])] {
+            for batched in [false, true] {
+                let (src, src_ptr, src_gpu) = warp.shared_buffer(1024);
+                let (_budget, budget_ptr, budget_gpu) = warp.shared_buffer(256);
+                let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
+                let (back, back_ptr, _) = warp.shared_buffer(256);
+                let dst = warp.default_uav(64 << 10);
+                // SAFETY: mapped buffers, which nothing reads yet; an open list and live buffers.
+                unsafe {
+                    std::ptr::write_bytes(budget_ptr, 0, 256);
+                    for (w, word) in asked.into_iter().enumerate() {
+                        src_ptr.cast::<u32>().add(w).write_volatile(word);
+                    }
+                    if batched {
+                        batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu, batch::Wait::All);
+                        assert_eq!(batch::Table::new(table_ptr, 0, [1, 0, 0, 0]).place(1, 0, 2), Some(0));
+                    } else {
+                        let to = (&dst, D3D12_RESOURCE_STATE_COMMON);
+                        assert!(record_clamp_as(&warp.clamp, &warp.list, to, budget_gpu, (&src, 0), None, (2, 12, 1), false));
+                    }
+                    warp.list.ResourceBarrier(&[transition(&dst, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                    warp.list.CopyBufferRegion(&back, 0, &dst, 0, 12);
+                }
+                warp.submit_and_wait();
+                // SAFETY: the list has run; mapped words.
+                let (record, notes): ([u32; 3], [u32; 2]) = unsafe {
+                    (
+                        std::array::from_fn(|w| back_ptr.cast::<u32>().add(w).read_volatile()),
+                        std::array::from_fn(|w| budget_ptr.cast::<u32>().add(5 + w).read_volatile()),
+                    )
+                };
+                assert_eq!(record, [65_535, 1, 1], "asked for {asked:?}, batched {batched}");
+                assert_eq!(notes, noted, "asked for {asked:?}, batched {batched}");
             }
         }
     }
@@ -3222,7 +3542,7 @@ void main(uint3 g : SV_GroupID) {
         // (alive until the list has run)
         let pass = make_from(&warp.device, batch::SOURCE).expect("the batched clamp must compile on WARP");
         let at = if batched {
-            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu, batch::Wait::All);
             // SAFETY: the mapped table; the list has not run.
             let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 0, 0, 0]) };
             table.place_packed(1, 32, 2, pack).expect("a place")
@@ -3385,7 +3705,7 @@ void main(uint3 g : SV_GroupID) {
                 // SAFETY: mapped buffers; nothing runs.
                 unsafe { std::ptr::write_bytes(budget_ptr, 0, 256) };
                 if batched {
-                    batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu, other_gpu, src_gpu, src_gpu], table_gpu);
+                    batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu, other_gpu, src_gpu, src_gpu], table_gpu, batch::Wait::All);
                     // SAFETY: the mapped table; the list has not run.
                     let mut table = unsafe { batch::Table::new(table_ptr, 0, [1, 2, 0, 0]) };
                     assert_eq!(table.place(1 + i as u64 % 2, offset, *kind), Some(0));
@@ -3433,7 +3753,7 @@ void main(uint3 g : SV_GroupID) {
             let (back, back_ptr, _) = warp.shared_buffer(1024);
             let (_table, table_ptr, table_gpu) = warp.shared_buffer(batch::TABLE);
             let dst = warp.default_uav(64 << 10);
-            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu);
+            batch::record(&pass, &warp.list, (&dst, D3D12_RESOURCE_STATE_COMMON), budget_gpu, [src_gpu; 4], table_gpu, batch::Wait::All);
             // SAFETY: mapped buffers, which the list has not read yet.
             let mut table = unsafe {
                 std::ptr::write_bytes(budget_ptr, 0, 256);
@@ -3534,6 +3854,98 @@ void main(uint3 g : SV_GroupID) {
         }
     }
 
+    const WRITER_CS: &str = r#"
+#define RS "UAV(u0)"
+RWByteAddressBuffer args : register(u0);
+[RootSignature(RS)]
+[numthreads(1, 1, 1)]
+void main() {
+    args.Store3(0, uint3(7, 1, 1));
+}
+"#;
+
+    /// A record a shader writes behind a batch's pass: the batch has it as it was before the
+    /// writer (what `LEONIDA_INDIRECT_BATCH=2` executed: the title's culling passes write the
+    /// arguments of executions right behind them, with no wait between), and the list says so
+    /// by the record's address (`HostList::shaders_wrote_since`), so that it is clamped anew
+    /// in a batch behind the writer (4). A record the writer is not bound to is still read
+    /// from the first batch.
+    #[test]
+    fn a_record_written_behind_a_batchs_pass_is_clamped_behind_its_writer() {
+        const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+        const WRITTEN: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+        // Where the title has the records (32 bytes apart).
+        const TITLE: u64 = 0x10_0000;
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(list) = host.new_list() else {
+            return;
+        };
+        let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
+        let writer = compile_cs(&host.device, WRITER_CS).expect("writer shader must compile");
+        let signature = one_argument(&host.device, 2, 12);
+        let (Some((source, ptr)), Some((hits_buf, hits_ptr))) = (host.shared_buffer(1024), host.shared_buffer(256)) else {
+            return;
+        };
+        // Records 0 and 1: 1 group and 20.
+        for (i, x) in [1u32, 20].into_iter().enumerate() {
+            for (w, word) in [x, 1, 1].into_iter().enumerate() {
+                // SAFETY: inside the mapping.
+                unsafe { ptr.cast::<u32>().add(i * 8 + w).write_volatile(word) };
+            }
+        }
+        // SAFETY: the mapping holds 256 bytes; nothing runs.
+        unsafe { std::ptr::write_bytes(hits_ptr, 0, 256) };
+        // SAFETY: live buffers.
+        let (source_gpu, hits_gpu) = unsafe { (source.GetGPUVirtualAddress(), hits_buf.GetGPUVirtualAddress()) };
+        let run = |table: &mut batch::Table, scratch: &ID3D12Resource, record: u64| {
+            let at = table.place(1, record * 32, 2).unwrap();
+            // SAFETY: an open list; the worker's root signature and pipeline; buffers the test
+            // holds until the list has run.
+            unsafe {
+                list.list.SetComputeRootSignature(&worker.root);
+                list.list.SetPipelineState(&worker.pso);
+                list.list.SetComputeRootUnorderedAccessView(0, hits_gpu);
+                list.list.ExecuteIndirect(&signature, 1, scratch, at, None, 0);
+            }
+        };
+        // SAFETY: an open list and a live buffer in that state.
+        unsafe { list.list.ResourceBarrier(&[crate::host::transition(&source, D3D12_RESOURCE_STATE_COMMON, READ)]) };
+        let (mut first, first_scratch) = open_batch(&list, (1, &source), &[]).unwrap();
+        list.batch_opened();
+        run(&mut first, &first_scratch, 1);
+        // The title's culling pass, bound to record 0 alone, and nothing the layer waits at.
+        // SAFETY: as above; the writer's root signature and pipeline.
+        unsafe {
+            list.list.ResourceBarrier(&[crate::host::transition(&source, READ, WRITTEN)]);
+            list.list.SetComputeRootSignature(&writer.root);
+            list.list.SetPipelineState(&writer.pso);
+            list.list.SetComputeRootUnorderedAccessView(0, source_gpu);
+            list.list.Dispatch(1, 1, 1);
+            list.list.ResourceBarrier(&[crate::host::transition(&source, WRITTEN, READ)]);
+        }
+        list.shaders_write(TITLE, 12);
+        assert!(!list.shaders_wrote_since(TITLE + 32, 12), "record 1 is as the pass read it");
+        assert!(list.shaders_wrote_since(TITLE, 12), "record 0 may be another");
+        run(&mut first, &first_scratch, 1);
+        // Record 0 from the first batch, as 2 read it: the group it had before the writer.
+        run(&mut first, &first_scratch, 0);
+        // And from a batch behind the writer, as 4 reads it: the 7 groups written.
+        let (mut second, second_scratch) = open_batch(&list, (1, &source), &[]).unwrap();
+        list.batch_opened();
+        assert!(!list.shaders_wrote_since(TITLE, 12), "nothing is bound to it behind the second pass");
+        run(&mut second, &second_scratch, 0);
+        list.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&list]);
+        list.reset();
+        // SAFETY: the list has run; a mapped buffer.
+        let hits = unsafe { (hits_ptr as *const u32).read_volatile() };
+        assert_eq!(hits, 20 + 20 + 1 + 7, "the first batch has record 0 as it was, the second as written");
+    }
+
     /// What clamps of a frame cost on the card one by one and in batches
     /// (ignored: a measurement): 2,355 executions of an empty dispatch, in
     /// 49 lists' worth of runs, as in the captured frame.
@@ -3566,7 +3978,7 @@ void main(uint3 g : SV_GroupID) {
                         assert!(record_clamp_as(&gpu.clamp, &gpu.list, (&dst, state), budget_gpu, (&src, u64::from(i % 2048) * 32), None, (2, 12, 1), false));
                     } else if i % run == 0 {
                         let k = u64::from(i / run) * batch::TABLE;
-                        batch::record(&pass, &gpu.list, (&dst, state), budget_gpu, [src_gpu; 4], tables_gpu + k);
+                        batch::record(&pass, &gpu.list, (&dst, state), budget_gpu, [src_gpu; 4], tables_gpu + k, batch::Wait::All);
                         // SAFETY: the mapped table; the list has not run.
                         table = unsafe { batch::Table::new(tables_ptr.add(k as usize), 0, [1, 0, 0, 0]) };
                     }

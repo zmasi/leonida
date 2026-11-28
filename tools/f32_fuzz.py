@@ -723,6 +723,12 @@ def same(want, got):
     return want == got
 
 
+# Ops whose translation applies the measured omod rule (a -0 result becomes +0 under mul:2/mul:4/div:2 with IEEE off,
+# dev_omod_neg_zero below) instead of keeping -0 as OpFMul does: docs/design.md, "`v_mul_legacy_f32` default-mode f32
+# denormal flushing". For them the translator is judged against the hardware word, not the ISA-text model's -0.
+TRANSLATOR_OMOD_POS_ZERO = ("v_mul_legacy_f32",)
+
+
 def check(op, vals, srcs, e64, out_mods):
     try:
         want = model(op, vals, srcs, out_mods)
@@ -730,6 +736,8 @@ def check(op, vals, srcs, e64, out_mods):
         return "skip", f"denormal {e}"
     except NotModelled as e:
         return "skip", str(e)
+    if op in TRANSLATOR_OMOD_POS_ZERO and want[0] == 0x80000000 and any(m in OMOD for m in out_mods):
+        want = [0, want[1]]
     text, obs = listing(op, vals, srcs, e64, out_mods)
     status, got = run_translated(text)
     if status != "ok":

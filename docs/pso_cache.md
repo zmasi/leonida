@@ -1,5 +1,12 @@
 # PSO/shader cache
 
+> **Scope note:** This page documents the **Xbox package PSO/pipeline library blob** stored inside `shaders.rpf`
+> (magic `PS\0\x09`, also covered in [shader_library.md](shader_library.md) and inspected by
+> `tools/psocache_inspect.py` and `tools/shader_library.py`). It is **not** the runtime's host-side Vulkan
+> `VkPipelineCache` files (`pipeline_cache.bin`, `pipeline_cache.session.bin`, `pipeline_cache.heavy.bin`, and the
+> per-compute-pipeline journal `pipeline_cache.d/`), which are documented in [d3d12_vulkan.md](d3d12_vulkan.md) and
+> [runtime/README.md](../runtime/README.md).
+
 One cache blob was found in the package data, stored as a single resource in the data area of a top-level RPF9
 archive. It is a chain of 4,205 adjacent zlib streams: 4,204 full 64 KiB streams and a 27,436-byte last one, with
 31,437 bytes of zero padding between the streams. Concatenating the inflated bytes in archive order gives

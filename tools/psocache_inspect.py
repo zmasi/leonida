@@ -56,6 +56,7 @@ S_END_PGM = b"\x00\x00\x81\xbf"  # s_endpgm, 0xBF810000 little-endian
 S_CODE_END = b"\x00\x00\x9f\xbf"  # s_code_end, 0xBF9F0000 little-endian
 HASH_OFF = 0x48
 STRING_OFFS = (0x04, 0x24)
+STRING_BOUNDS = ((0x04, 0x24), (0x24, HASH_OFF))
 COUNT_OFFS = (0x50, 0x54, 0x58, 0x5C)
 SIZE_OFFS = (0x60, 0x64)
 
@@ -97,6 +98,8 @@ def parse_chunks(m, base, start, size):
     The first header length, in 4-byte steps, that covers the entry exactly with 32-byte chunks all of type
     0x41/0x42/0x43 wins. Returns ``(header_size, [(tag, word1), ...])`` or ``(None, None)`` when no length fits.
     """
+    if base < 0 or start < 0 or size < 0 or base + start + size > len(m):
+        return None, None
     for header in range(0, ENTRY_HEADER_MAX + 1, 4):
         if size < header or (size - header) % CHUNK_SIZE:
             continue
@@ -267,8 +270,10 @@ def decode_meta(m, base, spans, limit=None):
 
 def inspect(path, with_meta=False, entry=None, limit=None):
     """Read ``path`` and return the report as a dict. Raises OSError/ValueError on unusable input."""
-    if limit is not None and limit < 1:
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
         raise ValueError("--limit must be at least 1")
+    if entry is not None and (isinstance(entry, bool) or not isinstance(entry, int) or entry < 0):
+        raise ValueError("--entry must be 0 or more")
     with open(path, "rb") as fh:
         size = os.fstat(fh.fileno()).st_size
         if size < HEADER_SIZE:
@@ -297,12 +302,17 @@ def inspect(path, with_meta=False, entry=None, limit=None):
             report["sizes"] = sizes
             report["header_hash"] = m[HASH_OFF : HASH_OFF + 8].hex()
             report["header_strings"] = []
-            for off in STRING_OFFS:
-                end = m.find(b"\x00", off, HEADER_SIZE)
-                report["header_strings"].append(
-                    {"offset": off, "length": (end - off) if end >= 0 else 0}
-                )
             problems = []
+            for off, stop in STRING_BOUNDS:
+                end = m.find(b"\x00", off, stop)
+                if end < 0:
+                    report["header_strings"].append({"offset": off, "length": 0})
+                    problems.append(
+                        "header string at 0x%x has no NUL terminator before 0x%x"
+                        % (off, stop)
+                    )
+                else:
+                    report["header_strings"].append({"offset": off, "length": end - off})
             if any(
                 m[off : off + 4] != b"\x00\x00\x00\x00"
                 for off in range(0x68, HEADER_SIZE, 4)
@@ -355,7 +365,7 @@ def inspect(path, with_meta=False, entry=None, limit=None):
             if (
                 regions["graphics"]["fits"]
                 and regions["compute"]["fits"]
-                and counts["meta_index"]
+                and (counts["meta_index"] or counts["graphics"] or counts["compute"])
             ):
                 meta_limit = counts["meta_index"]
                 bad_graphics = 0
@@ -471,7 +481,19 @@ def inspect(path, with_meta=False, entry=None, limit=None):
                             "--entry %d is outside the %d-entry meta index"
                             % (entry, len(entries))
                         )
-                    report["meta_entry"] = describe_entry(m, meta_off, *entries[entry])
+                    a, b = entries[entry]
+                    if a + b > meta_size:
+                        report["meta_entry"] = [
+                            "entry offset 0x%x size %d: points past the 0x%x-byte meta blob"
+                            % (a, b, meta_size)
+                        ]
+                    else:
+                        report["meta_entry"] = describe_entry(m, meta_off, a, b)
+            elif entry is not None:
+                raise ValueError(
+                    "--entry %d cannot be read because meta_index or meta_blob does not fit in the file"
+                    % entry
+                )
 
             # Shader index: (offset, size) pairs inside the code blob, in ascending offset order.
             if regions["shader_index"]["fits"] and regions["code_blob"]["fits"]:

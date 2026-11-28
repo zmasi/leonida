@@ -311,5 +311,126 @@ class ComputedIJRefusals(unittest.TestCase):
             rdna2spirv.F16_HALVES = old
 
 
+ENC = "    ; encoding: [0,0,0,0]"          # 4-byte encodings make the program counters (and branches) real
+F16_LO, F16_HI = (0.5, 1.5, 2.5), (-4.0, 8.0, 16.0)
+F16_ATTR0 = [(struct.unpack("<I", struct.pack("<ee", lo, hi))[0], 0, 0, 0) for lo, hi in zip(F16_LO, F16_HI)]
+
+
+def at_pcs(lines):
+    return [line + ENC for line in lines]
+
+
+class ComputedIJControlFlow(unittest.TestCase):
+    """interp_ij_analysis's block split and reaching-write walk, and the f16 pair's partner and partial
+    rules: which writes make a pair computed, and which pairs are refused. A pristine pair keeps the
+    interpolated-input read (no PerVertexKHR); a computed one weights the per-vertex values."""
+
+    def pristine(self, spv):
+        self.assertNotIn("PerVertexKHR", spv)
+
+    def refuse(self, asm, message):
+        with self.assertRaises(rdna2spirv.Unsupported) as cm:
+            support.translate_lines("ps_ij_refuse", asm)
+        self.assertIn(message, str(cm.exception))
+
+    def test_branch_target_alone_splits_the_pair(self):
+        # pc 8 branches to pc 16, the p2: the p2 starts a block although no branch sits between the ops
+        self.refuse(at_pcs(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0", "s_cbranch_scc0 1",
+                            "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                            "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"]),
+                    "the pair's ops are not in one basic block")
+
+    def test_write_before_an_unconditional_branch_does_not_reach_its_next_block(self):
+        # pc 0 branches to pc 12; the v0 write at pc 4 is followed by s_branch to pc 20, so it never
+        # falls through into the pair's block at pc 12
+        spv, w = run(at_pcs(["s_cbranch_scc0 2", "v_mov_b32_e32 v0, 0", "s_branch 2",
+                             "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                             "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"]))
+        self.pristine(spv)
+
+    def test_write_after_the_pair_does_not_make_it_computed(self):
+        spv, w = run(["v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                      "v_mov_b32_e32 v0, 0", "exp mrt0 v2, v0, v2, v2 done vm", "s_endpgm"])
+        self.pristine(spv)
+        self.assertEqual(floats(w[:2]), (2 * I, 0.0))
+
+    def test_interp_writing_its_own_i_register_does_not_make_it_computed(self):
+        # the p1 reads v0 and then writes it: a write at the site itself happens after the read
+        spv, w = run(["v_interp_p1_f32_e32 v0, v0, attr0.x", "v_interp_p2_f32_e32 v0, v1, attr0.x",
+                      "exp mrt0 v0, v0, v0, v0 done vm", "s_endpgm"])
+        self.pristine(spv)
+        self.assertEqual(floats(w[:1]), (2 * I,))
+
+    def test_write_two_blocks_back_reaches_the_pair(self):
+        # v0 = 0 at pc 0; the pair's block (pc 16) is reached only through the block at pc 8
+        spv, w = run(at_pcs(["v_mov_b32_e32 v0, 0", "s_cbranch_scc0 0", "v_mov_b32_e32 v5, 1.0",
+                             "s_cbranch_scc0 0",
+                             "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                             "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"]))
+        self.assertIn("PerVertexKHR", spv)
+        self.assertEqual(floats(w[:1]), (0.0,))
+
+    def test_write_reaches_through_a_taken_branch_only(self):
+        # pc 4 jumps over pc 8 to the pair at pc 12: the v0 write at pc 0 reaches it through the branch
+        # edge alone (the block at pc 8 that falls through into the pair writes nothing)
+        spv, w = run(at_pcs(["v_mov_b32_e32 v0, 0", "s_branch 1", "v_mov_b32_e32 v5, 1.0",
+                             "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+                             "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"]))
+        self.assertIn("PerVertexKHR", spv)
+        self.assertEqual(floats(w[:1]), (0.0,))
+
+    def test_loop_that_never_writes_the_register(self):
+        # the pair sits in a loop (pc 12 branches back to pc 4); v0 is written only after the loop,
+        # so the walk must stop at blocks it has seen and answer that no write reaches
+        spv = support.translate_lines("ps_ij_loop", at_pcs([
+            "v_mov_b32_e32 v5, 0",
+            "v_interp_p1_f32_e32 v2, v0, attr0.x", "v_interp_p2_f32_e32 v2, v1, attr0.x",
+            "s_cbranch_scc0 -3",
+            "v_mov_b32_e32 v0, 0", "exp mrt0 v2, v0, v2, v2 done vm", "s_endpgm"]))
+        self.pristine(spv)
+
+    def test_p2_before_its_p1_is_a_dangling_op(self):
+        self.refuse(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+                     "v_interp_p2_f32_e32 v2, v1, attr0.x", "v_interp_p1_f32_e32 v2, v0, attr0.x",
+                     "exp mrt0 v2, v2, v2, v2 done vm", "s_endpgm"],
+                    "without its p1 partner")
+
+    def test_two_f16_p2s_of_one_p1(self):
+        # both p2s name the p1's vdst v2 as their partial; the first p2 reading it between the p1 and
+        # the second p2 is allowed (hardware's lo/hi-style reuse), so both translate
+        _, w = run(["v_mov_b32_e32 v0, 0.5", "v_mov_b32_e32 v1, 0",
+                    "v_interp_p1ll_f16 v2, v0, attr0.x",
+                    "v_interp_p2_f16 v4, v1, attr0.x, v2", "v_interp_p2_f16 v5, v1, attr0.x, v2",
+                    "exp mrt0 v4, v5, v4, v5 done vm", "s_endpgm"], attrs={0: F16_ATTR0})
+        # (k, i, j) = (0.5, 0.5, 0): 0.5*0.5 + 0.5*1.5 = 1.0
+        self.assertEqual([f"{x & 0xFFFF:#06x}" for x in w[:2]], ["0x3c00", "0x3c00"])
+
+    def test_f16_partial_rewritten_between_the_ops(self):
+        # the f16 p2 writes v4 but reads the p1's partial from v2: rewriting v2 is what is refused
+        self.refuse(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0",
+                     "v_interp_p1ll_f16 v2, v0, attr0.x", "v_mov_b32_e32 v2, 1.0",
+                     "v_interp_p2_f16 v4, v1, attr0.x, v2",
+                     "exp mrt0 v4, v4, v4, v4 done vm", "s_endpgm"],
+                    "the p1 partial is rewritten between the ops")
+
+    def test_f16_partial_read_between_the_ops_as_another_p2s_j(self):
+        # only a p2's fourth operand may read the partial between the ops: here another f16 p2 reads
+        # v2 as its J, which observes the p1 partial
+        self.refuse(["v_mov_b32_e32 v0, 0", "v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v8, 0",
+                     "v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v6, v2, attr0.y, v8",
+                     "v_interp_p2_f16 v4, v1, attr0.x, v2",
+                     "exp mrt0 v4, v6, v4, v4 done vm", "s_endpgm"],
+                    "the p1 partial is read between the ops")
+
+    def test_f16_p2_pairs_with_the_nearest_p1(self):
+        # two f16 pairs on one partial register: p1ll+p2, then p1lv+p2. The second p2's partner is the
+        # p1lv just before it, not the earlier p1ll (whose range would hold the p1lv's rewrite of v2)
+        _, w = run(["v_mov_b32_e32 v0, 0.5", "v_mov_b32_e32 v1, 0", "v_mov_b32_e32 v10, 0",
+                    "v_interp_p1ll_f16 v2, v0, attr0.x", "v_interp_p2_f16 v4, v1, attr0.x, v2",
+                    "v_interp_p1lv_f16 v2, v0, attr0.x, v10", "v_interp_p2_f16 v5, v1, attr0.x, v2",
+                    "exp mrt0 v4, v5, v4, v5 done vm", "s_endpgm"], attrs={0: F16_ATTR0})
+        self.assertEqual(f"{w[0] & 0xFFFF:#06x}", "0x3c00")
+
+
 if __name__ == "__main__":
     unittest.main()

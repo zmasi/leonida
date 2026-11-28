@@ -315,10 +315,90 @@ class CheckNoGameData(unittest.TestCase):
         self.assertEqual(len(result.stdout.splitlines()), 2, result.stdout)
         self.assertIn("2 file(s)", result.stderr)
 
-    def test_directories_and_missing_paths_are_skipped(self):
-        os.mkdir(os.path.join(self.dir, "sub"))
-        result = run([os.path.join(self.dir, "sub"), os.path.join(self.dir, "missing.bin")])
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+    def test_explicit_directory_and_missing_file_are_errors(self):
+        directory = os.path.join(self.dir, "sub")
+        missing = os.path.join(self.dir, "missing.bin")
+        os.mkdir(directory)
+        result = run([directory, missing])
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(len(result.stderr.splitlines()), 2, result.stderr)
+        self.assertIn("sub:", result.stderr)
+        self.assertIn("missing.bin:", result.stderr)
+        self.assertIn("not a regular file", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_explicit_path_error_does_not_hide_a_match(self):
+        missing = os.path.join(self.dir, "missing.bin")
+        bad = self.write("bad.txt", b"DDS " + bytes(12))
+        clean = self.write("clean.txt", b"plain text\n")
+        for paths in ([missing, clean, bad], [bad, clean, missing]):
+            with self.subTest(paths=paths):
+                result = run(paths)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("bad.txt: DDS texture", result.stdout)
+                self.assertIn("cannot read", result.stderr)
+                self.assertIn("missing.bin:", result.stderr)
+                self.assertIn("1 file(s) start like game data", result.stderr)
+
+    def test_explicit_symlinks_are_errors_without_reading_targets(self):
+        if not hasattr(os, "symlink"):
+            self.skipTest("symlinks unavailable")
+        target = self.write("target.txt", b"DDS " + bytes(12))
+        links = [os.path.join(self.dir, "link.txt"), os.path.join(self.dir, "broken.txt")]
+        try:
+            os.symlink(target, links[0])
+            os.symlink(os.path.join(self.dir, "absent"), links[1])
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"cannot create symlinks: {e}")
+        result = run(links)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")  # do not follow even a link to a magic-bearing target
+        self.assertEqual(len(result.stderr.splitlines()), 2, result.stderr)
+        self.assertEqual(result.stderr.count("not a regular file"), 2, result.stderr)
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "FIFOs unavailable")
+    def test_explicit_fifo_is_rejected_without_blocking(self):
+        fifo = os.path.join(self.dir, "fifo")
+        os.mkfifo(fifo)
+        result = subprocess.run([sys.executable, "-I", SCRIPT, fifo], capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("not a regular file", result.stderr)
+
+    def test_default_scan_still_skips_non_regular_and_deleted_entries(self):
+        spec = importlib.util.spec_from_file_location("check_no_game_data_under_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        # Git lists submodule directories and files deleted from the working tree. Default mode must tolerate both.
+        paths = [self.dir, os.path.join(self.dir, "deleted.txt")]
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(module, "tracked_files", return_value=paths), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(module.main([]), 0)
+        self.assertEqual(out.getvalue() + err.getvalue(), "")
+
+    def test_explicit_missing_path_with_newline_has_one_diagnostic(self):
+        if os.name == "nt":
+            self.skipTest("Windows file names cannot contain newlines")
+        result = run([os.path.join(self.dir, "missing\nfile.txt")])
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 1, result.stderr)
+        self.assertIn(r"missing\nfile.txt", result.stderr)
+
+    def test_explicit_stat_failure_is_reported_without_opening(self):
+        spec = importlib.util.spec_from_file_location("check_no_game_data_under_test", SCRIPT)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(module.os, "lstat", side_effect=PermissionError(errno.EACCES, "Permission denied")), \
+                mock.patch.object(module, "classify_file") as classify, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(module.main(["locked.txt"]), 2)
+        classify.assert_not_called()
+        self.assertEqual(out.getvalue(), "")
+        self.assertEqual(err.getvalue().splitlines(), [
+            "check_no_game_data: cannot read locked.txt: Permission denied"])
 
     def run_with_unreadable(self, locked, paths):
         """main() in this process with open() refusing `locked`; (exit status, stdout, stderr)."""

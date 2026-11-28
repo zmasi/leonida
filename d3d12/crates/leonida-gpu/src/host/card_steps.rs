@@ -106,6 +106,77 @@ fn placed_order() -> bool {
 /// Why [`plan`] refuses for [`place`].
 const BEHIND_PLACED: &str = "a copy at its place in a list writes what it reads, or reads or writes what it writes";
 
+/// Whether a submission whose reads go to the card is held for the flights all the same while a copy at its
+/// place in one of its lists waits for them and the CPU still needs it (`LEONIDA_PLACED_LEFT_READERS=1`; off by
+/// default; `LEONIDA_AB` can name it).
+///
+/// [`Host::card_steps`] is asked when something keeps a submission from being prepared. If every step that
+/// flights' declared writes stop can be done on the card ([`plan`]), the submission is prepared at once, and
+/// nothing asks again what else stood in its way. Two things can ([`left_reader`]): a copy at its place that
+/// takes its source on the CPU where flights may write it (`place::Waits::Yes`), which then gives the list the
+/// bytes from before the flights; and a step left on the CPU (a fill whose own bytes no flight declares, a
+/// texture) that reads the destination of a copy the card alone does (`place::Waits::ForReaders`), which finds
+/// title memory as it was before that copy: a constant buffer a frame old, or older. With the switch such a
+/// submission is refused here and waits, as it would have with nothing done on the card.
+///
+/// Off by default: it adds waits of a whole landing to a frame the submitting thread bounds, nothing of it has
+/// run in the game, and how often the case comes up here is not known. A diagnostics build counts the
+/// submissions either way, and the frame-rate line says so ("submissions with steps done on the card and a
+/// copy at its place the CPU still needed"): if the line never appears the switch has nothing to do.
+///
+/// From TaynanGT/Vice-Tay df01b38b1 ("Read a fill behind a placed copy from the copy's source", author Petr
+/// Seifert, as committed there by TaynanGT, 2026-11-27; GPL-3.0-or-later): its `remaining_cpu_reader`, the half
+/// that waits. Measured there on an RTX 5080 (docs/rtx5080-16gb.md at 7706eb985): 0.30 submissions a frame
+/// refused and waited in the opening cutscene where none had been, about 0.7 in play, 5 to 10 ms of the
+/// submitting thread a frame. The other half, which has such a fill read the copy's source on the card and
+/// takes most of those waits away again (`VICTORY_PLACED_FILL_REDIRECT`, and 44a942b5c on top of it), is not
+/// here.
+fn left_readers_wait() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("LEONIDA_PLACED_LEFT_READERS") {
+        return on;
+    }
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_PLACED_LEFT_READERS").is_some_and(|v| v == "1"))
+}
+
+/// Why [`left_reader`] refuses: a step the CPU does reads a waiting copy's bytes; a waiting copy takes its
+/// source on the CPU.
+const LEFT_READER: &str = "a step left on the CPU reads what a copy at its place writes, whose bytes wait for flights";
+const LEFT_SOURCE: &str = "a copy at its place takes a source on the CPU that flights may write";
+
+/// Since the last frame-rate line: submissions whose steps were to go to the card although [`left_reader`]
+/// found a reader left on the CPU, and a source taken there.
+static LEFT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The steps of a submission that the card does: each by its list's address and its place in the list.
+type Steps = std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>;
+
+/// With the steps `taken` done on the card: why the submission still cannot be prepared before the flights
+/// that write `written` have landed, if so ([`left_readers_wait`]). A copy at its place takes a source on the
+/// CPU that they may write; or one that waits for its readers has one among the steps the CPU still does
+/// (behind it, with `place::readers_in_order`).
+fn left_reader(written: &[(usize, usize)], runs: &[&HostList], taken: &Steps) -> Option<&'static str> {
+    let mut placed: Vec<(usize, usize, usize)> = Vec::new();
+    for list in runs {
+        for step in &list.deferred().copies {
+            if let Step::Placed(p) = step {
+                let copy = std::ptr::from_ref::<place::Placed>(p) as usize;
+                match p.waits(written) {
+                    place::Waits::No => {}
+                    place::Waits::ForReaders => placed.push((copy, p.dst, p.dst + p.len)),
+                    place::Waits::Yes => return Some(LEFT_SOURCE),
+                }
+            }
+        }
+    }
+    if placed.is_empty() {
+        return None;
+    }
+    let done_here = |list: &HostList, i: usize| taken.contains(&(std::ptr::from_ref(list) as usize, i));
+    place::reader(runs, &placed, place::readers_in_order(), done_here).map(|_| LEFT_READER)
+}
+
 /// The bytes of our buffer between reading and writing: what one submission
 /// may do this way (each place read once, however many fills take it).
 const BETWEEN: u64 = 4 << 20;
@@ -830,7 +901,7 @@ static DONE: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::Ato
 /// list by address, their place in it).
 pub(super) struct Taken {
     own: Own,
-    steps: std::collections::HashSet<(usize, usize), std::hash::BuildHasherDefault<AddressHash>>,
+    steps: Steps,
     copied: Vec<(Arc<Shadow>, usize, usize)>,
 }
 
@@ -904,6 +975,17 @@ impl Host {
         let chosen = plan(&does, stage(), placed_order(), &mut None)?;
         if chosen.is_empty() {
             return Ok(None);
+        }
+        // What the CPU leaves out. A copy at its place that still waits for the flights, and that the CPU needs
+        // for what it does not leave out, is counted, and with `left_readers_wait` the old wait is due.
+        let taken: Steps = chosen.iter().map(|&(i, _)| steps[i]).collect();
+        if (cfg!(feature = "diagnostics") || left_readers_wait())
+            && let Some(why) = left_reader(written, runs, &taken)
+        {
+            LEFT[usize::from(why == LEFT_SOURCE)].fetch_add(1, Ordering::Relaxed);
+            if left_readers_wait() {
+                return Err(why);
+            }
         }
         spent.next("steps on the card: what holds their bytes");
         let mut writers = {
@@ -1081,11 +1163,7 @@ impl Host {
         #[cfg(feature = "diagnostics")]
         noted(&ops);
         spent.end();
-        Ok(Some(Taken {
-            own,
-            steps: chosen.iter().map(|&(i, _)| steps[i]).collect(),
-            copied,
-        }))
+        Ok(Some(Taken { own, steps: taken, copied }))
     }
 
     /// A list of ours open for recording, and its buffer.
@@ -1139,6 +1217,15 @@ pub(super) fn log(frames: f64) {
         d[2] / 1024.0,
         d[3],
     );
+    let [reader, source] = [0, 1].map(|i| LEFT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+    if reader + source > 0.0 {
+        tracing::info!(
+            "submissions with steps done on the card and a copy at its place the CPU still needed, per frame: {reader:.2} where a \
+             step left on the CPU read what the copy writes, {source:.2} where the copy took a source flights may write; {} \
+             (LEONIDA_PLACED_LEFT_READERS)",
+            if left_readers_wait() { "refused and held for the flights" } else { "prepared without waiting: =1 holds them for the flights" },
+        );
+    }
     let [passes, pieces] = [0, 1].map(|i| GATHERED[i].swap(0, Ordering::Relaxed) as f64 / frames);
     if passes > 0.0 {
         tracing::info!(

@@ -9,6 +9,7 @@ import io
 import os
 import random
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -663,6 +664,59 @@ class HarnessErrors(unittest.TestCase):
                 X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
         self.assertIn("no dump (exit 3): device lost", str(ctx.exception))
 
+    @staticmethod
+    def _write_dump(prog, dump):
+        words = HarnessErrors._expected_words(prog)
+        with open(dump, "wb") as f:
+            f.write(struct.pack(f"<{len(words)}I", *words))
+
+    def test_fresh_dump_from_failed_process_is_a_harness_error(self):
+        prog = X.make_program(1, 32, 4)
+        for status in (1, -11):
+            with self.subTest(status=status), tempfile.TemporaryDirectory() as work:
+                def failed(cmd, **kw):
+                    self._write_dump(prog, kw["env"]["VKC_DUMP"])
+                    return subprocess.CompletedProcess(cmd, status, stdout="compute subgroup size: 32\n",
+                                                       stderr="synthetic failure after dump\n")
+
+                with mock.patch.object(X.subprocess, "run", side_effect=failed):
+                    with self.assertRaises(X.HarnessError) as ctx:
+                        X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+                self.assertIn(f"exit {status}", str(ctx.exception))
+                self.assertIn("synthetic failure after dump", str(ctx.exception))
+
+    def test_successful_fresh_dump_still_returns_words(self):
+        prog = X.make_program(1, 32, 4)
+
+        def succeeded(cmd, **kw):
+            self._write_dump(prog, kw["env"]["VKC_DUMP"])
+            return subprocess.CompletedProcess(cmd, 0, stdout="compute subgroup size: 32\n", stderr="")
+
+        with tempfile.TemporaryDirectory() as work, mock.patch.object(X.subprocess, "run", side_effect=succeeded):
+            words = X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+        self.assertEqual(words, self._expected_words(prog))
+
+    def test_failed_process_cannot_be_skipped_as_unpinned(self):
+        prog = X.make_program(1, 32, 4)
+
+        def failed(cmd, **kw):
+            self._write_dump(prog, kw["env"]["VKC_DUMP"])
+            return subprocess.CompletedProcess(cmd, 1, stdout="compute subgroup size: 32 not available\n",
+                                               stderr="synthetic failure after dump\n")
+
+        with tempfile.TemporaryDirectory() as work, mock.patch.object(X.subprocess, "run", side_effect=failed):
+            with self.assertRaises(X.HarnessError) as ctx:
+                X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+        self.assertIn("exit 1", str(ctx.exception))
+        self.assertIn("synthetic failure after dump", str(ctx.exception))
+
+    def test_unsupported_unpinned_response_still_skips(self):
+        prog = X.make_program(1, 32, 4)
+        done = subprocess.CompletedProcess(["x"], 77, stdout="compute subgroup size: 32 not available\n", stderr="")
+        with tempfile.TemporaryDirectory() as work, mock.patch.object(X.subprocess, "run", return_value=done):
+            with self.assertRaises(X.Unpinned):
+                X.run_gpu("vk_compute_test", "p.spv", prog, work, False)
+
     def _main(self, run_gpu, argv):
         """main() with the assembler, translator and GPU replaced: every program 'translates'."""
         def translate(work, emulate, pc_tail=False):
@@ -711,6 +765,32 @@ class HarnessErrors(unittest.TestCase):
         self.assertIn(f"{calls[1]} [native] harness error: vk_compute_test timed out after 60 s", out)
         self.assertIn("programs 4, match 3, mismatch 0, hyp_only 0, rejected 0, harness_errors 1", out)
         self.assertEqual(kept, [f"{calls[1]}_native.asm"])
+
+    def test_run_goes_on_after_failed_process_writes_matching_dump(self):
+        actual_run_gpu = X.run_gpu
+        calls = []
+
+        def run_gpu(exe, spv, prog, work, emulate, pc_tail=False, **kwargs):
+            calls.append(prog.name)
+
+            def gpu(cmd, **kw):
+                self._write_dump(prog, kw["env"]["VKC_DUMP"])
+                failed = len(calls) == 2
+                return subprocess.CompletedProcess(cmd, 1 if failed else 0,
+                                                   stdout="compute subgroup size: 32\n",
+                                                   stderr="synthetic failure after dump\n" if failed else "")
+
+            with mock.patch.object(X.subprocess, "run", side_effect=gpu):
+                return actual_run_gpu(exe, spv, prog, work, emulate, pc_tail=pc_tail, **kwargs)
+
+        code, out = self._main(run_gpu, ["--programs", "4", "--wave", "32", "--modes", "native",
+                                         "--no-maskdata"])
+        self.assertEqual(len(calls), 4)
+        self.assertEqual(code, 2, out)
+        self.assertIn(f"{calls[1]} [native] harness error:", out)
+        self.assertIn("exit 1", out)
+        self.assertIn("synthetic failure after dump", out)
+        self.assertIn("programs 4, match 3, mismatch 0, hyp_only 0, rejected 0, harness_errors 1", out)
 
     def test_every_program_skipped_exits_2(self):
         def run_gpu(exe, spv, prog, work, emulate, pc_tail=False):

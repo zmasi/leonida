@@ -56,6 +56,43 @@ pub(crate) fn wanted() -> u32 {
     })
 }
 
+/// `LEONIDA_FG_LIMIT_FPS=<n>`: Reflex holds the frames **shown** to n a second (its frame
+/// limit, `frameLimitUs`), so that they come evenly; unset or 0: no limit, as before. With
+/// generation on, the limit counts the made frames too: n = 28 holds rendered frames to 14 a
+/// second, 71.4 ms apart (measured: 15 gave rendered frames 133.3 ms apart, 14 gave 142.9).
+///
+/// Frame generation puts one made frame between two rendered ones, halfway in time. Without
+/// a limit nothing paces the title: a frame that overruns its tick ends the frame wait at
+/// once, and here (Series X, 1080 lines, RTX 4060 Ti) rendered frames came 60-90 ms apart,
+/// so the frames shown were uneven too (the owner: "very non smooth"). A limit a little
+/// under the usual rate makes most rendered frames come at the same interval; only frames
+/// slower than it still come late. After the pacing notes of Leandroazc/Azc-Low-End
+/// (`streamline/reflex.rs`, GPL-3.0), whose projects all left the limit at 0.
+fn limit_us() -> u32 {
+    let fps = std::env::var("LEONIDA_FG_LIMIT_FPS").ok().and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(0.0);
+    limit_us_for(fps)
+}
+
+/// [`limit_us`] for `fps` rendered frames a second (0 or less, or not a number: no limit).
+fn limit_us_for(fps: f64) -> u32 {
+    if fps.is_finite() && fps > 0.0 { (1_000_000.0 / fps.clamp(1.0, 1000.0)).round() as u32 } else { 0 }
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::limit_us_for;
+
+    #[test]
+    fn a_frame_limit_is_microseconds_per_rendered_frame() {
+        assert_eq!(limit_us_for(0.0), 0);
+        assert_eq!(limit_us_for(-3.0), 0);
+        assert_eq!(limit_us_for(f64::NAN), 0);
+        assert_eq!(limit_us_for(15.0), 66_667);
+        assert_eq!(limit_us_for(14.0), 71_429);
+        assert_eq!(limit_us_for(0.5), 1_000_000);
+    }
+}
+
 /// `LEONIDA_FG_REFLEX=0`: Reflex left off and its sleep not taken (to tell its cost from the rest).
 fn reflex_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
@@ -135,13 +172,20 @@ fn init(device: &ID3D12Device) -> anyhow::Result<State> {
         anyhow::bail!("DLSS-G is not supported here: {supported}");
     }
     s.resolve_feature_functions()?;
+    let limit = limit_us();
     let reflex = sl::ReflexOptions {
         mode: if reflex_on() { sl::ReflexMode::eLowLatency } else { sl::ReflexMode::eOff },
+        frameLimitUs: if reflex_on() { limit } else { 0 },
         ..Default::default()
     };
     let r = s.reflex_set_options(&reflex);
     if !r.is_ok() {
         tracing::warn!(result = %r, "frame generation: Reflex not set");
+    } else if limit != 0 && reflex_on() {
+        tracing::info!(
+            rendered_fps = 1_000_000.0 / f64::from(limit),
+            "frame generation: Reflex paces the rendered frames to this rate (LEONIDA_FG_LIMIT_FPS)"
+        );
     }
     Ok(State { sl: s, set: None, most: 0, told: 0 })
 }

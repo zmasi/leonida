@@ -17,11 +17,13 @@ and half of it for stereo in all 7,451 measured streams).
 
 Streamed music (tag 0x48 descriptor: u32 blocks, u32 chunk size, u32 channels, then 16 bytes per channel: id,
 samples, rate at +10, codec at +12) is split into one Ogg Opus per descriptor channel: each chunk starts with a
-24-byte record per channel (subblock count at +4, repeated-prefix samples to skip at +8), the channel data are
-its run of 2048-byte subblocks after the 2048-aligned header, and the first `skip` samples of a chunk repeat the
-previous chunk's tail and are dropped (whole packets). The descriptor's `channels` is the number of channel
-groups, not necessarily the packet channel count: an Opus packet's TOC stereo bit gives the real channel count,
-and the descriptor's `samples` counts interleaved samples across those packet channels.
+24-byte record per channel (subblock count at +4, repeated-prefix samples to skip at +8, block sample budget at
++12), the channel data are its run of 2048-byte subblocks after the 2048-aligned header, trailing subblock padding
+packets past `block_samples` are trimmed, and the leading `skip` samples (interleaved across packet channels, with
+deficit continuation when the prior chunk stopped short of `block_samples`) are dropped on packet boundaries. The
+descriptor's `channels` is the number of channel groups, not necessarily the packet channel count: an Opus packet's
+TOC stereo bit gives the real channel count, and the descriptor's `samples` counts interleaved samples across those
+packet channels.
 
 Output: <out>/<bank>/<stream id>.ogg (or .wav). Directory input preserves each bank's relative path.
 
@@ -32,6 +34,7 @@ import argparse
 import functools
 import json
 from collections import Counter
+from collections.abc import Iterable
 import os
 import struct
 import sys
@@ -77,7 +80,7 @@ def ogg_page(serial: int, seq: int, granule: int, packets: list, flags: int) -> 
     return bytes(page)
 
 
-def opus_samples(packet: bytes) -> int:
+def opus_samples(packet: bytes | memoryview) -> int:
     """Samples at 48 kHz in one Opus packet (RFC 6716 TOC)."""
     toc = packet[0]
     config = toc >> 3
@@ -121,30 +124,30 @@ def write_ogg_opus(path: str, packets: list, channels: int, serial: int, length:
         pre_skip = total          # a granule below the pre-skip makes the stream undecodable
     head = b"OpusHead" + struct.pack("<BBHIhB", 1, channels, pre_skip, 48000, 0, 0)
     tags = b"OpusTags" + struct.pack("<I", 8) + b"leonida " + struct.pack("<I", 0)
-    out = [ogg_page(serial, 0, 0, [head], 0x02), ogg_page(serial, 1, 0, [tags], 0x00)]
-    seq, granule, pending, size = 2, 0, [], 0
     target = pre_skip + length if length > 0 else None
-    written = 0
-    if not packets:
-        out.append(ogg_page(serial, 2, pre_skip, [], 0x04))
-        write_file(path, b"".join(out))
-        return pre_skip
-    for i, p in enumerate(packets):
-        pending.append(p)
-        granule += opus_samples(p)
-        size += len(p)
-        reach = target is not None and granule >= target
-        last = i == len(packets) - 1
-        if reach or size > 4000 or len(pending) >= 50 or last:
-            g = target if reach else granule
-            out.append(ogg_page(serial, seq, g, pending, 0x04 if (reach or last) else 0x00))
-            written = g
-            seq += 1
-            pending, size = [], 0
-            if reach or last:
-                break
-    write_file(path, b"".join(out))
-    return written
+
+    def pages():
+        yield ogg_page(serial, 0, 0, [head], 0x02)
+        yield ogg_page(serial, 1, 0, [tags], 0x00)
+        if not packets:
+            yield ogg_page(serial, 2, pre_skip, [], 0x04)
+            return
+        seq, granule, pending, size = 2, 0, [], 0
+        for i, p in enumerate(packets):
+            pending.append(p)
+            granule += opus_samples(p)
+            size += len(p)
+            reach = target is not None and granule >= target
+            last = reach or i == len(packets) - 1
+            if size > 4000 or len(pending) >= 50 or last:
+                yield ogg_page(serial, seq, target if reach else granule, pending, 0x04 if last else 0x00)
+                if last:
+                    return
+                seq += 1
+                pending, size = [], 0
+
+    _write_file_parts(path, pages())
+    return min(total, target) if target is not None else total
 
 
 @functools.cache
@@ -157,7 +160,7 @@ def write_file(path: str, data: bytes) -> None:
     _write_file_parts(path, (data,))
 
 
-def _write_file_parts(path: str, parts: tuple[bytes | memoryview, ...]) -> None:
+def _write_file_parts(path: str, parts: Iterable[bytes | memoryview]) -> None:
     """Write under a private temporary name and rename into place: a stopped run or a full disk never leaves a
     short file under the final name, where a later run would keep it. The staging file is created in the
     destination directory (the same volume), so concurrent writers each publish a complete file (last wins)
@@ -251,7 +254,8 @@ def parse_awc(d: bytes):
     return streams, music
 
 
-def repeated_prefix_packets(packets: list[bytes], previous: list[bytes], samples: int) -> int | None:
+def repeated_prefix_packets(packets: list[bytes] | list[memoryview], previous: list[bytes] | list[memoryview],
+                            samples: int) -> int | None:
     """Count whole leading packets that repeat the previous chunk's tail, or reject a bad skip."""
     for count, packet in enumerate(packets, 1):
         duration = opus_samples(packet)
@@ -260,6 +264,36 @@ def repeated_prefix_packets(packets: list[bytes], previous: list[bytes], samples
         samples -= duration
         if samples == 0:
             return count if packets[:count] == previous[-count:] else None
+    return None
+
+
+def _trim_packets_to_budget(packets: list[bytes] | list[memoryview],
+                            target_frames: int) -> tuple[list[bytes] | list[memoryview], int]:
+    """Trim trailing subblock padding packets past a chunk's declared per-channel frame budget.
+
+    Returns (kept_packets, deficit_frames) where deficit_frames > 0 if the chunk's packets
+    stopped short of target_frames.
+    """
+    total = 0
+    for end, packet in enumerate(packets, 1):
+        total += opus_samples(packet)
+        if total >= target_frames:
+            return packets[:end], 0
+    return packets, target_frames - total
+
+
+def _drop_exact_prefix_packets(packets: list[bytes] | list[memoryview], frames: int) -> int | None:
+    """Count leading whole packets whose duration sums exactly to `frames`, or None."""
+    if frames == 0:
+        return 0
+    acc = 0
+    for count, packet in enumerate(packets, 1):
+        duration = opus_samples(packet)
+        if not 0 < duration <= frames - acc:
+            return None
+        acc += duration
+        if acc == frames:
+            return count
     return None
 
 
@@ -272,9 +306,12 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
 
     collect_packets=False keeps the packet lists empty for metadata-only callers (awc_manifest.py).
     The chunk size is the stride between blocks. The last block may be shorter, but each channel table and
-    subblock run must fit in its own block. A declared repeat must match whole packets from the same channel's
-    previous data. Channel rates outside 1000..192000 and non-Opus codecs are rejected as AwcRecovery.cs does.
-    Reject malformed descriptors without hiding other bank streams."""
+    subblock run must fit in its own block. Each 24-byte per-channel header carries `(subblocks, skip_samples,
+    block_samples)` at `+4..+16` where both sample counts are interleaved across packet channels: trailing
+    subblock padding packets past `block_samples` are trimmed, and `skip_samples` drops verified repeated
+    prefix packets (or applies exact-boundary deficit continuation when the previous chunk stopped short of
+    its `block_samples` budget). Channel rates outside 1000..192000 and non-Opus codecs are rejected as
+    AwcRecovery.cs does. Reject malformed descriptors without hiding other bank streams."""
     (m_at, m_size), (d_at, d_size) = mus, data
     if m_size < 12:
         return []
@@ -295,32 +332,72 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
         if not (1000 <= rate <= 192000) or codec != 0x0B:
             return []
         info.append([cid, samples, rate, codec, [], 0])
-    previous = [[] for _ in range(channels)]
+    block_data = [[] for _ in range(channels)]
     for b in range(blocks):
         offset = b * chunk
         at = d_at + offset
         block_size = min(chunk, d_size - offset)
         if channels * 24 > block_size:
             return []
-        recs = [struct.unpack_from("<II", d, at + 24 * c + 4) for c in range(channels)]   # (count, skip)
+        recs = [struct.unpack_from("<III", d, at + 24 * c + 4) for c in range(channels)]   # (count, skip, block_samples)
         total = sum(r[0] for r in recs)
         header = (channels * 24 + total * 4 + 2047) & ~2047
         if header + total * 2048 > block_size:
             return []
         before = 0
-        for c, (count, skip) in enumerate(recs):
+        for c, (count, skip, block_samples) in enumerate(recs):
             start = at + header + before * 2048
             before += count
-            packets = opus_packets(d, start, count * 2048)
-            repeated = repeated_prefix_packets(packets, previous[c], skip) if skip else 0
-            if repeated is None:
-                return []
-            if packets:
-                previous[c] = packets
-            if packets and info[c][5] < 2:
-                info[c][5] = 2 if any(p[0] & 0x04 for p in packets) else 1
-            if collect_packets:
-                info[c][4].extend(packets[repeated:] if repeated else packets)
+            size = count * 2048
+            if info[c][5] < 2:
+                for packet_start, _ in opus_packet_ranges(d, start, size):
+                    info[c][5] = 2 if d[packet_start] & 0x04 else 1
+                    if info[c][5] == 2:
+                        break
+            block_data[c].append((skip, block_samples, start, size))
+    packet_data = memoryview(d)
+    for c in range(channels):
+        pch = max(1, info[c][5])
+        previous = []
+        prev_deficit = 0
+        for skip, block_samples, start, size in block_data[c]:
+            packets = (opus_packets(d, start, size) if collect_packets else
+                       [packet_data[a:b] for a, b in opus_packet_ranges(d, start, size)])
+            kept = packets
+            deficit = 0
+            if block_samples > 0:
+                if block_samples % pch != 0:
+                    return []
+                kept, deficit = _trim_packets_to_budget(packets, block_samples // pch)
+            repeated = 0
+            if skip > 0:
+                if not kept:
+                    return []
+                candidates = ((skip // pch, skip) if pch > 1 and skip % pch == 0 else (skip,))
+                matched = None
+                for cand in candidates:
+                    if cand > 0:
+                        rep = repeated_prefix_packets(kept, previous, cand)
+                        if rep is not None:
+                            matched = rep
+                            break
+                if matched is not None:
+                    repeated = matched
+                elif prev_deficit > 0 and skip % pch == 0:
+                    skip_frames = skip // pch
+                    if skip_frames < prev_deficit:
+                        return []
+                    drop = _drop_exact_prefix_packets(kept, skip_frames - prev_deficit)
+                    if drop is None:
+                        return []
+                    repeated = drop
+                else:
+                    return []
+            if kept or block_samples:
+                previous = kept
+                prev_deficit = deficit
+            if collect_packets and kept:
+                info[c][4].extend(kept[repeated:] if repeated else kept)
     for x in info:
         if x[3] == 0x0B and x[5] > 1:
             x[1] //= x[5]
@@ -328,7 +405,10 @@ def music_channels(d: bytes, mus, data, collect_packets: bool = True):
 
 
 def opus_packets(d: bytes, at: int, size: int):
-    out = []
+    return [bytes(d[start:end]) for start, end in opus_packet_ranges(d, at, size)]
+
+
+def opus_packet_ranges(d: bytes, at: int, size: int):
     for b in range(at, at + size, 2048):
         p = b
         end = b + 2048
@@ -336,20 +416,21 @@ def opus_packets(d: bytes, at: int, size: int):
             n, = struct.unpack_from("<H", d, p)
             if n == 0 or p + 2 + n > end:
                 break
-            out.append(bytes(d[p + 2:p + 2 + n]))
+            yield p + 2, p + 2 + n
             p += 2 + n
-    return out
+
+
+def next_export_stem(sid, seen):
+    seen[sid] += 1
+    return f"{sid:08X}" if seen[sid] == 1 else f"{sid:08X}~{seen[sid]}"
 
 
 def export_stems(ids):
     """The file stem for each stream, in stream-table order: `<id>` (8 hex digits) for the first stream with an
     id and `<id>~2`, `<id>~3`, ... for later ones. A bank can hold two streams with the same 29-bit id; naming
     them apart keeps the second from overwriting the first. awc_manifest notes the same stems."""
-    seen, out = {}, []
-    for sid in ids:
-        seen[sid] = seen.get(sid, 0) + 1
-        out.append(f"{sid:08X}" if seen[sid] == 1 else f"{sid:08X}~{seen[sid]}")
-    return out
+    seen = Counter()
+    return [next_export_stem(sid, seen) for sid in ids]
 
 
 def bank_output_dir(path, out_dir):
@@ -401,14 +482,17 @@ def export_bank(path: str, out_dir: str, pre_skip: int = OPUS_PRE_SKIP, cue_shee
     os.makedirs(od, exist_ok=True)
     counts = {"opus": 0, "pcm": 0, "other": 0, "music": 0}
     channel_counts = Counter()
+    # Keep existing standalone stream names, even though music is written first.
+    used_stems = Counter(s["id"] for s in streams)
     frame_limits = {}
     for mus, data in music:
         for cid, samples, rate, codec, pk, packet_channels in music_channels(d, mus, data):
+            stem = next_export_stem(cid, used_stems)
             if cue_sheet:
                 channel_counts[cid] += 1
             if pk:
                 n48 = samples * 48000 // rate if rate else 0
-                granule = write_ogg_opus(os.path.join(od, f"{cid:08X}.ogg"), pk, packet_channels, cid, n48,
+                granule = write_ogg_opus(os.path.join(od, stem + ".ogg"), pk, packet_channels, cid, n48,
                                          pre_skip=pre_skip)
                 if cue_sheet and rate == 48000 and samples > 0:
                     frame_limits[cid] = min(samples, max(0, granule - pre_skip))

@@ -50,10 +50,14 @@ def fit_slices(pools):
                                 continue
                             blocks = min(2048, size // 16)
                             if d["depth"] == 1:
-                                # In a packed tail the stream starts with other mips or padding.
-                                # The usual 2D fit visits only the first 256 physical blocks.
+                                # In a packed tail the stream starts with other mips or padding. The usual 2D
+                                # fit (calib.calibrate_from_pools) stops at each chunk's first 256 blocks, but a
+                                # later block still reaches a built-in history entry through a chain of
+                                # references, so every 2D mip whose first block lies in the chunk is fitted here
+                                # over up to 2048 blocks. These results only fill entries the usual fit left
+                                # empty (extend_missing in build).
                                 first = start + calib.tiled_offset(layout, mip, 0, 0) - virt
-                                if not 256 * 16 <= first < blocks * 16:
+                                if not 0 <= first < blocks * 16:
                                     continue
                             chunks.append((size, offset, packed, virt - start, blocks))
                         if not chunks:

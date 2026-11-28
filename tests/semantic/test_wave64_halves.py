@@ -135,6 +135,38 @@ class Classification(unittest.TestCase):
             "v_cmp_eq_u32_e32 vcc, 2, v0", "s_cbranch_vccz 3", "s_and_saveexec_b64 s[16:17], vcc",
             "v_add_nc_u32_e32 v6, 9, v6", "s_or_b64 exec, exec, s[16:17]"]), "A", [], [])
 
+    def test_a_uvote_under_nonzero_exec(self):
+        self.tier("ps_a_uvote_nz", ps([
+            "s_mov_b64 s[16:17], exec", "v_cmpx_lt_f32_e32 s0, v0", "s_cbranch_execz 5",
+            "v_cmp_eq_f32_e64 s[0:1], s4, -1.0", "s_and_b64 vcc, exec, s[0:1]", "s_cbranch_vccnz 1",
+            "v_add_f32_e32 v6, 1.0, v6", "s_mov_b64 exec, s[16:17]"]), "A", [], [])
+
+    def test_c_uvote_under_narrowed_exec_without_execz_guard(self):
+        self.tier("ps_c_uvote_no_guard", ps([
+            "s_mov_b64 s[16:17], exec", "v_cmpx_lt_f32_e32 s0, v0",
+            "v_cmp_eq_f32_e64 s[0:1], s4, -1.0", "s_and_b64 vcc, exec, s[0:1]", "s_cbranch_vccnz 1",
+            "v_add_f32_e32 v6, 1.0, v6", "s_mov_b64 exec, s[16:17]"]), "C", contains=["unsafe-vote-branch"])
+
+    def test_a_uvote_and_or_combine(self):
+        self.tier("ps_a_uvote_comb", ps([
+            "v_cmp_le_f32_e64 s[14:15], s12, 0", "v_cmp_le_f32_e64 s[16:17], s13, 0",
+            "s_and_b64 s[14:15], s[14:15], s[16:17]", "s_and_b64 vcc, exec, s[14:15]",
+            "s_cbranch_vccnz 1", "v_add_f32_e32 v6, 1.0, v6"]), "A", [], [])
+
+    def test_a_uvote_cselect_from_uniform_scc(self):
+        self.tier("ps_a_uvote_csel", ps([
+            "s_cmp_eq_u32 s17, 0", "s_cselect_b64 s[24:25], exec, 0",
+            "v_cmp_eq_f32_e64 s[18:19], s4, 0", "s_or_b64 s[24:25], s[18:19], s[24:25]",
+            "s_and_b64 vcc, exec, s[24:25]", "s_cbranch_vccnz 1",
+            "v_add_f32_e32 v6, 1.0, v6"]), "A", [], [])
+
+    def test_a_wqm_restore_keeps_uvote(self):
+        self.tier("ps_a_wqm_restore", ps([
+            "s_mov_b64 s[12:13], exec", "s_wqm_b64 exec, exec",
+            "s_and_b64 exec, exec, s[12:13]",
+            "v_cmp_lt_f32_e64 s[14:15], 0.5, s4", "s_and_b64 vcc, exec, s[14:15]",
+            "s_cbranch_vccz 1", "v_add_f32_e32 v6, 1.0, v6"]), "A", [], [])
+
     def test_a_loop_execnz_no_scalar_state(self):
         self.tier("ps_a_loop", ps([
             "v_and_b32_e32 v4, 3, v0", "v_add_nc_u32_e32 v10, 1, v4", "v_mov_b32_e32 v9, 0",
@@ -1338,14 +1370,34 @@ class PixelShaders(unittest.TestCase):
                 if tier in ("A", "B"):
                     self.assertEqual(w32, w64)
                 else:
-                    self.assertNotEqual(w32, w64)
+                    none_diff = False
+                    for lane in range(64):
+                        x, y = _ps_xy(lane)
+                        exp = ref_fn(y * 64 + x)
+                        if w32[lane] is None:
+                            self.assertEqual(exp, (wg.CLEAR,) * 4, f"{name} wave32 lane {lane} was killed")
+                            continue
+                        for c in range(4):
+                            if exp[c] is not None:
+                                self.assertEqual(w32[lane][c], exp[c], f"{name} wave32 lane {lane} c{c}")
+                            elif w64[lane] is None or w32[lane][c] != w64[lane][c]:
+                                none_diff = True
+                    self.assertTrue(none_diff, f"{name}: tier C did not differ in any partition-dependent channel")
                 if "VKH_HEAP" in env:
-                    self.assertEqual(mem64[0], 16)
-                    self.assertEqual(mem32[0], 16)
-                    slots64 = {mem64[0x100 + 4 * k] for k in range(16)}
-                    slots32 = {mem32[0x100 + 4 * k] for k in range(16)}
-                    self.assertEqual(len(slots64), 16)
-                    self.assertEqual(slots64, slots32)
+                    expected_slots = {
+                        _ps_xy(lane)[1] * 64 + _ps_xy(lane)[0] + 1
+                        for lane in range(64)
+                        if _ps_xy(lane)[0] % 4 == 1
+                    }
+                    n_slots = len(expected_slots)
+                    self.assertEqual(mem64[0], n_slots)
+                    self.assertEqual(mem32[0], n_slots)
+                    slots64 = {mem64[0x100 + 4 * k] for k in range(n_slots)}
+                    slots32 = {mem32[0x100 + 4 * k] for k in range(n_slots)}
+                    self.assertEqual(slots64, expected_slots)
+                    self.assertEqual(slots32, expected_slots)
+                    self.assertNotIn(0x100 + 4 * n_slots, mem64)
+                    self.assertNotIn(0x100 + 4 * n_slots, mem32)
 
 
 class VcmpxDppExec(unittest.TestCase):

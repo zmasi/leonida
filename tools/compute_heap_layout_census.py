@@ -30,7 +30,7 @@ def captured_layouts(logs, group):
     for path in logs:
         # Never join handles across processes, or a reused handle with ambiguous ownership.
         names, layouts = defaultdict(set), defaultdict(set)
-        with path.open(encoding="utf-8", errors="replace") as stream:
+        with path.open(encoding="utf-8-sig", errors="replace") as stream:
             for line in stream:
                 if "[rt] compute-layout:" in line:
                     match = re.search(r"compute-layout: pso=(\w+) flags=([\da-fA-F]+) .*?shader-heap=\S+(.*)$", line)
@@ -100,8 +100,21 @@ def compare(kind, layout, loads):
 def program_loads(disasm, name):
     user = heap.cs_user_count(disasm, name)
     launch = disasm.parent / "fspx" / (name + ".json")
-    if user is None and launch.exists():
-        user = json.loads(launch.read_bytes()).get("user_sgprs")
+    if user is None and launch.is_file():
+        try:
+            with launch.open(encoding="utf-8-sig") as stream:
+                doc = json.load(stream)
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{launch}: invalid UTF-8: {exc}") from exc
+        except (ValueError, RecursionError) as exc:
+            raise ValueError(f"{launch}: invalid JSON: {exc}") from exc
+        if not isinstance(doc, dict):
+            raise ValueError(f"{launch}: expected a JSON object")
+        raw_user = doc.get("user_sgprs")
+        if raw_user is not None:
+            if type(raw_user) is not int or raw_user < 0:
+                raise ValueError(f"{launch}: user_sgprs must be a nonnegative integer")
+            user = raw_user
     listing = disasm / (name + ".s")
     if user is not None and listing.is_file():
         ir = heap.shader_ir.parse_file(str(listing))
@@ -151,22 +164,28 @@ def census(disasm, captured, per_program=False):
     return result
 
 
-if __name__ == "__main__":
-    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
-        sys.stdout.reconfigure(errors="replace")
-    except (AttributeError, ValueError, OSError):
-        pass
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("disasm", type=Path)
     parser.add_argument("--dispatch-log", action="append", default=[], type=Path)
     parser.add_argument("--group", default="", help="program path prefix in the dispatch log")
     parser.add_argument("--per-program", action="store_true", help="also print local program names and each heap result")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         counts = census(args.disasm, captured_layouts(args.dispatch_log, args.group), args.per_program)
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        parser.exit(2, f"ERROR: {exc}\n")
+    except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
     for key in ("compute", "missing SFI0", "direct", "resource only", "sampler only", "both",
                 "match", "resource matches", "sampler matches", "mismatch", "no room", "inconclusive", "missing layout",
                 "ambiguous or invalid layout", "incompatible flags"):
         print(f"{key}: {counts[key]}")
+    return 0
+
+
+if __name__ == "__main__":
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+    sys.exit(main())

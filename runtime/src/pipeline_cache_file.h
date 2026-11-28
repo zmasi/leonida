@@ -20,6 +20,8 @@
 
 inline std::error_code write_pipeline_cache_file(const std::filesystem::path& destination,
                                                 const char* data, size_t size) {
+    if (destination.empty() || (size > 0 && !data))
+        return std::make_error_code(std::errc::invalid_argument);
     namespace fs = std::filesystem;
     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
     fs::path staged;

@@ -566,6 +566,101 @@ class SpirvOptTests(unittest.TestCase):
         for dead in ("%dead_grp", "%dead_only", "%dead_str", "%dead_g", "%dead_id"):
             self.assertNotIn(dead, opt)
 
+    def test_mixed_signedness_folding_never_produces_type_mismatch(self):
+        # SPIR-V allows signed (%int) and unsigned (%uint) operands in integer arithmetic,
+        # bitwise, and shift instructions whose Result Type is %uint.
+        # Folding must never replace a %uint result with an %int SSA ID (or vice versa),
+        # while constant zero/all-ones results must resolve to the Result Type's constant.
+        spv = "\n".join([
+            "               OpCapability Shader",
+            "               OpMemoryModel Logical GLSL450",
+            '               OpEntryPoint Fragment %main "main" %in_s %in_u %out0 %out1',
+            "               OpExecutionMode %main OriginUpperLeft",
+            "               OpDecorate %in_s Location 0",
+            "               OpDecorate %in_s Flat",
+            "               OpDecorate %in_u Location 1",
+            "               OpDecorate %in_u Flat",
+            "               OpDecorate %out0 Location 0",
+            "               OpDecorate %out1 Location 1",
+            "       %void = OpTypeVoid",
+            "       %fn_t = OpTypeFunction %void",
+            "       %uint = OpTypeInt 32 0",
+            "        %int = OpTypeInt 32 1",
+            "     %v4uint = OpTypeVector %uint 4",
+            "   %ptr_in_s = OpTypePointer Input %int",
+            "   %ptr_in_u = OpTypePointer Input %uint",
+            " %ptr_out_v4 = OpTypePointer Output %v4uint",
+            "       %in_s = OpVariable %ptr_in_s Input",
+            "       %in_u = OpVariable %ptr_in_u Input",
+            "       %out0 = OpVariable %ptr_out_v4 Output",
+            "       %out1 = OpVariable %ptr_out_v4 Output",
+            "         %u0 = OpConstant %uint 0",
+            "       %umax = OpConstant %uint 4294967295",
+            "         %i0 = OpConstant %int 0",
+            "        %im1 = OpConstant %int -1",
+            "       %main = OpFunction %void None %fn_t",
+            "      %entry = OpLabel",
+            "          %s = OpLoad %int %in_s",
+            "          %u = OpLoad %uint %in_u",
+            "      %u_add = OpIAdd %uint %s %u0",
+            "      %u_and = OpBitwiseAnd %uint %s %s",
+            "      %u_shl = OpShiftLeftLogical %uint %s %u0",
+            "     %u_same = OpIAdd %uint %u %u0",
+            "     %u_mul0 = OpIMul %uint %u %i0",
+            "     %u_and0 = OpBitwiseAnd %uint %u %i0",
+            "     %u_orm1 = OpBitwiseOr %uint %u %im1",
+            "     %u_shl0 = OpShiftLeftLogical %uint %i0 %u",
+            "       %vec0 = OpCompositeConstruct %v4uint %u_add %u_and %u_shl %u_same",
+            "       %vec1 = OpCompositeConstruct %v4uint %u_mul0 %u_and0 %u_orm1 %u_shl0",
+            "               OpStore %out0 %vec0",
+            "               OpStore %out1 %vec1",
+            "               OpReturn",
+            "               OpFunctionEnd",
+            "",
+        ])
+        opt = spirv_opt.optimize(spv)
+        _validate(opt)
+        # Mixed-type identity ops must NOT alias %uint results to %s (%int).
+        self.assertIn("%u_add = OpIAdd %uint %s %u0", opt)
+        self.assertIn("%u_and = OpBitwiseAnd %uint %s %s", opt)
+        self.assertIn("%u_shl = OpShiftLeftLogical %uint %s %u0", opt)
+        # Same-type identity still folds (%u_same -> %u).
+        self.assertNotIn("%u_same = OpIAdd", opt)
+        self.assertIn("OpCompositeConstruct %v4uint %u_add %u_and %u_shl %u", opt)
+        # Mixed-type absorbing constants fold to the %uint constants (%u0 / %umax), never %i0 / %im1.
+        self.assertIn("OpCompositeConstruct %v4uint %u0 %u0 %umax %u0", opt)
+
+    def test_decorate_id_operand_is_not_deleted_by_dce(self):
+        # An SSA ID referenced as an OpDecorateId operand (args[2:]) on a surviving target must
+        # not be deleted by DCE, or the header would keep a dangling reference to an undefined ID.
+        spv = "\n".join([
+            "               OpCapability Shader",
+            "               OpMemoryModel Logical GLSL450",
+            '               OpEntryPoint Fragment %main "main" %out0',
+            "               OpExecutionMode %main OriginUpperLeft",
+            "               OpDecorate %out0 Location 0",
+            "               OpDecorateId %out0 CounterBuffer %pinned_ref",
+            "       %void = OpTypeVoid",
+            "       %fn_t = OpTypeFunction %void",
+            "       %uint = OpTypeInt 32 0",
+            "     %v4uint = OpTypeVector %uint 4",
+            " %ptr_out_v4 = OpTypePointer Output %v4uint",
+            "       %out0 = OpVariable %ptr_out_v4 Output",
+            "         %c0 = OpConstant %uint 0",
+            "         %c1 = OpConstant %uint 1",
+            "       %main = OpFunction %void None %fn_t",
+            "      %entry = OpLabel",
+            " %pinned_ref = OpIAdd %uint %c1 %c0",
+            "        %vec = OpCompositeConstruct %v4uint %c1 %c1 %c1 %c1",
+            "               OpStore %out0 %vec",
+            "               OpReturn",
+            "               OpFunctionEnd",
+            "",
+        ])
+        opt = spirv_opt.optimize(spv)
+        self.assertIn("OpDecorateId %out0 CounterBuffer %pinned_ref", opt)
+        self.assertIn("%pinned_ref = OpIAdd %uint %c1 %c0", opt)
+
 
 if __name__ == "__main__":
     unittest.main()

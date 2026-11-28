@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS_DIR = os.path.join(ROOT, "tools")
@@ -105,6 +106,20 @@ class ClassifyTest(unittest.TestCase):
         self.check("vaddps ymm0{k1},ymm1,ymm2", "AVX512")
         self.check("kmovw k1,eax", "AVX512")
 
+    def test_avx512vl_high_vector_registers_are_flagged(self):
+        # EVEX xmm16..xmm31 / ymm16..ymm31 require AVX-512VL and #UD on Zen 2.
+        for text in (
+            "vaddps ymm16,ymm17,ymm18",
+            "vpaddd ymm31,ymm0,ymm1",
+            "vmovaps xmm16,xmm0",
+            "vaesenc ymm20,ymm0,ymm1",
+        ):
+            self.check(text, "AVX512")
+        # Registers 0..15 stay baseline AVX/AVX2.
+        self.check("vaddps ymm15,ymm14,ymm13", "AVX")
+        self.check("vpaddd ymm15,ymm14,ymm13", "AVX2")
+        self.check("vmovaps xmm15,xmm0", "AVX")
+
     def test_privileged_and_kernel_calls(self):
         self.check("in al,dx", "PORT-IO")
         self.check("out dx,al", "PORT-IO")
@@ -120,8 +135,10 @@ class ClassifyTest(unittest.TestCase):
         self.check("int 0B9h", "INT")
 
     def test_windows_served_interrupts_are_not_flagged(self):
-        for vector in ("3", "29h", "2Ch", "2Dh"):
+        for vector in ("3", "29h", "2Ch", "2Dh", "2ch", "2dh", "29H", "0x3", "0x29", "0x2c", "0X2D"):
             self.check(f"int {vector}", None)
+        for vector in ("2eh", "0x2e", "0x29h"):
+            self.check(f"int {vector}", "INT")
 
     def test_host_queries(self):
         self.check("cpuid", "CPUID")
@@ -133,6 +150,19 @@ class ClassifyTest(unittest.TestCase):
         self.check("xacquire lock cmpxchg16b xmmword ptr [r8]", "CX16")
         self.check("lock add dword ptr [rax],1", None)
         self.check("rep stos byte ptr [rdi]", None)
+
+    def test_prefixes_with_extra_whitespace_and_mixed_case(self):
+        self.assertEqual(scan.classify("lock", "  cmpxchg16b xmmword ptr [r8]"), "CX16")
+        self.assertEqual(scan.classify("lock", "\tcmpxchg16b xmmword ptr [r8]"), "CX16")
+        self.assertEqual(scan.classify("xacquire", "  lock\t  cmpxchg16b xmmword ptr [r8]"), "CX16")
+        self.assertEqual(scan.classify("rep", "  insb"), "PORT-IO")
+        self.assertEqual(scan.classify("rep", "\tinsb"), "PORT-IO")
+        self.assertEqual(scan.classify("LOCK", "CMPXCHG16B XMMWORD PTR [R8]"), "CX16")
+        self.assertEqual(scan.classify("MOV", "RAX,CR0"), "SYSTEM")
+        self.assertEqual(scan.classify("VADDPS", "YMM0,YMM1,YMM2"), "AVX")
+        self.assertEqual(scan.classify("VMOVUPS", "XMMWORD PTR [RAX],XMM0"), "AVX")
+        self.assertEqual(scan.classify("VADDPS", "ZMM0,ZMM1,ZMM2"), "AVX512")
+        self.assertEqual(scan.classify("VADDPS", "YMM0{K1},YMM1,YMM2"), "AVX512")
 
     def test_plain_code_needs_nothing(self):
         for text in ("mov rax,qword ptr [rcx+18h]", "add rsp,28h", "ret", "movaps xmm0,xmmword ptr [rcx]",
@@ -261,6 +291,24 @@ class CliTest(unittest.TestCase):
         code, _, err = self.run_main(self.listing, "--image", bad)
         self.assertEqual(code, 2)
         self.assertIn("bad.bin", err)
+
+    def test_negative_and_invalid_base_rejected(self):
+        for bad_base in ("-0x1000", "not-hex"):
+            with self.subTest(base=bad_base):
+                out, err = io.StringIO(), io.StringIO()
+                with redirect_stdout(out), redirect_stderr(err):
+                    with self.assertRaises(SystemExit) as cm:
+                        scan.main([self.listing, "--base", bad_base])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertNotIn("<lambda>", err.getvalue())
+
+    def test_unreadable_source_exits_2_without_traceback(self):
+        with mock.patch.object(scan.inline_scan, "read_lines", side_effect=PermissionError("denied")):
+            code, out, err = self.run_main(self.listing)
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn("denied", err)
+        self.assertNotIn("Traceback", err)
 
 
 if __name__ == "__main__":

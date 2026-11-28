@@ -385,6 +385,26 @@ class Filters(unittest.TestCase):
         self.assertIn("s_ff0", asm.skip_reason(PROG + ["s_ff0_i32_b64 s[4:5], s[6:7]"], "gfx1201"))
         self.assertEqual(len([op for op in asm.GFX12_REMOVED if op.startswith("s_cmpk_")]), 12)
 
+    def test_gfx12_has_no_always_true_or_false_valu_compare(self):
+        # gfx1036, gfx1100 and gfx1150 assemble these; gfx1201 rejects all sixteen (AMD LLVM 23).
+        self.assertEqual(len(asm.GFX12_VALU_REMOVED), 16)
+        for op in ("v_cmp_t_u32", "v_cmp_f_i32", "v_cmpx_t_u64", "v_cmpx_f_i64"):
+            for spelled in (op, op + "_e32", op + "_e64"):
+                self.assertIn("removed in GFX12", asm.valu_skip_reason(spelled, "gfx1201"), spelled)
+                self.assertIn("removed in GFX12", asm.valu_skip_reason(spelled, "gfx1200"), spelled)
+                for arch in ("gfx1013", "gfx1036", "gfx1100", "gfx1150"):
+                    self.assertIsNone(asm.valu_skip_reason(spelled, arch), (spelled, arch))
+        for op in ("v_cmp_eq_u32", "v_cmp_lt_u32_e64", "v_cmpx_ne_u32_e32", "v_add_nc_u32"):
+            self.assertIsNone(asm.valu_skip_reason(op, "gfx1201"), op)
+        # the GFX10.1-only mads are unchanged
+        self.assertIn("GFX10.1", asm.valu_skip_reason("v_mad_f32", "gfx1201"))
+        self.assertIsNone(asm.valu_skip_reason("v_mad_f32", "gfx1013"))
+        prog = ["v_mov_b32_e32 v1, 5", "", "v_cmp_t_u32_e64 s[4:5], v1, v2", "v_cmp_f_i32_e32 vcc, v1, v2"]
+        self.assertEqual(asm.program_skip_reason(prog, "gfx1201"),
+                         "v_cmp_t_u32: removed in GFX12 (no always-true/always-false VALU compare there)")
+        self.assertIsNone(asm.program_skip_reason(prog, "gfx1150"))
+        self.assertIsNone(asm.program_skip_reason(["v_mov_b32_e32 v1, 5"], "gfx1201"))
+
 
 class VcvarsScript(unittest.TestCase):
     """The .cmd that calls vcvars64.bat and cl holds the checkout, %TEMP% and Visual Studio paths. A character

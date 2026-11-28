@@ -263,7 +263,7 @@ bool bc7(const Symbols &a, const Symbols &b, const BptcState &ep,
 // earlier uses of the slot.
 struct Coverage {
   array<bool, 256> missing_ep{}, missing_ix{};
-  size_t lost{}, inconsistent{}, limit{};
+  size_t lost{}, inconsistent{}, limit{}, lost_limit{};
   bool lost_endpoints{}, lost_indices{};
   void note_missing(const BptcState &block) {
     const bool ep = block.ep_root >= 0 && missing_ep[block.ep_root];
@@ -382,7 +382,7 @@ bool rebuild_bptc(unsigned codec, size_t i, size_t blocks, const Symbols &a,
   } else if (i >= 256)
     coverage.note_missing(next);
   if (!valid) return false;
-  if (coverage.lost > coverage.limit) {
+  if (coverage.lost > coverage.lost_limit) {
     reason = coverage.lost_endpoints && coverage.lost_indices ? "missing-endpoint-and-index" :
              coverage.lost_endpoints ? "missing-endpoint" : "missing-index";
     return false;
@@ -394,7 +394,8 @@ bool rebuild_bptc(unsigned codec, size_t i, size_t blocks, const Symbols &a,
 
 Quality decode(unsigned codec, std::span<const uint8_t> source,
                std::span<uint8_t> output, bool allow_fitted,
-               const Calibration *history, const char** failure, bool fast_entropy) {
+               const Calibration *history, const char** failure, bool fast_entropy, size_t lost_divisor,
+               Report *report) {
   const char* reason = "bcpack-stream";
   if (failure) *failure = reason;
   Quality quality = Quality::confirmed;
@@ -410,12 +411,17 @@ Quality decode(unsigned codec, std::span<const uint8_t> source,
   coverage.limit = allow_fitted && history
                        ? max<size_t>(2, output.size() / block_size / 1024)
                        : 0;
+  coverage.lost_limit = allow_fitted && history
+                            ? max<size_t>(2, output.size() / block_size / max<size_t>(1, lost_divisor))
+                            : 0;
+  if (report) *report = {output.size() / block_size, 0};
   const bool valid = visit_blocks(codec, source, output.size(), [&](size_t i, const Symbols &first, const Symbols &tuple) {
     auto *dst = output.data() + i * block_size;
     if (codec >= 6)
       return rebuild_bptc(codec, i, output.size() / block_size, first, tuple, bptc, dst, history, allow_fitted, quality, coverage, reason);
     return rebuild_classic(codec, i, first, tuple, classic, dst, allow_fitted, quality);
   }, fast_entropy);
+  if (report) report->lost = coverage.lost;
   if (valid && (!coverage.inconsistent || quality == Quality::fitted)) return quality;
   if (failure) *failure = coverage.inconsistent && valid ? "anchor-or-pbit" : reason;
   return Quality::failed;

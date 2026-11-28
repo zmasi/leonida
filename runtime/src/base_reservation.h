@@ -35,24 +35,51 @@ struct Range {
     std::uint64_t size = 0;
 };
 
+// Parses "<hex_base>:<hex_size>" (as stored in LEONIDA_BASE_RESERVED), rejecting trailing characters,
+// zero sizes, hex overflow, and ranges whose base + size wraps 64-bit address space.
+inline std::optional<Range> parse_range(const wchar_t* value) {
+    if (!value || !*value) return std::nullopt;
+    const wchar_t* p = value;
+    auto parse_hex = [&](std::uint64_t& out) -> bool {
+        if (!*p) return false;
+        std::uint64_t v = 0;
+        bool any = false;
+        while (*p) {
+            unsigned digit = 0;
+            if (*p >= L'0' && *p <= L'9') digit = static_cast<unsigned>(*p - L'0');
+            else if (*p >= L'a' && *p <= L'f') digit = static_cast<unsigned>(*p - L'a' + 10);
+            else if (*p >= L'A' && *p <= L'F') digit = static_cast<unsigned>(*p - L'A' + 10);
+            else break;
+            if (v > (UINT64_MAX - digit) / 16) return false;
+            v = v * 16 + digit;
+            any = true;
+            ++p;
+        }
+        if (!any) return false;
+        out = v;
+        return true;
+    };
+    Range r{};
+    if (!parse_hex(r.base) || *p != L':') return std::nullopt;
+    ++p;
+    if (!parse_hex(r.size) || *p != L'\0') return std::nullopt;
+    if (!r.size || r.base > UINT64_MAX - r.size) return std::nullopt;
+    return r;
+}
+
 // The range this process was started with (LEONIDA_BASE_RESERVED), if any.
 inline std::optional<Range> inherited() {
     wchar_t value[64] = {};
     const DWORD length = GetEnvironmentVariableW(kVariable, value, 64);
     if (!length || length >= 64) return std::nullopt;
-    Range r{};
-    // swscanf_s, not swscanf (MSVC's C4996): integer conversions take no buffer sizes, so the parse is the same.
-    if (swscanf_s(value, L"%llx:%llx", reinterpret_cast<unsigned long long*>(&r.base),
-                  reinterpret_cast<unsigned long long*>(&r.size)) != 2 ||
-        !r.size)
-        return std::nullopt;
-    return r;
+    return parse_range(value);
 }
 
 // Commits [base, base + size) for the loader when it lies inside the reservation this process was started with and
 // that reservation is still in place; returns null otherwise (the caller then allocates as usual). The reservation
 // is the allocation, so VirtualFree(base, 0, MEM_RELEASE) frees it as it frees any image.
 inline void* commit_reserved(std::uint64_t base, std::uint64_t size) {
+    if (!size || base > UINT64_MAX - size) return nullptr;
     const auto r = inherited();
     if (!r || base != r->base || size > r->size) return nullptr;
     MEMORY_BASIC_INFORMATION info{};
@@ -82,11 +109,17 @@ inline std::optional<Range> needed(const std::filesystem::path& image) {
         oh.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size)
         return std::nullopt;  // relocatable: the loader moves it if the base is taken
     const Range r{oh.ImageBase, (static_cast<std::uint64_t>(oh.SizeOfImage) + 0xffff) & ~std::uint64_t{0xffff}};
-    for (std::uint64_t at = r.base; at < r.base + r.size;) {
+    if (r.base > UINT64_MAX - r.size) return std::nullopt;
+    const std::uint64_t end = r.base + r.size;
+    for (std::uint64_t at = r.base; at < end;) {
         MEMORY_BASIC_INFORMATION info{};
         if (!VirtualQuery(reinterpret_cast<void*>(at), &info, sizeof info)) return r;
         if (info.State != MEM_FREE) return r;
-        at = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
+        const std::uint64_t region_base = reinterpret_cast<std::uint64_t>(info.BaseAddress);
+        if (at < region_base || at - region_base >= info.RegionSize) return r;
+        const std::uint64_t avail = info.RegionSize - (at - region_base);
+        if (avail >= end - at) break;
+        at += avail;
     }
     return std::nullopt;
 }

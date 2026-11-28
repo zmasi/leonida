@@ -5,6 +5,7 @@ stand-in oracle. No GPU, no assembler.
 """
 import hashlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -161,6 +162,24 @@ class KernelText(unittest.TestCase):
         with unittest.mock.patch.object(k, "lines", return_value=lines), self.assertRaises(ValueError):
             probe.check_kernel(k)
 
+    def test_check_kernel_rejects_empty_cases_and_bad_stores(self):
+        empty = probe.Kernel("empty")
+        empty.add_node(probe.leaf())
+        with self.assertRaises(ValueError):
+            probe.check_kernel(empty)
+
+        base = kernels()["tri_g1a"]
+        good_lines = base.lines()
+        for label, bad_line in (
+            ("negative offset", "global_store_dwordx4 v13, v[16:19], s[20:21] offset:-16"),
+            ("ctl dwordx4 overflow", "global_store_dwordx4 v13, v[16:19], s[24:25] offset:4"),
+            ("no-offset unknown base", "global_store_dwordx4 v13, v[16:19], s[0:1]"),
+        ):
+            with self.subTest(case=label):
+                patched = good_lines[:-1] + [bad_line, good_lines[-1]]
+                with unittest.mock.patch.object(base, "lines", return_value=patched), self.assertRaises(ValueError):
+                    probe.check_kernel(base)
+
 
 class HardwarePath(unittest.TestCase):
     def test_measured_outputs_match(self):
@@ -191,6 +210,67 @@ class HardwarePath(unittest.TestCase):
         hw = probe.run_hw([ks["tri_g1a"], ks["tri_lanes_w32"]], o, hw_asm)
         self.assertIn("skipped", hw["tri_lanes_w32"])
         self.assertEqual(o.calls, [1])
+
+    def test_skipped_hw_kernel_is_not_reported_ok_and_all_skipped_exits_77(self):
+        ks = kernels()
+        lane_k = ks["tri_lanes_w32"]
+        with redirect_stdout(io.StringIO()):
+            rows, bad = probe.compare([lane_k], None, {lane_k.label: "skipped: too big"})
+        self.assertEqual(bad, 0)
+        self.assertEqual(len(rows), 7 * 64)
+        self.assertTrue(all(r["status"] == "SKIP" for r in rows))
+
+        class CloseableOracle(FakeOracle):
+            max_words = 4096
+
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_json = os.path.join(tmp, "skipped.json")
+            o1 = CloseableOracle(ks)
+            buf = io.StringIO()
+            with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=o1), redirect_stdout(buf):
+                rc = probe.main(["--oracle", "hw", "--kernel", "tri_lanes_w32", "--json", out_json])
+            self.assertEqual(rc, 77)
+            self.assertTrue(o1.closed)
+            self.assertIn("0 match, 0 mismatch, 448 skipped", buf.getvalue())
+            with open(out_json, "rb") as f:
+                raw = f.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+            doc = json.loads(raw.decode("utf-8"))
+            self.assertTrue(all(r["status"] == "SKIP" for r in doc["rows"]))
+
+            o2 = CloseableOracle(ks)
+            buf2 = io.StringIO()
+            with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=o2), redirect_stdout(buf2):
+                rc2 = probe.main(["--oracle", "hw", "--kernel", "tri_g1a", "--kernel", "tri_lanes_w32"])
+            self.assertEqual(rc2, 0)
+            self.assertTrue(o2.closed)
+            self.assertIn(f"{len(ks['tri_g1a'].cases)} match, 0 mismatch, 448 skipped", buf2.getvalue())
+
+    def test_unsupported_arch_exits_77_cleanly(self):
+        class OldArchOracle:
+            arch = "gfx900"
+
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        o = OldArchOracle()
+        err = io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=o), redirect_stderr(err):
+            rc = probe.main(["--oracle", "hw", "--kernel", "tri_g1a"])
+        self.assertEqual(rc, 77)
+        self.assertTrue(o.closed)
+        self.assertIn("SKIP: gfx900 is not GFX10", err.getvalue())
 
     def test_missing_oracle_exits_77(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("LEONIDA_HW_") and k != "LEONIDA_AMD_CLANG"}
@@ -233,7 +313,41 @@ class CommandLine(unittest.TestCase):
                 data = f.read()
             self.assertNotIn(b"\r\n", data)
             self.assertEqual(data.decode("utf-8"), "\n".join(kernels()["tri_g4b"].lines()) + "\n")
-            self.assertTrue(os.path.isfile(os.path.join(tmp, "tri_g4b.json")))
+            with open(os.path.join(tmp, "tri_g4b.json"), "rb") as f:
+                jdata = f.read()
+            self.assertTrue(jdata.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", jdata)
+            self.assertEqual(json.loads(jdata.decode("utf-8"))["label"], "tri_g4b")
+
+    def test_write_kernels_rejects_empty_and_existing_file(self):
+        for bad in ("", "  "):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(probe.main(["--write-kernels", bad]), 2)
+            self.assertEqual(err.getvalue(), "error: --write-kernels (empty) is not a directory path\n")
+        with tempfile.TemporaryDirectory() as tmp:
+            fp = os.path.join(tmp, "not_a_dir")
+            with open(fp, "w", encoding="utf-8", newline="\n") as f:
+                f.write("x\n")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(probe.main(["--write-kernels", fp]), 2)
+            self.assertEqual(err.getvalue(), f"error: --write-kernels {fp} is not a directory path\n")
+
+    def test_json_atomic_write_preserves_existing_file_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_json = os.path.join(tmp, "report.json")
+            with open(out_json, "w", encoding="utf-8", newline="\n") as f:
+                f.write("keep-me\n")
+            err = io.StringIO()
+            with unittest.mock.patch.object(probe.replace_retry, "replace", side_effect=OSError("disk full")), \
+                    redirect_stdout(io.StringIO()), redirect_stderr(err):
+                rc = probe.main(["--kernel", "tri_g4a", "--json", out_json])
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot write --json", err.getvalue())
+            with open(out_json, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), "keep-me\n")
+            self.assertEqual(os.listdir(tmp), ["report.json"])
 
 
 if __name__ == "__main__":

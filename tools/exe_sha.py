@@ -26,6 +26,14 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CHUNK = 1 << 20
+_HEX_DIGITS = frozenset("0123456789abcdef")
+
+
+def _valid_sha256(value: object) -> str | None:
+    if not isinstance(value, str):
+        return None
+    s = value.strip().lower()
+    return s if len(s) == 64 and all(c in _HEX_DIGITS for c in s) else None
 
 
 def sha256_of(path: str) -> str:
@@ -42,7 +50,7 @@ def find_manifest(exe: str) -> str | None:
     name = os.path.basename(exe)
     for path in sorted(glob.glob(os.path.join(ROOT, "game", "*.json"))):
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(path, encoding="utf-8-sig") as f:
                 data = json.load(f)
         except (OSError, ValueError):
             continue
@@ -51,21 +59,24 @@ def find_manifest(exe: str) -> str | None:
     return None
 
 
-def recorded(manifest: str | None) -> tuple[str | None, int | None, str | None]:
+def recorded(manifest: str | None, *, strict: bool = False) -> tuple[str | None, int | None, str | None]:
     """(source, expected size, expected sha256) from a manifest path, ignoring absent or unusable keys."""
     if not manifest:
         return None, None, None
     try:
-        with open(manifest, encoding="utf-8") as f:
+        with open(manifest, encoding="utf-8-sig") as f:
             data = json.load(f)
     except (OSError, ValueError):
+        if strict:
+            raise
         return manifest, None, None
     if not isinstance(data, dict):
+        if strict:
+            raise ValueError("manifest root must be a JSON object")
         return manifest, None, None
     size = data.get("expected_exe_size")
-    digest = data.get("expected_exe_sha256")
-    size = size if isinstance(size, int) and size >= 0 else None
-    digest = digest.lower() if isinstance(digest, str) and len(digest) == 64 else None
+    size = size if isinstance(size, int) and not isinstance(size, bool) and size >= 0 else None
+    digest = _valid_sha256(data.get("expected_exe_sha256"))
     return manifest, size, digest
 
 
@@ -76,10 +87,10 @@ def check(exe: str, expect: str | None = None, manifest: str | None = None) -> d
     if manifest is None and expect is None:
         used = find_manifest(exe)
     if expect is None:
-        used, expected_size, expected_sha = recorded(used)
+        used, expected_size, expected_sha = recorded(used, strict=(manifest is not None))
     else:
         expect = expect.strip().lower()
-        expected_sha = expect if len(expect) == 64 else None
+        expected_sha = _valid_sha256(expect)
 
     size = os.path.getsize(exe)
     result = {
@@ -107,6 +118,8 @@ def check(exe: str, expect: str | None = None, manifest: str | None = None) -> d
             result["status"] = "mismatch"
         else:
             result["status"] = "match"
+    elif expected_size is not None:
+        result["status"] = "match"
     return result
 
 
@@ -129,7 +142,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = check(args.exe, args.expect, args.manifest)
     except OSError as exc:
-        print(f"exe_sha: {args.exe}: {exc.strerror or exc}", file=sys.stderr)
+        bad = args.manifest if args.manifest and getattr(exc, "filename", None) == args.manifest else args.exe
+        print(f"exe_sha: {bad}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"exe_sha: {args.manifest or args.exe}: {exc}", file=sys.stderr)
         return 2
 
     if args.json:

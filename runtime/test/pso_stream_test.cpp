@@ -45,6 +45,9 @@ std::size_t payload_of_type(const std::vector<unsigned char>& s, unsigned wanted
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK) { size = 4; align = 4; }
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER) { size = sizeof(D3D12_RASTERIZER_DESC); align = 4; }
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1) { size = sizeof(D3D12_DEPTH_STENCIL_DESC1); align = 4; }
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2) { size = sizeof(D3D12_DEPTH_STENCIL_DESC2); align = 4; }
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1) { size = sizeof(D3D12_RASTERIZER_DESC1); align = 4; }
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2) { size = sizeof(D3D12_RASTERIZER_DESC2); align = 4; }
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE) { size = 8; align = 8; }
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_INPUT_LAYOUT) { size = sizeof(D3D12_INPUT_LAYOUT_DESC); align = 8; }
         const std::size_t pay = align_up(off + 4, align);
@@ -285,6 +288,119 @@ void test_refusals() {
           "a stream with an unmodelled subobject type is not captured");
 }
 
+// Tags 0, 1 and 5 on a base whose depth-stencil is DEPTH_STENCIL2 and whose rasterizer is RASTERIZER1 or RASTERIZER2:
+// the record's D3D12 v0 description is converted into the later version (RT-STATE-PSO-OVERLAY-DS2-RS12).
+void test_later_subobject_versions() {
+    for (const bool raster2 : {false, true}) {
+        StreamBuilder s;
+        ID3D12RootSignature* root = nullptr;
+        s.entry(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, &root, 8, 8);
+        D3D12_DEPTH_STENCIL_DESC2 base_ds{};
+        base_ds.DepthEnable = TRUE;
+        base_ds.FrontFace.StencilReadMask = 0x11;
+        base_ds.BackFace.StencilReadMask = 0x22;
+        base_ds.DepthBoundsTestEnable = TRUE;
+        s.entry(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2, &base_ds, sizeof(base_ds), 4);
+        unsigned raster_type;
+        if (raster2) {
+            D3D12_RASTERIZER_DESC2 r{};
+            r.FillMode = D3D12_FILL_MODE_SOLID;
+            raster_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2;
+            s.entry(raster_type, &r, sizeof(r), 4);
+        } else {
+            D3D12_RASTERIZER_DESC1 r{};
+            r.FillMode = D3D12_FILL_MODE_SOLID;
+            raster_type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1;
+            s.entry(raster_type, &r, sizeof(r), 4);
+        }
+        auto rec = rt::d3d12_xs::PsoStreamRecord::capture({s.bytes.size(), s.bytes.data()});
+        if (!rec) { check(false, "base with DEPTH_STENCIL2 and RASTERIZER1/2 captured"); return; }
+        const std::size_t dp = payload_of_type(rec->bytes(), D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2);
+        const std::size_t rp = payload_of_type(rec->bytes(), raster_type);
+
+        D3D12_DEPTH_STENCIL_DESC ds{};
+        ds.DepthEnable = FALSE;
+        ds.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        ds.DepthFunc = D3D12_COMPARISON_FUNC_GREATER;
+        ds.StencilEnable = TRUE;
+        ds.StencilReadMask = 0x0f;
+        ds.StencilWriteMask = 0xf0;
+        ds.FrontFace = {D3D12_STENCIL_OP_ZERO, D3D12_STENCIL_OP_INCR, D3D12_STENCIL_OP_REPLACE, D3D12_COMPARISON_FUNC_EQUAL};
+        ds.BackFace = {D3D12_STENCIL_OP_INVERT, D3D12_STENCIL_OP_DECR, D3D12_STENCIL_OP_KEEP, D3D12_COMPARISON_FUNC_LESS};
+        D3D12_RASTERIZER_DESC raster{};
+        raster.FillMode = D3D12_FILL_MODE_WIREFRAME;
+        raster.CullMode = D3D12_CULL_MODE_FRONT;
+        raster.FrontCounterClockwise = TRUE;
+        raster.DepthBias = 7;
+        raster.DepthBiasClamp = 0.5f;
+        raster.SlopeScaledDepthBias = 2.0f;
+        raster.DepthClipEnable = TRUE;
+        raster.AntialiasedLineEnable = TRUE;
+        raster.ForcedSampleCount = 4;
+        auto r0 = record(0, &ds, sizeof(ds));
+        auto r1 = record(1, &raster, sizeof(raster));
+        std::vector<unsigned char> both;
+        both.insert(both.end(), r0.begin(), r0.end());
+        both.insert(both.end(), r1.begin(), r1.end());
+        std::vector<unsigned char> out;
+        check(rt::d3d12_xs::derive_stream(*rec, both.data(), 2, out) == rt::d3d12_xs::DeriveStatus::ok,
+              raster2 ? "tags 0 and 1 derive on DEPTH_STENCIL2 and RASTERIZER2"
+                      : "tags 0 and 1 derive on DEPTH_STENCIL2 and RASTERIZER1");
+        if (out.size() != rec->bytes().size()) continue;
+
+        D3D12_DEPTH_STENCIL_DESC2 d2;
+        std::memcpy(&d2, out.data() + dp, sizeof(d2));
+        check(!d2.DepthEnable && d2.DepthWriteMask == D3D12_DEPTH_WRITE_MASK_ZERO &&
+                  d2.DepthFunc == D3D12_COMPARISON_FUNC_GREATER && d2.StencilEnable,
+              "tag 0 sets the DEPTH_STENCIL2 depth fields");
+        check(d2.FrontFace.StencilFailOp == D3D12_STENCIL_OP_ZERO && d2.FrontFace.StencilPassOp == D3D12_STENCIL_OP_REPLACE &&
+                  d2.FrontFace.StencilFunc == D3D12_COMPARISON_FUNC_EQUAL &&
+                  d2.BackFace.StencilFailOp == D3D12_STENCIL_OP_INVERT &&
+                  d2.BackFace.StencilDepthFailOp == D3D12_STENCIL_OP_DECR &&
+                  d2.BackFace.StencilFunc == D3D12_COMPARISON_FUNC_LESS,
+              "tag 0 sets the DEPTH_STENCIL2 face ops");
+        check(d2.FrontFace.StencilReadMask == 0x0f && d2.BackFace.StencilReadMask == 0x0f &&
+                  d2.FrontFace.StencilWriteMask == 0xf0 && d2.BackFace.StencilWriteMask == 0xf0,
+              "tag 0 puts its one pair of masks on both DEPTH_STENCIL2 faces");
+        check(d2.DepthBoundsTestEnable == TRUE, "tag 0 keeps the DEPTH_STENCIL2 depth-bounds field of the base");
+
+        if (raster2) {
+            D3D12_RASTERIZER_DESC2 r2;
+            std::memcpy(&r2, out.data() + rp, sizeof(r2));
+            check(r2.FillMode == D3D12_FILL_MODE_WIREFRAME && r2.CullMode == D3D12_CULL_MODE_FRONT &&
+                      r2.FrontCounterClockwise && r2.DepthBias == 7.0f && r2.DepthBiasClamp == 0.5f &&
+                      r2.SlopeScaledDepthBias == 2.0f && r2.DepthClipEnable && r2.ForcedSampleCount == 4 &&
+                      r2.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED,
+                  "tag 1 is converted into RASTERIZER2 (float bias, line mode from AntialiasedLineEnable)");
+        } else {
+            D3D12_RASTERIZER_DESC1 r1d;
+            std::memcpy(&r1d, out.data() + rp, sizeof(r1d));
+            check(r1d.FillMode == D3D12_FILL_MODE_WIREFRAME && r1d.CullMode == D3D12_CULL_MODE_FRONT &&
+                      r1d.FrontCounterClockwise && r1d.DepthBias == 7.0f && r1d.DepthBiasClamp == 0.5f &&
+                      r1d.SlopeScaledDepthBias == 2.0f && r1d.DepthClipEnable && r1d.AntialiasedLineEnable &&
+                      r1d.ForcedSampleCount == 4,
+                  "tag 1 is converted into RASTERIZER1 (float bias)");
+        }
+
+        // Tag 5 sets both faces' masks and nothing else.
+        unsigned char mask_payload[0x16] = {};
+        mask_payload[0x10] = 0x3c;
+        mask_payload[0x11] = 0xc3;
+        auto r5 = record(5, mask_payload, sizeof(mask_payload));
+        check(rt::d3d12_xs::derive_stream(*rec, r5.data(), 1, out) == rt::d3d12_xs::DeriveStatus::ok,
+              "tag 5 derives on a base with DEPTH_STENCIL2");
+        if (out.size() != rec->bytes().size()) continue;
+        std::memcpy(&d2, out.data() + dp, sizeof(d2));
+        check(d2.FrontFace.StencilReadMask == 0x3c && d2.BackFace.StencilReadMask == 0x3c &&
+                  d2.FrontFace.StencilWriteMask == 0xc3 && d2.BackFace.StencilWriteMask == 0xc3,
+              "tag 5 sets both DEPTH_STENCIL2 faces' masks");
+        check(d2.DepthEnable == TRUE && !d2.StencilEnable && d2.DepthBoundsTestEnable == TRUE &&
+                  d2.FrontFace.StencilFailOp == base_ds.FrontFace.StencilFailOp &&
+                  d2.BackFace.StencilFunc == base_ds.BackFace.StencilFunc,
+              "tag 5 leaves the other DEPTH_STENCIL2 fields unchanged");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -295,6 +411,7 @@ int main() {
     test_stencil_mask_record();
     test_view_instancing_is_captured();
     test_refusals();
+    test_later_subobject_versions();
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;
 }

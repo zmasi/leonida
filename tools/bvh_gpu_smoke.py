@@ -29,6 +29,7 @@ which the wave64 bitonic sorts need on a 32 KiB device.
 Nothing from the package is written outside --work. The report holds module names, statuses and counts only.
 """
 import argparse
+import contextlib
 import json
 import math
 import os
@@ -39,6 +40,12 @@ import tempfile
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
+
 REHYDRATION = ("Box16Rehydration", "Box32Rehydration", "LeafRehydration")
 TABLE_QWORDS = 512   # a 4 KiB root table
 
@@ -252,6 +259,34 @@ def find_vk_compute_test(build):
     raise SystemExit(f"error: {exe} not found in {build} (build the runtime first)")
 
 
+def _write_json_atomic(path, payload):
+    """Write a JSON report to a staging file and rename atomically, cleaning up read-only staging files on failure."""
+    dest = os.path.abspath(os.fspath(path))
+    parent = os.path.dirname(dest) or "."
+    os.makedirs(parent, exist_ok=True)
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", delete=False,
+            dir=parent, prefix=".bvh_gpu_smoke-", suffix=".tmp",
+        ) as f:
+            staged = f.name
+            f.write(json.dumps(payload, indent=1) + "\n")
+        os.chmod(staged, published_mode(dest))
+        replace_retry(staged, dest)
+        staged = None
+    finally:
+        if staged is not None:
+            try:
+                os.chmod(staged, 0o600)
+            except OSError:
+                pass
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Run XboxBvhBuilder.dll's translated programs on the GPU (TEST-594).")
     src = ap.add_mutually_exclusive_group(required=True)
@@ -273,43 +308,71 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if not math.isfinite(a.timeout) or a.timeout <= 0:
         ap.error("--timeout must be finite and greater than zero")
+    if a.max_shared_memory <= 0:
+        ap.error("--max-shared-memory must be greater than zero")
     if a.heap_bytes % 4 or a.heap_bytes < TABLE_QWORDS * 8:
         ap.error(f"--heap-bytes must be a multiple of 4 and at least {TABLE_QWORDS * 8}")
     if not 0 <= a.table_qword < 1 << 64:
         ap.error("--table-qword must fit in 64 bits")
-    vkc = find_vk_compute_test(a.build)
-    if a.spirv:
-        spirv = Path(a.spirv)
-    else:
-        work = Path(a.work) if a.work else Path(tempfile.mkdtemp(prefix="bvh_gpu_work_"))
-        spirv = translate(a.game_dir, work, a.max_shared_memory)
-    results = smoke(spirv, vkc, table_qword=a.table_qword, heap_bytes=a.heap_bytes, validation=not a.no_validation,
-                    timeout=a.timeout, include_rehydration=a.include_rehydration)
-    if not results:
-        print(f"error: no translated programs in {spirv}", file=sys.stderr)
-        return 2
-    for r in results:
-        words = "-" if r["words_changed"] is None else str(r["words_changed"])
-        print(f"{r['name']:28} {r['status']:16} {words:>8}  {r['detail'] if r['status'] != 'pass' else ''}")
-    counts = {}
-    for r in results:
-        counts[r["status"]] = counts.get(r["status"], 0) + 1
-    working = sum(1 for r in results if r["status"] == "pass" and r["words_changed"] and
-                  r["words_changed"] > 0)
-    print(f"{counts.get('pass', 0)} of {len(results)} pass; {working} changed heap words beyond running; "
-          + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()) if k != "pass"))
-    checked = []
-    if a.checked:
-        checked = run_checked(spirv, vkc, heap_bytes=a.heap_bytes, validation=not a.no_validation, timeout=a.timeout)
-        for r in checked:
-            print(f"checked {r['name']:20} {r['status']:10} {r['detail']}")
-        print(f"checked: {sum(r['status'] == 'pass' for r in checked)} of {len(checked)} write exactly what they should")
     if a.json:
-        Path(a.json).write_text(json.dumps({"max_shared_memory": a.max_shared_memory, "table_qword": a.table_qword,
-                                            "heap_bytes": a.heap_bytes, "results": results, "checked": checked},
-                                           indent=1), encoding="utf-8", newline="\n")
-    ok = counts.get("pass", 0) == len(results) and all(r["status"] == "pass" for r in checked)
-    return 0 if ok else 1
+        if os.path.isdir(a.json):
+            ap.error(f"--json is a directory: {a.json}")
+        if a.game_dir and (same_report_path(a.json, a.game_dir)
+                           or same_report_path(a.json, os.path.join(a.game_dir, "XboxBvhBuilder.dll"))):
+            ap.error(f"--json must not overwrite an input: {a.json}")
+        if a.spirv:
+            if same_report_path(a.json, a.spirv):
+                ap.error(f"--json must not overwrite an input: {a.json}")
+            if os.path.isdir(a.spirv):
+                try:
+                    spvs = list(Path(a.spirv).glob("*.spv"))
+                except OSError:
+                    spvs = []
+                if any(same_report_path(a.json, str(p)) for p in spvs):
+                    ap.error(f"--json must not overwrite an input: {a.json}")
+    vkc = find_vk_compute_test(a.build)
+    with contextlib.ExitStack() as stack:
+        if a.spirv:
+            spirv = Path(a.spirv)
+        else:
+            work = Path(a.work) if a.work else Path(
+                stack.enter_context(tempfile.TemporaryDirectory(prefix="bvh_gpu_work_"))
+            )
+            spirv = translate(a.game_dir, work, a.max_shared_memory)
+        results = smoke(spirv, vkc, table_qword=a.table_qword, heap_bytes=a.heap_bytes,
+                        validation=not a.no_validation, timeout=a.timeout,
+                        include_rehydration=a.include_rehydration)
+        if not results:
+            print(f"error: no translated programs in {spirv}", file=sys.stderr)
+            return 2
+        for r in results:
+            words = "-" if r["words_changed"] is None else str(r["words_changed"])
+            print(f"{r['name']:28} {r['status']:16} {words:>8}  {r['detail'] if r['status'] != 'pass' else ''}")
+        counts = {}
+        for r in results:
+            counts[r["status"]] = counts.get(r["status"], 0) + 1
+        working = sum(1 for r in results if r["status"] == "pass" and r["words_changed"] and
+                      r["words_changed"] > 0)
+        print(f"{counts.get('pass', 0)} of {len(results)} pass; {working} changed heap words beyond running; "
+              + ", ".join(f"{k} {v}" for k, v in sorted(counts.items()) if k != "pass"))
+        checked = []
+        if a.checked:
+            checked = run_checked(spirv, vkc, heap_bytes=a.heap_bytes, validation=not a.no_validation,
+                                  timeout=a.timeout)
+            for r in checked:
+                print(f"checked {r['name']:20} {r['status']:10} {r['detail']}")
+            print(f"checked: {sum(r['status'] == 'pass' for r in checked)} of {len(checked)} "
+                  f"write exactly what they should")
+        if a.json:
+            payload = {"max_shared_memory": a.max_shared_memory, "table_qword": a.table_qword,
+                       "heap_bytes": a.heap_bytes, "results": results, "checked": checked}
+            try:
+                _write_json_atomic(a.json, payload)
+            except OSError as e:
+                print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+                return 2
+        ok = counts.get("pass", 0) == len(results) and all(r["status"] == "pass" for r in checked)
+        return 0 if ok else 1
 
 
 if __name__ == "__main__":

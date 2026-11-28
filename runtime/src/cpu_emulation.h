@@ -45,6 +45,8 @@ struct Decoded {
 
 // One of the encodings above at `code` (`avail` readable bytes), or Op::none.
 inline Decoded decode(const uint8_t* code, std::size_t avail) {
+    if (!code) return {};
+    if (avail > 15) avail = 15;  // architectural x86-64 maximum instruction length
     Decoded d;
     std::size_t i = 0;
     bool p66 = false, pf2 = false, pf3 = false;
@@ -186,10 +188,12 @@ inline std::atomic<uint64_t>& count(Op op) {
     return counts[int(op)];
 }
 
-// 0 when the page holding `addr` can be written; otherwise the exception a write raises there. A guard page loses
+// 0 when the page holding `addr` can be written (and sets `region_end` to the end of the contiguous committed
+// writable region returned by VirtualQuery); otherwise the exception a write raises there. A guard page loses
 // its guard on that first touch and reports STATUS_GUARD_PAGE_VIOLATION, as the system does for a real access.
-inline DWORD writable(uint64_t addr) {
-    MEMORY_BASIC_INFORMATION mbi;
+inline DWORD writable_region(uint64_t addr, uint64_t& region_end) {
+    region_end = addr;
+    MEMORY_BASIC_INFORMATION mbi{};
     if (!VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT)
         return DWORD(STATUS_ACCESS_VIOLATION);
     if (mbi.Protect & PAGE_GUARD) {
@@ -200,19 +204,33 @@ inline DWORD writable(uint64_t addr) {
     const DWORD p = mbi.Protect & 0xFF;
     const bool ok = p == PAGE_READWRITE || p == PAGE_WRITECOPY || p == PAGE_EXECUTE_READWRITE ||
                     p == PAGE_EXECUTE_WRITECOPY;
-    return ok ? 0 : DWORD(STATUS_ACCESS_VIOLATION);
+    if (!ok) return DWORD(STATUS_ACCESS_VIOLATION);
+    const uint64_t base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+    if (addr < base || addr - base >= mbi.RegionSize) return DWORD(STATUS_ACCESS_VIOLATION);
+    const uint64_t avail = mbi.RegionSize - (addr - base);
+    region_end = avail > UINT64_MAX - addr ? UINT64_MAX : addr + avail;
+    return 0;
+}
+
+inline DWORD writable(uint64_t addr) {
+    uint64_t region_end = 0;
+    return writable_region(addr, region_end);
 }
 
 // How many of the `want` bytes at `addr` can be read, by page protection (no fault is taken to find out).
 inline std::size_t readable(uint64_t addr, std::size_t want) {
     std::size_t got = 0;
     while (got < want) {
-        MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery(reinterpret_cast<void*>(addr + got), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
+        if (got > UINT64_MAX - addr) break;
+        const uint64_t cur = addr + got;
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (!VirtualQuery(reinterpret_cast<void*>(cur), &mbi, sizeof mbi) || mbi.State != MEM_COMMIT ||
             (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) || !mbi.Protect)
             break;
-        const uint64_t end = reinterpret_cast<uint64_t>(mbi.BaseAddress) + mbi.RegionSize;
-        got += std::size_t(end - (addr + got)) < want - got ? std::size_t(end - (addr + got)) : want - got;
+        const uint64_t base = reinterpret_cast<uint64_t>(mbi.BaseAddress);
+        if (cur < base || cur - base >= mbi.RegionSize) break;
+        const uint64_t avail = mbi.RegionSize - (cur - base);
+        got += avail < want - got ? static_cast<std::size_t>(avail) : want - got;
     }
     return got;
 }
@@ -315,15 +333,17 @@ inline ClzeroLoopResult try_clzero_loop(const uint8_t* code, std::size_t avail, 
 
     const uint64_t start = c->Rax;
     const uint64_t limit = gpr_read(c, limit_reg);
-    if ((start & 63) != 0 || limit <= start + 64) return ClzeroLoopResult::no_match;
+    if ((start & 63) != 0 || limit <= start || limit - start <= 64) return ClzeroLoopResult::no_match;
 
-    uint64_t total = (limit - start + 63) & ~uint64_t(63);
+    const uint64_t span = limit - start;
     constexpr uint64_t kMaxBatch = uint64_t(64) << 20;
-    if (total > kMaxBatch) total = kMaxBatch;
+    const uint64_t total = span >= kMaxBatch ? kMaxBatch : ((span + 63) & ~uint64_t(63));
+    if (total > UINT64_MAX - start) return ClzeroLoopResult::no_match;
     const uint64_t end = start + total;
 
     for (uint64_t cur = start; cur < end;) {
-        const DWORD err = writable(cur);
+        uint64_t region_end = cur;
+        const DWORD err = writable_region(cur, region_end);
         if (err) {
             if (cur > start) {
                 std::memset(reinterpret_cast<void*>(start), 0, std::size_t(cur - start));
@@ -339,8 +359,7 @@ inline ClzeroLoopResult try_clzero_loop(const uint8_t* code, std::size_t avail, 
             }
             return ClzeroLoopResult::faulted;
         }
-        const uint64_t next_page = (cur & ~uint64_t(0xFFF)) + 0x1000;
-        cur = next_page < end ? next_page : end;
+        cur = region_end < end ? region_end : end;
     }
 
     std::memset(reinterpret_cast<void*>(start), 0, std::size_t(total));

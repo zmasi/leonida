@@ -8,6 +8,7 @@ synthetically in memory — no game files or game-derived tables are used.
 import io
 import json
 import os
+import posixpath
 import struct
 import subprocess
 import sys
@@ -15,6 +16,7 @@ import tempfile
 import unittest
 import zlib
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 from unittest.mock import Mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,6 +26,7 @@ import bcpack  # noqa: E402
 import bcpack_history_calib as calib  # noqa: E402
 import bcpack_tables as tables  # noqa: E402
 import bcpack_tables_bptc as bptc  # noqa: E402
+import report_paths  # noqa: E402
 import ttpf_mips as ttpf  # noqa: E402
 
 
@@ -1136,6 +1139,147 @@ class PoolSelfCalibrationTest(unittest.TestCase):
             with redirect_stderr(err_s):
                 self.assertEqual(calib.main(["--verify", bad_bc7, "--codec", "bc7"]), 2)
             self.assertIn("ERROR:", err_s.getvalue())
+
+    def test_fit_slices_fits_a_2d_mip_that_starts_in_the_chunks_first_256_blocks(self):
+        """A 2D mip whose first block lies inside its chunk's first 256 blocks is fitted against its sibling.
+
+        The BC7 top mip starts at block 0 of its own chunk, with its raw packed tail as the child sibling; fit_slices
+        used to skip any 2D mip starting below block 256.
+        """
+        import build_dstorage_history as dhist
+
+        with tempfile.TemporaryDirectory() as tmp:
+            width, height, mips_n = 64, 64, 2
+            lay7 = ttpf.surface_layout(width, height, 98, mips_n, ttpf.tile_bytes(4))
+            lin7 = []
+            for m, mip in enumerate(lay7["mips"]):
+                buf = bytearray()
+                scale = 1 if m == 0 else 2
+                half = 0 if m == 0 else 3
+                for by in range(mip["blocks_h"]):
+                    for bx in range(mip["blocks_w"]):
+                        r = min(254, (32 + bx * 6 * scale + half) & 0xFE)
+                        g = min(254, (80 + by * 6 * scale + half) & 0xFE)
+                        b = 140
+                        acc = 1 << 6
+                        pos = 7
+                        for v in (r >> 1, r >> 1, g >> 1, g >> 1, b >> 1, b >> 1, 127, 127):
+                            acc |= (v & 0x7F) << pos
+                            pos += 7
+                        acc |= (r & 1) << pos
+                        acc |= (r & 1) << (pos + 1)
+                        buf += acc.to_bytes(16, "little")
+                lin7.append(bytes(buf))
+            t7_tail = calib.retile_mip(lin7[1], lay7, lay7["mips"][1])
+            t7_top = calib.retile_mip(lin7[0], lay7, lay7["mips"][0])
+            sec7_ep = tuple([0x40, 0x60, 0x90, 0xFE, 0x40, 0x60, 0x90, 0xFE] * 3)
+            sec7_ix = tuple([0] * 32)
+            raw7_top = _encode_bc7_mode6_tiled(
+                t7_top, secret_entry=91, secret_ep=sec7_ep, secret_ix=sec7_ix, ref_count=8
+            )
+            pool7 = os.path.join(tmp, "mixed_bc7.ttpf")
+            base = ttpf.align(16 + 24 + 32, 4096)
+            _write_custom_rds5_pool(
+                pool7,
+                [_pack_etpf(width, height, 1, 1, 98, base, mode=4)],
+                [(8, lay7["mips"][1]["region"], zlib.compress(t7_tail, 9)), (7, lay7["mips"][0]["region"], raw7_top)],
+            )
+            docs = dhist.fit_slices([pool7])
+            bc7_bits = docs["bc7"]["historyEndpointBits"]
+            self.assertEqual(bc7_bits[91][:8], [8] * 8)
+
+
+class PathDeduplicationAndGuardTest(unittest.TestCase):
+    @staticmethod
+    def _darwin(case_sensitive_result):
+        fake_os = mock.Mock(wraps=os, pathconf=mock.Mock(return_value=case_sensitive_result))
+        fake_os.path.normcase = posixpath.normcase
+        return mock.patch.multiple(report_paths, sys=mock.Mock(platform="darwin"), os=fake_os)
+
+    def test_resolve_pools_deduplicates_macos_case_and_accents_and_keeps_case_sensitive(self):
+        with mock.patch.object(calib._ttpf, "find_pools", side_effect=lambda p: [p]):
+            with self._darwin(0):
+                self.assertEqual(
+                    len(calib._resolve_pools(["/tmp/leonida_pool/Pool.ttpf", "/tmp/leonida_pool/pool.ttpf"])),
+                    1,
+                )
+                self.assertEqual(
+                    len(calib._resolve_pools(["/tmp/leonida_pool/caf\u00e9.ttpf", "/tmp/leonida_pool/cafe\u0301.ttpf"])),
+                    1,
+                )
+            with self._darwin(1):
+                self.assertEqual(
+                    len(calib._resolve_pools(["/tmp/leonida_pool/Pool.ttpf", "/tmp/leonida_pool/pool.ttpf"])),
+                    2,
+                )
+
+    def test_resolve_pools_deduplicates_relative_hardlink_and_symlink(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "sub"))
+            pool_path = os.path.join(tmp, "sample.ttpf")
+            _write_custom_rds5_pool(pool_path, [_pack_etpf(4, 4, 1, 0, 71, 4096)], [(8, 4096, zlib.compress(bytes(8)))])
+            rel_alias = os.path.join(tmp, ".", "sub", "..", "sample.ttpf")
+            self.assertEqual(len(calib._resolve_pools([pool_path, rel_alias])), 1)
+
+            hard_link = os.path.join(tmp, "hard.ttpf")
+            try:
+                os.link(pool_path, hard_link)
+            except (OSError, NotImplementedError, AttributeError):
+                pass
+            else:
+                self.assertEqual(len(calib._resolve_pools([pool_path, hard_link])), 1)
+
+            sym_link = os.path.join(tmp, "sym.ttpf")
+            try:
+                os.symlink(pool_path, sym_link)
+            except (OSError, NotImplementedError, AttributeError):
+                self.skipTest("symlinks unavailable")
+            self.assertEqual(len(calib._resolve_pools([pool_path, sym_link])), 1)
+
+    def test_output_guards_refuse_overwriting_pools_ref_pairs_and_nested_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "out_dir")
+            os.makedirs(out_dir)
+            raw_bc1 = encode_lanes([[0] for _ in range(12)], 1)
+            ref_bc1 = bytes(8)
+            chunk_path = os.path.join(out_dir, "bc7.json")
+            ref_path = os.path.join(tmp, "ref.bin")
+            with open(chunk_path, "wb") as fh:
+                fh.write(raw_bc1)
+            with open(ref_path, "wb") as fh:
+                fh.write(ref_bc1)
+
+            pairs_path = os.path.join(tmp, "pairs.json")
+            pairs_payload = json.dumps({"pairs": [{"codec": "bc1", "chunk_file": chunk_path, "ref_file": ref_path}]})
+            with open(pairs_path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(pairs_payload)
+
+            err_s = io.StringIO()
+            with redirect_stderr(err_s):
+                rc = calib.main(["--ref-pairs", pairs_path, "--codec", "bc1", "--out", pairs_path])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", err_s.getvalue())
+            with open(pairs_path, "r", encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), pairs_payload)
+
+            err_s = io.StringIO()
+            with redirect_stderr(err_s):
+                rc = calib.main(["--ref-pairs", pairs_path, "--codec", "bc1,bc7", "--out", out_dir])
+            self.assertEqual(rc, 2)
+            self.assertIn("ERROR:", err_s.getvalue())
+            self.assertFalse(os.path.exists(os.path.join(out_dir, "bc1.json")))
+            with open(chunk_path, "rb") as fh:
+                self.assertEqual(fh.read(), raw_bc1)
+
+            with self._darwin(0):
+                err_s = io.StringIO()
+                with redirect_stderr(err_s):
+                    rc = calib.main([
+                        "--ref-pairs", "/tmp/leonida_guard/Pairs.json",
+                        "--out", "/tmp/leonida_guard/pairs.json",
+                    ])
+                self.assertEqual(rc, 2)
+                self.assertIn("ERROR:", err_s.getvalue())
 
 
 if __name__ == "__main__":

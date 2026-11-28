@@ -169,6 +169,26 @@ class DecodeTests(unittest.TestCase):
         ins = self.one(asm("f3 0f 1e fa"))      # endbr64 (decoded, no crash)
         self.assertEqual(ins.size, 4)
 
+    def test_group7_0f01_carries_modrm(self):
+        # 0F 01 /r is the system-instruction group. Every form has a ModRM byte, so
+        # reading only the two opcode bytes stops the walk one byte early.
+        for code, mnem in (("0f 01 fc", "clzero"), ("0f 01 d0", "xgetbv"),
+                           ("0f 01 fa", "monitorx"), ("0f 01 fb", "mwaitx"),
+                           ("0f 01 c8", "monitor"), ("0f 01 f9", "rdtscp"),
+                           ("0f 01 f8", "swapgs"), ("0f 01 e0", "smsw")):
+            ins = self.one(asm(code))
+            self.assertEqual(ins.size, 3, code)
+            self.assertEqual(ins.mnem, mnem, code)
+            self.assertEqual(ins.kind, "sys", code)
+
+        # the memory forms keep their ModRM/SIB/displacement length
+        ins = self.one(asm("0f 01 00"))              # sgdt [rax]
+        self.assertEqual((ins.mnem, ins.size), ("sgdt", 3))
+        ins = self.one(asm("0f 01 44 24 10"))        # sgdt [rsp+0x10]
+        self.assertEqual((ins.mnem, ins.size), ("sgdt", 5))
+        ins = self.one(asm("0f 01 7c 24 10"))        # invlpg [rsp+0x10]
+        self.assertEqual((ins.mnem, ins.size), ("invlpg", 5))
+
 
 class ShiftCarryAnalysisTests(unittest.TestCase):
     def test_imm_shift_zero_preserves_reaching_producer(self):

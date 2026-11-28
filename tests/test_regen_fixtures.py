@@ -96,6 +96,56 @@ class RegenFixturesTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("cs_nope.asm", err)
 
+    def test_unknown_flag_and_help(self):
+        code, out, err = self.run_main("--help")
+        self.assertEqual(code, 0)
+        self.assertIn("Regenerate", out)
+        self.assertEqual(err, "")
+        code, _, err = self.run_main("--bogus")
+        self.assertEqual(code, 2)
+        self.assertIn("unknown option: --bogus", err)
+
+    def test_path_traversal_name_is_rejected_before_reading(self):
+        escape_asm = os.path.join(os.path.dirname(self.asm), "escape.asm")
+        self.write(escape_asm, rf.ASM_MARK + "\ns_endpgm\n")
+        for bad_name in ("../escape", "sub/cs_a", "..", "."):
+            code, _, err = self.run_main(bad_name)
+            self.assertEqual(code, 2)
+            self.assertIn("invalid shader name", err)
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.fix), "escape.s")))
+
+    def test_utf8_bom_handled_in_asm_and_fixture(self):
+        asm_path = os.path.join(self.asm, "cs_bom.asm")
+        with open(asm_path, "wb") as f:
+            f.write((rf.ASM_MARK + "\nv_mov_b32 v0, 1\ns_endpgm\n").encode("utf-8-sig"))
+        self.assertEqual(rf.marked_names(), ["cs_bom"])
+        rendered = rf.render("cs_bom")
+        self.assertFalse(rendered.startswith("\ufeff"))
+        code, _, err = self.run_main("cs_bom")
+        self.assertEqual(code, 0, err)
+        s_path = os.path.join(self.fix, "cs_bom.s")
+        with open(s_path, "wb") as f:
+            f.write(rendered.encode("utf-8-sig"))
+        self.assertEqual(rf.generated_names(), ["cs_bom"])
+        code, out, err = self.run_main("--check")
+        self.assertEqual(code, 0, out + err)
+
+    def test_atomic_write_preserves_existing_fixture_on_failure(self):
+        from unittest import mock
+
+        self.run_main("cs_a")
+        s_path = os.path.join(self.fix, "cs_a.s")
+        with open(s_path, "rb") as f:
+            original = f.read()
+        self.write(os.path.join(self.asm, "cs_a.asm"), rf.ASM_MARK + "\nv_mov_b32 v0, 2\ns_endpgm\n")
+        with mock.patch.object(rf, "published_mode", side_effect=PermissionError("chmod blocked")):
+            code, _, err = self.run_main("cs_a")
+        self.assertEqual(code, 2)
+        self.assertIn("error processing fixtures:", err)
+        with open(s_path, "rb") as f:
+            self.assertEqual(f.read(), original)
+        self.assertEqual(sorted(os.listdir(self.fix)), ["cs_a.s", "hand.s"])
+
 
 class RepositoryTest(unittest.TestCase):
     def test_marked_sources_and_generated_fixtures_match(self):

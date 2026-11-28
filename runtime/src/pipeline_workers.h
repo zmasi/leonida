@@ -15,6 +15,7 @@
 #include <exception>
 #include <functional>
 #include <mutex>
+#include <new>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -52,10 +53,16 @@ public:
         }
         Batch batch{&job, count};
         std::unique_lock lock(mutex_);
-        queue_.push_back(&batch);
+        start(count - 1);
+        try {
+            queue_.push_back(&batch);
+        } catch (const std::bad_alloc&) {
+            lock.unlock();
+            for (std::size_t i = 0; i < count; ++i) job(i);
+            return;
+        }
         ++batches_;
         jobs_ += count;
-        start(count - 1);
         work_.notify_all();
         while (batch.next < batch.count) step(batch, lock);
         batch.done.wait(lock, [&] { return !batch.running; });
@@ -101,6 +108,8 @@ private:
                 ++started_;
             } catch (const std::system_error&) {
                 exhausted_ = true;  // the workers there are, and the callers, do it all
+            } catch (const std::bad_alloc&) {
+                break;  // out of memory growing the pool; existing workers and callers finish this batch
             }
         }
     }

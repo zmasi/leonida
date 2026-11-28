@@ -5,7 +5,8 @@ On a device without VK_EXT_mesh_shader, `rdna2spirv.py --mesh-compute` turns eac
 with the same workgroup size. Each workgroup writes its vertex and primitive counts, its vertices and its
 primitives into a slot of an output buffer. The layout is the shader's "mesh_compute" entry in index.json:
 rdna2spirv.mesh_compute_layout. The buffer's device address is in push-constant dwords 36..37, for both the
-compute shader and this vertex shader.
+compute shader and this vertex shader (or in the set-1 binding-0 uniform block `%pc_tail` at `pc_tail_address_dwords`
+when translated with `rdna2spirv.py --pc-tail-ubo`).
 
 The draw that follows is non-indexed: vkCmdDraw(groups * max_primitives * 3), where groups is the number of
 workgroups dispatched. Vertex v belongs to workgroup v / (3 * max_primitives), primitive (v / 3) % max_primitives,
@@ -29,6 +30,25 @@ import tempfile
 
 SUFFIX = ".mesh_vs"   # <ms name>.mesh_vs.spvasm / .spv next to the mesh shader
 USER_SGPRS = 32       # push constants: s0..s31, heap base, code base, then the output address (rdna2spirv.py)
+PC_TAIL_SET = 1       # set/binding of rdna2spirv.py --pc-tail-ubo's uniform block (6 dwords with --mesh-compute)
+PC_TAIL_BINDING = 0
+PC_TAIL_MAX_DWORDS = 64   # upper bound on %PcTail member count (256 bytes; avoids unbounded OpTypeStruct)
+
+
+def _pc_tail_dwords(lay):
+    """Return (lo, hi, tail_len) when `lay` uses --pc-tail-ubo's set-1 uniform block, else None."""
+    dwords = lay.get("pc_tail_address_dwords")
+    if dwords is None:
+        return None
+    if (not isinstance(dwords, (list, tuple)) or len(dwords) != 2
+            or any(isinstance(x, bool) or not isinstance(x, int) or x < 0 or x >= PC_TAIL_MAX_DWORDS
+                   for x in dwords)):
+        raise ValueError(
+            f"pc_tail_address_dwords must be two distinct ints in 0..{PC_TAIL_MAX_DWORDS - 1}, got {dwords!r}")
+    lo, hi = dwords
+    if lo == hi:
+        raise ValueError(f"pc_tail_address_dwords must be two distinct ints, got {dwords!r}")
+    return lo, hi, max(6, lo + 1, hi + 1)
 
 
 F16_HALF_TOP = 29
@@ -73,6 +93,7 @@ def vs_spvasm(layout, f16_halves=None):
     params = sorted((int(k), int(v)) for k, v in lay["params"].items())
     maxv, maxp = int(lay["max_vertices"]), int(lay["max_primitives"])
     clip, cull = int(lay["clip_count"]), int(lay["cull_count"])
+    tail = _pc_tail_dwords(lay)
     consts = {}
 
     def c(v):
@@ -108,7 +129,16 @@ def vs_spvasm(layout, f16_halves=None):
             out.append(f)
         return out
 
-    c(0), c(1), c(3), c(5), c(6)
+    c(0), c(1), c(3)
+    if tail is not None:
+        addr_lo, addr_hi, tail_len = tail
+        c(addr_lo), c(addr_hi)
+        addr_chains = [f"%alo_p = OpAccessChain %_ptr_Uniform_uint_tail %pc_tail {c(addr_lo)}",
+                       f"%ahi_p = OpAccessChain %_ptr_Uniform_uint_tail %pc_tail {c(addr_hi)}"]
+    else:
+        c(5), c(6)
+        addr_chains = [f"%alo_p = OpAccessChain %_ptr_PC_uint %pc {c(5)}",
+                       f"%ahi_p = OpAccessChain %_ptr_PC_uint %pc {c(6)}"]
     if clip:
         c(clip)
     if cull:
@@ -118,7 +148,7 @@ def vs_spvasm(layout, f16_halves=None):
         f"%per = OpCopyObject %uint {c(3 * maxp)}",
         "%wg = OpUDiv %uint %vidu %per", "%rem = OpUMod %uint %vidu %per",
         f"%prim = OpUDiv %uint %rem {c(3)}", f"%corner = OpUMod %uint %rem {c(3)}",
-        f"%alo_p = OpAccessChain %_ptr_PC_uint %pc {c(5)}", f"%ahi_p = OpAccessChain %_ptr_PC_uint %pc {c(6)}",
+        *addr_chains,
         "%alo = OpLoad %uint %alo_p", "%ahi = OpLoad %uint %ahi_p",
         "%alo64 = OpUConvert %ulong %alo", "%ahi64 = OpUConvert %ulong %ahi",
         f"%ahis = OpShiftLeftLogical %ulong %ahi64 {cl(32)}", "%addr = OpBitwiseOr %ulong %ahis %alo64",
@@ -180,11 +210,12 @@ def vs_spvasm(layout, f16_halves=None):
         [f"%out{loc}" for loc, _ in params] + [f"%out{h}" for h in hout]
     caps = ["Shader", "Int64", "PhysicalStorageBufferAddresses"] + (["ClipDistance"] if clip else []) + \
         (["CullDistance"] if cull else [])
+    addr_var = "%pc_tail" if tail is not None else "%pc"
     head = [f"OpCapability {x}" for x in caps] + [
         'OpExtension "SPV_KHR_physical_storage_buffer"',
         '%glsl = OpExtInstImport "GLSL.std.450"',
         "OpMemoryModel PhysicalStorageBuffer64 GLSL450",
-        f'OpEntryPoint Vertex %main "main" %vertex_index %pc {" ".join(outs)}',
+        f'OpEntryPoint Vertex %main "main" %vertex_index {addr_var} {" ".join(outs)}',
         "OpDecorate %vertex_index BuiltIn VertexIndex",
         "OpDecorate %out_pos BuiltIn Position"]
     if clip:
@@ -192,18 +223,27 @@ def vs_spvasm(layout, f16_halves=None):
     if cull:
         head.append("OpDecorate %out_cull BuiltIn CullDistance")
     head += [f"OpDecorate %out{loc} Location {loc}" for loc in [p for p, _ in params] + hout]
-    head += ["OpDecorate %arr_ud ArrayStride 4", "OpDecorate %PC Block", "OpMemberDecorate %PC 0 Offset 0"]
-    head += [f"OpMemberDecorate %PC {k} Offset {4 * USER_SGPRS + 4 * (k - 1)}" for k in range(1, 7)]
+    if tail is not None:
+        head += ["OpDecorate %PcTail Block"] + [f"OpMemberDecorate %PcTail {k} Offset {4 * k}" for k in range(tail_len)]
+        head += [f"OpDecorate %pc_tail DescriptorSet {PC_TAIL_SET}", f"OpDecorate %pc_tail Binding {PC_TAIL_BINDING}"]
+    else:
+        head += ["OpDecorate %arr_ud ArrayStride 4", "OpDecorate %PC Block", "OpMemberDecorate %PC 0 Offset 0"]
+        head += [f"OpMemberDecorate %PC {k} Offset {4 * USER_SGPRS + 4 * (k - 1)}" for k in range(1, 7)]
     head += ["OpDecorate %rt_uint ArrayStride 4"]
     types = ["%void = OpTypeVoid", "%fn = OpTypeFunction %void", "%bool = OpTypeBool",
              "%uint = OpTypeInt 32 0", "%int = OpTypeInt 32 1", "%ulong = OpTypeInt 64 0",
              "%float = OpTypeFloat 32", "%v4float = OpTypeVector %float 4", "%v2float = OpTypeVector %float 2"]
     types += [f"{name} = OpConstant %uint {v}" for v, name in sorted(consts.items())]
     types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(ulongs.items())]
-    types += [f"%n_ud = OpConstant %uint {USER_SGPRS}", "%arr_ud = OpTypeArray %uint %n_ud",
-              "%PC = OpTypeStruct %arr_ud %uint %uint %uint %uint %uint %uint",
-              "%_ptr_PC = OpTypePointer PushConstant %PC", "%_ptr_PC_uint = OpTypePointer PushConstant %uint",
-              "%rt_uint = OpTypeRuntimeArray %uint",
+    if tail is not None:
+        types += [" ".join(["%PcTail = OpTypeStruct"] + ["%uint"] * tail_len),
+                  "%_ptr_Uniform_PcTail = OpTypePointer Uniform %PcTail",
+                  "%_ptr_Uniform_uint_tail = OpTypePointer Uniform %uint"]
+    else:
+        types += [f"%n_ud = OpConstant %uint {USER_SGPRS}", "%arr_ud = OpTypeArray %uint %n_ud",
+                  "%PC = OpTypeStruct %arr_ud %uint %uint %uint %uint %uint %uint",
+                  "%_ptr_PC = OpTypePointer PushConstant %PC", "%_ptr_PC_uint = OpTypePointer PushConstant %uint"]
+    types += ["%rt_uint = OpTypeRuntimeArray %uint",
               "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint",
               "%_ptr_In_int = OpTypePointer Input %int", "%_ptr_Out_v4 = OpTypePointer Output %v4float",
               "%f1 = OpConstant %float 1", "%f2 = OpConstant %float 2",
@@ -212,7 +252,9 @@ def vs_spvasm(layout, f16_halves=None):
         types += ["%arr_clip = OpTypeArray %float " + c(clip), "%_ptr_Out_clip = OpTypePointer Output %arr_clip"]
     if cull:
         types += ["%arr_cull = OpTypeArray %float " + c(cull), "%_ptr_Out_cull = OpTypePointer Output %arr_cull"]
-    gvars = ["%vertex_index = OpVariable %_ptr_In_int Input", "%pc = OpVariable %_ptr_PC PushConstant",
+    addr_decl = ("%pc_tail = OpVariable %_ptr_Uniform_PcTail Uniform"
+                 if tail is not None else "%pc = OpVariable %_ptr_PC PushConstant")
+    gvars = ["%vertex_index = OpVariable %_ptr_In_int Input", addr_decl,
              "%out_pos = OpVariable %_ptr_Out_v4 Output"]
     if clip:
         gvars.append("%out_clip = OpVariable %_ptr_Out_clip Output")

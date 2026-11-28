@@ -35,11 +35,9 @@ import time
 import zlib
 from contextlib import suppress
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from file_mode import published_mode  # noqa: E402
-
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from zero_span import gap_split  # noqa: E402
 
@@ -163,6 +161,13 @@ def scan_archive(path, start=None, limit=None):
     return rows, summary
 
 
+def _pattern_query(pattern):
+    query = pattern.replace(os.altsep, os.sep) if os.altsep else pattern
+    if query.split(os.sep, 1)[0] != "**":
+        query = os.path.join("**", query)
+    return query
+
+
 def scan_directory(root, pattern=None):
     """Read the first 128 bytes of each matching carved file. Rows are marker matches only."""
     pattern = pattern or "*.bin"
@@ -170,9 +175,7 @@ def scan_directory(root, pattern=None):
     t0 = time.time()
     # Escape only the caller's root: a folder named "carve[1]" would otherwise be read as a character
     # class by glob and match nothing. The pattern (and "**") stays as the caller's glob.
-    query = pattern.replace(os.altsep, os.sep) if os.altsep else pattern
-    if query.split(os.sep, 1)[0] != "**":
-        query = os.path.join("**", query)
+    query = _pattern_query(pattern)
     matches = glob.iglob(os.path.join(glob.escape(os.fspath(root)), query), recursive=True)
     # Separated ** segments (e.g. **/tiles/**/*.bin) can still match a pathname more than once.
     for path in sorted(set(matches) if query.split(os.sep).count("**") > 1 else matches):
@@ -232,10 +235,11 @@ def _publish(dest, write, newline):
         os.replace(temp, dest)
     except BaseException:
         if temp is not None:
+            # The staging file may have inherited a read-only destination's mode; make it deletable
+            # first, or Windows strands it beside the report when the replace fails.
             with suppress(OSError):
-                # The staging file may have inherited a read-only destination's mode; make it deletable
-                # first, or Windows strands it beside the report when the replace fails.
                 os.chmod(temp, 0o600)
+            with suppress(OSError):
                 os.unlink(temp)
         raise
 
@@ -296,13 +300,16 @@ def is_scanned_input(path, input_path, pattern):
             break
         root = parent
     else:
-        if (fnmatch.fnmatch(os.path.relpath(target, root), pattern)
-                or fnmatch.fnmatch(os.path.basename(target), pattern)):
+        rel = os.path.relpath(target, root)
+        pat = pattern.replace(os.altsep, os.sep) if os.altsep else pattern
+        rel_pat = pat[len("**" + os.sep):] if pat.startswith("**" + os.sep) else pat
+        if (fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(rel, rel_pat)
+                or (os.sep not in pat and fnmatch.fnmatch(os.path.basename(target), pat))):
             return True
     # A different spelling or a hard link anywhere can still refer to a scanned file.
     return any(same_report_path(target, scanned)
                for scanned in glob.iglob(
-                   os.path.join(glob.escape(os.fspath(input_path)), "**", pattern), recursive=True))
+                   os.path.join(glob.escape(os.fspath(input_path)), _pattern_query(pattern)), recursive=True))
 
 
 def main() -> int:
@@ -314,11 +321,6 @@ def main() -> int:
     ap.add_argument("--limit", type=byte_count, help="maximum bytes to scan in an archive")
     ap.add_argument("--pattern", default=None, help="directory input glob (default: *.bin)")
     a = ap.parse_args()
-    is_dir = os.path.isdir(a.input)
-    if is_dir and (a.start is not None or a.limit is not None):
-        ap.error("--start and --limit apply to a single archive, not a directory")
-    if not is_dir and a.pattern is not None:
-        ap.error("--pattern applies to a directory, not an archive")
     base = os.path.basename(os.path.normpath(a.input))
     out_path = a.out or os.path.splitext(base)[0] + ".navmesh-index.json"
     if a.csv and same_report_path(out_path, a.csv):
@@ -326,11 +328,17 @@ def main() -> int:
     for flag, path in (("--out", out_path), ("--csv", a.csv)):
         if path and os.path.isdir(path):     # open() on a folder ends the run in a PermissionError traceback
             ap.error(f"{flag} is a directory: {path}")
-        if path and is_scanned_input(path, a.input, a.pattern):
-            ap.error(f"{flag} would overwrite the input {path}")
     if not os.path.exists(a.input):
         print(f"ERROR: {a.input}: does not exist", file=sys.stderr)
         return 2
+    is_dir = os.path.isdir(a.input)
+    if is_dir and (a.start is not None or a.limit is not None):
+        ap.error("--start and --limit apply to a single archive, not a directory")
+    if not is_dir and a.pattern is not None:
+        ap.error("--pattern applies to a directory, not an archive")
+    for flag, path in (("--out", out_path), ("--csv", a.csv)):
+        if path and is_scanned_input(path, a.input, a.pattern):
+            ap.error(f"{flag} would overwrite the input {path}")
     below_normal()
 
     if is_dir:
@@ -349,7 +357,11 @@ def main() -> int:
             ap.error(str(e))
 
     add_distribution(summary, rows)
-    written = write_outputs(rows, summary, out_path, a.csv)
+    try:
+        written = write_outputs(rows, summary, out_path, a.csv)
+    except OSError as e:
+        print(f"ERROR: cannot write {e.filename or out_path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     print(json.dumps(summary, indent=1))
     print(f"wrote {out_path}" + (f", {', '.join(written)}" if written else ""))
     return 0

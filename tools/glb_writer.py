@@ -26,6 +26,7 @@ from collections.abc import Iterable, Iterator
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -604,8 +605,12 @@ def _pack_f32(values: list[tuple[float, ...]], components: int) -> tuple[bytes, 
 
 
 def _pack_indices(indices: list[int], vert_count: int) -> tuple[bytes, int]:
+    if not indices:
+        raise GlbError("triangle index list must not be empty")
     if len(indices) % 3 != 0:
         raise GlbError(f"triangle index count must be a multiple of 3, got {len(indices)}")
+    if any(isinstance(i, bool) or not isinstance(i, int) for i in indices):
+        raise GlbError("triangle indices must be integers")
     lo = min(indices)
     hi = max(indices)
     if lo < 0 or hi >= vert_count:
@@ -668,6 +673,8 @@ def pack_primitive(prim: dict) -> dict:
     positions = list(prim["positions"])
     indices = list(prim["indices"])
     vert_count = len(positions)
+    if vert_count == 0:
+        raise GlbError("primitive positions must not be empty")
     pos_bytes, pos_f32 = _pack_f32(positions, 3)
     idx_bytes, idx_comp_type = _pack_indices(indices, vert_count)
     normals_in = prim.get("normals")
@@ -765,7 +772,11 @@ def _parse_base_color_factor(value: object, default: list[float]) -> list[float]
         return list(default)
     if not isinstance(value, (list, tuple)) or len(value) not in (3, 4):
         raise GlbError("base_color_factor must be a 3- or 4-element float sequence")
-    out = [float(c) for c in value]
+    out: list[float] = []
+    for c in value:
+        if isinstance(c, bool) or not isinstance(c, (int, float)):
+            raise GlbError("base_color_factor values must be finite numbers in [0.0, 1.0]")
+        out.append(float(c))
     if len(out) == 3:
         out.append(1.0)
     if not all(math.isfinite(c) and 0.0 <= c <= 1.0 for c in out):
@@ -1079,11 +1090,15 @@ def _write_bytes_atomic(path: str, glb_bytes: bytes) -> None:
         # Close before replacement: Windows cannot rename an open staging file.
         _replace(tmp_path, out_path)
     except BaseException:
-        try:
-            if tmp_path is not None:
+        if tmp_path is not None:
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            try:
                 os.remove(tmp_path)
-        except OSError:
-            pass
+            except OSError:
+                pass
         raise
 
 
@@ -1175,18 +1190,34 @@ def build_instanced_glb(
         mesh_idx = len(gltf_meshes)
         gltf_meshes.append(mesh_obj)
         ts, rs, ss = [], [], []
-        for t, q, sc in insts:
-            t = [float(v) for v in t]
-            sc = [float(v) for v in sc]
-            q = [float(v) for v in q]
-            n = math.sqrt(sum(v * v for v in q))
+        for inst in insts:
+            if not isinstance(inst, (list, tuple)) or len(inst) != 3:
+                raise GlbError("instance transform must be a (translation, rotation, scale) 3-tuple")
+            t_in, q_in, sc_in = inst
+            if (
+                not isinstance(t_in, (list, tuple)) or len(t_in) != 3
+                or not isinstance(q_in, (list, tuple)) or len(q_in) != 4
+                or not isinstance(sc_in, (list, tuple)) or len(sc_in) != 3
+            ):
+                raise GlbError("instance transform must have 3 translation, 4 rotation, and 3 scale components")
+            try:
+                if any(isinstance(v, bool) for v in (*t_in, *q_in, *sc_in)):
+                    raise TypeError("boolean transform component")
+                t = [float(v) for v in t_in]
+                sc = [float(v) for v in sc_in]
+                q = [float(v) for v in q_in]
+            except (TypeError, ValueError) as exc:
+                raise GlbError(f"instance transform components must be numeric: {exc}") from exc
+            if not all(math.isfinite(v) for v in t + sc):
+                raise GlbError("instance translation and scale must be finite")
+            if not all(math.isfinite(v) for v in q):
+                raise GlbError("instance rotation must be a finite non-zero quaternion")
+            n = math.hypot(*q)
             if not n or not math.isfinite(n):
                 raise GlbError("instance rotation must be a finite non-zero quaternion")
             q = [v / n for v in q]
-            if sc[0] * sc[1] * sc[2] <= 0:
+            if any(v == 0.0 for v in sc) or ((sc[0] < 0) ^ (sc[1] < 0) ^ (sc[2] < 0)):
                 raise GlbError("instance scale must have a positive determinant; mirror the mesh instead")
-            if not all(math.isfinite(v) for v in t + sc):
-                raise GlbError("instance translation and scale must be finite")
             ts.append(t)
             rs.append(q)
             ss.append(sc)
@@ -1217,6 +1248,8 @@ def build_instanced_glb(
                 nodes.append(node)
         for t, q, sc in bounds_transforms:
             b = instance_bounds(box_min, box_max, t, q, sc)
+            if not all(math.isfinite(v) for v in b):
+                raise GlbError("instance bounds overflowed to non-finite values")
             for k in range(3):
                 lo[k] = min(lo[k], b[k])
                 hi[k] = max(hi[k], b[k + 3])
@@ -1296,8 +1329,14 @@ def read_glb_summary(data: bytes) -> dict:
         raise GlbError(f"JSON chunk length {json_len} exceeds total length {total_length}")
 
     json_raw = bytes(buf[20:20 + json_len])
+
+    def _reject_json_constant(token: str) -> None:
+        raise GlbError(f"non-finite JSON number {token}")
+
     try:
-        gltf = json.loads(json_raw.decode("utf-8"))
+        gltf = json.loads(json_raw.decode("utf-8"), parse_constant=_reject_json_constant)
+    except RecursionError as exc:
+        raise GlbError("invalid JSON chunk: nesting is too deep") from exc
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise GlbError(f"invalid JSON chunk: {exc}") from exc
     if not isinstance(gltf, dict):
@@ -1343,7 +1382,10 @@ def read_glb_summary(data: bytes) -> dict:
         for i, bv in enumerate(buffer_views):
             if not isinstance(bv, dict):
                 raise GlbError(f"bufferViews[{i}] is not an object")
-            if bv.get("buffer", 0) == 0:
+            bv_buf = bv.get("buffer", 0)
+            if isinstance(bv_buf, bool) or not isinstance(bv_buf, int) or bv_buf < 0:
+                raise GlbError(f"invalid buffer index in bufferViews[{i}]")
+            if bv_buf == 0:
                 bv_off = bv.get("byteOffset", 0)
                 bv_len = bv.get("byteLength", -1)
                 if (
@@ -1384,9 +1426,10 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         # write_glb replaces its target, so naming the OBJ as the output would silently destroy the model.
-        if os.path.exists(args.out_glb) and os.path.exists(args.in_obj) and os.path.samefile(
-                args.in_obj, args.out_glb):
+        if same_report_path(args.in_obj, args.out_glb):
             raise GlbError(f"output must not overwrite the input OBJ: {args.in_obj}")
+        if os.path.isdir(args.out_glb):
+            raise GlbError(f"output path is a directory: {args.out_glb}")
         primitives = parse_obj(args.in_obj, is_path=True, up_axis=args.up)
         stats = write_glb(args.out_glb, primitives)
     except (GlbError, OSError) as exc:

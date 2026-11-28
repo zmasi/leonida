@@ -145,7 +145,10 @@ def load_banks(source: str) -> dict:
     if os.path.isfile(source):
         return {os.path.splitext(os.path.basename(source))[0]: bank_ids(source)}
     out = {}
-    for root, _dirs, files in os.walk(source):
+    def scan_failed(error):
+        raise error
+
+    for root, _dirs, files in os.walk(source, onerror=scan_failed):
         for name in sorted(files):
             if name.lower().endswith(".awc"):
                 full = os.path.join(root, name)
@@ -178,18 +181,24 @@ def _files(path: str):
 
 def read_words(path: str) -> list:
     """Words from a text file (one per line), a hashdict.py JSON object or a JSON list of words."""
-    with open(path, "rb") as fh:
-        head = fh.read(1).lstrip()
-    if path.lower().endswith(".json") or head == b"{":
-        with open(path, encoding="utf-8") as fh:
-            doc = json.load(fh)
-        if isinstance(doc, dict):
-            return [str(v) for v in doc.values()]
-        if isinstance(doc, list):
-            return [str(v) for v in doc]
-        raise ValueError(f"expected a JSON object of hash -> word or a list of words, got {type(doc).__name__}")
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        return [line.strip() for line in fh if line.strip()]
+    is_json = path.lower().endswith(".json")
+    if not is_json:
+        with open(path, encoding="utf-8-sig", errors="replace") as fh:
+            for chunk in iter(lambda: fh.read(4096), ""):
+                content = chunk.lstrip(" \t\r\n")
+                if content:
+                    is_json = content.startswith("{")
+                    break
+            if not is_json:
+                fh.seek(0)
+                return [line.strip() for line in fh if line.strip()]
+    with open(path, encoding="utf-8-sig") as fh:
+        doc = json.load(fh)
+    if isinstance(doc, dict):
+        return [str(v) for v in doc.values()]
+    if isinstance(doc, list):
+        return [str(v) for v in doc]
+    raise ValueError(f"expected a JSON object of hash -> word or a list of words, got {type(doc).__name__}")
 
 
 def conversation_waves(paths) -> list:
@@ -406,10 +415,13 @@ def _publish_text(path, write_body, *, newline, prefix):
     try:
         with staged:
             write_body(staged)
-        if os.name != "nt":
-            os.chmod(staged.name, published_mode(destination))
+        os.chmod(staged.name, published_mode(destination))
         replace_retry(staged.name, destination)
     finally:
+        try:
+            os.chmod(staged.name, 0o600)
+        except OSError:
+            pass
         try:
             os.unlink(staged.name)
         except FileNotFoundError:

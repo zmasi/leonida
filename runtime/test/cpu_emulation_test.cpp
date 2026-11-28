@@ -89,6 +89,11 @@ void test_decode() {
     check(dec({0x66, 0x0F, 0xAE, 0x39}).op == ce::Op::none, "66 0F AE /7 is clflushopt");
     check(dec({0x66, 0x0F, 0xAE, 0x74, 0x01}).op == ce::Op::none, "a cut-off clwb is not decoded");
     check(dec({0x0F, 0x0B}).op == ce::Op::none, "ud2 is not handled");
+    check(ce::decode(nullptr, 15).op == ce::Op::none, "null code buffer is refused");
+    // 14 prefixes + 3-byte CLZERO = 17 bytes (> 15-byte architectural limit) must not decode.
+    check(dec({0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
+               0x0F, 0x01, 0xFC}).op == ce::Op::none,
+          "overlong >15-byte clzero is refused");
 }
 
 void test_bits() {
@@ -196,6 +201,24 @@ void test_apply() {
                   c.Rip == rip + 12 && c.Rax == base + kLargeSpan && (c.EFlags & 0xC1u) == 0x40u,
               "clzero loop >64 MiB second batch completes with CF=0, ZF=1, SF=0");
         VirtualFree(large, 0, MEM_RELEASE);
+    }
+
+    // Wraparound guards: start near UINT64_MAX and full-span [0, UINT64_MAX) must not wrap total to 0 or loop.
+    {
+        c = {};
+        c.Rax = UINT64_MAX - 63;  // 0xFFFFFFFFFFFFFFC0 (64-byte aligned); start + 64 would wrap to 0
+        c.Rdx = UINT64_MAX;
+        c.Rip = rip;
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::no_match,
+              "clzero loop rejects wraparound start near UINT64_MAX");
+
+        c = {};
+        c.Rax = 0;
+        c.Rdx = UINT64_MAX;  // limit - start + 63 would wrap to 0 without kMaxBatch clamp first
+        c.Rip = rip;
+        check(ce::try_clzero_loop(loop12, sizeof loop12, &c, &fault) == ce::ClzeroLoopResult::faulted &&
+                  fault.ExceptionCode == STATUS_ACCESS_VIOLATION && fault.ExceptionInformation[1] == 0,
+              "clzero loop with UINT64_MAX limit faults on null page instead of wrapping total to 0");
     }
 }
 

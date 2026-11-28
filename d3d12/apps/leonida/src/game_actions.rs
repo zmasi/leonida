@@ -495,6 +495,9 @@ impl Game {
         );
         let ped = self.ped();
         let _ = writeln!(s, "  player ped {ped:x?}, position {:?}, forward {:?}", self.position(), self.forward());
+        // The global `player_context` reads: the vehicle the player is in, null on foot.
+        let vehicle = self.at(Site::PlayerVehicle).and_then(mem::read_u64);
+        let _ = writeln!(s, "  player's vehicle {vehicle:x?}");
         // SAFETY: forwarded from this function's contract.
         let wanted = ped.and_then(|ped| unsafe { self.wanted_level(ped) });
         let _ = writeln!(s, "  wanted level {wanted:?}, clock {:?}", self.clock());
@@ -820,16 +823,24 @@ fn run_script(script: Vec<(f32, Command)>) {
 }
 
 /// With `LEONIDA_GAME_ACTIONS=1`: finds the title's code in the image just mapped, hooks its cheat update and
-/// lends the menu the actions. Nothing is changed in the title otherwise.
+/// lends the menu the actions. Nothing is changed in the title otherwise. Gives what it found of the title (for
+/// who else reads it: `player_context`), `None` when it did not look.
 ///
 /// # Safety
 /// `base` is the title's executable `info` describes, mapped, and none of its code runs yet.
-pub unsafe fn install(base: usize, info: &leonida_pe::ImageInfo) {
+pub unsafe fn install(base: usize, info: &leonida_pe::ImageInfo) -> Option<Sites> {
     if !places::wanted() {
-        return;
+        return None;
     }
     // SAFETY: forwarded from this function's contract; the hook is a function of this program.
     let (sites, hooked) = unsafe { places::install(base, info, frame_hook as extern "win64" fn() as usize) };
+    let found = sites.clone();
+    start(base, info, sites, hooked);
+    Some(found)
+}
+
+/// The rest of [`install`]: the actions, when the hook is in.
+fn start(base: usize, info: &leonida_pe::ImageInfo, sites: Sites, hooked: Result<(), String>) {
     for line in &sites.missing {
         println!("game actions   not found: {line}");
     }

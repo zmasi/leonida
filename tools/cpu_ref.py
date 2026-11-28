@@ -311,21 +311,30 @@ class Machine:
 
         self.info = info
         self.insns = info["insns"]
-        self.lanes = int(inputs.get("lanes", 1))
-        if self.lanes not in (1, 64):
+        self.lanes = inputs.get("lanes", 1)
+        if isinstance(self.lanes, bool) or not isinstance(self.lanes, int) or self.lanes not in (1, 64):
             raise ValueError("lanes must be 1 or 64")
-        self.lane = int(inputs.get("lane", 0))
+        self.lane = inputs.get("lane", 0)
         if self.lanes == 64 and "lane" in inputs:
             raise ValueError("lane is only valid in one-lane mode")
-        if not 0 <= self.lane < 64:
+        if isinstance(self.lane, bool) or not isinstance(self.lane, int) or not 0 <= self.lane < 64:
             raise ValueError("lane must be in 0..63")
 
         self.sgpr = {}
         for k, v in (inputs.get("sgpr") or {}).items():
-            self.sgpr[int(k)] = int(v) & MASK32
+            if isinstance(k, bool):
+                raise ValueError("sgpr index must be a non-negative integer")
+            k = int(k)
+            if k < 0:
+                raise ValueError(f"sgpr index must be non-negative, got {k}")
+            self.sgpr[k] = int(v) & MASK32
         self.vgpr = {}
         for k, v in (inputs.get("vgpr") or {}).items():
+            if isinstance(k, bool):
+                raise ValueError("vgpr index must be a non-negative integer")
             k = int(k)
+            if k < 0:
+                raise ValueError(f"vgpr index must be non-negative, got {k}")
             if isinstance(v, (list, tuple)):
                 if len(v) != self.lanes:
                     raise ValueError(f"vgpr[{k}] has {len(v)} values, expected {self.lanes}")
@@ -336,8 +345,8 @@ class Machine:
         self.vcc = int(inputs.get("vcc", 0)) & MASK64
         self.exec = int(inputs.get("exec", MASK64)) & MASK64
         self.scc = 1 if inputs.get("scc", 0) else 0
-        self.max_steps = int(inputs.get("max_steps", 100000))
-        if self.max_steps <= 0:
+        self.max_steps = inputs.get("max_steps", 100000)
+        if isinstance(self.max_steps, bool) or not isinstance(self.max_steps, int) or self.max_steps <= 0:
             raise ValueError("max_steps must be positive")
 
         self.steps = 0
@@ -353,13 +362,34 @@ class Machine:
         values = self.vgpr.get(index)
         return 0 if values is None else values[lane]
 
-    def _write_vgpr(self, dst, lane, value):
+    def _check_vgpr_dst(self, dst):
         if dst["k"] != "vgpr":
             raise Unsupported(dst.get("t", "destination"), self.pc, "expected a VGPR destination")
         if dst.get("n", 1) != 1:
             raise Unsupported("v[%d:%d]" % (dst["r"], dst["r"] + dst.get("n", 1) - 1), self.pc,
                               "multi-dword VGPR destination is not modelled")
+
+    def _write_vgpr(self, dst, lane, value):
+        self._check_vgpr_dst(dst)
         self.vgpr.setdefault(dst["r"], [0] * self.lanes)[lane] = value & MASK32
+
+    def _check_scalar_dst(self, dst):
+        if dst["k"] == "sgpr":
+            if dst.get("n", 1) != 1:
+                raise Unsupported("s[%d:%d]" % (dst["r"], dst["r"] + dst.get("n", 1) - 1), self.pc,
+                                  "multi-dword SGPR destination is not modelled")
+            return
+        if dst["k"] != "special" or dst["t"] not in SPECIAL_WRITE:
+            raise Unsupported(dst.get("t", "destination"), self.pc, "expected an SGPR or special destination")
+
+    def _validate_vector_operands(self, dst, srcs, *, float_srcs=False, cond=None):
+        """Check destination and sources even when EXEC masks every lane off."""
+        self._check_vgpr_dst(dst)
+        read = self._float_src if float_srcs else self._int_src
+        for src in srcs:
+            read(src, 0)
+        if cond is not None:
+            self._mask_bit(cond, 0)
 
     def _read_special(self, name):
         if name == "scc":
@@ -378,14 +408,10 @@ class Machine:
 
     def _write_scalar_dst(self, dst, value):
         value &= MASK32
+        self._check_scalar_dst(dst)
         if dst["k"] == "sgpr":
-            if dst.get("n", 1) != 1:
-                raise Unsupported("s[%d:%d]" % (dst["r"], dst["r"] + dst.get("n", 1) - 1), self.pc,
-                                  "multi-dword SGPR destination is not modelled")
             self.sgpr[dst["r"]] = value
             return
-        if dst["k"] != "special" or dst["t"] not in SPECIAL_WRITE:
-            raise Unsupported(dst.get("t", "destination"), self.pc, "expected an SGPR or special destination")
         name = dst["t"]
         if name == "scc":
             self.scc = 1 if value else 0
@@ -405,6 +431,9 @@ class Machine:
         if kind == "vgpr":
             if scalar:
                 raise Unsupported("vgpr source", self.pc, "a scalar instruction cannot read a VGPR directly")
+            if arg.get("n", 1) != 1:
+                raise Unsupported("v[%d:%d]" % (arg["r"], arg["r"] + arg.get("n", 1) - 1), self.pc,
+                                  "multi-dword VGPR source is not modelled")
             value = self._vgpr(arg["r"], lane)
         elif kind == "sgpr":
             if arg.get("n", 1) != 1:
@@ -428,6 +457,9 @@ class Machine:
     def _float_src(self, arg, lane):
         kind = arg["k"]
         if kind == "vgpr":
+            if arg.get("n", 1) != 1:
+                raise Unsupported("v[%d:%d]" % (arg["r"], arg["r"] + arg.get("n", 1) - 1), self.pc,
+                                  "multi-dword VGPR source is not modelled")
             bits = self._vgpr(arg["r"], lane)
         elif kind == "sgpr":
             if arg.get("n", 1) != 1:
@@ -491,6 +523,12 @@ class Machine:
             lanes = range(64)
         return [lane for lane in lanes if (self.exec >> self._hw_lane(lane)) & 1]
 
+    def _vector_lanes(self, dst, srcs, *, float_srcs=False, cond=None):
+        lanes = self._active_lanes()
+        if not lanes:
+            self._validate_vector_operands(dst, srcs, float_srcs=float_srcs, cond=cond)
+        return lanes
+
     # -- execution --
     def run(self):
         if not self.insns:
@@ -501,6 +539,7 @@ class Machine:
             if self.steps >= self.max_steps:
                 raise ProgramError(f"step limit {self.max_steps} reached at pc 0x{ins['pc']:x}")
             self.steps += 1
+            self.pc = ins["pc"]
             self.step(ins)
             enc = ins.get("enc")
             self.next_pc = ins["pc"] + (len(enc) // 2 if enc else 0)
@@ -510,6 +549,7 @@ class Machine:
         return self.result()
 
     def step(self, ins):
+        self.pc = ins["pc"]
         op = ins["op"]
         reason = check_supported(ins)
         if reason:
@@ -523,11 +563,11 @@ class Machine:
 
         if base == "v_mov_b32":
             self._expect(ins, 2)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 self._write_vgpr(args[0], lane, self._int_src(args[1], lane))
         elif base in FLOAT_OPS:
             self._expect(ins, 4 if base == "v_fma_f32" else 3)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:], float_srcs=True):
                 a = self._float_src(args[1], lane)
                 b = self._float_src(args[2], lane)
                 if base == "v_add_f32":
@@ -549,7 +589,7 @@ class Machine:
             # the hardware operand is the full VCC. VOP3 (_e64) names a 32-bit half explicitly.
             implicit = cond is None or (cond["k"] == "special" and cond["t"] in ("vcc", "vcc_lo")
                                         and not op.endswith("_e64"))
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:3], cond=None if implicit else cond):
                 if implicit:
                     bit = (self.vcc >> self._hw_lane(lane)) & 1
                 else:
@@ -559,14 +599,14 @@ class Machine:
                 self._write_vgpr(args[0], lane, src1 if bit else src0)
         elif base in ("v_and_b32", "v_or_b32", "v_xor_b32"):
             self._expect(ins, 3)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 a = self._int_src(args[1], lane)
                 b = self._int_src(args[2], lane)
                 r = a & b if base == "v_and_b32" else (a | b if base == "v_or_b32" else a ^ b)
                 self._write_vgpr(args[0], lane, r)
         elif base in ("v_lshlrev_b32", "v_lshrrev_b32", "v_ashrrev_i32"):
             self._expect(ins, 3)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 shift = self._int_src(args[1], lane) & 31
                 value = self._int_src(args[2], lane)
                 if base == "v_lshlrev_b32":
@@ -580,7 +620,7 @@ class Machine:
         elif base in ("v_add_nc_u32", "v_sub_nc_u32", "v_mul_u32_u24", "v_mul_lo_u32",
                       "v_min_u32", "v_max_u32", "v_min_i32", "v_max_i32"):
             self._expect(ins, 3)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 a = self._int_src(args[1], lane)
                 b = self._int_src(args[2], lane)
                 if base == "v_add_nc_u32":
@@ -600,13 +640,13 @@ class Machine:
                 self._write_vgpr(args[0], lane, r)
         elif base == "v_subrev_nc_u32":
             self._expect(ins, 3)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 a = self._int_src(args[1], lane)
                 b = self._int_src(args[2], lane)
                 self._write_vgpr(args[0], lane, (b - a) & MASK32)
         elif base in ("v_mul_hi_u32", "v_mul_hi_i32"):
             self._expect(ins, 3)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 a = self._int_src(args[1], lane)
                 b = self._int_src(args[2], lane)
                 if base == "v_mul_hi_i32":
@@ -615,7 +655,7 @@ class Machine:
                 self._write_vgpr(args[0], lane, ((a * b) >> 32) & MASK32)
         elif base in ("v_mad_u32_u24", "v_mad_i32_i24"):
             self._expect(ins, 4)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 x = self._int_src(args[1], lane) & 0xFFFFFF
                 y = self._int_src(args[2], lane) & 0xFFFFFF
                 if base == "v_mad_i32_i24":
@@ -625,7 +665,7 @@ class Machine:
                 self._write_vgpr(args[0], lane, (x * y + z) & MASK32)
         elif base == "v_mul_i32_i24":
             self._expect(ins, 3)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 x = self._int_src(args[1], lane) & 0xFFFFFF
                 y = self._int_src(args[2], lane) & 0xFFFFFF
                 sx = x - (1 << 24) if x & 0x800000 else x
@@ -633,7 +673,7 @@ class Machine:
                 self._write_vgpr(args[0], lane, (sx * sy) & MASK32)
         elif base in ("v_bfe_u32", "v_bfe_i32"):
             self._expect(ins, 4)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 value = self._int_src(args[1], lane)
                 off = self._int_src(args[2], lane) & 31
                 width = min(self._int_src(args[3], lane) & 31, 32 - off)
@@ -646,14 +686,14 @@ class Machine:
                 self._write_vgpr(args[0], lane, r)
         elif base == "v_bfi_b32":
             self._expect(ins, 4)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 x = self._int_src(args[1], lane)
                 y = self._int_src(args[2], lane)
                 z = self._int_src(args[3], lane)
                 self._write_vgpr(args[0], lane, (x & y) | (~x & z))
         elif base in ("v_alignbit_b32", "v_alignbyte_b32"):
             self._expect(ins, 4)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 hi = self._int_src(args[1], lane)
                 lo = self._int_src(args[2], lane)
                 shift = self._int_src(args[3], lane)
@@ -661,7 +701,7 @@ class Machine:
                 self._write_vgpr(args[0], lane, (((hi << 32) | lo) >> shift) & MASK32)
         elif base == "v_perm_b32":
             self._expect(ins, 4)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 hi = self._int_src(args[1], lane)
                 lo = self._int_src(args[2], lane)
                 sel = self._int_src(args[3], lane)
@@ -683,7 +723,7 @@ class Machine:
                 self._write_vgpr(args[0], lane, r)
         elif base in ("v_med3_i32", "v_med3_u32"):
             self._expect(ins, 4)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 vals = [self._int_src(args[i], lane) for i in (1, 2, 3)]
                 if base == "v_med3_i32":
                     vals = [v - (1 << 32) if v & SIGN32 else v for v in vals]
@@ -692,7 +732,7 @@ class Machine:
         elif base in _INT_VOP:
             arity, fn = _INT_VOP[base]
             self._expect(ins, 1 + arity)
-            for lane in self._active_lanes():
+            for lane in self._vector_lanes(args[0], args[1:]):
                 vals = [self._int_src(args[i], lane) for i in range(1, 1 + arity)]
                 self._write_vgpr(args[0], lane, fn(*vals) & MASK32)
         elif base == "s_mov_b32":
@@ -700,6 +740,7 @@ class Machine:
             self._write_scalar_dst(args[0], self._int_src(args[1], 0, scalar=True))
         elif base == "s_add_u32":
             self._expect(ins, 3)
+            self._check_scalar_dst(args[0])
             a = self._int_src(args[1], 0, scalar=True)
             b = self._int_src(args[2], 0, scalar=True)
             total = a + b
@@ -707,6 +748,7 @@ class Machine:
             self._write_scalar_dst(args[0], total & MASK32)
         elif base in ("s_lshl_b32", "s_lshr_b32"):
             self._expect(ins, 3)
+            self._check_scalar_dst(args[0])
             value = self._int_src(args[1], 0, scalar=True)
             shift = self._int_src(args[2], 0, scalar=True) & 31
             r = ((value << shift) & MASK32) if base == "s_lshl_b32" else (value >> shift)
@@ -801,7 +843,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Execute a small RDNA2 subset from a shader_ir listing.")
     ap.add_argument("listing", help=".s listing (tools/shader_disasm.py or runtime/test/shaders/build.py)")
     ap.add_argument("--lanes", type=int, choices=(1, 64), default=1)
-    ap.add_argument("--lane", type=int, default=0, help="hardware lane for one-lane mode")
+    ap.add_argument("--lane", type=int, default=None, help="hardware lane for one-lane mode")
     ap.add_argument("--sgpr", action="append", default=[], metavar="N=VALUE")
     ap.add_argument("--vgpr", action="append", default=[], metavar="N=VALUE[,VALUE...]")
     ap.add_argument("--vcc", type=_value, default=0)
@@ -814,10 +856,14 @@ def main(argv=None):
         return 2
 
     inputs = {"lanes": args.lanes, "vcc": args.vcc}
-    if args.lanes == 1:
-        if not 0 <= args.lane < 64:
+    if args.lanes == 64:
+        if args.lane is not None:
+            ap.error("--lane is only valid with --lanes 1")
+    else:
+        lane = 0 if args.lane is None else args.lane
+        if not 0 <= lane < 64:
             ap.error("--lane must be in 0..63")
-        inputs["lane"] = args.lane
+        inputs["lane"] = lane
     if args.exec is not None:
         inputs["exec"] = args.exec
     for kind, assignments, syntax in (
@@ -828,6 +874,8 @@ def main(argv=None):
             try:
                 register, text = item.split("=", 1)
                 index = _value(register)
+                if index < 0:
+                    raise ValueError("negative register index")
                 value = _value(text) if kind == "sgpr" else _vgpr_value(text, args.lanes)
             except (ValueError, argparse.ArgumentTypeError):
                 ap.exit(2, f"error: --{kind} expects {syntax}, got {item!r}\n")

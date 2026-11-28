@@ -64,10 +64,15 @@ pub enum Site {
     WeatherForced,
     /// The global that points at the weather types ([`WEATHER_TYPE_STRIDE`] bytes each, the name's hash first).
     WeatherTypes,
+    /// The global that holds the vehicle the player is in, null on foot. Read from the code, not yet seen in
+    /// the running title: its one setter is called with a vehicle from a large function, with null where a ped
+    /// that is the player is taken out of a vehicle, and with what the title's own "the vehicle this ped is in"
+    /// gives when the player's ped is set (`docs/gameinput.md`).
+    PlayerVehicle,
 }
 
 /// How many [`Site`]s there are.
-pub const SITES: usize = Site::WeatherTypes as usize + 1;
+pub const SITES: usize = Site::PlayerVehicle as usize + 1;
 
 /// The queue the title's own cheats are deferred to (`mov ecx, 4` in the pattern of [`Site::Defer`], whose
 /// stores are the closure's four words).
@@ -192,6 +197,14 @@ const PLACES: &[Place] = &[
                   8B 84 87 ?? ?? 00 00 48 6B C0 38 8B 04 01",
         takes: &[(Site::WeatherTypes, Take::Rel { at: 3, next: 7 })],
     },
+    Place {
+        what: "the function that records the vehicle the player is in",
+        // push rsi, rdi; sub rsp, 38h; mov rsi, rcx; lea rcx, [player's vehicle]; mov rdx, rsi; call (set the
+        // reference); test rsi, rsi; je; mov rcx, rsi; call; test al, al; jne
+        pattern: "56 57 48 83 EC 38 48 89 CE 48 8D 0D ?? ?? ?? ?? 48 89 F2 E8 ?? ?? ?? ?? 48 85 F6 0F 84 ?? ?? ?? ?? \
+                  48 89 F1 E8 ?? ?? ?? ?? 84 C0 0F 85",
+        takes: &[(Site::PlayerVehicle, Take::Rel { at: 12, next: 16 })],
+    },
 ];
 
 /// What was found: each [`Site`]'s offset in the image (or its number), `None` for what this executable does
@@ -238,8 +251,17 @@ fn once(pattern: &Pattern, code: &[(usize, &[u8])]) -> Result<(usize, usize), &'
 /// `image_size`. A place that is missing, there twice, or that points outside the image leaves its sites `None`
 /// and a line in [`Sites::missing`].
 pub fn resolve(code: &[(usize, &[u8])], image_size: usize) -> Sites {
+    resolve_some(code, image_size, None)
+}
+
+/// [`resolve`] for the places that give one of `wanted` only (all of them with `None`): each place is a pass
+/// over the image's code, and whoever needs two sites need not pay for all.
+pub fn resolve_some(code: &[(usize, &[u8])], image_size: usize, wanted: Option<&[Site]>) -> Sites {
     let mut sites = Sites::default();
     for place in PLACES {
+        if wanted.is_some_and(|wanted| !place.takes.iter().any(|(site, _)| wanted.contains(site))) {
+            continue;
+        }
         let Some(pattern) = Pattern::parse(place.pattern) else {
             sites.missing.push(format!("{}: its pattern does not read", place.what));
             continue;
@@ -280,6 +302,26 @@ pub fn resolve(code: &[(usize, &[u8])], image_size: usize) -> Sites {
     sites
 }
 
+/// The sites (those of `wanted`, or all with `None`) of the image mapped at `base`. Reads the image's code and
+/// changes nothing.
+///
+/// # Safety
+/// `base` is the mapped image `info` describes, and nothing writes its code meanwhile (none of it runs yet).
+pub unsafe fn find(base: usize, info: &leonida_pe::ImageInfo, wanted: Option<&[Site]>) -> Sites {
+    let code: Vec<(usize, &[u8])> = info
+        .sections
+        .iter()
+        .filter(|s| s.characteristics & crate::vipatch::SCN_MEM_EXECUTE != 0)
+        .filter(|s| u64::from(s.rva) + u64::from(s.virtual_size) <= u64::from(info.size_of_image))
+        .map(|s| {
+            let (start, len) = (s.rva as usize, s.virtual_size as usize);
+            // SAFETY: a section of the mapped image, readable, which nothing writes now.
+            (start, unsafe { std::slice::from_raw_parts((base + start) as *const u8, len) })
+        })
+        .collect();
+    resolve_some(&code, info.size_of_image as usize, wanted)
+}
+
 /// `jmp [rip + 0]` and the address it jumps to: 14 bytes of code that reach anywhere.
 fn far_jump(to: usize) -> [u8; 14] {
     let mut code = [0xFF, 0x25, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
@@ -301,21 +343,8 @@ fn call_distance(call: usize, to: usize) -> Option<[u8; 4]> {
 /// `base` is the mapped image `info` describes, no title code runs yet, and `hook` stays valid for the process.
 #[cfg(windows)]
 pub unsafe fn install(base: usize, info: &leonida_pe::ImageInfo, hook: usize) -> (Sites, Result<(), String>) {
-    let sites = {
-        // The image's code as it is mapped; the slices end with this block, before anything is written.
-        let code: Vec<(usize, &[u8])> = info
-            .sections
-            .iter()
-            .filter(|s| s.characteristics & crate::vipatch::SCN_MEM_EXECUTE != 0)
-            .filter(|s| u64::from(s.rva) + u64::from(s.virtual_size) <= u64::from(info.size_of_image))
-            .map(|s| {
-                let (start, len) = (s.rva as usize, s.virtual_size as usize);
-                // SAFETY: a section of the mapped image, readable, which nothing writes now.
-                (start, unsafe { std::slice::from_raw_parts((base + start) as *const u8, len) })
-            })
-            .collect();
-        resolve(&code, info.size_of_image as usize)
-    };
+    // SAFETY: forwarded from this function's contract; the slices end with the call, before anything is written.
+    let sites = unsafe { find(base, info, None) };
     let (Some(call), Some(_), Some(_)) =
         (sites.get(Site::HookCall), sites.get(Site::CheatsUpdate), sites.get(Site::Defer))
     else {
@@ -451,7 +480,32 @@ mod tests {
         assert_eq!(sites.get(Site::WantedSet).unwrap() % 16, 0);
         assert_eq!(sites.get(Site::WantedLevelAt), Some(0));
         assert!(sites.has(&[Site::ClockSet, Site::WeatherForce, Site::WeatherTypes]));
+        // The player's vehicle: lea rcx, [rip + 0], whose end is 16 bytes into its place.
+        assert_eq!(sites.get(Site::PlayerVehicle), Some(at(Site::PlayerVehicle) + 16));
         assert_eq!(sites.count(), SITES);
+    }
+
+    #[test]
+    fn some_sites_are_found_without_looking_for_the_rest() {
+        let mut code = image();
+        let vehicle = place_at(place_of(Site::PlayerVehicle));
+        code[vehicle + 12..vehicle + 16].copy_from_slice(&0x4321i32.to_le_bytes());
+        // A place nobody asks for may be missing: it is not looked for, and not reported.
+        let clock = place_at(place_of(Site::ClockSet));
+        code[clock] ^= 0xFF;
+        let wanted = [Site::PlayerPed, Site::PlayerVehicle];
+        let sites = resolve_some(&[(0x1000, &code[..])], 0x10_0000, Some(&wanted));
+        assert!(sites.missing.is_empty(), "{:?}", sites.missing);
+        assert_eq!(sites.count(), 2);
+        assert_eq!(sites.get(Site::PlayerPed), Some(0x1000 + place_at(place_of(Site::PlayerPed)) + 11));
+        assert_eq!(sites.get(Site::PlayerVehicle), Some(0x1000 + vehicle + 16 + 0x4321));
+        assert!(sites.get(Site::HookCall).is_none() && sites.get(Site::ClockSet).is_none());
+        // Asked for, it is reported.
+        let sites = resolve_some(&[(0x1000, &code[..])], 0x10_0000, Some(&[Site::ClockTime]));
+        assert_eq!((sites.count(), sites.missing.len()), (0, 1));
+        // All of them: as `resolve`.
+        let all = resolve_some(&[(0x1000, &code[..])], 0x10_0000, None);
+        assert_eq!(all, resolve(&[(0x1000, &code[..])], 0x10_0000));
     }
 
     #[test]
@@ -635,6 +689,7 @@ mod tests {
             Site::WeatherNext,
             Site::WeatherForced,
             Site::WeatherTypes,
+            Site::PlayerVehicle,
         ] {
             assert!(!in_code(sites.get(site).unwrap()), "{site:?}");
         }

@@ -30,12 +30,17 @@ import math
 import os
 import queue
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 REPO = Path(__file__).resolve().parent.parent
 CDB_DEFAULT = Path(r"C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe")
@@ -131,9 +136,14 @@ def thread_stacks(cdb, pid):
 def kill_tree(proc):
     """Stop the title and every process it started (taskkill /T on Windows, the process alone elsewhere)."""
     if os.name == "nt":
-        subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
-    else:
+        try:
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True)
+        except OSError:
+            pass
+    try:
         proc.kill()
+    except OSError:
+        pass
 
 
 def run_title(cmd, env, cwd, run, known, timeout, cdb, events, skip, transcript=None):
@@ -144,22 +154,31 @@ def run_title(cmd, env, cwd, run, known, timeout, cdb, events, skip, transcript=
     env = dict(env)
     if skip:
         env["XCL_TESTTITLE_SKIP"] = ";".join(skip)
-    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
-    lines = queue.Queue()
-
-    def pump():
-        with proc.stdout:
-            for line in proc.stdout:
-                lines.put(line.rstrip("\r\n"))
-        lines.put(None)
-
-    threading.Thread(target=pump, daemon=True).start()
     out = open(transcript, "a", encoding="utf-8", newline="\n") if transcript else None
-    if out:
-        out.write("--- %s\n" % " ".join(str(c) for c in cmd))
+    proc = None
     try:
+        if out:
+            out.write("--- %s\n" % " ".join(str(c) for c in cmd))
+        proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace")
+        lines = queue.Queue()
+
+        def pump():
+            with proc.stdout:
+                for line in proc.stdout:
+                    lines.put(line.rstrip("\r\n"))
+            lines.put(None)
+
+        threading.Thread(target=pump, daemon=True).start()
         return _follow(proc, lines, run, known, timeout, cdb, events, out, cmd)
+    except BaseException:
+        if proc is not None and proc.poll() is None:
+            kill_tree(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        raise
     finally:
         if out:
             out.close()
@@ -184,7 +203,7 @@ def _follow(proc, lines, run, known, timeout, cdb, events, out, cmd):
                 stacks = thread_stacks(cdb, proc.pid)
                 kill_tree(proc)
                 proc.wait()
-                run.set(hung, status="HANG", reason="no output for %d s" % timeout, stack=stacks,
+                run.set(hung, status="HANG", reason="no output for %g s" % timeout, stack=stacks,
                         seconds=round(time.monotonic() - started, 2))
                 events.put(("check", run.label, hung))
                 return hung
@@ -225,7 +244,56 @@ def _follow(proc, lines, run, known, timeout, cdb, events, out, cmd):
     return None
 
 
+def _write_json_atomic(path, report):
+    """Publish complete JSON atomically, leaving any existing report intact on failure."""
+    destination = os.path.realpath(str(path))
+    out_dir = os.path.dirname(destination) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(destination, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False, allow_nan=False)
+            f.write("\n")
+        return
+    if mode is not None:
+        os.close(os.open(destination, os.O_WRONLY))
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=out_dir, prefix=".xcl_compare-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=2, ensure_ascii=False, allow_nan=False)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
+def _validate_out_path(raw_out):
+    if raw_out is None:
+        return None
+    if not str(raw_out).strip():
+        raise SystemExit("--out must not be empty")
+    text = str(raw_out)
+    if text.endswith(os.sep) or (os.altsep and text.endswith(os.altsep)) or os.path.isdir(text):
+        raise SystemExit(f"--out is a folder, not a file: {raw_out}")
+    return Path(raw_out)
+
+
 def run_all(args, events):
+    for flag, val in (("--xcl", args.xcl), ("--gta6rt", args.gta6rt), ("--work", args.work), ("--cdb", args.cdb)):
+        if val is not None and not str(val).strip():
+            raise SystemExit(f"{flag} must not be empty")
+    out = _validate_out_path(args.out)
     xcl_dir = Path(args.xcl).resolve()
     bins = find_xcl_binaries(xcl_dir)
     if not bins:
@@ -237,6 +305,10 @@ def run_all(args, events):
     if work.drive.upper() == "D:":
         # XCL maps the console drive D: to the game folder, so a real D:\ path is not reachable inside it.
         raise SystemExit("--work is on D:, which XCL maps to the game folder; use a folder on another drive")
+    if out is None:
+        out = work / "report.json"
+        if out.is_dir():
+            raise SystemExit(f"--out is a folder, not a file: {out}")
     work.mkdir(parents=True, exist_ok=True)
     cdb = Path(args.cdb) if args.cdb else (CDB_DEFAULT if CDB_DEFAULT.is_file() else None)
 
@@ -244,7 +316,8 @@ def run_all(args, events):
     events.put(("runs", xcl, leo))
     transcripts = {"xcl": work / "xcl_output.txt", "leonida": work / "leonida_output.txt"}
     for path in transcripts.values():
-        open(path, "w", encoding="utf-8", newline="\n").close()
+        with open(path, "w", encoding="utf-8", newline="\n"):
+            pass
 
     # 1. XCL: the reference run, which also gives the check order.
     if (work / "xcl").exists():
@@ -280,11 +353,7 @@ def run_all(args, events):
             leo.set(name)
     report = make_report(xcl, leo, known, gta6rt, xcl_dir)
     report["transcripts"] = {k: str(v) for k, v in transcripts.items()}
-    out = Path(args.out) if args.out else work / "report.json"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    with open(out, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
-        f.write("\n")
+    _write_json_atomic(out, report)
     events.put(("done", report, str(out)))
     return report, out
 
@@ -466,7 +535,7 @@ def gui(args):
     root.mainloop()
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--xcl", required=True, help="an XCL checkout with 'cargo build --release --workspace' done")
     ap.add_argument("--gta6rt", help="gta6rt.exe (default: the one under runtime/build)")
@@ -477,7 +546,11 @@ def main():
     ap.add_argument("--cdb", help="cdb.exe for stacks of a hung title")
     ap.add_argument("--out", help="report path (default: <work>/report.json)")
     ap.add_argument("--gui", action="store_true", help="show the checks live in a window")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
+    for flag, val in (("--xcl", args.xcl), ("--gta6rt", args.gta6rt), ("--work", args.work),
+                      ("--cdb", args.cdb), ("--out", args.out)):
+        if val is not None and not val.strip():
+            ap.error(f"{flag} must not be empty")
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         ap.error("--timeout must be finite and greater than zero")
     if args.max_restarts < 0:
@@ -507,5 +580,8 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.stdout.reconfigure(errors="replace")
+    try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

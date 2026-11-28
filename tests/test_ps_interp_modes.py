@@ -405,6 +405,33 @@ class CliTest(unittest.TestCase):
         self.assertEqual(out.returncode, 2)
         self.assertIn("does not exist", out.stderr)
 
+    def test_single_file_without_psv0_exits_two(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = os.path.join(tmp, "not_a_shader.dxbc")
+            with open(bad, "wb") as f:
+                f.write(b"NOT_DXBC_DATA")
+            for extra in ((), ("--json",)):
+                with self.subTest(extra=extra):
+                    p = subprocess.run([sys.executable, "-I", TOOL, bad, *extra],
+                                       capture_output=True, text=True)
+                    self.assertEqual(p.returncode, 2)
+                    self.assertEqual(p.stdout, "")
+                    self.assertEqual(len(p.stderr.splitlines()), 1)
+                    self.assertIn("ERROR:", p.stderr)
+                    self.assertIn("no readable PSV0", p.stderr)
+
+    def test_directory_still_skips_file_without_psv0(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.write_two_shaders(tmp)
+            with open(os.path.join(tmp, "bad.dxbc"), "wb") as f:
+                f.write(b"NOT_DXBC_DATA")
+            p = subprocess.run([sys.executable, "-I", TOOL, tmp, "--json"],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            doc = json.loads(p.stdout)
+            self.assertEqual(len(doc["files"]), 2)
+            self.assertEqual(doc["skipped"], {"no psv0": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

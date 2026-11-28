@@ -216,15 +216,25 @@ public:
     // SetFrameIntervalX(output, interval, latency, flags). `period_us` is the interval as a period; `latency` is
     // the number of frames allowed in flight (0 counts as 1). The vblank grid is re-based: its epoch is now. A
     // scheduled origin event stays armed (with its offset, kept below the new period) and its next origin is one
-    // new period from now; waiters blocked on the old grid pick the new one up.
+    // new period from now. When the period changes, pending frames receive consecutive vblanks on that grid in
+    // their original order. Reapplying the same period preserves their display deadlines.
     std::int32_t set_frame_interval(std::uint32_t period_us, std::uint32_t latency, std::uint32_t flags) {
         (void)flags;
         if (period_us == 0) return pacer_hr::invalid_arg;
         std::lock_guard guard(mutex_);
         if (suspended_) return pacer_hr::invalid_state;
+        const auto now = clock_.now_us();
+        if (period_us_ != period_us) {
+            retire_locked(now);
+            auto next_flip = now;
+            for (Pending& frame : pending_) {
+                next_flip += period_us;
+                frame.flip_us = next_flip;
+            }
+        }
         period_us_ = period_us;
         latency_ = std::max(latency, 1u);
-        epoch_us_ = clock_.now_us();
+        epoch_us_ = now;
         interval_set_ = true;
         for (std::uint32_t k = 0; k < frame_event_count; ++k) {
             event_offset_us_[k] = std::min(event_offset_us_[k], period_us - 1);
@@ -397,6 +407,7 @@ public:
     // SuspendX: presentation stops, the registration and the frames in flight are dropped, waiters fail.
     void suspend() {
         std::lock_guard guard(mutex_);
+        ++suspend_generation_;
         suspended_ = true;
         interval_set_ = false;
         has_last_present_ = false;  // do not count the suspended pause as a frame interval after resume
@@ -554,7 +565,8 @@ private:
         auto& tick = last_event_tick_[frame_event_origin];
         tick = std::max(tick, newest);
         const auto origin = first + static_cast<std::uint64_t>(tick) * period_us_;
-        *token = issue_token_locked(origin, origin - offset + period_us_);
+        // The current token can be polled before the first configured origin.
+        *token = issue_token_locked(std::min(origin, now), origin - offset + period_us_);
         return pacer_hr::ok;
     }
 
@@ -575,13 +587,15 @@ private:
 
     std::int32_t wait_locked(std::unique_lock<std::mutex>& lock, std::uint32_t event, std::uint32_t timeout_ms,
                              std::uint32_t flags, std::uint64_t* token) {
+        const auto generation = suspend_generation_;  // resume may re-arm the event before this wait reacquires the lock
         const bool is_origin = (event == frame_event_origin);
         const bool token_on_timeout = (flags & frame_wait_flag_token_on_timeout) != 0;
         const std::uint64_t start = clock_.now_us();
         const std::uint64_t give_up = timeout_ms == infinite_timeout_ms ? no_deadline
                                                                          : start + std::uint64_t(timeout_ms) * 1000;
         for (;;) {
-            if (shutdown_ || suspended_ || !interval_set_) return pacer_hr::invalid_state;
+            if (shutdown_ || suspended_ || !interval_set_ || generation != suspend_generation_)
+                return pacer_hr::invalid_state;
             if (is_origin ? !event_armed_[frame_event_origin]
                           : (!event_armed_[event] && !event_armed_[frame_event_origin])) {
                 return pacer_hr::invalid_state;
@@ -630,6 +644,7 @@ private:
     std::uint32_t waiters_ = 0;
 
     bool suspended_ = false;
+    std::uint64_t suspend_generation_ = 0;
     bool interval_set_ = false;
     bool event_armed_[frame_event_count] = {false, false, false};
     bool uncapped_ = false;

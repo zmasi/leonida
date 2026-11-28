@@ -37,14 +37,14 @@ Rien n'est jouable, sur aucune plateforme. Ce qui tourne aujourd'hui :
 - **AMD RDNA1 (RX 5000)** : une cible prise en charge, proche du RDNA2 de la console ; ses sous-groupes de 64
   exécutent les shaders wave64 nativement.
 
-Les résultats GPU de toutes les plateformes sont regroupés dans
-l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
+Les résultats GPU de toutes les plateformes sont envoyés sous forme de pull requests ajoutant un fichier à
+[gpu-test-results/](../../../gpu-test-results).
 
 ## Prérequis
 
 - **Votre propre copie** du paquet Xbox Series, version `1.0.2.1` : le dossier qui contient `MicrosoftGame.Config` et
   les archives `.rpf`, sous forme de fichiers lisibles sur le disque.
-- **Windows 10/11 x64**, avec environ **350 Go libres** pour les fichiers de travail. Ils peuvent aller sur un autre
+- **Windows 10/11 x64**, avec environ **400 Go libres** pour les fichiers de travail. Ils peuvent aller sur un autre
   disque avec `--work`.
 - [Python 3.12+](https://www.python.org/downloads/) (cochez « Add python.exe to PATH » à l'installation).
 - [SDK .NET 8](https://dotnet.microsoft.com/download/dotnet/8.0).
@@ -80,7 +80,7 @@ l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
 1. Installez les prérequis ci-dessus.
 2. Clonez le dépôt **avec son sous-module** :
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/ubiquitarianism/leonida
    ```
    Un « Download ZIP » depuis GitHub n'inclut pas `third_party/rpf9-explorer` : la compilation le récupère si `git`
    est installé, et sinon vous dit quoi faire.
@@ -137,7 +137,7 @@ encore ce cache.
 - **Ce qui est refait automatiquement** : la compilation enregistre la commande et la version de `llvm-mc`, les
   sources du traducteur et le décodeur des ressources (`third_party/rpf9-explorer` et `tools/rpf9dump`). Si l'un
   d'eux change, seule l'étape concernée est refaite (désassemblage, traduction ou export des modèles et textures).
-- **`--work`** : choisissez un disque avec au moins 350 Go libres. La traduction des shaders est l'étape la plus
+- **`--work`** : choisissez un disque avec au moins 400 Go libres. La traduction des shaders est l'étape la plus
   longue ; elle utilise par défaut la moitié des threads du processeur (réglable avec `--jobs`).
 - **`--wav`** : désactivé par défaut, car le WAV PCM 16 bits est plusieurs fois plus volumineux que l'Ogg Opus.
 - **Linux et Wine/Proton** : `make_game.py` fonctionne aussi sous Linux. L'étape `pipelines` utilise
@@ -177,7 +177,7 @@ encore ce cache.
    [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
 Le [guide des tests GPU](../../testing.md) explique comment lancer les tests sans aucun fichier du jeu. Publiez vos
-résultats dans l'[issue #166](https://github.com/ItsNotRexed/Leonida/issues/166), un commentaire par GPU et par
-pilote.
+résultats sous forme de pull request ajoutant un fichier à [gpu-test-results/](../../../gpu-test-results), un
+fichier par GPU et par pilote.
 
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+[coord]: https://github.com/ubiquitarianism/leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22

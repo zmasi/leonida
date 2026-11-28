@@ -657,19 +657,20 @@ def _bc_interp_lut(v0: int, v1: int) -> tuple[int, int, int, int, int, int, int,
 
 
 def _bc_interp_lut_snorm(b0: int, b1: int) -> tuple[int, int, int, int, int, int, int, int]:
-    """Build the 8-entry BC4_SNORM / BC5_SNORM table mapped from [-1, 1] to [0, 255]."""
-    s0 = b0 - 256 if b0 >= 128 else b0
-    s1 = b1 - 256 if b1 >= 128 else b1
-    if s0 == -128:
-        s0 = -127
-    if s1 == -128:
-        s1 = -127
+    """Build the 8-entry BC4_SNORM / BC5_SNORM table mapped from [-1, 1] to [0, 255].
+
+    The eight- or six-value ramp is chosen by comparing the stored int8 endpoints, as D3D's BC4_SNORM rule does;
+    -128 is read as -127 only once it becomes a value. So 0x81, 0x80 (-127 > -128) is an eight-value block, which
+    clamping before the compare would turn into a six-value one with +1.0 at index 7."""
+    r0 = b0 - 256 if b0 >= 128 else b0
+    r1 = b1 - 256 if b1 >= 128 else b1
+    s0, s1 = max(r0, -127), max(r1, -127)
 
     def to_u8(v: float) -> int:
         # Map [-127.0, 127.0] -> [0, 255]
         return int(round((v / 127.0 * 0.5 + 0.5) * 255.0))
 
-    if s0 > s1:
+    if r0 > r1:
         return (
             to_u8(s0),
             to_u8(s1),
@@ -1493,10 +1494,10 @@ def _decode_dds(data: bytes, *, mip: int = 0, layer: int = 0, face: str | None =
 
 
 def decode_dds(data: bytes, *, mip: int = 0, layer: int = 0, face: str | None = None,
-               z: int = 0) -> tuple[int, int, bytes]:
-    """Decode one DDS image plane into top-down row-major RGBA8 with straight alpha."""
-    width, height, rgba, _ = _decode_dds(data, mip=mip, layer=layer, face=face, z=z)
-    return width, height, rgba
+               z: int = 0, max_size: int = 0) -> tuple[int, int, bytes]:
+    """Decode a straight-alpha RGBA8 plane, optionally filtering in its declared color space."""
+    width, height, rgba, srgb = _decode_dds(data, mip=mip, layer=layer, face=face, z=z)
+    return downscale_rgba(width, height, rgba, max_size, srgb=srgb)
 
 
 def _box_spans(source: int, target: int) -> list:
@@ -1609,17 +1610,15 @@ def encode_png(width: int, height: int, rgba: bytes) -> bytes:
 
     ihdr = _png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
 
-    raw = bytearray(height * (stride + 1))
-    mv = memoryview(rgba)
-    dst = 1
-    src = 0
-    dst_step = stride + 1
-    for _ in range(height):
-        raw[dst : dst + stride] = mv[src : src + stride]
-        dst += dst_step
-        src += stride
+    compressor = zlib.compressobj()
+    compressed = bytearray()
+    pixels = memoryview(rgba)
+    for start in range(0, expected, stride):
+        compressed.extend(compressor.compress(b"\x00"))  # PNG filter type 0
+        compressed.extend(compressor.compress(pixels[start:start + stride]))
+    compressed.extend(compressor.flush())
 
-    idat = _png_chunk(b"IDAT", zlib.compress(raw))
+    idat = _png_chunk(b"IDAT", compressed)
     iend = _png_chunk(b"IEND", b"")
     return PNG_SIGNATURE + ihdr + idat + iend
 

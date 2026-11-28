@@ -29,10 +29,13 @@ import os
 import re
 import struct
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 import psin_data  # noqa: E402
 import psin_index  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from world_names import joaat, murmur3_x64_128  # noqa: E402
 
@@ -92,7 +95,7 @@ def load_names(paths):
     JSON, or not the shape rpf9_names.py writes, raises ValueError naming the file (--names is repeatable)."""
     names = set()
     for path in paths:
-        if path.endswith(".json"):
+        if path.lower().endswith(".json"):
             try:
                 with open(path, encoding="utf-8") as f:
                     doc = json.load(f)
@@ -211,8 +214,8 @@ def main():
             if any(same_report_path(path, a.refs) for path in inputs):
                 ap.error("--refs must not overwrite an input")
             if os.path.isdir(a.src):
-                src_real = os.path.realpath(a.src)
-                refs_real = os.path.realpath(a.refs)
+                src_real = os.path.normcase(os.path.realpath(a.src))
+                refs_real = os.path.normcase(os.path.realpath(a.refs))
                 try:
                     inside_src = os.path.commonpath([src_real, refs_real]) == src_real
                 except ValueError:
@@ -224,9 +227,30 @@ def main():
                     ap.error("--refs must not overwrite an input")
         names = load_names(a.names)
         if a.refs:
-            with open(a.refs, "w", encoding="utf-8", newline="\n") as refs:
-                refs.write("file\tstruct\tfield\ttype\tvalue\tname\n")
-                summary, table = scan(a.src, names, a.limit, refs)
+            dest = os.path.abspath(a.refs)
+            parent = os.path.dirname(dest) or "."
+            staged = None
+            try:
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", newline="\n", delete=False,
+                    dir=parent, prefix=".psin_names-", suffix=".tmp",
+                ) as refs:
+                    staged = refs.name
+                    refs.write("file\tstruct\tfield\ttype\tvalue\tname\n")
+                    summary, table = scan(a.src, names, a.limit, refs)
+                os.chmod(staged, published_mode(dest))
+                replace_retry(staged, dest)
+                staged = None
+            finally:
+                if staged is not None:
+                    try:
+                        os.chmod(staged, 0o600)
+                    except OSError:
+                        pass
+                    try:
+                        os.unlink(staged)
+                    except OSError:
+                        pass
         else:
             summary, table = scan(a.src, names, a.limit)
     except (OSError, ValueError) as e:

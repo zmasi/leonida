@@ -103,7 +103,7 @@ def find_hip_dll():
 
 def _is_msvc(cc):
     """cl.exe (MSVC or clang-cl) takes /Fe, not -o."""
-    return os.path.basename(cc).lower() in ("cl.exe", "cl", "clang-cl.exe", "clang-cl")
+    return os.path.basename(cc.replace("\\", "/")).lower() in ("cl.exe", "cl", "clang-cl.exe", "clang-cl")
 
 
 def find_vcvars():

@@ -27,6 +27,7 @@ from collections import Counter, defaultdict
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+from file_mode import published_mode  # noqa: E402
 import gamedata_index as gi  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
@@ -249,16 +250,26 @@ def summarize_documents(docs: list[tuple[str, bytes]]) -> dict:
 
 
 def _write_json_atomic(path: str, payload: dict) -> None:
-    parent = os.path.dirname(os.path.abspath(path)) or "."
+    out_abs = os.path.abspath(path)
+    parent = os.path.dirname(out_abs) or "."
     os.makedirs(parent, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=".timecycle_pairs_", suffix=".tmp", dir=parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
             json.dump(payload, f, indent=1, sort_keys=True)
             f.write("\n")
-        os.replace(tmp_path, path)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp_path, published_mode(out_abs))
+        os.replace(tmp_path, out_abs)
     except BaseException:
         try:
+            os.chmod(tmp_path, 0o600)
             os.unlink(tmp_path)
         except OSError:
             pass

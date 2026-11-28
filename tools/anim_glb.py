@@ -3,8 +3,9 @@
 Three readers meet here: the skeleton that a character fragment carries at drawable + 0x18, the skin streams of
 a part drawable (docs/character_skeleton.md, ASSET-12) and the clip dictionaries of anim.rpf (anim_clips.py). Each
 part mesh is bound to the skeleton through its model's bone list, and each clip track to a skeleton joint through
-its bone hash. Nothing is invented: a part whose weighted bones are not in the skeleton is refused, and clip tracks
-that name no joint are counted and left out.
+its bone hash. A weighted bone that the skeleton does not name (cloth and accessory bones of clothing) becomes an
+extra joint under the skeleton root that keeps the rest pose (see `extend_joints`); clip tracks that name no joint
+are counted and left out.
 
 Skeleton (measured on the 596-bone female and 560-bone male humanoid fragments of packs.rpf):
 
@@ -369,6 +370,29 @@ def read_part(sys, gfx, drawable, lod=0):
     return meshes
 
 
+def extend_joints(meshes, joints):
+    """Joints plus one extra joint for each weighted bone hash of the part that the skeleton does not name.
+
+    Clothing carries cloth and accessory bones that no master skeleton lists, and the part has no skeleton of its
+    own to read them from. Nothing about them is invented beyond what keeps the rest pose exact: an extra joint is a
+    child of the skeleton's first root, with an identity local transform and that root's inverse bind matrix, so
+    its world matrix times its inverse bind is the identity and a vertex bound to it stays where it was stored.
+    It is named `bone_0x<hash>`, the way skinned_glb.py names a palette hash that resolves nowhere. A hash the
+    skeleton lists twice is still refused by `bind_part`, and an unweighted bone is not added. Earlier joints keep
+    their indices, so meshes bound before the extension stay valid. -> a new list; `joints` is not changed."""
+    known = {j["hash"] for j in joints}
+    wanted = {mesh["palette"][b] for mesh in meshes for pairs in mesh["skin"] for b, _w in pairs
+              if mesh["palette"][b] not in known}
+    if not wanted:
+        return joints
+    root = next((i for i, j in enumerate(joints) if j["parent"] is None), None)
+    require(root is not None, "the skeleton has no root joint to attach extra bones to")
+    extra = [{"hash": h, "name": f"bone_0x{h:08x}", "parent": root, "rotation": (0.0, 0.0, 0.0, 1.0),
+              "translation": (0.0, 0.0, 0.0), "scale": (1.0, 1.0, 1.0), "inverse_bind": list(joints[root]["inverse_bind"])}
+             for h in sorted(wanted)]
+    return list(joints) + extra
+
+
 def bind_part(meshes, joints, max_influences=8):
     """Model bone index -> skeleton joint index through the bone hashes; -> per mesh JOINTS/WEIGHTS sets.
 
@@ -637,7 +661,11 @@ def export(args):
             name = c_string(sys_pages, drawable + 168) or f"part_0x{offset:x}"
             if name.endswith(".#dr"):
                 name = name[:-4]
-            part = bind_part(read_part(sys_pages, gfx, drawable, args.lod), joints, args.max_influences)
+            raw = read_part(sys_pages, gfx, drawable, args.lod)
+            extended = extend_joints(raw, joints)
+            report["counts"]["extra_joints"] += len(extended) - len(joints)
+            joints = extended
+            part = bind_part(raw, joints, args.max_influences)
             for mesh in part:
                 mesh["name"] = f"{name}_m{mesh['model']}_g{mesh['geometry']}"
             meshes.extend(part)

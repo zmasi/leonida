@@ -483,6 +483,30 @@ class SkinnedGlbTest(unittest.TestCase):
         with self.assertRaises(skinned_glb.SkinError):
             skinned_glb.build_skinned_glb(skeleton, [component])
 
+    def test_malformed_gfx_off_and_none_default(self):
+        component = _component(self.root)
+        for bad in ("abc", "", False, True, float("inf"), 1.5, []):
+            model = _read_model(component)
+            model["drawable"]["buffers"][0]["gfx_off"] = bad
+            with self.subTest(gfx_off=bad), self.assertRaisesRegex(
+                skinned_glb.SkinError, "vertex buffer offset is not an integer"
+            ):
+                skinned_glb.read_skin_streams(component, model, model["meshes"][0])
+        model_none = _read_model(component)
+        model_none["drawable"]["buffers"][0]["gfx_off"] = None
+        streams = skinned_glb.read_skin_streams(component, model_none, model_none["meshes"][0])
+        self.assertIn("j0", streams)
+
+    def test_bool_vertex_count_is_rejected(self):
+        component = _component(self.root)
+        for bad in (False, True):
+            model = _read_model(component)
+            model["meshes"][0]["vertex_count"] = bad
+            with self.subTest(vertex_count=bad), self.assertRaisesRegex(
+                skinned_glb.SkinError, "positive integer vertex_count"
+            ):
+                skinned_glb.read_skin_streams(component, model, model["meshes"][0])
+
     def test_mesh_blob_sections_supply_the_stream_offsets(self):
         j0, j1, w0, w1 = _streams()
         buffer = bytearray(_skin_buffer(j0, j1, w0, w1))

@@ -224,9 +224,13 @@ pub fn run(
     }
     // The trainer menu's game actions (`LEONIDA_GAME_ACTIONS=1`, game_actions.rs): the title's cheat update,
     // once a frame, goes through the runtime, which does there what the menu asks.
+    // What the player is in, for the keyboard and mouse layout (player_context.rs): read only, with or without
+    // the game actions.
     if execute {
         // SAFETY: the image stays mapped, and nothing of it has run yet.
-        unsafe { crate::game_actions::install(image.base(), image.info()) };
+        let found = unsafe { crate::game_actions::install(image.base(), image.info()) };
+        // SAFETY: as above.
+        unsafe { crate::player_context::install(image.base(), image.info(), found.as_ref()) };
     }
     // Renderer port #2 (LEONIDA_PORT_DESCRIPTORS=1): the title's stores of descriptor records tell the layer their
     // slots. Only the 1.0.2.1 executable, each store's bytes checked as well.

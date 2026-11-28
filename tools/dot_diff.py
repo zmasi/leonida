@@ -523,6 +523,10 @@ def run_grid(ops=None):
 
 def run_suite(programs, seed, max_ops=6, ops=None):
     """Random seeded programs. Returns (counts, failure)."""
+    if type(programs) is not int or programs < 0:
+        raise ValueError("programs must be a nonnegative integer")
+    if type(max_ops) is not int or max_ops < 1:
+        raise ValueError("max_ops must be at least 1")
     counts = _new_counts()
     failure = None
     rng = random.Random(f"suite:{seed}")
@@ -619,7 +623,7 @@ def self_test():
     return ok
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--programs", type=int, default=300, help="random programs after the sweep")
@@ -630,7 +634,7 @@ def main():
     ap.add_argument("--no-sweep", action="store_true", help="skip the source-kind sweep and the edge grid")
     ap.add_argument("--list-ops", action="store_true")
     ap.add_argument("--self-test", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     if args.list_ops:
         for op, form in OP_FORMS.items():
@@ -640,30 +644,44 @@ def main():
     if args.self_test:
         return 0 if self_test() else 1
 
-    if args.ops == "gfx103x":
-        ops = list(GFX103X_OPS)
-    else:
-        ops = [o.strip() for o in args.ops.split(",")] if args.ops else None
-    bad = [o for o in (ops or []) if o not in FAMILY]
-    if bad:
-        print(f"unknown op(s) {bad}; --list-ops shows the family", file=sys.stderr)
-        return 2
+    if args.programs < 0:
+        ap.error("--programs must be nonnegative")
+    if args.max_ops < 1:
+        ap.error("--max-ops must be at least 1")
+    if args.no_sweep and args.programs == 0:
+        ap.error("nothing to run: pass --programs >= 1 or omit --no-sweep")
 
-    total_pass = total_run = total_mismatch = 0
+    ops = None
+    if args.ops is not None:
+        if args.ops.strip() == "gfx103x":
+            ops = list(GFX103X_OPS)
+        else:
+            tokens = [o.strip() for o in args.ops.split(",")]
+            if not tokens or any(not o for o in tokens):
+                ap.error("--ops must be a comma-separated list of opcodes (or 'gfx103x')")
+            ops = list(dict.fromkeys(tokens))
+            bad = [o for o in ops if o not in FAMILY]
+            if bad:
+                print(f"unknown op(s) {bad}; --list-ops shows the family", file=sys.stderr)
+                return 2
+
+    total_pass = total_run = total_mismatch = total_skip = 0
     per_op, events = Counter(), Counter()
     failure = None
     try:
         for label, enabled, runner in (
             ("sweep", not args.no_sweep, lambda: run_sweep(args.seed, ops)),
             ("edge grid", not args.no_sweep, lambda: run_grid(ops)),
-            ("random", True, lambda: run_suite(args.programs, args.seed, args.max_ops, ops)),
+            ("random", args.programs > 0, lambda: run_suite(args.programs, args.seed, args.max_ops, ops)),
         ):
             if not enabled:
                 continue
             counts, first = runner()
-            ran = counts["pass"] + counts["mismatch"] + sum(counts["skip"].values())
+            skips = sum(counts["skip"].values())
+            ran = counts["pass"] + counts["mismatch"] + skips
             total_pass += counts["pass"]
             total_mismatch += counts["mismatch"]
+            total_skip += skips
             total_run += ran
             per_op.update(counts["ops"])
             events.update(counts["events"])
@@ -681,6 +699,12 @@ def main():
     if failure:
         _report(failure)
         return 1
+    if total_skip:
+        print(f"SKIPPED {total_skip} program(s): every generated form should translate (reasons above)")
+        return 1
+    if total_run == 0:
+        print("no program ran", file=sys.stderr)
+        return 2
     return 0
 
 

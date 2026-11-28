@@ -153,6 +153,9 @@ pub(crate) struct Translated {
     pub(crate) stores: bool,
     /// Whether it can store through raw addresses ([`stores_by_address`]).
     pub(crate) stores_by_address: bool,
+    /// Whether it can store to buffer memory otherwise than through a buffer view
+    /// ([`stores_past_views`]); true when its code is not known.
+    pub(crate) stores_past_views: bool,
     /// Whether its code can write through unordered access at all: a store
     /// to buffer memory ([`stores`]) or to a texture ([`image_stores`]); true
     /// when its code is not known. What a later wait for every shader write
@@ -166,6 +169,9 @@ pub(crate) struct Translated {
     /// Whether it stores through a view it picks from the heap by an index,
     /// once asked (`crate::picked`).
     pub(crate) picks: std::sync::atomic::AtomicU8,
+    /// Whether all it stores to buffers goes through views bound to it, once asked
+    /// ([`stores_bound`]).
+    pub(crate) bound: std::sync::atomic::AtomicU8,
 }
 
 #[cfg(windows)]
@@ -240,6 +246,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         _ => None,
     });
     let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
+    let stores_past_views = programs.is_empty() || programs.iter().any(stores_past_views);
     let writes = stores || programs.iter().any(image_stores);
     let used = programs
         .into_iter()
@@ -265,10 +272,12 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         tables,
         stores,
         stores_by_address,
+        stores_past_views,
         writes,
         pack,
         pack_logged: Default::default(),
         picks: Default::default(),
+        bound: Default::default(),
     })
 }
 
@@ -457,6 +466,179 @@ fn stores_by_address(program: &leonida_shader::NativeProgram) -> bool {
     })
 }
 
+/// Whether a console program can store to buffer memory otherwise than through a buffer view:
+/// of what [`stores`] counts, anything but a buffer or typed-buffer store or atomic the table
+/// knows (a scalar-memory, flat or global store, an instruction outside the table, an indirect
+/// jump, code that does not decode). What a program stores through buffer views lands in the
+/// views bound to it, whose ranges a list is told (`crate::shadow::Shadow::gpu_writes`); the
+/// rest can land anywhere (`LEONIDA_INDIRECT_BATCH=4`, `crate::draw`).
+#[cfg(windows)]
+fn stores_past_views(program: &leonida_shader::NativeProgram) -> bool {
+    use leonida_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        let name = i.name();
+        match i.encoding {
+            Encoding::Mubuf | Encoding::Mtbuf => name.is_none(),
+            Encoding::Smem | Encoding::Flat | Encoding::Global => {
+                name.is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
+            }
+            Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
+            _ => false,
+        }
+    })
+}
+
+/// Whether everything a console program can store to buffers goes through views a list is told
+/// of at every bind of it (`crate::shadow::Shadow::gpu_writes`; `LEONIDA_INDIRECT_BATCH=4`, where
+/// a batch of indirect records stays open past such a program). Each buffer store or atomic has
+/// to go through
+///
+/// - a descriptor loaded from a fixed place in a table (no offset the program computes), at the
+///   first descriptor of an entry of its used-resource list that is an unordered access view:
+///   the entries `crate::draw::State::tables` goes through (`readable`) at every bind, by the
+///   first entry of each descriptor (`TableGroup::entry`), declaring the views of unordered
+///   access; a range of several views names only its first, so a store past it does not count;
+/// - or a descriptor built around a root view of unordered access, in a program whose user data
+///   is not spilled: the host binds that root view and declares it to the end of its host copy
+///   (`crate::draw::State::root_uav`); a spilled program reaches it through title memory by
+///   address instead.
+///
+/// A store through a view picked from the view heap, from a table at an offset the program
+/// computes, per lane out of memory (a waterfall loop), or built around another address, a
+/// scalar, flat or global store ([`stores_past_views`]), code that does not decode or that
+/// resource tracking does not follow: no. A program that stores to no buffer: yes.
+#[cfg(windows)]
+fn stores_in_bound_views(program: &leonida_shader::NativeProgram) -> bool {
+    use leonida_shader::gfx10::Fields;
+    use leonida_shader::native::{ResourceType, RootType};
+    use leonida_shader::resource::{Role, Source};
+    if !stores(program) {
+        return true;
+    }
+    if stores_past_views(program) || leonida_shader::spill::is_spilled(program) {
+        return false;
+    }
+    let Ok(p) = leonida_shader::spill::build(program) else {
+        return false;
+    };
+    // (As `crate::picked`: the structure only where plain tracking needs it.)
+    let plain = leonida_shader::resource::track(&p, &program.layout, program.stage, None);
+    let res = plain.or_else(|_| {
+        let st = leonida_shader::structure::structure(&p);
+        leonida_shader::resource::track(&p, &program.layout, program.stage, st.as_ref().ok())
+    });
+    let Ok(res) = res else {
+        return false;
+    };
+    let declared = |leaf: &Source| match leaf {
+        Source::Loaded { load, first } => {
+            let Some((_, a)) = res.scalar.iter().find(|(site, _)| site == load) else {
+                return false;
+            };
+            let Some(rp) = program.layout.get(a.param) else {
+                return false;
+            };
+            if rp.root != RootType::Table || a.dynamic.is_some() {
+                return false;
+            }
+            // The descriptor (32 bytes each) and the first entry of the table that names it.
+            let descriptor = (a.offset / 4 + u32::from(*first)) / 8;
+            program
+                .used
+                .iter()
+                .find(|u| u.root == RootType::Table && u.user_data == rp.user_data && u.table_offset_dwords / 8 == descriptor)
+                .is_some_and(|u| u.kind == ResourceType::Uav)
+        }
+        Source::Built { address, .. } => program.layout.get(address.param).is_some_and(|rp| {
+            rp.root == RootType::Descriptor
+                && program.used.iter().find(|u| u.root == RootType::Descriptor && u.user_data == rp.user_data).is_some_and(|u| u.kind == ResourceType::Uav)
+        }),
+        _ => false,
+    };
+    // Every buffer store or atomic of the code, each with the descriptor tracking found for it
+    // (one it did not find for, in a block it did not go through say, does not count).
+    p.blocks.iter().enumerate().all(|(b, block)| {
+        block.insts.iter().enumerate().all(|(i, inst)| {
+            let name = inst.name();
+            let stores = matches!(inst.fields, Fields::Buffer { .. }) && (name.contains("store") || name.contains("atomic"));
+            let mut found = res.descriptors.iter().filter(|d| d.site == (b, i) && d.role == Role::Resource).peekable();
+            !stores || found.peek().is_some() && found.all(|d| d.source.leaves().into_iter().all(declared))
+        })
+    })
+}
+
+/// [`stores_in_bound_views`] of every program of a shader that can store to buffers; and the one
+/// that does must be the program whose used-resource list the host binds by ([`translate`]: the
+/// first that is translated). No for code that is not known.
+#[cfg(windows)]
+fn bound_programs(all: &[leonida_shader::NativeProgram]) -> bool {
+    use leonida_shader::HwStage;
+    let first = all.iter().position(|p| matches!(p.stage, HwStage::Vs | HwStage::Ps | HwStage::Ms | HwStage::Cs));
+    !all.is_empty() && all.iter().enumerate().all(|(i, p)| !stores(p) || (Some(i) == first && stores_in_bound_views(p)))
+}
+
+/// What [`stores_bound`] knows of a shader ([`Translated::bound`]).
+#[cfg(windows)]
+const BOUND_UNKNOWN: u8 = 0;
+#[cfg(windows)]
+const BOUND_ASKED: u8 = 1;
+#[cfg(windows)]
+const BOUND_YES: u8 = 2;
+#[cfg(windows)]
+const BOUND_NO: u8 = 3;
+
+/// Shaders looked at by [`stores_bound`] since the last frame-rate line: those whose stores all go
+/// through views bound to them, and the others.
+#[cfg(windows)]
+pub(crate) static BOUND_SAID: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether all that `shader` (translated as `t`) can store to buffers goes through views a list
+/// is told of at every bind ([`bound_programs`]). The first time it is asked its programs are
+/// looked at on a thread of its own (resource tracking takes a good part of what a translation
+/// takes, and the recording threads do not wait for it); until that answers, no.
+#[cfg(windows)]
+pub(crate) fn stores_bound(shader: &Arc<Shader>, t: &Translated) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    match t.bound.load(Relaxed) {
+        BOUND_YES => true,
+        BOUND_UNKNOWN => {
+            if t.bound.compare_exchange(BOUND_UNKNOWN, BOUND_ASKED, Relaxed, Relaxed).is_ok() {
+                ask_bound(shader.clone());
+            }
+            false
+        }
+        _ => false,
+    }
+}
+
+#[cfg(windows)]
+fn ask_bound(shader: Arc<Shader>) {
+    use std::sync::atomic::Ordering::Relaxed;
+    use std::sync::mpsc::{Sender, channel};
+    static ASKS: OnceLock<Mutex<Sender<Arc<Shader>>>> = OnceLock::new();
+    let asks = ASKS.get_or_init(|| {
+        let (send, asks) = channel::<Arc<Shader>>();
+        let _ = std::thread::Builder::new().name("leonida-bound".into()).spawn(move || {
+            use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+            // SAFETY: this thread's own.
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+            for shader in asks {
+                let yes = shader.programs().is_some_and(|all| bound_programs(&all));
+                BOUND_SAID[usize::from(!yes)].fetch_add(1, Relaxed);
+                if let Some(t) = shader.translated() {
+                    t.bound.store(if yes { BOUND_YES } else { BOUND_NO }, Relaxed);
+                }
+            }
+        });
+        Mutex::new(send)
+    });
+    // (If the thread could not be made, the shader stays asked: no.)
+    let _ = asks.lock().unwrap_or_else(|e| e.into_inner()).send(shader);
+}
+
 #[repr(C)]
 struct Pipeline {
     object: Object,
@@ -476,6 +658,10 @@ struct Pipeline {
     /// from the first time it is asked ([`kept_answer`]).
     #[cfg(all(windows, feature = "diagnostics"))]
     skip: std::sync::atomic::AtomicU8,
+    /// Which of the sets tried in turns name one of its shaders ([`skip_tried`]): a bit each,
+    /// and bit 7 once asked.
+    #[cfg(all(windows, feature = "diagnostics"))]
+    skip_try: std::sync::atomic::AtomicU8,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -613,6 +799,47 @@ fn kept_answer(cell: &std::sync::atomic::AtomicU8, ask: impl FnOnce() -> bool) -
     }
 }
 
+/// Timing experiment: the pipelines with a shader that `LEONIDA_SKIP_TRY_A`, `_B` or `_C` names
+/// (hashes, as for `LEONIDA_SKIP_PIPELINES`) are left out while that switch is on. Each is a
+/// switch of `LEONIDA_AB` (`LEONIDA_AB=15,LEONIDA_SKIP_TRY_A,LEONIDA_SKIP_TRY_B`) and does nothing
+/// when it is not named there: a phase's frame time against the next one's says what those
+/// programs cost the card in the frame. Their lines of a timing run do not say it: a command's
+/// time there runs from the end of the command before it, so the first program behind the
+/// geometry is charged with the card finishing the geometry. For timing only: the picture is
+/// wrong while one is on, and what the programs left out make is stale for those after them.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn skip_tried(p: &Pipeline) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    const NAMES: [&str; 3] = ["LEONIDA_SKIP_TRY_A", "LEONIDA_SKIP_TRY_B", "LEONIDA_SKIP_TRY_C"];
+    // The sets that are switches of this run, each with its number among the switches.
+    static SETS: OnceLock<Vec<(u32, std::collections::HashSet<String>)>> = OnceLock::new();
+    let sets = SETS.get_or_init(|| {
+        NAMES
+            .iter()
+            .filter_map(|name| {
+                let bit = crate::ab::bit(name)?;
+                let hashes: std::collections::HashSet<String> =
+                    parse_skip_hashes(&std::env::var(name).unwrap_or_default()).into_iter().collect();
+                (!hashes.is_empty()).then_some((bit, hashes))
+            })
+            .collect()
+    });
+    if sets.is_empty() {
+        return false;
+    }
+    let mut mask = p.skip_try.load(Relaxed);
+    if mask == 0 {
+        mask = 0x80;
+        for (n, (_, hashes)) in sets.iter().enumerate() {
+            if p.shaders.iter().any(|shader| hashes.contains(&shader.hash)) {
+                mask |= 1 << n;
+            }
+        }
+        p.skip_try.store(mask, Relaxed);
+    }
+    mask & 0x7f != 0 && sets.iter().enumerate().any(|(n, (bit, _))| mask >> n & 1 != 0 && crate::ab::on(*bit))
+}
+
 /// Whether the skip list (`LEONIDA_SKIP_PIPELINES`) leaves the pipeline out.
 /// Every draw, dispatch and indirect execution asks, on the threads that
 /// record lists; each ask looked every shader of the pipeline up in the
@@ -629,6 +856,9 @@ pub(crate) fn is_skipped(this: This) -> bool {
         return false;
     }
     let p = pipeline(this);
+    if skip_tried(p) {
+        return true;
+    }
     static KEPT: OnceLock<bool> = OnceLock::new();
     if !*KEPT.get_or_init(|| std::env::var_os("LEONIDA_SKIP_KEPT").is_none_or(|v| v != "0")) {
         return skipped_shader(p).is_some();
@@ -716,6 +946,8 @@ fn hand_out(
         bound: std::sync::atomic::AtomicBool::new(false),
         #[cfg(all(windows, feature = "diagnostics"))]
         skip: std::sync::atomic::AtomicU8::new(0),
+        #[cfg(all(windows, feature = "diagnostics"))]
+        skip_try: std::sync::atomic::AtomicU8::new(0),
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
@@ -917,6 +1149,85 @@ pub fn use_pipeline_cache(dir: std::path::PathBuf) {
 #[cfg(windows)]
 pub fn save_pipeline_cache() {
     library::save(true);
+}
+
+/// Which stores [`stores_in_bound_views`] takes as declared at a bind (`LEONIDA_INDIRECT_BATCH=4`).
+#[cfg(all(test, windows))]
+mod bound_tests {
+    use leonida_shader::native::{ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource};
+
+    fn used(kind: ResourceType, root: RootType, at: u32) -> UsedResource {
+        UsedResource { kind, root, table_offset_dwords: at, lower_bound: 0, stride: 4, dwords: 4, user_data: 4, slot: 1 }
+    }
+
+    /// A compute program: constants in s[0:3], the second parameter (`root`) from s4, `code` and
+    /// an end.
+    fn program(root: RootType, used: Vec<UsedResource>, code: &[u32]) -> NativeProgram {
+        let param = |root, user_data, sgprs, slot| RootParam { root, table_offset_dwords: 0, sgprs, base_register: 0, user_data, slot };
+        let words: Vec<u32> = code.iter().copied().chain([0xBF81_0000]).collect(); // s_endpgm
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: false,
+            vgprs: 22,
+            layout: vec![param(RootType::Constants, 0, 4, 0), param(root, 4, if root == RootType::Table { 1 } else { 2 }, 1)],
+            used,
+            io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [32, 1, 1] }),
+            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
+        }
+    }
+
+    /// v[13:16] stored at 16 bytes a thread through the descriptor loaded from the table at byte
+    /// `at` (with s0 added: `computed`).
+    fn table_store(at: u32, computed: bool) -> Vec<u32> {
+        let soffset = if computed { 0 } else { 0x7D << 25 };
+        vec![
+            0xBE85_0380, // s_mov_b32 s5, 0
+            0xF408_0302,
+            soffset | at, // s_load_dwordx4 s[12:15], s[4:5], at (+ s0)
+            0x342A_0084, // v_lshlrev_b32 v21, 4, v0
+            0xE078_1000,
+            0x8003_0D15, // buffer_store_dwordx4 v[13:16], v21, s[12:15], 0 offen
+        ]
+    }
+
+    /// The same through a descriptor built around the root view in s[4:5].
+    const ROOT_STORE: [u32; 6] = [
+        0xBE86_03C1, // s_mov_b32 s6, -1
+        0xBE87_03FF,
+        0x0002_7FAC, // s_mov_b32 s7, 0x27fac
+        0x342A_0084, // v_lshlrev_b32 v21, 4, v0
+        0xE078_1000,
+        0x8001_0D15, // buffer_store_dwordx4 v[13:16], v21, s[4:7], 0 offen
+    ];
+
+    #[test]
+    fn stores_through_bound_views_are_told_from_the_others() {
+        use ResourceType::{Srv, Uav};
+        use RootType::{Descriptor, Table};
+        let yes = |p: NativeProgram| super::stores_in_bound_views(&p);
+        // Descriptor 1 of the table, the first of an entry of unordered access: declared at every bind.
+        assert!(yes(program(Table, vec![used(Srv, Table, 0), used(Uav, Table, 8)], &table_store(0x20, false))));
+        // The same entry named as read only: the bind declares nothing for it.
+        assert!(!yes(program(Table, vec![used(Srv, Table, 0), used(Srv, Table, 8)], &table_store(0x20, false))));
+        // Descriptor 2, inside a range that names only its first (1): not gone through.
+        assert!(!yes(program(Table, vec![used(Uav, Table, 8)], &table_store(0x40, false))));
+        // At an offset the program computes: any of the table's.
+        assert!(!yes(program(Table, vec![used(Uav, Table, 8)], &table_store(0x20, true))));
+        // Through a root view of unordered access: declared to the end of its copy.
+        assert!(yes(program(Descriptor, vec![used(Uav, Descriptor, 0)], &ROOT_STORE)));
+        assert!(!yes(program(Descriptor, vec![used(Srv, Descriptor, 0)], &ROOT_STORE)));
+        // A program that stores nothing.
+        assert!(yes(program(Table, vec![used(Uav, Table, 8)], &[0x342A_0084])));
+        // Code that does not decode.
+        assert!(!yes(program(Table, vec![used(Uav, Table, 8)], &[0xFFFF_FFFF])));
+        // Of a shader's programs, the one that stores must be the one the host binds by.
+        let bound = program(Table, vec![used(Srv, Table, 0), used(Uav, Table, 8)], &table_store(0x20, false));
+        assert!(super::bound_programs(std::slice::from_ref(&bound)));
+        assert!(!super::bound_programs(&[]));
+        let mut ps = bound.clone();
+        ps.stage = HwStage::Ps;
+        assert!(!super::bound_programs(&[bound.clone(), ps]), "a second storing program the host does not bind by");
+    }
 }
 
 #[cfg(test)]

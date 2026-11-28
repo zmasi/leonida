@@ -25,6 +25,8 @@ static HEAP: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod ambient;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod capture;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod census;
 #[cfg(windows)]
 mod compose;
 pub mod console;
@@ -149,6 +151,6 @@ pub use shadow::title_memory_write_combined;
 #[cfg(windows)]
 pub use watch::{
     kernel_writing, remap_boost, title_memory_allocated, title_memory_freed, title_memory_reading, title_memory_remapped,
-    title_memory_remapping, title_memory_splitting, title_memory_unmapping, title_memory_written,
+    title_memory_remapping, title_memory_remapping_of, title_memory_splitting, title_memory_unmapping, title_memory_written,
     writing as kernel_will_write,
 };

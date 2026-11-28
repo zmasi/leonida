@@ -51,6 +51,7 @@
 #include <mutex>
 #include <new>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 
@@ -172,6 +173,14 @@ struct Connection {
     uint32_t accepted = 0;
     uint32_t dequeued = 0;
 };
+
+// The connections XApuConnect handed out and XApuDisconnect has not ended. Every call checks its handle here under the
+// shared lock and keeps it for the call, so a second XApuDisconnect, or a call with a stale or foreign handle, is
+// refused instead of freeing or reading freed memory, and a disconnect waits for the calls in flight.
+std::shared_mutex g_live_mu;
+std::set<Connection*> g_live;
+
+bool live(Connection* c) { return c && g_live.count(c) != 0; }  // g_live_mu held
 
 // gta6rt --trace FILE: the first call of each function and the first XApuEnqueueCommand of each command kind, with
 // the caller, so the first boot shows what the title sends without a line per call.
@@ -318,6 +327,15 @@ HRESULT __stdcall XApuConnect(const ConnectInput* input, ConnectOutput* output, 
     }
     c->commands_per_stream = in.commands_per_stream;
     c->deinterleaved = (in.options & kDeinterleavedOutput) != 0;
+    try {
+        std::unique_lock lock(g_live_mu);
+        g_live.insert(c);
+    } catch (...) {
+        if (c->event) CloseHandle(c->event);
+        VirtualFree(c->memory, 0, MEM_RELEASE);
+        delete c;
+        return E_OUTOFMEMORY;
+    }
     const ConnectOutput o{c->memory, c->event};
     std::memcpy(output, &o, sizeof(o));
     *out = c;
@@ -332,7 +350,11 @@ HRESULT __stdcall XApuConnect(const ConnectInput* input, ConnectOutput* output, 
 
 HRESULT __stdcall XApuDisconnect(Connection* c, uint32_t /*0x20 at the measured site*/) {
     note("XApuDisconnect", 0, _ReturnAddress());
-    if (!c) return E_INVALIDARG;
+    {
+        std::unique_lock lock(g_live_mu);
+        if (!live(c)) return E_INVALIDARG;
+        g_live.erase(c);
+    }
 #if defined(LEONIDA_HAVE_OPUS_DECODER)
     for (Stream& s : c->streams)
         if (s.decoder) leonida_opus_decoder_destroy(s.decoder);
@@ -350,10 +372,18 @@ HRESULT __stdcall XApuEnqueueCommand(Connection* c, const void* command, uint32_
     note("XApuEnqueueCommand", id.kind, _ReturnAddress());
     if (id.kind < kActivate || id.kind > kReset) return kInvalidCommand;
 
+    const std::shared_lock live_lock(g_live_mu);
+    if (!live(c)) return E_INVALIDARG;
     const std::lock_guard lock(c->mutex);
     if (id.stream >= c->streams.size()) return kInvalidStream;
     Stream& stream = c->streams[id.stream];
     if (stream.pending >= c->commands_per_stream) return kQueueFull;
+    // The result's slot first: out of memory refuses the command before it changes the stream.
+    try {
+        c->results.emplace_back();
+    } catch (...) {  // nothing may unwind into the title
+        return E_OUTOFMEMORY;
+    }
 
     Result r{};
     r.id = id;
@@ -394,11 +424,7 @@ HRESULT __stdcall XApuEnqueueCommand(Connection* c, const void* command, uint32_
         if (!stream.active) r.error = kInvalidStream;
         else fill(*c, stream, p, r);
     }
-    try {
-        c->results.push_back(r);
-    } catch (...) {  // out of memory: refuse the command, nothing may unwind into the title
-        return E_OUTOFMEMORY;
-    }
+    c->results.back() = r;
     ++stream.pending;
     ++c->accepted;
     if (accepted_so_far) *accepted_so_far = c->accepted;
@@ -409,6 +435,8 @@ HRESULT __stdcall XApuEnqueueCommand(Connection* c, const void* command, uint32_
 HRESULT __stdcall XApuDequeueResult(Connection* c, Result* out) {
     note("XApuDequeueResult", 0, _ReturnAddress());
     if (!c || !out) return E_INVALIDARG;
+    const std::shared_lock live_lock(g_live_mu);
+    if (!live(c)) return E_INVALIDARG;
     const std::lock_guard lock(c->mutex);
     if (c->results.empty()) return kNoResult;
     const Result r = c->results.front();
@@ -421,7 +449,8 @@ HRESULT __stdcall XApuDequeueResult(Connection* c, Result* out) {
 
 uint32_t __stdcall XApuGetResultCount(Connection* c, uint32_t* dequeued_so_far) {
     note("XApuGetResultCount", 0, _ReturnAddress());
-    if (!c) return 0;
+    const std::shared_lock live_lock(g_live_mu);
+    if (!live(c)) return 0;
     const std::lock_guard lock(c->mutex);
     if (dequeued_so_far) *dequeued_so_far = c->dequeued;
     return static_cast<uint32_t>(c->results.size());

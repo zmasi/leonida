@@ -30,6 +30,7 @@ Exit codes:
 import argparse
 import json
 import os
+import stat
 import struct
 import sys
 import tempfile
@@ -42,7 +43,9 @@ for p in (HERE, os.path.join(ROOT, "tests", "semantic")):
     if p not in sys.path:
         sys.path.insert(0, p)
 
+from file_mode import published_mode  # noqa: E402
 import rdna2spirv  # noqa: E402
+import replace_retry  # noqa: E402
 import spirv_mini_interp  # noqa: E402
 
 # Buffer layout in the allocated buffer (s[0:3] RAW V# at offset 0):
@@ -539,6 +542,92 @@ def self_test():
     return 0
 
 
+def _has_trailing_sep(path: str) -> bool:
+    seps = tuple(s for s in (os.sep, os.altsep) if s)
+    return path.endswith(seps)
+
+
+def _resolve_output_target(path: str) -> tuple[str, str]:
+    out_path = os.path.abspath(path)
+    target = os.path.realpath(out_path) if os.path.islink(out_path) else out_path
+    return out_path, target
+
+
+def validate_json_path(path: str) -> str | None:
+    """Validate --json destination before running translator or GPU work. Returns an error message or None."""
+    if not isinstance(path, str) or not path.strip():
+        return "--json path must not be empty"
+    out_path, target = _resolve_output_target(path)
+    if _has_trailing_sep(path) or os.path.isdir(out_path) or os.path.isdir(target):
+        return f"--json path is a directory: {out_path}"
+    parent = os.path.dirname(target)
+    probe = parent
+    while probe and not os.path.exists(probe):
+        nxt = os.path.dirname(probe)
+        if nxt == probe:
+            break
+        probe = nxt
+    if probe and os.path.exists(probe) and not os.path.isdir(probe):
+        return f"cannot write {out_path}: parent path is not a directory: {probe}"
+    if os.path.exists(target):
+        try:
+            fd = os.open(target, os.O_WRONLY)
+            os.close(fd)
+        except OSError as exc:
+            return f"cannot write {out_path}: {exc.strerror or exc}"
+    return None
+
+
+def write_json_report(path: str, payload: dict) -> str | None:
+    """Write JSON report with LF endings atomically (direct write for non-regular targets like /dev/null)."""
+    err = validate_json_path(path)
+    if err:
+        return err
+    out_path, target = _resolve_output_target(path)
+    try:
+        text = json.dumps(payload, indent=2, allow_nan=False) + "\n"
+    except (TypeError, ValueError) as exc:
+        return f"cannot serialize JSON report for {out_path}: {exc}"
+    try:
+        st = os.stat(target) if os.path.exists(target) else None
+    except OSError as exc:
+        return f"cannot write {out_path}: {exc.strerror or exc}"
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        try:
+            with open(target, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            return None
+        except OSError as exc:
+            return f"cannot write {out_path}: {exc.strerror or exc}"
+    parent = os.path.dirname(target)
+    tmp_path = None
+    try:
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".buffer_swizzle_probe.", suffix=".tmp", dir=parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+                f.flush()
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        os.chmod(tmp_path, published_mode(target))
+        replace_retry.replace(tmp_path, target)
+        tmp_path = None
+        return None
+    except OSError as exc:
+        return f"cannot write {out_path}: {exc.strerror or exc}"
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--oracle", choices=("translator", "hw", "both"), default="translator")
@@ -565,13 +654,27 @@ def main(argv=None):
             print(f"{g:<22} ({n} cases)")
         return 0
 
+    if args.hw_arch is not None and not args.hw_arch.strip():
+        print("ERROR: --hw-arch must not be empty", file=sys.stderr)
+        return 2
+
     if args.group:
-        unknown = [g for g in args.group if g not in groups]
+        if any(not g.strip() for g in args.group):
+            print("ERROR: --group must not be empty", file=sys.stderr)
+            return 2
+        cleaned = [g.strip() for g in args.group]
+        unknown = list(dict.fromkeys(g for g in cleaned if g not in groups))
         if unknown:
             print(f"unknown group(s): {', '.join(unknown)}", file=sys.stderr)
             return 2
-        want = set(args.group)
+        want = set(cleaned)
         cases = [c for c in cases if c.group in want]
+
+    if args.json_out is not None:
+        err = validate_json_path(args.json_out)
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
+            return 2
 
     waves = (32, 64) if args.wave == "both" else (int(args.wave),)
     tr_res = run_translator(cases, waves=waves) if args.oracle in ("translator", "both") else None
@@ -596,20 +699,26 @@ def main(argv=None):
         h64 = hw_res[64][c.name] if hw_res and 64 in hw_res else None
         status = "OK"
         tag = None
-        if not c.wave_dependent and h32 is not None and h64 is not None and h32 != h64:
+        if any(v is not None and not isinstance(v, list) for v in (t32, t64, h32, h64)):
+            status = "ERROR"
+            mismatches += 1
+        elif not c.wave_dependent and h32 is not None and h64 is not None and h32 != h64:
             status = "WAVE_DIFF"
             wave_diffs += 1
         elif c.wave_dependent and h32 is not None and h64 is not None and h32 == h64:
             status = "WAVE_SAME"
             mismatches += 1
-        elif any(v is not None and not isinstance(v, list) for v in (t32, t64, h32, h64)):
-            status = "ERROR"
+        elif h32 is None and h64 is None and not c.wave_dependent and t32 is not None and t64 is not None and t32 != t64:
+            status = "WAVE_DIFF"
+            wave_diffs += 1
+        elif h32 is None and h64 is None and c.wave_dependent and t32 is not None and t64 is not None and t32 == t64:
+            status = "WAVE_SAME"
             mismatches += 1
         else:
             bad = ((t32 is not None and h32 is not None and t32 != h32)
                    or (t64 is not None and h64 is not None and t64 != h64))
             if bad:
-                hw_ref = h32 if h32 is not None else h64
+                hw_ref = h32 if (t32 is not None and h32 is not None and t32 != h32) else h64
                 known = KNOWN_DIVERGENCES.get(c.name)
                 if known and hw_ref == known[1]:
                     status = "KNOWN_DIFF"
@@ -640,19 +749,10 @@ def main(argv=None):
     print(f"summary: {total} cases: {matched} match, {known_diffs} known divergence, "
           f"{mismatches} unexpected mismatch, {wave_diffs} wave32/64 diff")
 
-    if args.json_out:
-        out_path = os.path.abspath(args.json_out)
-        if os.path.isdir(out_path):
-            print(f"ERROR: --json path is a directory: {out_path}", file=sys.stderr)
-            return 2
-        parent = os.path.dirname(out_path)
-        try:
-            os.makedirs(parent, exist_ok=True)
-            with open(out_path, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"device": hw_device, "waves": list(waves), "cases": records}, f, indent=2)
-                f.write("\n")
-        except OSError as exc:
-            print(f"ERROR: cannot write {out_path}: {exc.strerror or exc}", file=sys.stderr)
+    if args.json_out is not None:
+        err = write_json_report(args.json_out, {"device": hw_device, "waves": list(waves), "cases": records})
+        if err:
+            print(f"ERROR: {err}", file=sys.stderr)
             return 2
 
     if mismatches or wave_diffs or (args.strict and known_diffs):

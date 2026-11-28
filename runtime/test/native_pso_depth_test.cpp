@@ -93,6 +93,18 @@ void stencil() {
     auto r = regs(0x007007e3, 0, 0x01ffff00);
     r.stencil_ref_mask_bf = 0x01f0ff00;
     check(!np::d3d12_depth_raster(r), "front and back write masks that differ are not built");
+    // Single-sided stencil (BACKFACE_ENABLE [7] clear): DB_STENCILREFMASK_BF is ignored, so whatever it holds the
+    // state is built, with the front masks and ops on both faces (RT-STATE-DEPTH-RASTER-BACKFACE-MASK).
+    r = regs(0x00700763, 0x00030030, 0x01ffff00);
+    r.stencil_ref_mask_bf = 0;
+    s = np::d3d12_depth_raster(r);
+    check(s && s->stencil_enable && s->depth_enable && !s->depth_write && s->depth_func == GEQUAL &&
+              s->cull == CULL_BACK && s->read_mask == 0xff && s->write_mask == 0xff && s->front.pass == REPLACE &&
+              s->back.pass == REPLACE && s->back.func == s->front.func,
+          "single-sided stencil: the back-face mask register is ignored, depth and raster state kept");
+    r.stencil_ref_mask_bf = 0x01f0ff00;
+    s = np::d3d12_depth_raster(r);
+    check(s && s->write_mask == 0xff, "single-sided stencil: a differing back write mask is ignored");
     r = regs(0x007007e2, 0x0000000a, 0x01ffff00);
     check(np::d3d12_depth_raster(r).has_value(), "stencil registers are not read while the stencil is off");
 }

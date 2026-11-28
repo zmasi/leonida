@@ -258,6 +258,7 @@ class RuntimePackagingTest(unittest.TestCase):
         make_game.runtime(self.game, self.out, {"expected_exe": image}, self.build, work=work)
         launcher = os.path.join(self.out, "gta6rt.sh")
         env = dict(os.environ, WINE=sys.executable)
+        env.pop("LEONIDA_CX_BOTTLE", None)
         env.pop("LEONIDA_D3D12", None)
         env.pop("LEONIDA_SHADERS", None)
         missing = subprocess.run([launcher, "--run"], cwd=self.root, env=env, capture_output=True, text=True)
@@ -285,6 +286,49 @@ class RuntimePackagingTest(unittest.TestCase):
         env.pop("LEONIDA_SHADERS")
         result = subprocess.check_output([os.path.join(moved, "gta6rt.sh"), "--dry-run"], cwd=self.root, env=env)
         self.assertEqual(json.loads(result)[2], "Z:" + real(moved) + "/Shader cache '$HOME'/shaders/spirv")
+
+    @unittest.skipIf(os.name == "nt", "executes the generated POSIX launcher")
+    def test_crossover_launches_in_the_selected_bottle(self):
+        image = "Player's test.exe"
+        out = os.path.join(self.root, "CrossOver port")
+        self.write_artifact("gta6rt_tls_host.dll", b"")
+        make_game.runtime(self.game, out, {"expected_exe": image}, self.build)
+        with open(os.path.join(self.game, image), "wb"):
+            pass
+        fake_wine = os.path.join(self.root, "CrossOver Wine")
+        with open(fake_wine, "w", encoding="utf-8", newline="\n") as f:
+            f.write('#!/bin/sh\nprintf "%s\\n" "$ROSETTA_ADVERTISE_AVX" "$LEONIDA_D3D12" "$@"\n')
+        os.chmod(fake_wine, 0o755)
+        launcher = os.path.join(out, "gta6rt.sh")
+        env = dict(os.environ, WINE="./CrossOver Wine", LEONIDA_CX_BOTTLE="Test bottle")
+        env.pop("ROSETTA_ADVERTISE_AVX", None)
+        env.pop("LEONIDA_D3D12", None)
+        real_out = os.path.realpath(out)
+        common = ["--bottle", "Test bottle", "--cx-app", "Z:" + (real_out + "/gta6rt.exe").replace("/", "\\")]
+
+        result = subprocess.check_output([launcher, "--dry-run"], cwd=self.root, env=env, text=True)
+        self.assertEqual(result.splitlines(), [
+            "1", "vulkan", *common, "--workdir", os.path.realpath(self.game), "--no-gui", "--",
+            "--dry-run", "./" + image, "--overlay", "Z:" + real_out + "/overlay",
+        ])
+        env["ROSETTA_ADVERTISE_AVX"] = "0"
+        result = subprocess.check_output(
+            [launcher, "--run", "other.exe", "--", "two words"], cwd=self.root, env=env, text=True,
+        )
+        self.assertEqual(result.splitlines(), [
+            "0", "", *common, "--workdir", os.path.realpath(self.root), "--no-gui", "--",
+            "--run", "other.exe", "--", "two words",
+        ])
+
+    @unittest.skipIf(os.name == "nt", "executes the generated POSIX launcher")
+    def test_crossover_reports_missing_wine(self):
+        self.write_artifact("gta6rt_tls_host.dll", b"")
+        make_game.runtime(self.game, self.out, {"expected_exe": "game.exe"}, self.build)
+        env = dict(os.environ, WINE=os.path.join(self.root, "missing wine"), LEONIDA_CX_BOTTLE="Test bottle")
+        result = subprocess.run([os.path.join(self.out, "gta6rt.sh"), "--help"], env=env,
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("CrossOver Wine not found", result.stderr)
 
     def test_runtime_records_shader_work_directory(self):
         self.write_artifact("gta6rt_tls_host.dll", b"TLS host")

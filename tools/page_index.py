@@ -38,10 +38,13 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import zlib
 
 # -I omits the script directory from sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_file  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 # zlib stream start. Kept in step with rpf9_carve.py.
@@ -87,6 +90,8 @@ def is_page(data):
 
 def scan_rpf(path, start=None, limit=None):
     """Yield (archive_offset, stored_bytes, inflated_bytes) for each zlib stream."""
+    if limit is not None and limit < 1:
+        raise ValueError("limit must be at least 1")
     with open(path, "rb") as fh:
         if os.fstat(fh.fileno()).st_size < 8:   # no header word; mmap also refuses an empty file
             return
@@ -97,7 +102,7 @@ def scan_rpf(path, start=None, limit=None):
         if not 0 <= pos <= size:
             m.close()
             raise ValueError("start offset is outside the archive")
-        end = min(size, pos + limit) if limit else size
+        end = min(size, pos + limit) if limit is not None else size
         try:
             while pos < end:
                 match = ZHDR.search(m, pos, end)
@@ -343,6 +348,7 @@ def index_streams(streams, progress=None):
 
 def summarise(pages, mode, source):
     complete = sum(1 for p in pages if p["complete"])
+    versions = Counter(p["version"] for p in pages)
     return {
         "mode": mode,
         "source": source,
@@ -363,20 +369,45 @@ def summarise(pages, mode, source):
         "declared_matches_units": sum(1 for p in pages if p["resource"]["declared_matches_units"]),
         "declared_differs_from_units": sum(1 for p in pages
                                            if p["resource"]["declared_matches_units"] is False),
-        "versions": {str(v): sum(1 for p in pages if p["version"] == v)
-                     for v in sorted({p["version"] for p in pages})},
+        "versions": {str(v): versions[v]
+                     for v in sorted(versions, key=lambda v: (v is None, 0 if v is None else v))},
         "page_counts": {str(v): n for v, n in sorted(Counter(
             p["page_count"] for p in pages if p["page_count"] is not None).items())},
     }
 
 
+def _atomic_write(path, newline, writer):
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path) or "."
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline=newline, dir=parent,
+            prefix=".page-index-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp_path = f.name
+            writer(f)
+        os.chmod(tmp_path, published_mode(abs_path))
+        replace_file(tmp_path, abs_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def write_json(path, pages, summary):
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump({"summary": summary, "pages": pages}, f, indent=1)
+    def _dump(f):
+        json.dump({"summary": summary, "pages": pages}, f, indent=1, allow_nan=False)
+        f.write("\n")
+
+    _atomic_write(path, "\n", _dump)
 
 
 def write_csv(path, pages):
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    def _dump(f):
         w = csv.DictWriter(f, fieldnames=COLUMNS, lineterminator="\n")
         w.writeheader()
         for page in pages:
@@ -399,6 +430,8 @@ def write_csv(path, pages):
             for i, r in enumerate(records):
                 w.writerow(dict(base, record_index=i, hash="0x%08x" % r["hash"], size=r["size"],
                                 target="0x%x" % r["target"], target_stream=r["target_stream"]))
+
+    _atomic_write(path, "", _dump)
 
 
 def byte_count(text):
@@ -445,7 +478,12 @@ def main(argv=None):
         if same_report_path(manifest, a.out):
             ap.error(f"output would overwrite the carve manifest: {a.out}")
         if os.path.isfile(a.out):
-            for name in os.listdir(a.source):
+            try:
+                names = os.listdir(a.source)
+            except OSError as e:
+                print(f"{a.source}: {e}", file=sys.stderr)
+                return 2
+            for name in names:
                 inp = os.path.join(a.source, name)
                 if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
                     if same_report_path(inp, a.out):

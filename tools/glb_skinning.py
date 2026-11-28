@@ -18,7 +18,7 @@ BIN chunk, 4-byte padding), then checks every skin and every mesh primitive:
 
 Missing optional fields are reported as null; they are never filled in with a
 guess. A malformed container, a file with no skin, or a skin whose
-inverseBindMatrices count differs from its joint count exits nonzero. Structural
+inverseBindMatrices count is smaller than its joint count exits nonzero. Structural
 problems also exit nonzero with a one-line ``ERROR:`` message.
 
 Each joint's inverse bind matrix must have the affine fourth row (0, 0, 0, 1).
@@ -28,17 +28,21 @@ Only the standard library is used, and the input is read, never modified.
 from __future__ import annotations
 
 import argparse
+from contextlib import suppress
+import errno
 import json
 import math
 import os
 import re
 import struct
 import sys
+import tempfile
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
@@ -78,7 +82,8 @@ MODE_NAMES = {
     6: "TRIANGLE_FAN",
 }
 
-ATTRIBUTE_RE = re.compile(r"^(JOINTS|WEIGHTS)_(\d+)$")
+ATTRIBUTE_RE = re.compile(r"^(JOINTS|WEIGHTS)_(0|[1-9]\d*)$")
+LEADING_ZERO_ATTRIBUTE_RE = re.compile(r"^(JOINTS|WEIGHTS)_(0\d+)$")
 _MISSING = object()
 
 
@@ -139,7 +144,12 @@ def _reject_json_constant(token):
 
 
 def parse_glb(data):
-    """Return ``(gltf, bin_chunk, container)`` for a binary glTF 2.0 container."""
+    """Return the JSON, embedded BIN bytes (if present) and container metadata."""
+    gltf, bin_view, container = _parse_chunks(data)
+    return gltf, bytes(bin_view) if bin_view is not None else None, container
+
+
+def _parse_chunks(data):
     if not isinstance(data, (bytes, bytearray, memoryview)):
         raise GlbSkinError("GLB data must be bytes-like")
     raw = bytes(data)
@@ -173,16 +183,15 @@ def parse_glb(data):
             raise GlbSkinError(
                 f"GLB chunk at {offset} declares {chunk_length} bytes, past the end of the file"
             )
-        payload = raw[start:end]
         if chunk_index == 0:
             if chunk_type != CHUNK_TYPE_JSON:
                 raise GlbSkinError(
                     f"first GLB chunk must be JSON (0x{CHUNK_TYPE_JSON:08X}), "
                     f"got 0x{chunk_type:08X}"
                 )
-            json_chunk = payload
+            json_chunk = raw[start:end]
         elif chunk_index == 1 and chunk_type == CHUNK_TYPE_BIN:
-            bin_chunk = payload
+            bin_chunk = memoryview(raw)[start:end]
         else:
             if chunk_type == CHUNK_TYPE_JSON:
                 raise GlbSkinError("repeated JSON chunk in GLB")
@@ -351,6 +360,11 @@ class _Reader:
                     f"bufferViews[{view_index}].byteStride {stride} is not a multiple "
                     f"of the component size {component_size}"
                 )
+        if accessor_offset > view_length:
+            raise GlbSkinError(
+                f"accessors[{index}].byteOffset {accessor_offset} exceeds "
+                f"bufferViews[{view_index}] length {view_length}"
+            )
         if count:
             last_end = accessor_offset + (count - 1) * stride + element_size
             if last_end > view_length:
@@ -361,12 +375,12 @@ class _Reader:
 
         if self.buffer_limit == 0:
             raise GlbSkinError(f"accessors[{index}] needs buffer 0, but the GLB has no embedded buffer")
-        data = self.bin_chunk[: self.buffer_limit]
+        # The view and accessor bounds above already exclude any BIN alignment padding.
         unpacker = struct.Struct("<" + fmt_char * components)
         base = view_offset + accessor_offset
         values = []
         for i in range(count):
-            values.append(unpacker.unpack_from(data, base + i * stride))
+            values.append(unpacker.unpack_from(self.bin_chunk, base + i * stride))
         meta["buffer_view"] = view_index
         return values, meta
 
@@ -400,20 +414,20 @@ def _skin_label(skin_index, skin_name):
 def _bbox(values):
     minimum = [math.inf, math.inf, math.inf]
     maximum = [-math.inf, -math.inf, -math.inf]
+    axis_finite = [False, False, False]
     non_finite = 0
-    finite = 0
     for row in values:
         for axis in range(3):
             value = row[axis]
             if not math.isfinite(value):
                 non_finite += 1
                 continue
-            finite += 1
+            axis_finite[axis] = True
             if value < minimum[axis]:
                 minimum[axis] = value
             if value > maximum[axis]:
                 maximum[axis] = value
-    if not finite:
+    if not all(axis_finite):
         return None, None, non_finite
     return minimum, maximum, non_finite
 
@@ -488,10 +502,10 @@ def _validate_skins(gltf, reader, warnings, errors):
                 "component_type": meta["component_type"],
                 "normalized": meta["normalized"],
             })
-            if meta["count"] != len(joints):
+            if meta["count"] < len(joints):
                 errors.append(
                     f"{_skin_label(skin_index, name)}: inverseBindMatrices count "
-                    f"{meta['count']} != joint count {len(joints)}"
+                    f"{meta['count']} is below joint count {len(joints)}"
                 )
             if meta["type"] != "MAT4":
                 errors.append(
@@ -503,12 +517,16 @@ def _validate_skins(gltf, reader, warnings, errors):
                     f"{_skin_label(skin_index, name)}: inverseBindMatrices component type "
                     f"{meta['component_type_name']} is not FLOAT"
                 )
+            if meta["normalized"]:
+                errors.append(
+                    f"{_skin_label(skin_index, name)}: inverseBindMatrices must not be normalized"
+                )
             bad = 0
             first_non_affine = None
             for index, row in enumerate(values):
                 bad += sum(1 for value in row if not math.isfinite(value))
                 # glTF stores MAT4 columns consecutively; translation is in the last column.
-                if (first_non_affine is None and index < len(joints) and meta["type"] == "MAT4"
+                if (first_non_affine is None and meta["type"] == "MAT4"
                         and row[3::4] != (0.0, 0.0, 0.0, 1.0)):
                     first_non_affine = index
             if first_non_affine is not None:
@@ -704,6 +722,9 @@ def _validate_primitive(reader, primitive, mesh_index, mesh_name, primitive_inde
                 f"{path}.POSITION has {non_finite_positions} non-finite component(s)"
             )
 
+    for key in sorted(attributes):
+        if LEADING_ZERO_ATTRIBUTE_RE.match(key):
+            errors.append(f"{path}: {key} must not have leading zeros in set index")
     set_numbers = sorted({
         int(match.group(2))
         for key in attributes
@@ -919,7 +940,7 @@ def _validate_primitive(reader, primitive, mesh_index, mesh_name, primitive_inde
 
 def analyze_glb(data):
     """Validate a GLB and return a JSON-serializable report."""
-    gltf, bin_chunk, container = parse_glb(data)
+    gltf, bin_chunk, container = _parse_chunks(data)
     reader = _Reader(gltf, bin_chunk)
     warnings = []
     errors = []
@@ -1109,10 +1130,34 @@ def format_report(report):
 
 
 def write_json(path, report):
-    """Write LF-only JSON without ever guessing values that JSON cannot hold."""
-    payload = json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
-    with open(path, "wb") as handle:
-        handle.write(payload.encode("utf-8"))
+    """Write LF-only JSON atomically without ever guessing values that JSON cannot hold."""
+    payload = (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+    out_path = os.fspath(path)
+    destination = os.path.realpath(out_path)
+    if os.path.islink(destination):
+        raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), out_path)
+    if os.path.isdir(destination):
+        raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), out_path)
+    if os.path.exists(destination) and not os.path.isfile(destination):
+        with open(destination, "wb") as handle:
+            handle.write(payload)
+        return
+    directory = os.path.dirname(os.path.abspath(destination)) or "."
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=directory, prefix=".glb_skinning-", suffix=".tmp", delete=False
+        ) as handle:
+            staged = handle.name
+            handle.write(payload)
+        os.chmod(staged, published_mode(destination))
+        os.replace(staged, destination)
+        staged = None
+    finally:
+        if staged is not None:
+            with suppress(OSError):
+                os.chmod(staged, 0o600)
+                os.unlink(staged)
 
 
 def main(argv=None):
@@ -1123,9 +1168,13 @@ def main(argv=None):
     parser.add_argument("--json", metavar="FILE", help="write the report as LF-only JSON")
     args = parser.parse_args(argv)
 
-    if args.json and same_report_path(args.glb, args.json):
-        print("ERROR: --json must not overwrite the input GLB", file=sys.stderr)
-        return 2
+    if args.json:
+        if same_report_path(args.glb, args.json):
+            print("ERROR: --json must not overwrite the input GLB", file=sys.stderr)
+            return 2
+        if os.path.isdir(args.json):
+            print(f"ERROR: --json is a directory: {args.json}", file=sys.stderr)
+            return 2
     try:
         with open(args.glb, "rb") as handle:
             data = handle.read()

@@ -167,6 +167,9 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
 * `--stages` limits the output to some stages.
 * `--compute-hashes FILE` instead writes only the compute programs whose code has one of the SHA-256 digests listed
   in `FILE` (`fspx_code_sha256`), with every state they are used with. A digest no compute program has is an error.
+* `tools/pso_code_base_pairs.py` reads the same library, in either form, and joins each graphics record's stage to
+  the translation index through that stage's source digest (§3). It counts whole PSOs by the `uses_code_base` of
+  their stages: counts only, no name or code. §6 and [d3d12_vulkan.md](d3d12_vulkan.md) §5.2 report what it says.
 
 The output is game data and must stay in your work folder. `tests/test_shader_library.py` builds libraries and
 archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest
@@ -265,7 +268,10 @@ None of the programs has been run on a GPU.
 
 * **Pipeline pairing is in the package.** [d3d12_vulkan.md](d3d12_vulkan.md) question 14 asks whether a PSO pairs
   two code-base stages, and says the pairing is in the executable. The graphics records give it for 25,471
-  pipelines: each names its VS or MS and its PS. Each source can be found through §3.
+  pipelines: each names its VS or MS and its PS, and each source can be found through §3. `tools/pso_code_base_pairs.py`
+  joins that to the FSSM translation index and counts the result: **no PSO in 1.0.2.1 has two code-base stages**.
+  25,027 have none, 444 exactly one (343 MS, 60 PS, 41 VS), and 21 stay unknown because a stage's program is not in
+  the carve output. So the one code base in the 144-byte push-constant block is enough for this package.
 * **A second compiled form of 6,522 shaders.** The pipeline builds differ from the FSSM code. Which form the game
   runs for a pipeline is not measured here (that needs the executable). Either way, a translated pipeline build can
   be compared with the translated FSSM shader of the same pipeline.

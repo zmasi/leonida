@@ -742,6 +742,21 @@ class Bc4Tests(unittest.TestCase):
         # 129 as int8 is -127, which maps to 0; 64 maps to round(191.75) = 192.
         self.assertEqual(pixels(rgba), [(0, 0, 0, 255), (192, 192, 192, 255)])
 
+    def test_snorm_ramp_is_chosen_by_the_raw_endpoints(self):
+        # D3D's BC4_SNORM rule compares red_0 > red_1 as stored int8s; -128 counts as -127 only once it becomes a
+        # value (DirectXTex and Pillow decode it the same way). So 0x81, 0x80 (-127 > -128) is the eight-value ramp,
+        # every entry -1.0, and index 7 decodes to 0. Clamping before the compare made the endpoints equal and
+        # picked the six-value ramp, whose index 7 is the constant +1.0 (255). The reverse order stays six-value.
+        for fourcc in (b"BC4S", b"BC5S"):
+            for (v0, v1), expected in {(0x81, 0x80): 0, (0x80, 0x81): 255}.items():
+                with self.subTest(fourcc=fourcc, endpoints=(v0, v1)):
+                    block = bc4_block(v0, v1, 7)
+                    payload = block * 2 if fourcc == b"BC5S" else block
+                    _, _, rgba = dds.decode_dds(dds_buffer(
+                        1, 1, payload, flags=DDPF_FOURCC, fourcc=fourcc,
+                    ))
+                    self.assertEqual(pixels(rgba)[0][0], expected)
+
 
 class Bc5Tests(unittest.TestCase):
     def test_two_channel_z_reconstruction(self):
@@ -940,6 +955,23 @@ class DownscaleTests(unittest.TestCase):
 
 
 class PngTests(unittest.TestCase):
+    def test_compressible_png_has_bounded_scanline_storage(self):
+        import subprocess
+        import sys
+        # Measure after allocating the source; isolate tracemalloc from the test runner.
+        measure = """
+import sys, tracemalloc
+sys.path.insert(0, sys.argv[1])
+import dds_png
+rgba = bytes(1024 * 1024 * 4)
+tracemalloc.start()
+png = dds_png.encode_png(1024, 1024, rgba)
+print(tracemalloc.get_traced_memory()[1])
+"""
+        peak = subprocess.check_output([sys.executable, "-I", "-c", measure, os.path.join(ROOT, "tools")],
+                                       timeout=60)
+        self.assertLess(int(peak), 1024 * 1024)
+
     def test_png_structure_and_crcs(self):
         rgba = bytes((1, 2, 3, 4, 5, 6, 7, 8))
         png = dds.encode_png(2, 1, rgba)

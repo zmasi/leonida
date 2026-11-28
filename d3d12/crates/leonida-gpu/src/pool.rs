@@ -592,6 +592,10 @@ pub(crate) unsafe fn texture(
             tracing::warn!(error = %e, "a block of texture memory is not resident");
             return None;
         }
+        #[cfg(feature = "diagnostics")]
+        if let Some(h) = &heap {
+            crate::census::block(h, "blocks of textures");
+        }
         heap
     })?;
     let mut made: Option<ID3D12Resource> = None;
@@ -605,6 +609,7 @@ pub(crate) unsafe fn texture(
             made_now(&made);
             #[cfg(feature = "diagnostics")]
             {
+                crate::census::placed(&made, "textures in blocks");
                 crate::book::made(&made, || "a texture in a block".into());
                 crate::book::block(&heap, &made, piece.start, BLOCK);
                 crate::book::note(made.as_raw() as usize, || {

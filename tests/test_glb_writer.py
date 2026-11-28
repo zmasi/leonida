@@ -1148,6 +1148,94 @@ class TestGlbWriterMainCli(unittest.TestCase):
                 with open(obj_path, encoding="utf-8", newline="") as f:
                     self.assertEqual(f.read(), text)
 
+    def test_main_cli_rejects_directory_output(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            obj_path = os.path.join(tmp_dir, "input.obj")
+            out_dir = os.path.join(tmp_dir, "out_dir")
+            os.makedirs(out_dir)
+            with open(obj_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                ret = glb_writer.main([obj_path, out_dir])
+            self.assertEqual(ret, 1)
+            self.assertIn("directory", err.getvalue())
+
+
+class TestGlbWriterValidationHardening(unittest.TestCase):
+    """Regressions for strict JSON parsing, primitive/material validation, and instanced transforms."""
+
+    @staticmethod
+    def _wrap_json_chunk(raw_json: bytes) -> bytes:
+        padded = raw_json + b" " * ((-len(raw_json)) % 4)
+        total = 12 + 8 + len(padded)
+        return (
+            struct.pack("<4sII", glb_writer.GLB_MAGIC, glb_writer.GLB_VERSION, total)
+            + struct.pack("<II", len(padded), glb_writer.CHUNK_TYPE_JSON)
+            + padded
+        )
+
+    def test_read_glb_summary_rejects_nonfinite_json_recursion_and_bool_buffer(self):
+        nan_glb = self._wrap_json_chunk(b'{"asset":{"version":"2.0"},"x":NaN}')
+        with self.assertRaises(glb_writer.GlbError):
+            glb_writer.read_glb_summary(nan_glb)
+
+        inf_glb = self._wrap_json_chunk(b'{"asset":{"version":"2.0"},"x":Infinity}')
+        with self.assertRaises(glb_writer.GlbError):
+            glb_writer.read_glb_summary(inf_glb)
+
+        bool_buf_glb = self._wrap_json_chunk(
+            b'{"asset":{"version":"2.0"},"bufferViews":[{"buffer":false,"byteLength":0}]}'
+        )
+        with self.assertRaises(glb_writer.GlbError):
+            glb_writer.read_glb_summary(bool_buf_glb)
+
+        valid_glb = glb_writer.build_glb([_simple_triangle_primitive()])
+        with mock.patch.object(glb_writer.json, "loads", side_effect=RecursionError):
+            with self.assertRaisesRegex(glb_writer.GlbError, "nesting is too deep"):
+                glb_writer.read_glb_summary(valid_glb)
+
+    def test_pack_primitive_and_base_color_validation(self):
+        with self.assertRaises(glb_writer.GlbError):
+            glb_writer.pack_primitive({"positions": [], "indices": [0, 1, 2]})
+        with self.assertRaises(glb_writer.GlbError):
+            glb_writer.pack_primitive({"positions": [(0.0, 0.0, 0.0)], "indices": []})
+        with self.assertRaises(glb_writer.GlbError):
+            glb_writer.pack_primitive({
+                "positions": [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+                "indices": [False, True, 0],
+            })
+        prim = _simple_triangle_primitive()
+        for bad_factor in ([True, 0.0, 0.0], ["red", 0.0, 0.0], [0.5, 0.5, 0.5, False]):
+            with self.subTest(bad_factor=bad_factor):
+                with self.assertRaises(glb_writer.GlbError):
+                    glb_writer.build_glb([prim], materials={"": {"base_color_factor": bad_factor}})
+
+    def test_instanced_glb_transform_validation_and_scale_underflow(self):
+        packed = glb_writer.pack_primitive(_simple_triangle_primitive())
+        # Tiny positive scale whose product underflows float64 + huge finite quaternion
+        glb_bytes, stats = glb_writer.build_instanced_glb(
+            [{"primitives": [packed], "instances": [((0.0, 0.0, 0.0), (1e200, 0.0, 0.0, 0.0), (1e-120, 1e-120, 1e-120))]}],
+            mode="nodes",
+        )
+        self.assertGreater(len(glb_bytes), 20)
+        self.assertTrue(all(math.isfinite(v) for v in stats["bounds"]))
+
+        bad_instances = [
+            ((0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0)),            # 2-elem translation
+            ((0.0, 0.0, 0.0), (0.0, 0.0, 1.0), (1.0, 1.0, 1.0)),            # 3-elem quaternion
+            ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0)),            # 2-elem scale
+            ((False, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1.0, 1.0, 1.0)),     # bool component
+            ((1e308, 0.0, 0.0), (0.0, 0.0, 0.0, 1.0), (1e308, 1.0, 1.0)),   # overflowing bounds
+        ]
+        for bad_inst in bad_instances:
+            with self.subTest(bad_inst=bad_inst):
+                with self.assertRaises(glb_writer.GlbError):
+                    glb_writer.build_instanced_glb(
+                        [{"primitives": [packed], "instances": [bad_inst]}],
+                        mode="nodes",
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()

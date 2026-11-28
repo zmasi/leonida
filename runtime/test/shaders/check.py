@@ -104,7 +104,9 @@ CS_SMEM_VCC = list(range(0x7210, 0x7218))
 CS_SMEM = [0x5eed0024, 0x5eed0028, 0x5eed002c, 0x5eed0030, 0x5eed0010, 0x5eed0014, 0x5eed0018, 0x5eed001c]
 # -0, and NaN checks that need SignedZeroInfNanPreserve (cs_signed_zero_nan.asm); 0 in out[4..7] means it's missing
 SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00007c00]
+CVT_F16_MODS_WORDS = [0xFFC4A000, 0x33800000, 0x36800000, 0xAAAA0001, 0xAAAA03FF, 0xAAAA0000, 0xAAAA0000, 0xAAAA0001]
 WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
+                "cs_w32_cvt_f16_mods",
                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
                 "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
@@ -117,6 +119,7 @@ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm
 # otherwise pick a narrower size and return different words (#774).
 WAVE32_LANE_ENV = {"VKC_SUBGROUP_SIZE": "32"}
 WAVE32_LANE_DUMPS = ("cs_wqm_w32", "cs_w32_lane_wrap", "cs_w32_permute", "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_partial_permute", "cs_exec_const",
+                     "cs_w32_cvt_f16_mods",
                      "cs_w32_mask_imm", "cs_lds_b64_cmpst", "cs_lds_xchg64_ext", "cs_lds_atomics_ext", "cs_w32_wrxchg2_ext", "cs_w32_wrxchg2st64", "cs_w32_andn2_exec", "cs_mask_vgpr_exec", "cs_w32_permlane_fi",
                      "cs_w32_exec_computed")
 CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
@@ -134,6 +137,7 @@ CS_DPP = [("cs_dpp", [1, 0, 3, 2, 5, 4, 7, 6]),
 WAVE32_DUMPS += tuple(n for n, _ in CS_DPP)
 WAVE32_LANE_DUMPS += tuple(n for n, _ in CS_DPP)
 CS_DUMPS = [*CS_DPP, ("cs_smem_vcc_base", CS_SMEM_VCC), ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
+            ("cs_w32_cvt_f16_mods", CVT_F16_MODS_WORDS),
             # SHADER-52: wave32 lane select is & 31; lane 40 wraps to 8
             ("cs_w32_lane_wrap", [25, 16, 777, 777]),
             # v_movrelsd_2_b32: VGPR[D + M0[25:16]] = VGPR[S0 + M0[9:0]]
@@ -802,6 +806,7 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_ops7": (0x00ff8077, 0xff0000ff, 0x89abcdef, 0x00070003),
               "ps_ops8": (0x80000000, 0xbfffffff, 0x000f100e, 0x0f0f0f1f),
               "ps_f32_mods": (0xc0256a01, 0x3f800000, 0x41e00000, 0x3fc00000),
+              "ps_exp_f32_denorm": (0x01000000, 0x00800000, 0x00000000, 0x00000000),
               "ps_scc": (1, 1, 3, 0x80000000), "ps_sdwa": (0x000000f1, 0xbffefff2, 0x3c003344, 0xbff70000),
               # 16-bit SDWA results with dst_sel:DWORD zero the high half (.asm header, measured on gfx1036)
               "ps_sdwa_dword_hi": (0x00004000, 0x00000003, 0x00004700, 0x0000c000),
@@ -815,7 +820,7 @@ PIXEL_BITS = {"ps_clip_color": (0x3e800000, 0x3f000000, 0x3f400000, 0x3f800000),
               "ps_scc_logic32": (0x0fff0fff, 0x000f000f, 0xf00ff00f, 0x36),
               "ps_scc_logic64": (0x0fff0fff, 0xff000000, 0xff0000ff, 0x16),
               "ps_fma_literal": (0x41b80000, 0x41800000, 0x40e00000, 0x41a40000),
-              "ps_f64_mods": (0x40040000, 0x3ff00000, 0x3fe40000, 0x3ff00000),
+              "ps_f64_mods": (0x3ff40000, 0x3ff00000, 0x3ff00000, 0x3fd00000),
               "ps_f64_round": (0xc12af665, 0x3fe7ffff, 0xbfffffff, 0xc12af666),
               "ps_outmods_f16": (0xaaaa3c00, 0xaaaa3e00, 0x7c000000, 0x3c000000),
               # f16 op_sel, partial writes, inline constants: words measured on RDNA2 hardware (.asm headers)
@@ -2050,6 +2055,20 @@ def mandelbrot_counts(w):
     return counts
 
 
+def exp_f32_denorm_problem(px):
+    if len(px) != 4096:
+        return f"expected 4096 pixels, got {len(px)}"
+    for i, pixel in enumerate(px):
+        x = i % 64
+        result = (0x01000000, 0x00800000)[x] if x < 2 else 0
+        exponent = struct.unpack('<I', struct.pack('<f', -125.0 - x))[0]
+        column = struct.unpack('<I', struct.pack('<f', float(x)))[0]
+        expected = (result, exponent, column, result)
+        if tuple(pixel) != expected:
+            return f"pixel {i}: got {pixel}, expected {expected}"
+    return ''
+
+
 def mandelbrot_problem(px):
     """ps_mandelbrot: channel 3 is the lane's iteration count. A lane that leaves EXEC too early or late, or a loop
     that ends on the wrong branch, changes counts; the colour channels are only for looking at the frame."""
@@ -2163,6 +2182,8 @@ def pixel_test(tools, spirv, name):
         c = collections.Counter((a, b) for a, b, _, _ in px)
         fine = c[(8, 1)] and c[(8, 0)] and c[(7, 0)] and set(c) <= {(8, 1), (8, 0), (7, 0)}
         return "" if fine else f"(s5, bit) counts {dict(c)}"
+    if name == "ps_exp_f32_denorm_rt":
+        return exp_f32_denorm_problem(px)
     if name == "ps_mandelbrot":
         return mandelbrot_problem(px)
     return "no check written for this shader"

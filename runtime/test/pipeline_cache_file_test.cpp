@@ -46,6 +46,15 @@ static int test_checkpoint(const fs::path& dir) {
     CHECK(write_pipeline_cache_file(directory, "next", 4));
     CHECK(fs::is_directory(directory));
 
+    // Guard against empty path and null buffer with positive size
+    CHECK(write_pipeline_cache_file("", "data", 4) == std::make_error_code(std::errc::invalid_argument));
+    CHECK(write_pipeline_cache_file(cache, nullptr, 16) == std::make_error_code(std::errc::invalid_argument));
+    // Zero size with null pointer safely succeeds and writes empty file
+    const auto empty_file = dir / "empty.bin";
+    CHECK(!write_pipeline_cache_file(empty_file, nullptr, 0));
+    CHECK(contents(empty_file).empty());
+    fs::remove(empty_file);
+
 #ifdef _WIN32
     {
         using namespace rt::d3d12;

@@ -105,6 +105,20 @@ class WorldBuildOutputLockTests(unittest.TestCase):
                     self.assertFalse(os.path.exists(os.path.join(out, "world.json")))
                     self.assertFalse(os.path.exists(os.path.join(out, "chunks")))
 
+    def test_case_and_unicode_variants_share_a_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "Wörld")
+            alias = os.path.join(tmp, "wo\u0308RLD")
+            unrelated = os.path.join(tmp, "other")
+            with _lock_held_by_child(tmp, out):
+                with self.assertRaisesRegex(RuntimeError, "another world_build is using"):
+                    with wb._exclusive_output(alias):
+                        pass
+                with wb._exclusive_output(unrelated):
+                    pass
+            with wb._exclusive_output(alias):
+                pass
+
     def test_short_name_spelling_of_a_held_output_is_refused(self):
         if os.name != "nt":
             self.skipTest("8.3 short names are Windows only")

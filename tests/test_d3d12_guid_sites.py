@@ -176,7 +176,7 @@ class GuidSites(unittest.TestCase):
         image, _ = pe32plus(text, rdata)
         path = self.write("t6.dll", image)
         out = os.path.join(self.tmp.name, "out.json")
-        header = os.path.join(self.tmp.name, "none.h")
+        header = self.write("none.h", b"// a header that lists no interfaces\n")
         result = subprocess.run(
             [sys.executable, "-I", os.path.join(ROOT, "tools", "d3d12_guid_sites.py"), path,
              "--header", header, "--known", f"ID3D12CommandQueue={QUEUE}", "--json", out],

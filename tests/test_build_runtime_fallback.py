@@ -78,6 +78,23 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             with self.subTest(source=name):
                 self.assertTrue((ROOT / "runtime" / "test" / name).is_file())
 
+    def test_a_program_that_opens_a_window_links_user32(self):
+        """BUILD-FALLBACK-SANDBOX-USER32: CMake's Visual Studio and Ninja builds link kernel32, user32, gdi32 ... to
+        every program (CMAKE_CXX_STANDARD_LIBRARIES), but a plain cl line links none of them. vk_sandbox opens a
+        window, so without user32.lib the link stopped at 14 unresolved __imp_ symbols and the fallback exited 1."""
+        window_api = re.compile(r"\b(CreateWindowExW|RegisterClassW|PeekMessageW|DefWindowProcW|GetAsyncKeyState)\b")
+        checked = 0
+        for line in self.body.splitlines():
+            source = re.search(r'"\$src\\test\\([A-Za-z0-9_]+\.cpp)"', line)
+            if not source or " cl " not in f" {line}":
+                continue
+            text = (ROOT / "runtime" / "test" / source.group(1)).read_text(encoding="utf-8", errors="replace")
+            if window_api.search(text):
+                checked += 1
+                with self.subTest(source=source.group(1)):
+                    self.assertRegex(line, r"/link (\S+ )*user32\.lib( |$)")
+        self.assertGreaterEqual(checked, 1)
+
     def test_the_pipeline_checker_gets_the_stack_reserve_cmake_gives_it(self):
         """BUILD-1457: a driver compiles on vk_pipeline_check's threads, and AMD's Windows compiler overflows the
         1 MB PE default. CMake links the checker with /STACK:<LEONIDA_PIPELINE_CHECK_STACK>; the fallback has to pass

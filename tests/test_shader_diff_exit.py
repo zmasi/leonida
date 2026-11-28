@@ -2,6 +2,7 @@
 import contextlib
 import io
 import os
+import random
 import sys
 import unittest
 from unittest import mock
@@ -144,6 +145,37 @@ class ArgumentValidation(unittest.TestCase):
     def test_the_defaults_are_unchanged(self):
         a = sd.main(["--programs", "1", "--limit", "1"])
         self.assertIn(a, (0, 1))  # 1 pass or 1 mismatch; never an argparse exit
+
+    def test_deduplicates_repeated_ops_preserving_order(self):
+        seen = []
+
+        def fake_suite(programs, seed, max_ops, limit=None, *, start=0, ops=None):
+            seen.append(ops)
+            return {"pass": 1, "mismatch": 0, "skip": {}, "harness-error": 0}, None
+
+        with mock.patch.object(sd, "run_suite", side_effect=fake_suite), contextlib.redirect_stdout(io.StringIO()):
+            rc = sd.main(["--programs", "1", "--ops", "v_add_f32,v_mul_f32,v_add_f32"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen, [("v_add_f32", "v_mul_f32")])
+
+    def test_generate_program_and_run_suite_reject_invalid_bounds_and_empty_templates(self):
+        rng = random.Random(1)
+        with self.assertRaises(ValueError):
+            sd.generate_program(rng, -1)
+        for bad_ops in ([], ("unknown_op",)):
+            with self.subTest(bad_ops=bad_ops):
+                with self.assertRaises(ValueError):
+                    sd.generate_program(rng, 1, ops=bad_ops)
+        for args, kw in (
+            ((0, 1, 4), {}),
+            ((1, 1, 0), {}),
+            ((1, 1, 4), {"start": -1}),
+            ((1, 1, 4), {"limit": 0}),
+            ((1, 1, 4), {"limit": -2}),
+        ):
+            with self.subTest(args=args, kw=kw):
+                with self.assertRaises(ValueError):
+                    sd.run_suite(*args, **kw)
 
 
 if __name__ == "__main__":

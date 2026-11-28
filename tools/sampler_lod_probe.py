@@ -210,11 +210,27 @@ def main(argv=None):
             except ValueError as e:
                 print(f"cannot build the kernel: {e}")
                 return 2
-            res = oracle.run([k])[0]
+            raw = oracle.run([k])
+            if not isinstance(raw, (list, tuple)) or len(raw) != 1:
+                got_desc = len(raw) if isinstance(raw, (list, tuple)) else type(raw).__name__
+                print(f"wave{wave}: expected 1 oracle result, got {got_desc}")
+                return 2
+            res = raw[0]
             if isinstance(res, str):
                 print(f"wave{wave}: kernel rejected: {res}")
                 return 2
-            got[wave] = [struct.unpack("<f", struct.pack("<I", w))[0] if w != tsharp.POISON else None for w in res]
+            if not isinstance(res, (list, tuple)) or len(res) != len(table):
+                got_desc = len(res) if isinstance(res, (list, tuple)) else type(res).__name__
+                print(f"wave{wave}: expected {len(table)} words, got {got_desc}")
+                return 2
+            bad_types = [type(w).__name__ for w in res if isinstance(w, bool) or not isinstance(w, int)]
+            if bad_types:
+                print(f"wave{wave}: expected {len(table)} int words, got {bad_types[0]} element")
+                return 2
+            got[wave] = [
+                struct.unpack("<f", struct.pack("<I", w & 0xFFFFFFFF))[0] if (w & 0xFFFFFFFF) != tsharp.POISON else None
+                for w in res
+            ]
         if any(v is None for v in got[32] + got[64]):
             print("the texture did not land 256-byte aligned (POISON)")
             return 2
@@ -222,8 +238,10 @@ def main(argv=None):
         # level first, each row padded to 256 bytes); wave64 must agree.
         starts = [got[32][n] for n in range(LEVELS)]
         print("level starts (dwords): " + ", ".join(f"{n}:{s:.0f}" for n, s in enumerate(starts)))
-        if len(set(starts)) != LEVELS or starts != [got[64][n] for n in range(LEVELS)]:
-            print("calibration: the level starts are not distinct, or wave32 and wave64 disagree; cannot name levels")
+        if (any(not math.isfinite(s) for s in starts)
+                or len(set(starts)) != LEVELS
+                or starts != [got[64][n] for n in range(LEVELS)]):
+            print("calibration: the level starts are not distinct, finite, or wave32 and wave64 disagree; cannot name levels")
             return 2
         level_of = {s: n for n, s in enumerate(starts)}
         bad = vk_diff = 0
@@ -239,6 +257,12 @@ def main(argv=None):
             print(f"{name:18} hw level {shown:>2}{extra:12} rule {want}  {'ok' if ok else 'DIFFERS'}{note}")
         print(f"{len(table) - bad}/{len(table)} rows match the rule; Vulkan's level differs on {vk_diff}")
         return 1 if bad else 0
+    except runner.Unavailable as e:
+        print(f"hardware oracle unavailable: {e}")
+        return 77
+    except RuntimeError as e:
+        print(f"harness error: {e}")
+        return 2
     finally:
         oracle.close()
 

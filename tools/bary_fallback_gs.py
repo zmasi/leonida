@@ -18,6 +18,7 @@ Usage: `python -I tools/bary_fallback_gs.py --help` lists the options.
 """
 import argparse
 from collections.abc import Iterator
+from contextlib import suppress
 import json
 import os
 from pathlib import Path
@@ -25,13 +26,45 @@ import subprocess
 import sys
 import tempfile
 
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+from file_mode import published_mode  # noqa: E402
+
 SUFFIX = ".bary_gs"   # <ps name>.bary_gs.spvasm / .spv next to the pixel shader
+
+
+def _parse_location(value) -> int:
+    if type(value) is int:
+        n = value
+    elif isinstance(value, str):
+        try:
+            n = int(value)
+        except ValueError:
+            raise ValueError(f"input location must be a non-negative integer, got {value!r}") from None
+    else:
+        raise ValueError(f"input location must be a non-negative integer, got {value!r}")
+    if n < 0:
+        raise ValueError(f"input location must be a non-negative integer, got {value!r}")
+    return n
+
+
+def _validate_shader_name(name: str, index_path: str) -> None:
+    if (
+        not isinstance(name, str)
+        or not name
+        or name in (".", "..")
+        or "/" in name
+        or "\\" in name
+        or os.path.basename(name) != name
+    ):
+        raise ValueError(f"{index_path}: invalid shader name {name!r}")
 
 
 def gs_spvasm(locations, bary_location, clip_count: int = 0, cull_count: int = 0):
     """SPIR-V assembly for a triangle pass-through GS: Position and the vec4 inputs at `locations`, copied per vertex,
     plus the one-hot barycentric vec3 at `bary_location`."""
-    locations = sorted(set(int(n) for n in locations))
+    locations = sorted(set(_parse_location(n) for n in locations))
     if type(bary_location) is not int or bary_location < 0:
         raise ValueError(f"bary location must be a non-negative integer, got {bary_location!r}")
     if bary_location in locations:
@@ -117,7 +150,7 @@ def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] 
     index_path = os.path.join(spirv_dir, "index.json")
     if pair is None and not os.path.isfile(index_path):
         return
-    with open(index_path, encoding="utf-8") as f:
+    with open(index_path, encoding="utf-8-sig") as f:
         index = json.load(f)
     if not isinstance(index, dict):
         raise ValueError(f"{index_path}: translation index must be a JSON object")
@@ -133,7 +166,10 @@ def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] 
                 raise ValueError(f"{index_path}: index entry {name!r} must be a JSON object")
         if producer.get("stage") != "vs" or consumer.get("stage") != "ps" or not consumer.get("bary_fallback_input"):
             raise ValueError("--pair requires a translated VS and a barycentric-fallback PS from the index")
-        caps = set(producer.get("capabilities", []))
+        raw_caps = producer.get("capabilities", [])
+        if not isinstance(raw_caps, list) or not all(isinstance(c, str) for c in raw_caps):
+            raise ValueError(f"{index_path}: index entry {vertex!r} capabilities must be a list of strings")
+        caps = set(raw_caps)
         unsupported = caps & {"ShaderLayer", "ShaderViewportIndex"}
         if unsupported:
             raise ValueError("paired helper cannot forward " + ", ".join(sorted(unsupported)))
@@ -155,16 +191,49 @@ def _helpers_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] 
         fb = meta.get("bary_fallback_input") if isinstance(meta, dict) else None
         if not fb:
             continue
+        _validate_shader_name(name, index_path)
+        if not isinstance(fb, dict) or "location" not in fb:
+            raise ValueError(
+                f"{index_path}: index entry {name!r} bary_fallback_input must be an object with 'location'"
+            )
+        inputs = meta.get("inputs", [])
+        if not isinstance(inputs, list):
+            raise ValueError(f"{index_path}: index entry {name!r} inputs must be a list")
         path = os.path.join(spirv_dir, name + SUFFIX + suffix + ".spvasm")
-        shader = gs_spvasm(meta.get("inputs", []), fb["location"], clip_count, cull_count)
+        shader = gs_spvasm(inputs, fb["location"], clip_count, cull_count)
         yield path, shader
+
+
+def _write_text_atomic(path: str, text: str) -> None:
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=parent,
+            prefix=".bary-gs-",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            staged = f.name
+            f.write(text)
+        os.chmod(staged, published_mode(path))
+        os.replace(staged, path)
+        staged = None
+    finally:
+        if staged is not None:
+            with suppress(OSError):
+                os.chmod(staged, 0o600)
+                os.unlink(staged)
 
 
 def write_for_index(spirv_dir: str | os.PathLike[str], pair: tuple[str, str] | None = None) -> list[str]:
     """Write helpers for all fallback PS entries, or one distance-layout-specific helper for an explicit (VS, PS) pair."""
     written = []
     for path, shader in _helpers_for_index(spirv_dir, pair):
-        Path(path).write_text(shader, encoding="utf-8", newline="\n")
+        _write_text_atomic(path, shader)
         written.append(path)
     return written
 

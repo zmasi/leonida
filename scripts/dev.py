@@ -90,15 +90,15 @@ def guest_scene(args: list[str]) -> int:
     parser.add_argument("-h", "--help", action="store_true")
     parser.add_argument("--out", metavar="PATH")
     options, _ = parser.parse_known_args(args)
-    if not options.help and not options.out:
+    if not options.help and not (options.out and options.out.strip()):
         parser.error("--out PATH is required to keep the scene results")
 
     return run_producer(GUEST_SCENE, args)
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     # The producer owns its arguments and help. Forward before argparse handles them.
-    argv = sys.argv[1:]
+    argv = sys.argv[1:] if argv is None else list(argv)
     if argv[:1] == ["boot-trace"]:
         return run_producer(BOOT_TRACE, argv[1:])
     if argv[:1] == ["guest-scene"]:
@@ -119,7 +119,10 @@ def main() -> int:
     if args.json:
         print(json.dumps(result, indent=2))
     else:
-        sys.stdout.reconfigure(encoding="utf-8")
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            pass
         print("Paths and help commands are relative to the Leonida checkout root.")
         for tool in result["tools"]:
             status = "present" if tool["present"] else "missing"

@@ -167,6 +167,117 @@ class RootSigContractEdgeTests(unittest.TestCase):
             self.assertEqual(rc, 1)
             self.assertEqual(out.getvalue().count("  - "), 1)
 
+    def test_console_reconcile_rejects_ptr64_lo_on_one_dword_table(self):
+        sig = {"params": [{"type": "table"}, {"type": "table"}, {"type": "cbv"}]}
+        dwords, err = rsc.pack_layout(sig, "cs")
+        self.assertEqual(err, "")
+        # s4 and s5 are 1-dword console tables; s6..s7 is a 2-dword root CBV.
+        self.assertEqual(rsc.reconcile([{"sgpr": 4, "kind": "ptr32_lo"}], dwords), [])
+        self.assertEqual(rsc.reconcile([{"sgpr": 6, "kind": "ptr64_lo"}], dwords), [])
+        for sgpr in (4, 5):
+            with self.subTest(sgpr=sgpr):
+                issues = rsc.reconcile([{"sgpr": sgpr, "kind": "ptr64_lo"}], dwords)
+                self.assertEqual(len(issues), 1)
+                self.assertIn("without paired hi dword", issues[0])
+        # Trailing 1-dword table at end of layout also fails without paired hi dword.
+        tail_dwords, err = rsc.pack_layout({"params": [{"type": "table"}]}, "cs")
+        self.assertEqual(err, "")
+        issues = rsc.reconcile([{"sgpr": 4, "kind": "ptr64_lo"}], tail_dwords)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("without paired hi dword", issues[0])
+
+    def test_pack_layout_rejects_unhashable_stage(self):
+        for stage in ([], {}, 123):
+            with self.subTest(stage=stage):
+                dwords, err = rsc.pack_layout(ROOT_SIG, stage)
+                self.assertEqual(dwords, [])
+                self.assertIn("no console base", err)
+
+    def test_reconcile_and_cluster_handle_unhashable_kind(self):
+        dwords, err = rsc.pack_layout(ROOT_SIG)
+        self.assertEqual(err, "")
+        for kind in (["const32"], {"k": 1}, 42):
+            with self.subTest(kind=kind):
+                issues = rsc.reconcile([{"sgpr": 0, "kind": kind}], dwords)
+                self.assertEqual(len(issues), 1)
+                self.assertIn("unknown read kind", issues[0])
+        ranked = rsc.cluster({
+            "a": {"user_sgpr_reads": [{"sgpr": 0, "kind": ["const32"]}, {"sgpr": 1, "kind": "const32"}]},
+            "b": {"user_sgpr_reads": [{"sgpr": 0, "kind": {"k": 1}}]},
+        })
+        self.assertEqual(len(ranked), 2)
+        self.assertEqual(sum(count for _, count, _ in ranked), 2)
+
+    def test_cli_bom_json_inputs_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            idx_path = os.path.join(tmp, "index.json")
+            sig_path = os.path.join(tmp, "sig.json")
+            with open(idx_path, "w", encoding="utf-8-sig", newline="\n") as f:
+                json.dump({"ok": {"user_sgpr_reads": [{"sgpr": 0, "kind": "const32"}]}}, f)
+            with open(sig_path, "w", encoding="utf-8-sig", newline="\n") as f:
+                json.dump(ROOT_SIG, f)
+            res = subprocess.run(
+                [sys.executable, "-I", TOOL, idx_path, "--rootsig", sig_path],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(res.returncode, 0, res.stdout + res.stderr)
+            self.assertIn("1 compatible, 0 contradictory", res.stdout)
+
+    def test_cli_console_model_empty_index_validates_rootsig(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            idx_path = os.path.join(tmp, "index.json")
+            bad_sig = os.path.join(tmp, "bad_sig.json")
+            wide_sig = os.path.join(tmp, "wide_sig.json")
+            with open(idx_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({}, f)
+            with open(bad_sig, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"params": [{"type": "bogus"}]}, f)
+            # 17 console tables fit s4..s20 (cs) even though they would spill under s0 (34 dwords).
+            with open(wide_sig, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"params": [{"type": "table"} for _ in range(17)]}, f)
+            res = subprocess.run(
+                [sys.executable, "-I", TOOL, idx_path, "--rootsig", bad_sig, "--model", "console"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(res.returncode, 1, res.stdout + res.stderr)
+            self.assertIn("root signature refused", res.stdout)
+
+            ok = subprocess.run(
+                [sys.executable, "-I", TOOL, idx_path, "--rootsig", wide_sig, "--model", "console"],
+                capture_output=True, text=True,
+            )
+            self.assertEqual(ok.returncode, 0, ok.stdout + ok.stderr)
+            self.assertIn("0 shaders: 0 compatible, 0 contradictory", ok.stdout)
+
+    def test_cli_console_model_rejects_missing_or_non_string_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            sig_path = os.path.join(tmp, "sig.json")
+            with open(sig_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(ROOT_SIG, f)
+            for label, entry in (
+                ("missing", {"user_sgpr_reads": []}),
+                ("null", {"stage": None, "user_sgpr_reads": []}),
+                ("int", {"stage": 4, "user_sgpr_reads": []}),
+            ):
+                with self.subTest(case=label):
+                    idx_path = os.path.join(tmp, f"index_{label}.json")
+                    with open(idx_path, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump({"s": entry}, f)
+                    res = subprocess.run(
+                        [sys.executable, "-I", TOOL, idx_path, "--rootsig", sig_path, "--model", "console"],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                    self.assertIn("'stage' must be a string", res.stderr)
+                    self.assertNotIn("Traceback", res.stderr)
+
+    def test_cli_rejects_whitespace_paths(self):
+        for argv in (["   ", "--rootsig", "sig.json"], ["idx.json", "--rootsig", "   "]):
+            with self.subTest(argv=argv):
+                res = subprocess.run([sys.executable, "-I", TOOL, *argv], capture_output=True, text=True)
+                self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                self.assertIn("required", res.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

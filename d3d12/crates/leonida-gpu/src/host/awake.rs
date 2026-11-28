@@ -47,7 +47,14 @@ static LAST: AtomicU64 = AtomicU64::new(0);
 
 fn wanted() -> bool {
     let (last, now) = (LAST.load(Ordering::Relaxed), now_ms());
-    last != 0 && now + 1 < last + QUIET_MS && (mode() != Mode::ByTurns || now / TURN_MS % 2 == 1)
+    last != 0
+        && now + 1 < last + QUIET_MS
+        && match mode() {
+            Mode::ByTurns => now / TURN_MS % 2 == 1,
+            #[cfg(feature = "diagnostics")]
+            Mode::Named(bit) => crate::ab::on(bit),
+            _ => true,
+        }
 }
 
 /// With `LEONIDA_CARD_AWAKE=turns`: this long on, this long off.
@@ -59,14 +66,25 @@ enum Mode {
     On,
     /// On and off by turns, to compare the two in one run (the log says when).
     ByTurns,
+    /// `LEONIDA_AB` names the switch: on and off as its bit there says, in
+    /// turns as short as that asks for and counted in its phase lines (the
+    /// turns of 20 s above are as long as one view of a title's idle camera).
+    #[cfg(feature = "diagnostics")]
+    Named(u32),
 }
 
 fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("LEONIDA_CARD_AWAKE").as_deref() {
-        Ok("1") => Mode::On,
-        Ok("turns") => Mode::ByTurns,
-        _ => Mode::Off,
+    *MODE.get_or_init(|| {
+        #[cfg(feature = "diagnostics")]
+        if let Some(bit) = crate::ab::bit("LEONIDA_CARD_AWAKE") {
+            return Mode::Named(bit);
+        }
+        match std::env::var("LEONIDA_CARD_AWAKE").as_deref() {
+            Ok("1") => Mode::On,
+            Ok("turns") => Mode::ByTurns,
+            _ => Mode::Off,
+        }
     })
 }
 
@@ -163,6 +181,8 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
             &mut sum,
         )?;
         let sum = sum.ok_or_else(windows::core::Error::empty)?;
+        #[cfg(feature = "diagnostics")]
+        crate::census::made(&sum, "the buffer the card is kept awake with");
         let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COMPUTE)?;
         let mut lists = Vec::new();
         for _ in 0..2 {

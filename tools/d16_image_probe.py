@@ -49,8 +49,10 @@ import argparse
 import json
 import os
 import random
+import stat
 import struct
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
@@ -58,6 +60,8 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 import d16_format_probe as fp  # noqa: E402
+from file_mode import published_mode  # noqa: E402
+import replace_retry  # noqa: E402
 
 # name: (GFX10 FORMAT, kind, bits per texel, texture width). Width x rows = 1024 texels; rows are 256 bytes, so the
 # 256-byte pitch of a linear image adds no padding.
@@ -353,6 +357,92 @@ def self_test():
     return 0
 
 
+def validate_json_path(path):
+    """Return an error string if `path` cannot be used as a --json output file, or None."""
+    if not path or not path.strip():
+        return "--json path must not be empty"
+    if "\x00" in path:
+        return "--json path contains a NUL byte"
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+        return f"--json path is a directory: {path}"
+    dest = os.path.realpath(path)
+    if os.path.isdir(dest):
+        return f"--json path is a directory: {path}"
+    cur = os.path.dirname(dest)
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--json parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def write_json_report(path, report):
+    """Atomically write `report` as LF-terminated JSON (or directly for non-regular targets), returning an error or None."""
+    payload = json.dumps(report, indent=1, allow_nan=False) + "\n"
+    dest = os.path.realpath(path)
+    try:
+        st = os.stat(dest)
+    except FileNotFoundError:
+        st = None
+    except OSError as e:
+        return f"cannot write --json {path}: {e.strerror or e}"
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        try:
+            with open(dest, "w", encoding="utf-8", newline="\n") as f:
+                f.write(payload)
+        except OSError as e:
+            return f"cannot write --json {path}: {e.strerror or e}"
+        return None
+    parent = os.path.dirname(dest)
+    if parent:
+        try:
+            os.makedirs(parent, exist_ok=True)
+        except OSError as e:
+            return f"cannot create directory for --json {path}: {e.strerror or e}"
+    if st is not None:
+        try:
+            probe_fd = os.open(dest, os.O_WRONLY)
+        except OSError as e:
+            return f"cannot write --json {path}: {e.strerror or e}"
+        os.close(probe_fd)
+    temp = None
+    try:
+        fd, temp = tempfile.mkstemp(dir=parent or ".", prefix=".d16-image-", suffix=".tmp")
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(temp, published_mode(dest))
+        replace_retry.replace(temp, dest)
+    except OSError as e:
+        if temp is not None:
+            try:
+                os.chmod(temp, 0o600)
+                os.unlink(temp)
+            except OSError:
+                pass
+        return f"cannot write --json {path}: {e.strerror or e}"
+    except BaseException:
+        if temp is not None:
+            try:
+                os.chmod(temp, 0o600)
+                os.unlink(temp)
+            except OSError:
+                pass
+        raise
+    return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--formats", default=",".join(FORMATS))
@@ -364,11 +454,25 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
-    fmts = [f for f in a.formats.split(",") if f]
-    bad = [f for f in fmts if f not in FORMATS] + [w for w in a.waves.split(",") if w not in ("32", "64")]
-    if bad or not fmts or not 0 < a.frac < 1:
-        ap.error("unknown or out of range: " + ", ".join(bad or ["--frac must be in (0, 1)"]))
-    waves = [int(w) for w in a.waves.split(",")]
+    raw_fmts = [f.strip() for f in a.formats.split(",")]
+    raw_waves = [w.strip() for w in a.waves.split(",")]
+    if not raw_fmts or any(not f for f in raw_fmts):
+        ap.error("--formats must be a comma-separated list of formats")
+    if not raw_waves or any(not w for w in raw_waves):
+        ap.error("--waves must be a comma-separated list of 32 and/or 64")
+    fmts = list(dict.fromkeys(raw_fmts))
+    bad_fmts = [f for f in fmts if f not in FORMATS]
+    bad_waves = [w for w in raw_waves if w not in ("32", "64")]
+    if bad_fmts or bad_waves:
+        ap.error("unknown: " + ", ".join(bad_fmts + bad_waves))
+    if not 0 < a.frac < 1:
+        ap.error("--frac must be in (0, 1)")
+    waves = list(dict.fromkeys(int(w) for w in raw_waves))
+    if a.json is not None:
+        err = validate_json_path(a.json)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle(arch=a.hw_arch)
@@ -408,9 +512,11 @@ def main(argv=None):
         return 2
     finally:
         oracle.close()
-    if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+    if a.json is not None:
+        err = write_json_report(a.json, report)
+        if err:
+            print(f"error: {err}", file=sys.stderr)
+            return 2
     return rc
 
 

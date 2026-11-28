@@ -13,6 +13,8 @@ Usage:
     python -I tools/batch_glb.py <in_dir> <out_dir> [--jobs N] [--up z|y] [--textures <dir>]
 Usage: `python -I tools/batch_glb.py --help` lists the options.
 
+PNG is preferred when PNG and DDS share a stem. If it cannot be loaded, its diagnostic is
+retained and the converter tries the matching DDS.
 A matched texture is also reported as unembedded when none of its primitives has UV coordinates.
 """
 from __future__ import annotations
@@ -20,9 +22,11 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import os
+import struct
 import sys
 import threading
 import time
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import glb_writer
@@ -36,21 +40,62 @@ def _existing_texture_dir(value: str) -> str:
     return value
 
 
-def _build_texture_index(texture_dir: str | None) -> dict[str, str]:
-    """Index available texture files (.png and .dds) by lowercase basename without extension."""
-    if not texture_dir:
-        return {}
-    index: dict[str, str] = {}
-    for entry in os.scandir(texture_dir):
-        if not entry.is_file():
-            continue
-        lower = entry.name.lower()
-        if lower.endswith(".png") or lower.endswith(".dds"):
-            stem = os.path.splitext(lower)[0]
-            # Prefer png over dds if both exist
-            if stem not in index or lower.endswith(".png"):
-                index[stem] = entry.path
+def _build_texture_index(texture_dir: str | None) -> dict[str, list[str]]:
+    """Index files by lowercase stem, in PNG-before-DDS preference order."""
+    index: dict[str, list[str]] = {}
+    if texture_dir:
+        with os.scandir(texture_dir) as entries:
+            for entry in entries:
+                stem, ext = os.path.splitext(entry.name.lower())
+                if ext in (".png", ".dds") and entry.is_file():
+                    index.setdefault(stem, []).append(entry.path)
+        for paths in index.values():
+            paths.sort(key=lambda path: (not path.lower().endswith(".png"), path))
     return index
+
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+def _validate_png_bytes(data: bytes) -> str | None:
+    if not data:
+        return "the PNG file is empty"
+    if len(data) < 33 or not data.startswith(_PNG_SIGNATURE):
+        return "not a valid PNG header"
+    pos = len(_PNG_SIGNATURE)
+    chunk_idx = 0
+    saw_idat = False
+    while pos < len(data):
+        if pos + 12 > len(data):
+            return "truncated PNG chunk header"
+        length = struct.unpack_from(">I", data, pos)[0]
+        ctype = data[pos + 4:pos + 8]
+        chunk_end = pos + 12 + length
+        if chunk_end > len(data):
+            return f"truncated PNG {ctype.decode('ascii', 'replace')} chunk"
+        expected_crc = struct.unpack_from(">I", data, pos + 8 + length)[0]
+        actual_crc = zlib.crc32(data[pos + 4:pos + 8 + length]) & 0xFFFFFFFF
+        if actual_crc != expected_crc:
+            return f"bad CRC in PNG {ctype.decode('ascii', 'replace')} chunk"
+        if chunk_idx == 0:
+            if ctype != b"IHDR" or length != 13:
+                return "missing valid PNG IHDR chunk"
+            width, height = struct.unpack_from(">II", data, pos + 8)
+            if width <= 0 or height <= 0:
+                return "PNG IHDR has zero dimension"
+        elif ctype == b"IDAT":
+            saw_idat = True
+        elif ctype == b"IEND":
+            if length != 0:
+                return "non-empty PNG IEND chunk"
+            if chunk_end != len(data):
+                return "trailing data after PNG IEND"
+            if not saw_idat:
+                return "PNG has no IDAT chunk"
+            return None
+        pos = chunk_end
+        chunk_idx += 1
+    return "missing PNG IEND chunk"
 
 
 def _load_png_bytes(tex_path: str, max_size: int = 0) -> tuple[bytes | None, str]:
@@ -63,8 +108,9 @@ def _load_png_bytes(tex_path: str, max_size: int = 0) -> tuple[bytes | None, str
                 data = f.read()
         except OSError as exc:
             return None, str(exc)
-        if not data:
-            return None, "the PNG file is empty"
+        err = _validate_png_bytes(data)
+        if err:
+            return None, err
         return data, ""
     elif lower.endswith(".dds"):
         try:
@@ -93,7 +139,7 @@ class TextureCache:
 
 
 def convert_single(
-    args_tuple: tuple[str, str, str, dict[str, str], int, TextureCache],
+    args_tuple: tuple[str, str, str, dict[str, str | list[str]], int, TextureCache],
 ) -> tuple[bool, str, str, list[tuple[str, str]]]:
     in_path, out_path, up_axis, tex_index, max_tex_size, tex_cache = args_tuple
     dropped: list[tuple[str, str]] = []
@@ -124,13 +170,10 @@ def convert_single(
                     f"{clean_stem}_diff",
                 ])
 
-                found_path = None
-                for key in lookup_keys:
-                    if key in tex_index:
-                        found_path = tex_index[key]
-                        break
-
-                if found_path:
+                candidates = next((tex_index[key] for key in lookup_keys if key in tex_index), [])
+                if isinstance(candidates, str):
+                    candidates = [candidates]   # callers may supply a single path for each stem
+                for found_path in candidates:
                     png_bytes, why_not = tex_cache.get_or_load(found_path, max_size=max_tex_size)
                     if why_not and found_path not in dropped_seen:
                         dropped_seen.add(found_path)        # one line per texture per model, not per primitive
@@ -141,6 +184,7 @@ def convert_single(
                             "name": mat_name or clean_stem,
                             "png_bytes": png_bytes,
                         }
+                        break
             dropped.extend((path, "matching primitives have no texture coordinates")
                            for path, has_uv in texture_has_uv.items() if not has_uv)
 

@@ -162,7 +162,18 @@ def hw_lines(op, s0, s1):
 def run_hw(oracle, case_list, wave, mode):
     from hw_oracle import asm
     got = oracle.run([asm.Kernel(hw_lines(*c), wave, 1, 1, raw=True, mode=mode) for c in case_list], words=1)
-    return [w if isinstance(w, str) else w[0] for w in got]
+    if not isinstance(got, (list, tuple)) or len(got) != len(case_list):
+        got_desc = len(got) if isinstance(got, (list, tuple)) else type(got).__name__
+        raise RuntimeError(f"wave{wave}: hardware oracle returned {got_desc} results for {len(case_list)} cases")
+    out = []
+    for idx, w in enumerate(got):
+        if isinstance(w, str):
+            out.append(w)
+        elif isinstance(w, (list, tuple)) and len(w) >= 1 and isinstance(w[0], int) and not isinstance(w[0], bool):
+            out.append(w[0] & 0xFFFFFFFF)
+        else:
+            raise RuntimeError(f"wave{wave}: invalid oracle result at index {idx}: {w!r}")
+    return out
 
 
 def main(argv=None):
@@ -170,7 +181,14 @@ def main(argv=None):
     ap.add_argument("--oracle", default="translator", help="translator (default) or translator,hw / hw")
     ap.add_argument("--hw-arch", help="override the hardware architecture (LEONIDA_HW_ARCH)")
     a = ap.parse_args(argv)
-    sides = {s.strip() for s in a.oracle.split(",") if s.strip()} - {"translator"}
+    if a.hw_arch is not None:
+        a.hw_arch = a.hw_arch.strip()
+        if not a.hw_arch:
+            ap.error("--hw-arch must not be empty")
+    oracle_tokens = [s.strip() for s in a.oracle.split(",")]
+    if not any(oracle_tokens) or any(not s for s in oracle_tokens):
+        ap.error("--oracle must be a comma-separated list of sides: translator, hw")
+    sides = set(oracle_tokens) - {"translator"}
     if sides - {"hw"}:
         ap.error(f"unknown --oracle side(s): {', '.join(sorted(sides - {'hw'}))}")
     case_list = cases()
@@ -202,11 +220,11 @@ def main(argv=None):
         for wave in (32, 64):
             for name, mode in MODES:
                 got = run_hw(oracle, case_list, wave, mode)
-                diffs = [(c, g, w) for c, g, w in zip(case_list, got, want) if g != w]
                 errors = [g for g in got if isinstance(g, str)]
                 if errors:
                     print(f"wave{wave} {name}: harness error: {errors[0]}")
                     return 2
+                diffs = [(c, g, w) for c, g, w in zip(case_list, got, want) if g != w]
                 same = {k: sum(1 for gr, g, w in zip(groups, got, want) if gr == k and g == w) for k in counts}
                 hw_single = sum(1 for gr, g, s in zip(groups, got, single) if gr == "near_tie" and g == s)
                 nan_halves = [(g >> (16 * h)) & 0xFFFF for (_, s0, s1), g in zip(case_list, got)
@@ -219,6 +237,12 @@ def main(argv=None):
                     print(f"  {op} {s0:08x} {s1:08x}: hw {g:08x}, translator {w:08x}")
                 if diffs:
                     status = 1
+    except runner.Unavailable as e:
+        print(f"hardware oracle unavailable: {e}")
+        return 77
+    except RuntimeError as e:
+        print(f"harness error: {e}")
+        return 2
     finally:
         oracle.close()
     return status

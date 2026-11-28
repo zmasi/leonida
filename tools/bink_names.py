@@ -50,6 +50,7 @@ if ROOT not in sys.path:
 import bink_index  # noqa: E402
 import gamedata_index  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 import gamedata_xml  # noqa: E402
 
@@ -125,7 +126,8 @@ def read_mount_lists(paths):
     for data in mount_documents(paths):
         if LIST_MARKER not in data.lower():
             continue
-        text = data.decode("utf-8", errors="replace")
+        # Filename-shaped text in comments, CDATA or processing instructions is not an element.
+        text = gamedata_xml.COMMENT_MARKUP.sub(b" ", data).decode("utf-8", errors="replace")
         for name in LIST_ENTRY.findall(text):
             name = name.strip().replace("\\", "/")
             if name.lower() not in seen:
@@ -183,6 +185,10 @@ def load_streams(source, skip_report=None):
         out[-1]["source"] = out[-1]["source"].replace("\\", "/")  # an older Windows index wrote "\"
     # A directory of carved files sorts by file name; carves name files by archive offset.
     out.sort(key=lambda r: (r["source"], r["offset"]))
+    for i in range(1, len(out)):
+        prev, curr = out[i - 1], out[i]
+        if prev["source"] == curr["source"] and prev["offset"] == curr["offset"]:
+            raise ValueError(f"duplicate stream location: {curr['source']} at offset {curr['offset']}")
     return out
 
 
@@ -368,10 +374,13 @@ def write(out, rows, unmatched, summary):
     try:
         with staged:
             _write_report_body(staged, rows, unmatched, summary, json_out=out.lower().endswith(".json"))
-        if os.name != "nt":
-            os.chmod(staged.name, published_mode(destination))
+        os.chmod(staged.name, published_mode(destination))
         replace_retry(staged.name, destination)
     finally:
+        try:
+            os.chmod(staged.name, 0o600)
+        except OSError:
+            pass
         try:
             os.unlink(staged.name)
         except FileNotFoundError:
@@ -399,6 +408,18 @@ def _write_report_body(fh_or_path, rows, unmatched, summary, json_out=None):
         w = csv.DictWriter(fh, fieldnames=FIELDS, lineterminator="\n")
         w.writeheader()
         w.writerows(rows)
+
+
+def _inside_folder(path, folder):
+    """Whether a report path is inside a folder, including filesystem aliases."""
+    ancestor = os.path.realpath(os.path.abspath(path))
+    while True:
+        if same_report_path(ancestor, folder):
+            return True
+        parent = os.path.dirname(ancestor)
+        if parent == ancestor:
+            return False
+        ancestor = parent
 
 
 def main(argv=None):
@@ -431,13 +452,7 @@ def main(argv=None):
             # be an input this check never saw, so refuse it. Any other unlistable folder is left to the scan,
             # which stops on it with exit 1 whether or not the report already exists.
             locked = error.filename or folder
-            out_key = os.path.normcase(os.path.realpath(a.out))
-            locked_key = os.path.normcase(os.path.realpath(locked))
-            try:
-                inside = os.path.commonpath([out_key, locked_key]) == locked_key
-            except ValueError:  # different drives on Windows
-                inside = False
-            if inside:
+            if _inside_folder(a.out, locked):
                 ap.error(f"--out cannot be checked against the inputs: cannot list {locked}: "
                          f"{error.strerror or error}")
 

@@ -26,10 +26,13 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from rsc8_audio import parse_adat_header_bytes  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from restofworld_model_join import ModelSystemPages  # noqa: E402
@@ -113,6 +116,34 @@ def first_adat_bank(m, start, end):
             return at
         pos = at + 1
     return None
+
+
+def _write_index_atomic(index_path, payload):
+    """Write index.json cleanly on rename so failed publishes preserve the previous index."""
+    dest = os.path.abspath(index_path)
+    directory = os.path.dirname(dest) or "."
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", delete=False,
+            dir=directory, prefix=".rpf9_carve-", suffix=".tmp",
+        ) as f:
+            staged = f.name
+            json.dump(payload, f)
+            f.write("\n")
+        os.chmod(staged, published_mode(dest))
+        replace_retry(staged, dest)
+        staged = None
+    finally:
+        if staged is not None:
+            try:
+                os.chmod(staged, 0o600)
+            except OSError:
+                pass
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
 
 
 def main(argv=None) -> int:
@@ -207,6 +238,8 @@ def main(argv=None) -> int:
                              "frames": struct.unpack_from("<I", m, s + 8)[0], "pre": "", "head": m[s:s + 16].hex()})
                 if not a.index_only:
                     out_file = os.path.join(a.out, f"{s:012x}.bk2")
+                    if same_report_path(out_file, a.archive):
+                        sys.exit(f"{out_file}: output must not overwrite input archive {a.archive}")
                     try:
                         with open(out_file, "wb") as f:
                             f.write(m[s:s + blen])
@@ -244,6 +277,8 @@ def main(argv=None) -> int:
                          "head": out[:16].hex()})
             if not a.index_only:
                 out_file = os.path.join(a.out, f"{s:012x}.bin")
+                if same_report_path(out_file, a.archive):
+                    sys.exit(f"{out_file}: output must not overwrite input archive {a.archive}")
                 try:
                     with open(out_file, "wb") as f:
                         f.write(out)
@@ -251,7 +286,7 @@ def main(argv=None) -> int:
                     sys.exit(f"{out_file}: cannot write: {e.strerror or e}")
             last = pos = s + used
             if len(rows) % 2000 == 0:
-                done = (pos - (a.start or 0)) / max(1, end - (a.start or 0))
+                done = (pos - base) / max(1, end - base)
                 print(f"[{done:6.1%}] {len(rows)} files, {time.time() - t0:.0f}s", flush=True)
         account(last, end)
     total = sum(r["stored"] for r in rows)
@@ -266,8 +301,7 @@ def main(argv=None) -> int:
         summary["first_adat_bank"] = boundary   # None: no bank in the window, the whole window was scanned
     index_path = os.path.join(a.out, "index.json")
     try:
-        with open(index_path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": summary, "files": rows, "unread": unread_ranges}, f)
+        _write_index_atomic(index_path, {"summary": summary, "files": rows, "unread": unread_ranges})
     except OSError as e:
         sys.exit(f"{index_path}: cannot write: {e.strerror or e}")
     print(json.dumps(summary, indent=1))

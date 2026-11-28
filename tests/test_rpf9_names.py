@@ -388,6 +388,36 @@ class NamesTest(unittest.TestCase):
             self.assertIn(f"output {arc} is the input archive", p.stderr)
             self.assertNotIn(repr(arc), p.stderr)   # a repr would quote the path and double every backslash
 
+    def test_failed_replace_of_read_only_report_makes_stage_deletable(self):
+        """A failed replace over a read-only report still cleans the stage: the staged file has the
+        read-only destination's bits, so the cleanup makes it deletable before deleting, and one
+        delete failure is swallowed instead of masking the replace error (Windows behavior)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "index.json")
+            with open(out, "w", encoding="utf-8") as f:
+                f.write('{"prior": true}')
+            with open(out, "rb") as f:
+                prior = f.read()
+            os.chmod(out, 0o444)
+            self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
+            made_writable = []
+            real_chmod = os.chmod
+
+            def chmod(staged_path, mode, *args, **kwargs):
+                if isinstance(staged_path, str) and ".rpf9_names-" in staged_path and mode == 0o600:
+                    made_writable.append(staged_path)
+                return real_chmod(staged_path, mode, *args, **kwargs)
+
+            with self.assertRaises(OSError) as raised:
+                with mock.patch.object(rpf9_names.os, "replace", side_effect=OSError("replace denied")), \
+                        mock.patch.object(rpf9_names.os, "chmod", chmod):
+                    rpf9_names.publish_report(out, [], {"files": 0})
+            self.assertIn("replace denied", str(raised.exception))
+            self.assertEqual(len(made_writable), 1)                     # the stage was made deletable
+            with open(out, "rb") as f:
+                self.assertEqual(f.read(), prior)                       # the prior report is untouched
+            self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".rpf9_names-")], [])
+
     def test_write_error_names_the_report_path_as_given(self):
         with tempfile.TemporaryDirectory() as tmp:
             arc = os.path.join(tmp, "tiny.rpf")

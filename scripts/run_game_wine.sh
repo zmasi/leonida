@@ -55,11 +55,13 @@ die() { echo "run_game_wine.sh: $*" >&2; exit 2; }
 
 if [ "${1:-}" = --inner ]; then
   # ---- inside the session: DISPLAY is kwin's Xwayland (headless) or the caller's display (--visible) ----
+  [ "$#" -ge 5 ] || die "--inner requires RUN BUILD LIMIT SHOT_EVERY"
   RUN=$2; BUILD=$3; LIMIT=$4; SHOT_EVERY=$5
   shift 5
   WINE=${WINE:-wine}
-  WINESERVER=$(dirname "$(command -v "$WINE")")/wineserver
-  [ -x "$WINESERVER" ] || WINESERVER=wineserver
+  wine_bin=$(command -v "$WINE" 2>/dev/null || true)
+  WINESERVER=${wine_bin:+$(dirname "$wine_bin")/wineserver}
+  [ -n "$WINESERVER" ] && [ -x "$WINESERVER" ] || WINESERVER=wineserver
   unset WAYLAND_DISPLAY  # Wine's X11 driver on Xwayland, never its Wayland driver
   {
     echo "display: ${DISPLAY:-none}"
@@ -70,7 +72,7 @@ if [ "${1:-}" = --inner ]; then
   mkdir -p "$WINEPREFIX"
   "$WINESERVER" -p
   # Warm-up: starts the prefix's services; no Mono/Gecko prompts in a new prefix.
-  WINEDLLOVERRIDES="$WINEDLLOVERRIDES;mscoree,mshtml=" "$WINE" wineboot -u </dev/null >/dev/null 2>&1
+  WINEDLLOVERRIDES="${WINEDLLOVERRIDES:+$WINEDLLOVERRIDES;}mscoree,mshtml=" "$WINE" wineboot -u </dev/null >/dev/null 2>&1
   SHOTS=
   if [ "$SHOT_EVERY" != 0 ]; then
     mkdir -p "$RUN/shots"
@@ -97,7 +99,10 @@ if [ "${1:-}" = --inner ]; then
   code=$?
   echo "$(( $(date +%s) - t0 ))" > "$RUN/seconds"
   echo "$code" > "$RUN/exit_code"
-  [ -n "$SHOTS" ] && kill "$SHOTS" 2>/dev/null
+  if [ -n "$SHOTS" ]; then
+    kill "$SHOTS" 2>/dev/null || true
+    wait "$SHOTS" 2>/dev/null || true
+  fi
   "$WINESERVER" -k 2>/dev/null
   exit 0
 fi
@@ -132,10 +137,11 @@ done
 [ -n "$OUT" ] || die "--out is required: the run folder"
 [ -n "$SHADERS" ] || die "--shaders (or LEONIDA_SHADERS) is required: the translated shader library, or none"
 case $LIMIT in ''|*[!0-9]*|0*) die "--seconds must be a whole number of seconds above 0, not '$LIMIT'" ;; esac
-case $SHOT_EVERY in ''|*[!0-9]*) die "--screenshot-every must be a whole number of seconds, not '$SHOT_EVERY'" ;; esac
+case $SHOT_EVERY in ''|*[!0-9]*|0?*) die "--screenshot-every must be a whole number of seconds, not '$SHOT_EVERY'" ;; esac
 if [ -n "$DEVICE" ] && ! [[ $DEVICE =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{4}$ ]]; then
   die "--device takes VID:DID in hex, as lspci -nn prints it (e.g. 1002:744c), not '$DEVICE'"
 fi
+[ -e "$SRC" ] || die "no build path at $SRC"
 [ -f "$EXE" ] || die "no game executable at $EXE"
 [ -d "$GAME" ] || die "no package folder at $GAME"
 if [ "$SHADERS" != none ]; then
@@ -195,6 +201,7 @@ fi
 # ---- one run at a time: a shared prefix has one wineserver ----
 LOCK=${LOCK:-${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/leonida-run-game-wine.lock}}
 LOCK=${LOCK:-$RUN/run.lock}
+mkdir -p "$(dirname "$LOCK")" || die "cannot create lock parent for $LOCK"
 exec 9>"$LOCK" || die "cannot open the lock $LOCK"
 flock -n 9 || die "another run holds $LOCK"
 mkdir -p "$RUN/overlay" "$RUN/saves"
@@ -217,11 +224,17 @@ else
   unset DISPLAY XAUTHORITY
 fi
 export QT_QPA_PLATFORM=offscreen
+DRM_SYSFS=${LEONIDA_DRM_SYSFS_DIR:-/sys/class/drm}
 if [ -n "$DEVICE" ]; then
   export MESA_VK_DEVICE_SELECT="$DEVICE!"
   # kwin and Xwayland's glamor on the card that renders, so the present path stays on one device.
-  for n in /sys/class/drm/renderD*; do
-    [ "$(cat "$n/device/vendor" 2>/dev/null):$(cat "$n/device/device" 2>/dev/null)" = "0x${DEVICE%%:*}:0x${DEVICE#*:}" ] \
+  dev_lc=${DEVICE,,}
+  for n in "$DRM_SYSFS"/renderD*; do
+    [ -e "$n" ] || continue
+    ven=$(cat "$n/device/vendor" 2>/dev/null || true)
+    did=$(cat "$n/device/device" 2>/dev/null || true)
+    ven=${ven//$'\r'/}; did=${did//$'\r'/}
+    [ "${ven,,}:${did,,}" = "0x${dev_lc%%:*}:0x${dev_lc#*:}" ] \
       && export KWIN_DRM_DEVICES=/dev/dri/${n##*/}
   done
 else
@@ -242,8 +255,9 @@ else
 fi
 env | grep -E '^(LEONIDA_|MESA_VK|WINEDLL|KWIN_DRM)' | sort > "$RUN/env.txt"
 
-WINESERVER=$(dirname "$(command -v "$WINE")")/wineserver
-[ -x "$WINESERVER" ] || WINESERVER=wineserver
+wine_bin=$(command -v "$WINE" 2>/dev/null || true)
+WINESERVER=${wine_bin:+$(dirname "$wine_bin")/wineserver}
+[ -n "$WINESERVER" ] && [ -x "$WINESERVER" ] || WINESERVER=wineserver
 SESSION_PID=
 teardown() {
   "$WINESERVER" -k 2>/dev/null
@@ -257,7 +271,7 @@ trap 'exit 130' INT TERM HUP
 
 # The session command with its arguments baked in (kwin takes one program path).
 {
-  echo '#!/bin/sh'
+  echo '#!/usr/bin/env bash'
   printf 'exec %q --inner %q %q %q %q' "$SELF" "$RUN" "$BUILD" "$LIMIT" "$SHOT_EVERY"
   for a in "$@"; do printf ' %q' "$a"; done
   echo
@@ -276,10 +290,17 @@ else
 fi
 SESSION_PID=$!
 # The session ends when the inner run returns; this outer limit adds a margin for the start-up.
-( sleep $((LIMIT + 180)); kill -TERM "$SESSION_PID" 2>/dev/null ) 9>&- 2>/dev/null &
+( trap 'kill "${watch_sleep_pid:-}" 2>/dev/null || true; exit 0' TERM INT
+  watch_sleep_pid=""
+  sleep $((LIMIT + 180)) &
+  watch_sleep_pid=$!
+  wait "$watch_sleep_pid" 2>/dev/null || exit 0
+  kill -TERM "$SESSION_PID" 2>/dev/null ) 9>&- </dev/null >/dev/null 2>&1 &
 WATCH=$!
 wait "$SESSION_PID"
-pkill -P "$WATCH" 2>/dev/null; kill "$WATCH" 2>/dev/null
+pkill -P "$WATCH" 2>/dev/null || true
+kill "$WATCH" 2>/dev/null || true
+wait "$WATCH" 2>/dev/null || true
 teardown; SESSION_PID=
 T1=$(date +%s)
 
@@ -289,5 +310,6 @@ if [ ! -f "$RUN/exit_code" ]; then
   exit 3
 fi
 python3 -I "$ROOT/tools/game_run_summary.py" "$RUN" --limit-seconds "$LIMIT" | tee "$RUN/summary.txt"
+summary_rc=${PIPESTATUS[0]}
 echo "output: $RUN (stderr.log, boot.jsonl, summary.txt); total $((T1 - T0)) s. The logs stay on this machine."
-exit 0
+exit "$summary_rc"
