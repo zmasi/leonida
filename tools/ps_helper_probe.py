@@ -318,11 +318,46 @@ def _write_json_atomic(path, payload):
         raise
 
 
+def validate_json_path(path):
+    """Return an error string if `path` cannot be used as a --json output file, or None."""
+    if not path or not path.strip():
+        return "--json path must not be empty"
+    if "\x00" in path:
+        return "--json path contains a NUL byte"
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+        return f"--json path is a directory: {path}"
+    cur = os.path.dirname(os.path.abspath(path))
+    while cur:
+        if os.path.isdir(cur):
+            break
+        if os.path.lexists(cur):
+            return f"--json parent is not a directory: {cur}"
+        nxt = os.path.dirname(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return None
+
+
+def write_json_report(path, data):
+    """Write `data` atomically as LF-terminated JSON (preserving symlinks), or return an error string."""
+    try:
+        _write_json_atomic(path, data)
+    except OSError as e:
+        return f"cannot write --json {path}: {e.strerror or e}"
+    return None
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--build", required=True, help="runtime build folder with vk_harness")
     ap.add_argument("--json", help="write {device, checks, words} here")
     a = ap.parse_args(argv)
+    if a.json is not None:
+        err = validate_json_path(a.json)
+        if err:
+            print(f"ps_helper_probe: {err}", file=sys.stderr)
+            return 2
     out_path = None
     if a.json is not None:
         out_path, err_msg = _validate_json_out(a.json)
@@ -352,10 +387,9 @@ def main(argv=None):
             "checks": [[n, ok, d] for n, ok, d in checks],
             "words": {n: {f"{x},{y}": list(w) for (x, y), w in px.items()} for n, px in res.items()},
         }
-        try:
-            _write_json_atomic(out_path, payload)
-        except OSError as e:
-            print(f"ps_helper_probe: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+        err = write_json_report(out_path, payload)
+        if err:
+            print(f"ps_helper_probe: {err}", file=sys.stderr)
             return 2
     return 0 if good == len(checks) else 1
 

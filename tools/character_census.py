@@ -40,10 +40,13 @@ import csv
 import json
 import os
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:  # -I does not put the script's directory on sys.path
     sys.path.insert(0, HERE)
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 MODEL_JSON = "model.json"
@@ -173,12 +176,13 @@ def _looks_like_model(data) -> bool:
 
 def _entry_path(entry):
     if isinstance(entry, str):
-        return entry
+        text = entry.strip()
+        return text or None
     if isinstance(entry, dict):
         for key in ("model_json", "model_path", "path", "json"):
             value = entry.get(key)
             if isinstance(value, str) and value.strip():
-                return value
+                return value.strip()
     return None
 
 
@@ -394,7 +398,8 @@ def _collect_textures(materials, drawable, issues: list) -> list:
 
 
 def _bones(model, drawable, meshes, row, issues: list):
-    for source, where in ((row, "manifest"), (model, "model")):
+    sources = ((model, "model"),) if row is model else ((row, "manifest"), (model, "model"))
+    for source, where in sources:
         if not isinstance(source, dict):
             continue
         for key in BONE_KEYS:
@@ -551,7 +556,7 @@ def model_row(model: dict, source: str, issues: list | None = None) -> dict:
         name = _fallback_name(source)
         issues.append("missing name")
     row["name"] = name
-    row["kind"] = _kind(model, row, issues)
+    row["kind"] = _kind(model, model, issues)
 
     vertices = _count_field(model, VERTEX_KEYS, "vertex count", issues)
     if vertices is None and meshes:
@@ -572,8 +577,9 @@ def model_row(model: dict, source: str, issues: list | None = None) -> dict:
 
     row["shaders"] = _collect_shaders(materials, drawable, issues)
     row["textures"] = _collect_textures(materials, drawable, issues)
-    row["bones"] = _bones(model, drawable, meshes, row, issues)
-    row["skin_8"] = _skin_8(meshes, row, issues, drawable)
+    row["bones"] = _bones(model, drawable, meshes, model, issues)
+    row["skin_8"] = _skin_8(meshes, model, issues, drawable)
+    row["issues"] = list(dict.fromkeys(issues))
     return row
 
 
@@ -852,9 +858,33 @@ def _make_parent(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
+def _atomic_write(path: str, write_body, *, newline: str) -> None:
+    target = os.path.abspath(path)
+    parent = os.path.dirname(target) or "."
+    _make_parent(target)
+    mode = published_mode(target)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline=newline,
+            prefix=".character_census.", suffix=".tmp",
+            dir=parent, delete=False,
+        ) as handle:
+            tmp_path = handle.name
+            write_body(handle)
+        os.chmod(tmp_path, mode)
+        replace_retry(tmp_path, target)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def write_csv(path: str, rows: list) -> None:
-    _make_parent(path)
-    with open(path, "w", newline="", encoding="utf-8") as handle:
+    def body(handle):
         writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS, lineterminator="\n")
         writer.writeheader()
         for row in rows:
@@ -867,12 +897,12 @@ def write_csv(path: str, rows: list) -> None:
                 out[key] = "" if row[key] is None else row[key]
             writer.writerow(out)
 
+    _atomic_write(path, body, newline="")
+
 
 def write_json(path: str, summary: dict, rows: list) -> None:
-    _make_parent(path)
-    with open(path, "w", encoding="utf-8", newline="\n") as handle:
-        json.dump({"summary": summary, "models": rows}, handle, indent=1, ensure_ascii=False)
-        handle.write("\n")
+    payload = json.dumps({"summary": summary, "models": rows}, indent=1, ensure_ascii=False, allow_nan=False) + "\n"
+    _atomic_write(path, lambda handle: handle.write(payload), newline="\n")
 
 
 def main(argv=None) -> int:
@@ -919,8 +949,8 @@ def main(argv=None) -> int:
         if path:
             try:
                 writer(path, *values)
-            except OSError as exc:
-                print(f"ERROR: cannot write {path}: {exc.strerror or exc}", file=sys.stderr)
+            except (OSError, ValueError) as exc:
+                print(f"ERROR: cannot write {path}: {getattr(exc, 'strerror', None) or exc}", file=sys.stderr)
                 return 2
             reports.append(path)
     print_report(summary, rows)

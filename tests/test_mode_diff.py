@@ -1,11 +1,15 @@
 """tools/mode_diff.py: the MODE.FP_ROUND reference against hand-worked f16 words, the generator, a short seeded run
 of each stage, and planted translator bugs that the run must catch. Standard library only; no GPU, no game files.
 """
+import contextlib
+import io
 import os
 import random
 import sys
 import unittest
+from collections import Counter
 from fractions import Fraction
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 import mode_diff as d  # noqa: E402
@@ -157,6 +161,70 @@ class PlantedBugs(unittest.TestCase):
         counts, failure = d.run_invariance(10, 1)
         self.assertGreater(counts["mismatch"], 0)
         self.assertIn("with the MODE writes", failure[2])
+
+
+class CliGuards(unittest.TestCase):
+    def _run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["mode_diff.py", *argv]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = d.main()
+            except SystemExit as exc:
+                rc = exc.code
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_invalid_counts_and_empty_runs_are_rejected(self):
+        for argv, needle in (
+            (["--no-sweep", "--programs", "-1", "--invariance", "0"], "--programs"),
+            (["--no-sweep", "--programs", "0", "--invariance", "-1"], "--invariance"),
+            (["--no-sweep", "--programs", "1", "--invariance", "0", "--max-ops", "0"], "--max-ops"),
+            (["--no-sweep", "--programs", "1", "--invariance", "0", "--max-ops", "-2"], "--max-ops"),
+            (["--no-sweep", "--programs", "0", "--invariance", "0"], "nothing to run"),
+        ):
+            with self.subTest(argv=argv):
+                rc, _, err = self._run_main(argv)
+                self.assertEqual(rc, 2)
+                self.assertIn(needle, err)
+
+    def test_all_unjudged_run_exits_two(self):
+        with mock.patch.object(d, "run_one", return_value=("unjudged", "synthetic unjudged")):
+            rc, _, err = self._run_main(["--no-sweep", "--programs", "2", "--invariance", "0", "--ops", "v_add_f16"])
+        self.assertEqual(rc, 2)
+        self.assertIn("no judged program ran", err)
+
+    def test_ops_validation_and_deduplication(self):
+        for bad_ops in ("", "   ", ",", "v_add_f16,", ",v_add_f16"):
+            with self.subTest(ops=bad_ops):
+                rc, _, err = self._run_main(["--no-sweep", "--programs", "1", "--invariance", "0", "--ops", bad_ops])
+                self.assertEqual(rc, 2)
+                self.assertIn("--ops", err)
+
+        seen_ops = []
+
+        def fake_suite(programs, seed, max_ops=6, ops=None):
+            seen_ops.append(ops)
+            return {"pass": 1, "mismatch": 0, "skip": Counter(), "unjudged": Counter(),
+                    "ops": Counter({"v_add_f16": 1}), "events": {}}, None
+
+        with mock.patch.object(d, "run_suite", side_effect=fake_suite):
+            rc, _, _ = self._run_main(["--no-sweep", "--programs", "1", "--invariance", "0",
+                                       "--ops", "v_add_f16, v_add_f16"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen_ops, [["v_add_f16"]])
+
+    def test_suites_validate_bounds_and_main_accepts_argv(self):
+        for fn in (d.run_suite, d.run_invariance):
+            for bad_programs in (-1, True):
+                with self.subTest(fn=fn.__name__, programs=bad_programs), self.assertRaises(ValueError):
+                    fn(bad_programs, 1)
+            for bad_max_ops in (0, -1, True):
+                with self.subTest(fn=fn.__name__, max_ops=bad_max_ops), self.assertRaises(ValueError):
+                    fn(1, 1, max_ops=bad_max_ops)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(d.main(["--list-ops"]), 0)
+        self.assertIn("v_add_f16", out.getvalue())
 
 
 if __name__ == "__main__":

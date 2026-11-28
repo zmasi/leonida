@@ -1458,6 +1458,28 @@ class ClipWindowTest(unittest.TestCase):
         anim_clips.count_clip_windows(clips, stats)
         self.assertEqual(stats, {"clip_windows": 4, "clip_windows_match_duration": 2, "clip_windows_rate_zero": 1})
 
+    def test_write_json_atomic_and_replace_failure_preserves_existing(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.json")
+            anim_clips._write_json_atomic(out, {"summary": {}, "dictionaries": []})
+            self.assertEqual(os.listdir(tmp), ["out.json"])
+            with open(out, "rb") as f:
+                raw = f.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": true}\n')
+            with mock.patch.object(anim_clips, "replace_retry", side_effect=OSError("replace denied")):
+                with self.assertRaises(OSError):
+                    anim_clips._write_json_atomic(out, {"summary": {}, "dictionaries": [1]})
+            self.assertEqual(os.listdir(tmp), ["out.json"])
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": true}\n')
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -28,14 +28,18 @@ import argparse
 import io
 import json
 import os
+import stat
 import struct
 import sys
+import tempfile
 from collections import Counter
 
 import numpy as np
 
-sys.path.insert(0, os.path.dirname(__file__))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 from amd_swizzle import _parity, equation, load  # noqa: E402
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from tex_headers import FMT_INFO  # noqa: E402
 
@@ -61,6 +65,8 @@ def eq4k(bpe):
 
 
 def detile_offsets(bpe, we, he):
+    if type(we) is not int or type(he) is not int or we < 1 or he < 1:
+        raise ValueError(f"detile dimensions must be positive integers (got {we!r}x{he!r})")
     eq = eq4k(bpe)
     elems = 4096 // bpe
     lb = elems.bit_length() - 1
@@ -114,12 +120,36 @@ def score_image(w, h, fmt, payload, bpe):
     return float(d / (a.std() + 1e-6))
 
 
+def _safe_relpath(value, field):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty relative path")
+    norm = value.replace("\\", "/")
+    if norm.startswith("/") or os.path.isabs(value) or os.path.splitdrive(value)[0]:
+        raise ValueError(f"{field} must not be an absolute path: {value!r}")
+    parts = [p for p in norm.split("/") if p]
+    if not parts or any(p in (".", "..") for p in parts):
+        raise ValueError(f"{field} escapes output root: {value!r}")
+    return os.path.join(*parts)
+
+
+def _safe_component(value, field):
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty name")
+    if "/" in value or "\\" in value or value in (".", ".."):
+        raise ValueError(f"{field} must not contain path separators: {value!r}")
+    return value
+
+
 def export_one(t, carve, out, blob_cache, png=False):
     fmt = t["fmt"]
     if fmt not in FMT:
         return "unsupported format"
     bpe, blk = FMT[fmt]
     w, h = t["w"], t["h"]
+    if type(w) is not int or type(h) is not int or w < 1 or h < 1:
+        raise ValueError(f"texture dimensions must be positive integers (got {w!r}x{h!r})")
+    archive_rel = _safe_relpath(t["archive"], "archive")
+    fmt_name = _safe_component(t["fmt_name"], "fmt_name")
     we, he = (w + blk - 1) // blk, (h + blk - 1) // blk
     chain_offs = tuple(off for off, _ in (t.get("gpu_chain") or ((t["gpu"], t["gpu_size"]),)))
     key = (t["archive"], chain_offs)
@@ -127,7 +157,7 @@ def export_one(t, carve, out, blob_cache, png=False):
         blob_cache.clear()
         parts = []
         for off in chain_offs:
-            with open(os.path.join(carve, t["archive"], f"{off:012x}.bin"), "rb") as f:
+            with open(os.path.join(carve, archive_rel, f"{off:012x}.bin"), "rb") as f:
                 parts.append(f.read())
         blob_cache[key] = b"".join(parts)
     G = blob_cache[key]
@@ -151,12 +181,20 @@ def export_one(t, carve, out, blob_cache, png=False):
         return "data outside GPU blob"
     cands.sort(key=lambda c: c[0])
     s, place, payload = cands[0]
-    name = f"{t['cpu']:012x}_{t['q_index']}_{w}x{h}_{t['fmt_name']}.dds"
-    d = os.path.join(out, t["archive"])
+    name = f"{t['cpu']:012x}_{t['q_index']}_{w}x{h}_{fmt_name}.dds"
+    d = os.path.join(out, archive_rel)
     os.makedirs(d, exist_ok=True)
     dds = dds_bytes(w, h, fmt, payload)
-    with open(os.path.join(d, name), "wb") as f:
-        f.write(dds)
+    dds_path = os.path.join(d, name)
+    try:
+        with open(dds_path, "wb") as f:
+            f.write(dds)
+    except OSError:
+        try:
+            os.remove(dds_path)
+        except OSError:
+            pass
+        raise
     # two placements that fit at different offsets leave the pick to the score, not to a known layout
     t["export"] = {"file": name, "place": place, "score": round(s, 4), "heuristic": len(cands) > 1 and chain > top}
     if png:
@@ -188,18 +226,55 @@ def positive_int(text):
     return value
 
 
-def main():
+def _write_json_atomic(path, payload):
+    """Publish export_log.json atomically so a write failure leaves any previous log intact."""
+    destination = os.path.realpath(path)
+    out_dir = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    except OSError:
+        mode = 0
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(destination, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(payload, f, allow_nan=False)
+        return
+    if mode is not None:
+        os.close(os.open(destination, os.O_WRONLY))
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=out_dir, prefix=".tex_export-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(payload, staged, allow_nan=False)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("index")
     ap.add_argument("carve")
     ap.add_argument("out")
     ap.add_argument("--limit", type=positive_int, help="export only the first N textures (N >= 1)")
     ap.add_argument("--png", action="store_true", help="also write a PNG beside each DDS dds_png.py can decode")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
+    for field, value in (("index", a.index), ("carve", a.carve), ("out", a.out)):
+        if not value.strip():
+            print(f"ERROR: {field} path must not be empty", file=sys.stderr)
+            return 2
     try:
         with open(a.index, encoding="utf-8-sig") as f:  # Notepad and PowerShell ">" save a BOM; json would refuse it
             texs = json.load(f)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         print(f"ERROR: cannot read {a.index}: {e}", file=sys.stderr)
         return 2
     if not isinstance(texs, list):
@@ -246,8 +321,7 @@ def main():
             print(f"[{i}/{len(texs)}] {dict(res)}", flush=True)
     report = os.path.join(a.out, "export_log.json")
     try:
-        with open(report, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(texs, f)
+        _write_json_atomic(report, texs)
     except OSError as e:
         print(f"ERROR: cannot write {report}: {e.strerror or e}", file=sys.stderr)
         return 1

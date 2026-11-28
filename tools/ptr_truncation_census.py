@@ -44,12 +44,15 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 import pool_workers  # noqa: E402
 import rdna2spirv  # noqa: E402
+from replace_retry import replace as replace_file  # noqa: E402
 import shader_meta  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
@@ -139,6 +142,9 @@ def scan_one(path):
         reached, error = r.args_, None
     except rdna2spirv.Unsupported as e:
         error = f"Unsupported: {e}"
+    except OSError as e:
+        # Never embed the path or filename in the aggregate error string.
+        error = f"cannot read listing: {type(e).__name__}"
     except (IndexError, KeyError, ValueError) as e:
         error = f"translator error {type(e).__name__}"
     finally:
@@ -246,7 +252,7 @@ def summarise(records):
         "shaders": {s: shaders[s] for s in stages},
         "total": sum(shaders.values()),
         "reached_metadata": {s: reached[s] for s in stages},
-        "not_reached": dict(errors.most_common()),
+        "not_reached": dict(sorted(errors.items(), key=lambda kv: (-kv[1], kv[0]))),
         "truncating_shaders": {s: trunc_shaders[s] for s in stages},
         "pointer_mode": per(mode),
         "truncated_pointers_per_shader": {s: {str(k): v for k, v in sorted(per_shader[s].items())}
@@ -303,6 +309,58 @@ def positive_int(text: str) -> int:
     return value
 
 
+def _input_paths(src, files):
+    """Source folder, scanned listings, and adjacent metadata/binary inputs the scan reads."""
+    seen = set()
+    yield src
+    for path in files:
+        yield path
+        name = os.path.splitext(os.path.basename(path))[0]
+        root = os.path.dirname(os.path.dirname(os.path.realpath(path)))
+        index_path = os.path.join(root, "index.json")
+        if index_path not in seen:
+            seen.add(index_path)
+            yield index_path
+        yield os.path.join(root, name + ".dxbc")
+        yield from rdna2spirv.native_paths(path, name)
+
+
+def _validate_output(ap, flag, path, inputs):
+    if not path.strip():
+        ap.error(f"{flag} path must not be empty")
+    if os.path.isdir(path):
+        ap.error(f"{flag}: {path} is a folder, not a JSON file")
+    parent = os.path.dirname(os.path.abspath(path)) or "."
+    if not os.path.isdir(parent):
+        ap.error(f"{flag}: output folder does not exist: {parent}")
+    for inp in inputs:
+        if same_report_path(inp, path):
+            ap.error(f"{flag} must not overwrite an input: {inp}")
+
+
+def _write_json_atomic(path, obj):
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path) or "."
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline="\n", dir=parent,
+            prefix=".ptr-truncation-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp_path = f.name
+            json.dump(obj, f, indent=1, sort_keys=True, allow_nan=False)
+            f.write("\n")
+        os.chmod(tmp_path, published_mode(abs_path))
+        replace_file(tmp_path, abs_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("src", help="folder of .s listings (<work>/shaders/disasm)")
@@ -314,9 +372,20 @@ def main(argv=None):
     if not os.path.isdir(a.src):
         print(f"ERROR: {a.src} is not a folder", file=sys.stderr)
         return 2
-    if a.json and a.index_out and same_report_path(a.json, a.index_out):
-        ap.error(f"--json and --index-out name one file: {a.json}; the second report would replace the first")
-    files = listings(a.src)[: a.limit] if a.limit is not None else listings(a.src)
+    try:
+        all_files = listings(a.src)
+    except OSError as e:
+        print(f"ERROR: cannot read {a.src}: {e.strerror or e}", file=sys.stderr)
+        return 2
+    files = all_files[: a.limit] if a.limit is not None else all_files
+    if a.json is not None or a.index_out is not None:
+        inputs = list(_input_paths(a.src, files))
+        if a.json is not None:
+            _validate_output(ap, "--json", a.json, inputs)
+        if a.index_out is not None:
+            _validate_output(ap, "--index-out", a.index_out, inputs)
+        if a.json is not None and a.index_out is not None and same_report_path(a.json, a.index_out):
+            ap.error(f"--json and --index-out name one file: {a.json}; the second report would replace the first")
     jobs = pool_workers.process_workers(max(1, a.jobs))
     if jobs == 1 or len(files) < 64:
         records = scan_many(files)
@@ -328,14 +397,12 @@ def main(argv=None):
     summary = summarise(records)
     print_summary(summary)
     try:
-        if a.json:
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(summary, f, indent=1, sort_keys=True)
-        if a.index_out:
+        if a.json is not None:
+            _write_json_atomic(a.json, summary)
+        if a.index_out is not None:
             index = {str(n): {"stage": r["stage"], "user_sgpr_reads": r.get("user_sgpr_reads", [])}
                      for n, r in enumerate(records) if not r.get("error")}
-            with open(a.index_out, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(index, f, indent=1, sort_keys=True)
+            _write_json_atomic(a.index_out, index)
     except OSError as e:
         print(f"ERROR: cannot write: {e.strerror or e}", file=sys.stderr)
         return 2

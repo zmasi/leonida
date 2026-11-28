@@ -50,17 +50,27 @@ def original(path: str) -> tuple[int, int]:
             if kind == "vgpr":
                 top = max(top, operand["r"] + operand.get("n", 1))
             elif kind == "vlist":
-                top = max(top, max(operand["r"]) + 1)
+                if operand["r"]:
+                    top = max(top, max(operand["r"]) + 1)
     return len(insns), top
 
 
 REQUIRED = ("name", "stage", "statistic", "value")
 
 
+def _safe_shader_name(name):
+    """True when `name` is a single non-empty filename stem inside the disasm directory."""
+    if not name or name in (".", "..") or "\x00" in name:
+        return False
+    if "/" in name or "\\" in name or os.path.splitdrive(name)[0]:
+        return False
+    return os.path.basename(name) == name
+
+
 def load_stats(path):
     """Read counters keyed by (shader, stage) from vk_pipeline_check --stats."""
     out = defaultdict(dict)
-    with open(path, newline="", encoding="utf-8") as f:
+    with open(path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f, strict=True)
         header = reader.fieldnames or []
         missing = [c for c in REQUIRED if c not in header]
@@ -76,12 +86,16 @@ def load_stats(path):
             absent = [c for c in REQUIRED if row[c] is None]
             if absent:
                 raise ValueError(f"line {line}: row missing required column(s): {', '.join(absent)}")
+            if not _safe_shader_name(row["name"]):
+                raise ValueError(f"line {line}: invalid shader name {row['name']!r}")
             out[row["name"], row["stage"]][row["statistic"]] = row["value"]
     return out
 
 
 def number(raw):
     """The exact int, or else the finite float, a raw value holds; None if it is missing or not such a number."""
+    if isinstance(raw, bool):
+        return None
     try:
         value = float(raw)
     except (TypeError, ValueError, OverflowError):
@@ -149,18 +163,18 @@ def median_clause(rs, key, label):
 USAGE = "usage: shader_stats.py <stats.csv> <disasm dir> [--details]"
 
 
-def main():
-    argv = sys.argv[1:]
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
     if "-h" in argv or "--help" in argv:
         print(__doc__)
         return 0
-    # A misspelt option (--detail) used to be dropped, and the summary printed as if it had been asked for.
-    unknown = [a for a in argv if a.startswith("--") and a != "--details"]
+    # A misspelt option (--detail, -d) used to be dropped or misparsed as a positional argument.
+    unknown = [a for a in argv if a.startswith("-") and a != "--details"]
     if unknown:
         print(f"unknown option {unknown[0]}\n{USAGE}", file=sys.stderr)
         return 2
-    args = [a for a in argv if not a.startswith("--")]
-    if len(args) != 2:
+    args = [a for a in argv if not a.startswith("-")]
+    if len(args) != 2 or not args[0].strip() or not args[1].strip():
         print(USAGE, file=sys.stderr)
         return 2
     path = args[0]
@@ -169,6 +183,8 @@ def main():
     except (OSError, ValueError, csv.Error) as e:
         sys.exit(f"{path}: {e}")
     disasm = args[1]
+    if not os.path.isdir(disasm):
+        sys.exit(f"{disasm}: not a directory")
     rows = []
     for (name, stage), st in sorted(stats.items()):
         src = os.path.join(disasm, name + ".s")
@@ -179,7 +195,7 @@ def main():
                 sys.exit(f"{src}: {e.strerror or e}")
     if not rows:
         sys.exit("no shader is in both the statistics and the disasm folder")
-    if "--details" in sys.argv:
+    if "--details" in argv:
         print(f"{'shader':26} {'stage':5} " + " ".join(f"{head:>{width}}" for _, head, width, _ in COLUMNS))
         for r in rows:
             print(f"{r['name']:26} {r['stage']:5} "

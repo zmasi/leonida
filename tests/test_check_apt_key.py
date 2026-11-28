@@ -58,8 +58,15 @@ class PrimaryFingerprints(unittest.TestCase):
 
     def test_normalize(self):
         self.assertEqual(check_apt_key.normalize("d43f 6401 4536 9c51 d786  ddea 76f1 a20f f987 672f"), WINEHQ)
-        for bad in ("", "D43F", WINEHQ + "00", "G" * 40):
+        for bad in ("", "D43F", WINEHQ + "00", "G" * 40, None, 123):
             self.assertIsNone(check_apt_key.normalize(bad), bad)
+
+    def test_pub_without_fpr_is_counted_not_dropped(self):
+        pub_only = "pub:-:3072:1:0000000000000000:1544460984:::-:::scESC::::::23::0:\n"
+        self.assertEqual(check_apt_key.primary_fingerprints(listing((WINEHQ, [])) + pub_only), [WINEHQ, ""])
+        self.assertEqual(check_apt_key.primary_fingerprints(pub_only + listing((WINEHQ, []))), ["", WINEHQ])
+        sub_only = "sub:-:3072:1:0000000000000001:1544460984::::::e::::::23:\nfpr:::::::::" + LLVM + ":\n"
+        self.assertEqual(check_apt_key.primary_fingerprints(pub_only + sub_only + listing((WINEHQ, []))), ["", WINEHQ])
 
 
 class CheckWithStandInGpg(unittest.TestCase):
@@ -102,10 +109,48 @@ class CheckWithStandInGpg(unittest.TestCase):
                                       (os.path.join(self.dir, "no-such-gpg"),))
         self.assertIsNotNone(problem)
 
+    def test_extra_pub_without_fpr_fails(self):
+        pub_only = "pub:-:3072:1:0000000000000000:1544460984:::-:::scESC::::::23::0:\n"
+        problem = check_apt_key.check(self.key(listing((WINEHQ, [])) + pub_only), WINEHQ, self.gpg)
+        self.assertIsNotNone(problem)
+        self.assertIn("holds 2 primary keys", problem)
+        self.assertIn("<missing>", problem)
+
+    def test_appended_secret_key_fails(self):
+        sec_block = f"sec:-:3072:1:{LLVM[-16:]}:1544460984:::-:::scESC::::::23::0:\nfpr:::::::::{LLVM}:\n"
+        problem = check_apt_key.check(self.key(listing((WINEHQ, [])) + sec_block), WINEHQ, self.gpg)
+        self.assertIsNotNone(problem)
+        self.assertIn("secret key", problem)
+
+    def test_check_normalizes_and_validates_expected(self):
+        spaced = " ".join(WINEHQ.lower()[i:i + 4] for i in range(0, 40, 4))
+        self.assertIsNone(check_apt_key.check(self.key(listing((WINEHQ, []))), spaced, self.gpg))
+        pub_only = "pub:-:3072:1:0000000000000000:1544460984:::-:::scESC::::::23::0:\n"
+        problem = check_apt_key.check(self.key(pub_only), "", self.gpg)
+        self.assertIsNotNone(problem)
+        self.assertIn("not a 40-digit key fingerprint", problem)
+
+    def test_show_keys_passes_end_of_options_before_path(self):
+        spy = os.path.join(self.dir, "spy_gpg.py")
+        with open(spy, "w", encoding="utf-8", newline="\n") as f:
+            f.write("import sys\nassert sys.argv[-2] == '--', sys.argv\nsys.stdout.write(open(sys.argv[-1], encoding='utf-8').read())\n")
+        dash_key = os.path.join(self.dir, "-leading-dash.asc")
+        with open(dash_key, "w", encoding="utf-8", newline="\n") as f:
+            f.write(listing((WINEHQ, [])))
+        self.assertIsNone(check_apt_key.check(dash_key, WINEHQ, (sys.executable, "-I", spy)))
+
 
 class CommandLine(unittest.TestCase):
     def run_script(self, *args):
         return subprocess.run([sys.executable, "-I", SCRIPT, *args], capture_output=True, text=True)
+
+    def test_help_prints_usage_and_exits_zero(self):
+        for flag in ("-h", "--help"):
+            with self.subTest(flag=flag):
+                result = self.run_script(flag)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("KEYFILE FINGERPRINT", result.stdout)
+                self.assertEqual(result.stderr, "")
 
     def test_usage_errors(self):
         self.assertEqual(self.run_script().returncode, 2)

@@ -3,6 +3,7 @@
 from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
+import os
 from pathlib import Path
 import random
 import re
@@ -86,6 +87,85 @@ class WaveTraceTests(unittest.TestCase):
             with redirect_stderr(io.StringIO()):
                 self.assertEqual(trace.main(args), 2)
             self.assertEqual(path.read_bytes(), original)
+
+    def test_select_case_rejects_invalid_bounds_and_bools(self):
+        for bad_case, bad_ops in [(-1, 4), (True, 4), (0, 0), (0, True)]:
+            with self.subTest(case=bad_case, max_ops=bad_ops):
+                with self.assertRaises(ValueError):
+                    trace.select_case(1, bad_case, bad_ops)
+
+    def test_render_report_escapes_gt_rejects_nan_and_checks_marker(self):
+        report = {"text": "</script><!-- -->"}
+        html = trace.render_report(report)
+        payload = re.search(r'<script id="wave-data" type="application/json">(.*?)</script>', html).group(1)
+        self.assertNotIn("<", payload)
+        self.assertNotIn(">", payload)
+        self.assertEqual(json.loads(payload), report)
+
+        with self.assertRaises(ValueError):
+            trace.render_report({"bad": float("nan")})
+
+        with mock.patch.object(Path, "read_text", return_value="<html>no marker</html>"):
+            with self.assertRaises(ValueError):
+                trace.render_report(report)
+
+    def test_cli_validates_out_before_running_inspect_case(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as cwd:
+            existing = Path(tmp) / "existing.html"
+            existing.write_text("keep", encoding="utf-8", newline="\n")
+            missing_parent = Path(tmp) / "no_such_dir" / "wave.html"
+            trailing = str(Path(tmp) / "folder") + os.sep
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(cwd)
+                with mock.patch.object(trace, "inspect_case", side_effect=AssertionError("should not run")):
+                    for bad in ("", "   ", trailing):
+                        with self.subTest(bad=bad), redirect_stderr(io.StringIO()):
+                            with self.assertRaises(SystemExit) as cm:
+                                trace.main(["--max-ops", "1", "--out", bad])
+                            self.assertEqual(cm.exception.code, 2)
+                    for target in (existing, missing_parent):
+                        with self.subTest(target=str(target)), redirect_stderr(io.StringIO()):
+                            self.assertEqual(trace.main(["--max-ops", "1", "--out", str(target)]), 2)
+                self.assertEqual(os.listdir(cwd), [])
+            finally:
+                os.chdir(old_cwd)
+            self.assertEqual(existing.read_text(encoding="utf-8"), "keep")
+
+    def test_failed_write_unlinks_partial_output_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "partial.html"
+            real_open = Path.open
+
+            class FailingStream:
+                def __init__(self, inner):
+                    self._inner = inner
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *exc):
+                    self._inner.close()
+                    return False
+
+                def write(self, _text):
+                    raise OSError("disk full")
+
+                def close(self):
+                    self._inner.close()
+
+            def open_fail(self_path, mode="r", *args, **kwargs):
+                inner = real_open(self_path, mode, *args, **kwargs)
+                if mode == "x" and self_path == path:
+                    return FailingStream(inner)
+                return inner
+
+            with mock.patch.object(trace, "inspect_case", return_value={"steps": [], "first_mismatch": None, "columns": []}), \
+                    mock.patch.object(Path, "open", open_fail), \
+                    redirect_stderr(io.StringIO()):
+                code = trace.main(["--max-ops", "1", "--out", str(path)])
+            self.assertEqual(code, 2)
+            self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

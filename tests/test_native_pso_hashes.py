@@ -69,6 +69,14 @@ class NativePsoHashesTest(unittest.TestCase):
             self.assertEqual(build.call_count, 2)
             self.assertEqual(self.read(), [tool.HEADER])
 
+    def test_translation_index_with_utf8_bom_is_accepted(self):
+        digest = bytes(range(16))
+        self.put("one", container(digest))
+        with open(os.path.join(self.spirv, "index.json"), "w", encoding="utf-8-sig", newline="\n") as f:
+            json.dump({"one": {"stage": "vs", "fssm_sha256": "a" * 64}}, f)
+        self.assertEqual(tool.build(self.dxbc, self.spirv),
+                         {digest.hex(): ("vs", "../dxbc/one.dxbc")})
+
     def test_replacing_one_container_refreshes_the_digest(self):
         self.index({"one": {"stage": "ps", "fssm_sha256": "a" * 64}})
         self.put("one", container(bytes(16)))

@@ -1,4 +1,5 @@
 """tools/heap_index_census.py on hand-written listings and containers (no game files, no GPU)."""
+import io
 import json
 import os
 import struct
@@ -6,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -249,6 +252,89 @@ class HeapIndexCensus(unittest.TestCase):
         self.assertIn("--json would overwrite an input the census reads", p.stderr)
         with open(container, "rb") as f:
             self.assertEqual(f.read(), before)
+
+    def test_lshl_add_tracks_unshifted_base_and_ignores_shifted_index(self):
+        self.work.add("ps_base", "ps", SFI0_RES, [
+            ("s_lshl4_add_u32 s2, s5, s8", 4),
+            ("s_mov_b32 s3, 0", 4),
+            ("s_load_dwordx4 s[20:23], s[2:3], 0x0", 8),
+            ("buffer_load_dword v0, v1, s[20:23], 0 offen", 8),
+            ("s_endpgm", 4),
+        ])
+        self.work.add("ps_idx", "ps", SFI0_RES, [
+            ("s_lshl4_add_u32 s2, s5, 0x20", 4),
+            ("s_mov_b32 s3, 0", 4),
+            ("s_load_dwordx4 s[20:23], s[2:3], 0x0", 8),
+            ("s_endpgm", 4),
+        ])
+        g = hic.census(self.work.disasm)["groups"]["ps sfi0=res"]
+        rows = {(r["base"], r["ptr"], r["role"], r["offset"]): r["count"] for r in g["loads"]}
+        self.assertEqual(rows, {
+            ("user s8", "ptr32", "V#", "dynamic"): 1,
+            ("unknown", "unknown", "unused", "static"): 1,
+        })
+
+    def test_smem_inline_offset_modifier_is_included_in_static_offset(self):
+        self.work.add("ps_off", "ps", SFI0_RES, [
+            ("s_mov_b32 s9, 0", 4),
+            ("s_load_dwordx8 s[20:27], s[8:9], null offset:0x24", 8),
+            ("image_load v[0:3], v[4:5], s[20:27] dmask:0xf dim:SQ_RSRC_IMG_2D", 8),
+            ("s_endpgm", 4),
+        ])
+        g = hic.census(self.work.disasm)["groups"]["ps sfi0=res"]
+        self.assertEqual(g["static_offsets"]["T#"], {"other": 1, "max": 0x24})
+
+    def test_x16_subdescriptor_and_backward_branch_consumer_roles(self):
+        self.work.add("ps_x16", "ps", SFI0_RES | SFI0_SMP, [
+            ("s_mov_b32 s9, 0", 4),
+            ("s_load_dwordx16 s[16:31], s[8:9], 0x0", 8),
+            ("image_sample v[0:3], v[4:5], s[16:23], s[24:27] dmask:0xf dim:SQ_RSRC_IMG_2D", 8),
+            ("s_endpgm", 4),
+        ])
+        self.work.add("ps_back", "ps", SFI0_RES, [
+            ("s_branch 3", 4),
+            ("image_load v[0:3], v[4:5], s[20:27] dmask:0xf dim:SQ_RSRC_IMG_2D", 8),
+            ("s_endpgm", 4),
+            ("s_mov_b32 s9, 0", 4),
+            ("s_load_dwordx8 s[20:27], s[8:9], 0x40", 8),
+            ("s_branch -7", 4),
+        ])
+        out = hic.census(self.work.disasm)
+        self.assertEqual(out["groups"]["ps sfi0=res+smp"]["loads"][0]["role"], "mixed")
+        self.assertEqual(out["groups"]["ps sfi0=res"]["loads"][0]["role"], "T#")
+
+    def test_bom_index_validation_and_atomic_json_io(self):
+        self.work.add("ps_heap", "ps", SFI0_RES | SFI0_SMP, PS_HEAP)
+        idx_path = os.path.join(self.work.root, "index.json")
+        with open(idx_path, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + json.dumps(self.work.index).encode("utf-8"))
+        self.assertEqual(hic.stage_index(self.work.disasm), {"ps_heap": "ps"})
+
+        for bad in ("", "   ", self.work.root):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertEqual(hic.main([self.work.disasm, "--json", bad]), 2)
+            self.assertIn("ERROR: --json", err.getvalue())
+
+        out_json = os.path.join(self.work.root, "out.json")
+        with open(out_json, "w", encoding="utf-8", newline="\n") as f:
+            f.write("keep-me\n")
+        err = io.StringIO()
+        with mock.patch.object(hic.replace_retry, "replace", side_effect=OSError("disk full")), \
+                redirect_stdout(io.StringIO()), redirect_stderr(err):
+            rc = hic.main([self.work.disasm, "--json", out_json])
+        self.assertEqual(rc, 2)
+        self.assertIn("ERROR: cannot write", err.getvalue())
+        with open(out_json, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep-me\n")
+        self.assertEqual([n for n in os.listdir(self.work.root) if n.endswith(".tmp")], [])
+
+        with open(idx_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump([{"file": "bad_no_ext", "stage": "ps"}], f)
+        err2 = io.StringIO()
+        with redirect_stderr(err2):
+            self.assertEqual(hic.main([self.work.disasm]), 2)
+        self.assertIn("ERROR: cannot read the carve index", err2.getvalue())
 
 
 if __name__ == "__main__":

@@ -238,6 +238,47 @@ class EffectsTest(unittest.TestCase):
             with self.subTest(cut=cut), self.assertRaises(ValueError):
                 sgd5_effects.read_database(io.BytesIO(data[:cut]), layout)
 
+    def test_program_groups_never_reads_past_limit_into_following_data(self):
+        # Six zero counts occupy 24 bytes; with limit=16 followed by extra zero bytes (as in a second database),
+        # program_groups must reject instead of reading past limit.
+        with self.subTest(case="group_counts_cross_limit"):
+            with self.assertRaises(ValueError):
+                sgd5_effects.program_groups(io.BytesIO(bytes(64)), 16)
+
+        # A program label that starts before limit and ends past limit must fail before crossing limit.
+        with self.subTest(case="label_crosses_limit"):
+            stream = io.BytesIO(u32(1) + b"\x08abcdefg\x00\x02" + u32(12) + bytes(256))
+            with self.assertRaises(ValueError) as cm:
+                sgd5_effects.program_groups(stream, 10)
+            self.assertIn("database boundary", str(cm.exception))
+            self.assertLessEqual(stream.tell(), 10)
+
+        # An inflated group count that cannot fit within limit must be rejected up front without reading records.
+        with self.subTest(case="inflated_count"):
+            huge = io.BytesIO(u32(0xFFFFFFFF) + bytes(128))
+            with self.assertRaises(ValueError) as cm:
+                sgd5_effects.program_groups(huge, 64)
+            self.assertIn("database boundary", str(cm.exception))
+            self.assertEqual(huge.tell(), 4)
+
+    def test_program_identity_raises_value_error_on_truncated_or_invalid_offset(self):
+        for reason, blob, offset in [
+            ("eof", b"", 0),
+            ("short length", b"\x01\x00", 0),
+            ("truncated window", b"\x10abc", 0),
+            ("negative offset", b"\x02a\x00", -1),
+        ]:
+            with self.subTest(reason=reason), self.assertRaises(ValueError):
+                sgd5_effects.program_identity(io.BytesIO(blob), 0, 0, offset)
+
+    def test_read_database_rejects_invalid_layout(self):
+        blob = b"SGD5" + bytes(128)
+        for layout in [(-4, 0, 64), (0, 2, 64), (0, 64, 64), (0, 64, 32)]:
+            with self.subTest(layout=layout):
+                with self.assertRaises(ValueError) as cm:
+                    sgd5_effects.read_database(io.BytesIO(blob), layout)
+                self.assertIn("layout", str(cm.exception))
+
     @unittest.skipUnless(os.environ.get("LEONIDA_GAME_DIR"), "set LEONIDA_GAME_DIR to check package counts")
     def test_xbox_package_counts(self):
         archive = Path(os.environ["LEONIDA_GAME_DIR"]) / "shaders.rpf"

@@ -5,6 +5,8 @@ differential runs. Standard library only; no GPU, no game files.
 The family is v_cvt_flr_i32_f32, v_cvt_rpi_i32_f32, v_cvt_norm_i16_f16, v_cvt_norm_u16_f16 (VOP1) and
 v_cvt_pknorm_i16_f32, v_cvt_pknorm_u16_f32, v_cvt_pknorm_i16_f16, v_cvt_pknorm_u16_f16 (VOP3).
 """
+import contextlib
+import io
 import itertools
 import os
 import random
@@ -12,6 +14,7 @@ import re
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -293,6 +296,66 @@ class Translated(unittest.TestCase):
                 self.assertEqual(c.run_one(lines, "ps_cvt_short", tmp), ("mismatch", "exported 2 words, want 4"))
         finally:
             c.translate_listing = real
+
+
+class CliGuards(unittest.TestCase):
+    def _run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["cvt_diff.py", *argv]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = c.main()
+            except SystemExit as exc:
+                rc = exc.code
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_invalid_counts_and_empty_runs_are_rejected(self):
+        for argv, needle in (
+            (["--no-sweep", "--programs", "-1"], "--programs"),
+            (["--no-sweep", "--programs", "1", "--max-ops", "0"], "--max-ops"),
+            (["--no-sweep", "--programs", "1", "--max-ops", "-2"], "--max-ops"),
+            (["--no-sweep", "--programs", "0"], "nothing to run"),
+        ):
+            with self.subTest(argv=argv):
+                rc, _, err = self._run_main(argv)
+                self.assertEqual(rc, 2)
+                self.assertIn(needle, err)
+
+    def test_zero_program_exhaustive_f32_run_exits_two(self):
+        rc, _, err = self._run_main(["--no-sweep", "--programs", "0", "--exhaustive-f16", "--ops", "v_cvt_flr_i32_f32"])
+        self.assertEqual(rc, 2)
+        self.assertIn("no program ran", err)
+
+    def test_ops_validation_and_deduplication(self):
+        for bad_ops in ("", "   ", "v_cvt_flr_i32_f32,", ",v_cvt_flr_i32_f32"):
+            with self.subTest(ops=bad_ops):
+                rc, _, err = self._run_main(["--no-sweep", "--programs", "1", "--ops", bad_ops])
+                self.assertEqual(rc, 2)
+                self.assertIn("--ops", err)
+
+        seen_ops = []
+
+        def fake_suite(programs, seed, max_ops=6, ops=None):
+            seen_ops.append(ops)
+            return {"pass": 1, "mismatch": 0, "skip": c.Counter(), "ops": c.Counter({"v_cvt_flr_i32_f32": 1}),
+                    "events": c.Counter()}, None
+
+        with mock.patch.object(c, "run_suite", side_effect=fake_suite):
+            rc, _, _ = self._run_main(["--no-sweep", "--programs", "1", "--ops", "v_cvt_flr_i32_f32, v_cvt_flr_i32_f32"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen_ops, [["v_cvt_flr_i32_f32"]])
+
+    def test_run_suite_validates_bounds_and_main_accepts_argv(self):
+        for bad_programs in (-1, True):
+            with self.subTest(programs=bad_programs), self.assertRaises(ValueError):
+                c.run_suite(bad_programs, 1)
+        for bad_max_ops in (0, -1, True):
+            with self.subTest(max_ops=bad_max_ops), self.assertRaises(ValueError):
+                c.run_suite(1, 1, max_ops=bad_max_ops)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(c.main(["--list-ops"]), 0)
+        self.assertIn("v_cvt_flr_i32_f32", out.getvalue())
 
 
 if __name__ == "__main__":

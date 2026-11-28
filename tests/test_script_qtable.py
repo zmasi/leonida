@@ -464,6 +464,35 @@ class ScriptQtableTests(unittest.TestCase):
         self.assertEqual(by_name["000000001000.bin"], 0x1000)
         self.assertGreater(by_name["-10.bin"], 0x1000)
 
+    def test_empty_json_rejected_and_atomic_write_preserves_existing(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "qtable.bin")
+            with open(src, "wb") as f:
+                f.write(build_synthetic_qtable())
+            err_buf = io.StringIO()
+            with contextlib.redirect_stderr(err_buf):
+                rc = script_qtable.main([src, "--json", ""])
+            self.assertEqual(rc, 2)
+
+            out = os.path.join(tmp, "report.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                rc = script_qtable.main([src, "--json", out])
+            self.assertEqual(rc, 0)
+            self.assertEqual(sorted(os.listdir(tmp)), ["qtable.bin", "report.json"])
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": true}\n')
+            with mock.patch.object(script_qtable, "replace_retry", side_effect=OSError("replace denied")), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = script_qtable.main([src, "--json", out])
+            self.assertEqual(rc, 2)
+            self.assertEqual(sorted(os.listdir(tmp)), ["qtable.bin", "report.json"])
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": true}\n')
+
 
 if __name__ == "__main__":
     unittest.main()

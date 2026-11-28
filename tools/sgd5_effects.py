@@ -41,20 +41,32 @@ def u32(data, pos=0):
     return struct.unpack_from("<I", data, pos)[0]
 
 
+_MIN_PROGRAM_BYTES = 1 + 2 + 1 + 4 + 12 + 152 + 4  # length + min label + tag + size + header + pad + trailer len
+
+
 def program_groups(stream, limit):
     groups = []
     for _ in range(6):
+        if stream.tell() + 4 > limit:
+            raise ValueError("program group crosses the database boundary")
         count = u32(stream.read(4))
+        if count > (limit - stream.tell()) // _MIN_PROGRAM_BYTES:
+            raise ValueError("program count crosses the database boundary")
         offsets = []
         for _ in range(count):
             start = stream.tell()
+            if start >= limit:
+                raise ValueError("program crosses the database boundary")
             length = stream.read(1)
             if not length or length[0] < 2:
                 raise ValueError("invalid program label length")
+            if stream.tell() + length[0] + 5 > limit:
+                raise ValueError("program crosses the database boundary")
             label = stream.read(length[0])
             if len(label) != length[0] or label[-1:] != b"\x00":
                 raise ValueError("truncated program label")
-            stream.seek(1, 1)  # tag
+            if len(stream.read(1)) != 1:  # tag
+                raise ValueError("truncated program tag")
             size = u32(stream.read(4))
             if size < 12 or stream.tell() + size + 156 > limit:
                 raise ValueError("program crosses the database boundary")
@@ -69,14 +81,22 @@ def program_groups(stream, limit):
 
 
 def program_identity(stream, group, ordinal, start):
+    if start < 0:
+        raise ValueError(f"invalid program offset {start:#x}")
     stream.seek(start)
-    length = stream.read(1)[0]
+    raw_length = stream.read(1)
+    if not raw_length or raw_length[0] < 2:
+        raise ValueError(f"truncated program header at {start:#x}")
+    length = raw_length[0]
     # shader_carve.ENTRY can include a printable native length byte (and up to
     # 200 printable bytes in all). Match the same wire header to recover its key.
     terminator = start + length
     window_start = max(0, terminator - 200)
+    expected = terminator + 18 - window_start
     stream.seek(window_start)
-    window = stream.read(terminator + 18 - window_start)
+    window = stream.read(expected)
+    if len(window) < expected:
+        raise ValueError(f"truncated program window at {start:#x}")
     pos = terminator - window_start
     while pos and 0x21 <= window[pos - 1] <= 0x7e:
         pos -= 1
@@ -201,11 +221,15 @@ def techniques(data, effect):
 
 def read_database(stream, layout, effect=None, technique=None, *, list_effects=False, shader_hash=None):
     database, first_group, end = layout
+    if database < 0 or first_group < database + 4 or end <= first_group:
+        raise ValueError("invalid SGD5 database layout")
     stream.seek(database)
     if stream.read(4) != b"SGD5":
         raise ValueError(f"expected Xbox 1.0.2.1 SGD5 database at {database:#x}")
     stream.seek(first_group)
     groups = program_groups(stream, end)
+    if stream.tell() + 4 > end:
+        raise ValueError("missing effect region")
     count = u32(stream.read(4))
     base = stream.tell()
     if base >= end:
@@ -265,7 +289,7 @@ def main(argv=None):
             parser.error("no matching effect or technique; use --list-effects, then --effect NAME")
     except (ValueError, OSError) as exc:
         parser.error(str(exc))
-    print(json.dumps(results, indent=2))
+    print(json.dumps(results, indent=2, allow_nan=False))
     return 0
 
 

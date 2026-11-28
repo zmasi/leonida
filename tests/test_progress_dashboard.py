@@ -106,9 +106,24 @@ class Tests(unittest.TestCase):
                  '<testcase classname="tests.a" name="t[1_2]"><skipped/></testcase></testsuite></testsuites>'
         self.assertEqual([(n, r) for n, r, _, _ in pd.parse_junit(pytest)], [("tests.a::t[1-2]", "pass"), ("tests.a::t[1_2]", "skip")])
 
+    def test_junit_omits_invalid_durations_without_losing_verdicts(self):
+        reports = '<testsuite>' + ''.join(
+            f'<testcase name="test{i}" time="{value}"/>'
+            for i, value in enumerate(("NaN", "Infinity", "1e999", "-1", "0", "0.08"))
+        ) + '</testsuite>'
+        rows = pd.parse_junit(reports)
+        self.assertEqual([row[1] for row in rows], ["pass"] * 6)
+        self.assertEqual([row[2] for row in rows], [None, None, None, None, 0.0, 0.08])
+        json.dumps(rows, allow_nan=False)
+
     def test_lasttest_log(self):
         log = "Start testing: Nov 22 10:00 X\n1/2 Test: loader\nTest time =   0.91 sec\nTest Passed.\n2/2 Test: xmem\nTest Failed.\n"
         self.assertEqual(pd.parse_lasttest(log), [("loader", "pass", 0.91), ("xmem", "fail", None)])
+
+    def test_lasttest_retains_verdicts_after_an_invalid_duration(self):
+        log = ("1/2 Test: invalid_time\nTest time = 1..5 sec\nTest Failed.\n"
+               "2/2 Test: next\nTest time = 0.02 sec\nTest Passed.\n")
+        self.assertEqual(pd.parse_lasttest(log), [("invalid_time", "fail", None), ("next", "pass", 0.02)])
 
     def test_lasttest_uses_ctest_verdicts_after_captured_output(self) -> None:
         cases = (

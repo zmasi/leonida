@@ -267,6 +267,25 @@ def blobs(source: str):
                     yield path, 0, fh.read()
 
 
+def input_under(source: str, address: str):
+    """The input file below directory `source` that a report at `address` would overwrite, or None.
+
+    blobs() reads every file below a plain directory and every carved stream beside an rpf9_carve.py index.json,
+    so checking a report only against the named sources left it free to replace one of those files.
+    """
+    if os.path.isfile(os.path.join(source, "index.json")):
+        import gamedata_index
+        return gamedata_index.carved_stream(address, source)
+    if not os.path.isfile(address):          # a new file is written after the scan, so it was never read
+        return None
+    from report_paths import same_report_path
+    for root, _dirs, names in os.walk(source):   # an unlistable folder fails the scan before anything is written
+        for name in names:
+            if same_report_path(address, os.path.join(root, name)):
+                return os.path.join(root, name)
+    return None
+
+
 def nested_archives(path: str) -> list:
     """Offsets of the RPF9 archives nested in an archive file, in order.
 
@@ -464,6 +483,11 @@ def main(argv=None) -> int:
         index = os.path.join(source, "index.json")
         if os.path.isdir(source) and os.path.isfile(index) and any(_same_output_path(index, o) for o in outs):
             ap.error(f"an output must not overwrite an input: {index}")
+        if os.path.isdir(source):
+            for flag, path in out_flags:
+                clash = input_under(source, path)
+                if clash:
+                    ap.error(f"{flag} would overwrite the input {clash}")
 
     scan = Scan()
     try:

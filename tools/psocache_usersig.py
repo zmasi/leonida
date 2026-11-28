@@ -132,13 +132,13 @@ def describe_record(index, chunks):
 
 def stage_record_refs(m, meta_off, meta_index, chunk_records, stage):
     """(stage offset, chunk record index) for every stage field that names a chunk record, deduplicated."""
-    if not 0 <= stage < len(meta_index):
+    if type(stage) is not int or not 0 <= stage < len(meta_index):
         return []
     a, b = meta_index[stage]
     out = []
     seen = set()
     for p in STAGE_REFS:
-        if p + 4 <= b:
+        if a >= 0 and p + 4 <= b and meta_off + a + p + 4 <= len(m):
             value = pi.u32(m, meta_off + a + p)
             if chunk_records.get(value) is not None and value not in seen:
                 seen.add(value)
@@ -148,7 +148,14 @@ def stage_record_refs(m, meta_off, meta_index, chunk_records, stage):
 
 def describe_pso(m, region, meta_off, meta_index, chunk_records, index):
     """Decode one graphics PSO and the chunk records its stage record names."""
+    if type(index) is not int or index < 0:
+        raise ValueError("PSO index must be a nonnegative integer")
     offset = region + index * pi.GRAPHICS_STRIDE
+    if offset < 0 or offset + pi.GRAPHICS_STRIDE > len(m):
+        raise ValueError(
+            "graphics PSO %d at 0x%x does not fit in %d-byte cache"
+            % (index, offset, len(m))
+        )
     stage = pi.u32(m, offset + 8)
     layout = pi.u32(m, offset + 0xC)
     refs = stage_record_refs(m, meta_off, meta_index, chunk_records, stage)
@@ -174,14 +181,17 @@ def describe_pso(m, region, meta_off, meta_index, chunk_records, index):
     }
 
 
-def summarise(m, report, limit=None):
-    """Aggregate the sampled graphics PSOs. Returns a JSON-safe dict."""
+def _load_meta(m, report):
+    """Unpack meta_index and chunk_records after checking that `m` still covers the inspected size."""
+    expected_size = report["size"]
+    if len(m) < expected_size:
+        raise ValueError(
+            "cache shrank during read (%d bytes, expected at least %d)"
+            % (len(m), expected_size)
+        )
     counts = report["counts"]
-    graphics = counts["graphics"]
-    sampled = graphics if limit is None else min(graphics, limit)
     meta_off = report["regions"]["meta_blob"]["offset"]
     meta_region = report["regions"]["meta_index"]
-    graphics_region = report["regions"]["graphics"]
     meta_index = [
         struct.unpack_from("<II", m, meta_region["offset"] + i * pi.INDEX_STRIDE)
         for i in range(counts["meta_index"])
@@ -190,6 +200,18 @@ def summarise(m, report, limit=None):
         i: pi.entry_chunks(m, meta_off, a, b) for i, (a, b) in enumerate(meta_index)
     }
     chunk_records = {i: c for i, c in chunk_records.items() if c}
+    return meta_off, meta_index, chunk_records
+
+
+def summarise(m, report, limit=None):
+    """Aggregate the sampled graphics PSOs. Returns a JSON-safe dict."""
+    if limit is not None and (type(limit) is not int or limit < 1):
+        raise ValueError("--limit must be at least 1")
+    counts = report["counts"]
+    graphics = counts["graphics"]
+    sampled = graphics if limit is None else min(graphics, limit)
+    graphics_region = report["regions"]["graphics"]
+    meta_off, meta_index, chunk_records = _load_meta(m, report)
 
     kind_counts = collections.Counter()
     range_counts = collections.Counter()
@@ -399,6 +421,8 @@ def main(argv=None):
         "--quiet", action="store_true", help="print nothing, only set the exit code"
     )
     a = ap.parse_args(argv)
+    if not a.cache or not a.cache.strip():
+        ap.error("cache path must not be empty")
     if a.limit is not None and a.limit < 1:
         ap.error("--limit must be at least 1")
     if a.entry is not None and a.limit is not None:
@@ -413,43 +437,35 @@ def main(argv=None):
         for problem in report["problems"]:
             print("  %s" % problem, file=sys.stderr)
         return 2
-    with open(a.cache, "rb") as fh:
-        with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
-            if a.entry is not None:
-                meta_off = report["regions"]["meta_blob"]["offset"]
-                meta_region = report["regions"]["meta_index"]
-                meta_index = [
-                    struct.unpack_from(
-                        "<II", m, meta_region["offset"] + i * pi.INDEX_STRIDE
+    if a.entry is not None and not 0 <= a.entry < report["counts"]["graphics"]:
+        print(
+            "--entry %d is outside the %d graphics records"
+            % (a.entry, report["counts"]["graphics"]),
+            file=sys.stderr,
+        )
+        return 2
+    try:
+        with open(a.cache, "rb") as fh:
+            with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as m:
+                if a.entry is not None:
+                    meta_off, meta_index, chunk_records = _load_meta(m, report)
+                    pso = describe_pso(
+                        m,
+                        report["regions"]["graphics"]["offset"],
+                        meta_off,
+                        meta_index,
+                        chunk_records,
+                        a.entry,
                     )
-                    for i in range(report["counts"]["meta_index"])
-                ]
-                chunk_records = {
-                    i: pi.entry_chunks(m, meta_off, off, size)
-                    for i, (off, size) in enumerate(meta_index)
-                }
-                chunk_records = {i: c for i, c in chunk_records.items() if c}
-                if not 0 <= a.entry < report["counts"]["graphics"]:
-                    print(
-                        "--entry %d is outside the %d graphics records"
-                        % (a.entry, report["counts"]["graphics"]),
-                        file=sys.stderr,
-                    )
-                    return 2
-                pso = describe_pso(
-                    m,
-                    report["regions"]["graphics"]["offset"],
-                    meta_off,
-                    meta_index,
-                    chunk_records,
-                    a.entry,
-                )
-                result = {"summary": None, "pso": pso}
-            else:
-                result = {"summary": summarise(m, report, a.limit), "pso": None}
+                    result = {"summary": None, "pso": pso}
+                else:
+                    result = {"summary": summarise(m, report, a.limit), "pso": None}
+    except (OSError, ValueError, struct.error) as e:
+        print("%s: %s" % (a.cache, e), file=sys.stderr)
+        return 2
     if not a.quiet:
         if a.json:
-            print(json.dumps(result, indent=1))
+            print(json.dumps(result, indent=1, allow_nan=False))
         else:
             if result["summary"] is not None:
                 print_summary(result["summary"])

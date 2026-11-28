@@ -91,6 +91,18 @@ _GROUP4 = ("inc", "dec", None, None, None, None, None, None)
 _GROUP5 = ("inc", "dec", "call", "callf", "jmp", "jmpf", "push", None)
 _GROUP8 = (None, None, None, None, "bt", "bts", "btr", "btc")
 _GROUP15 = ("fxsave", "fxrstor", "ldmxcsr", "stmxcsr", "xsave", "xrstor", "xsaveopt", "fence")
+# 0F 01 /r: memory forms select by the ModRM reg field; the register forms are whole
+# ModRM bytes (0F 01 C1 is VMCALL, 0F 01 D0 is XGETBV, 0F 01 FC is CLZERO, ...).
+_GROUP7 = ("sgdt", "sidt", "lgdt", "lidt", "smsw", None, "lmsw", "invlpg")
+_GROUP7_REG = {
+    0xC1: "vmcall", 0xC2: "vmlaunch", 0xC3: "vmresume", 0xC4: "vmxoff",
+    0xC8: "monitor", 0xC9: "mwait", 0xCA: "clac", 0xCB: "stac",
+    0xD0: "xgetbv", 0xD1: "xsetbv", 0xD4: "vmfunc", 0xD5: "xend", 0xD6: "xtest",
+    0xD8: "vmrun", 0xD9: "vmmcall", 0xDA: "vmload", 0xDB: "vmsave",
+    0xDC: "stgi", 0xDD: "clgi", 0xDE: "skinit", 0xDF: "invlpga",
+    0xEE: "rdpkru", 0xEF: "wrpkru",
+    0xF8: "swapgs", 0xF9: "rdtscp", 0xFA: "monitorx", 0xFB: "mwaitx", 0xFC: "clzero",
+}
 
 PREFIXES = {0x66, 0x67, 0xF0, 0xF2, 0xF3, 0x2E, 0x36, 0x3E, 0x26, 0x64, 0x65}
 SEG_PREFIX = {0x2E: "cs", 0x36: "ss", 0x3E: "ds", 0x26: "es", 0x64: "fs", 0x65: "gs"}
@@ -160,6 +172,7 @@ for _i in range(8):
     PRIMARY[0xD8 + _i] = ("x87", "E")
 
 OF = {
+    0x01: ("grp7", "E"),
     0x05: ("syscall", "sys"), 0x07: ("sysret", "sys"), 0x0B: ("ud2", ""),
     0x0D: ("nop", "Ev"), 0x1E: ("endbr", "Eb"), 0x1F: ("nop", "Ev"),
     0x31: ("rdtsc", "sys"), 0x32: ("rdmsr", "sys"), 0x33: ("rdpmc", "sys"),
@@ -632,7 +645,7 @@ def decode_one(buf, pos, end, addr):
 
     if mnem == "invalid" or opspec in ("invalid", "sys"):
         pass  # still decoded below so operands/length are right where known
-    if mnem in ("grp1", "grp2", "grp3", "grp4", "grp5", "grp8", "grppop", "grpmov", "grp15"):
+    if mnem in ("grp1", "grp2", "grp3", "grp4", "grp5", "grp7", "grp8", "grppop", "grpmov", "grp15"):
         return _finish_group(buf, pos, end, ins, start, mnem, opspec, state, addr, opcode_byte)
     if mnem in ("invalid",):
         ins.mnem, ins.kind, ins.error = "invalid", "invalid", "invalid opcode"
@@ -678,6 +691,16 @@ def _finish_group(buf, pos, end, ins, start, group, opspec, state, addr, opcode_
         mnem, spec = ("fence" if mod == 3 else _GROUP15[reg7]), ""
         ins.mnem, ins.size = mnem, pos - start
         ins.kind = "nop" if mnem in ("fence", "xsaveopt") else "sys"
+        return ins
+    elif group == "grp7":
+        if mod == 3:
+            mnem = _GROUP7_REG.get(buf[pos - 1])
+            if mnem is None:
+                mnem = "smsw" if reg7 == 4 else "lmsw" if reg7 == 6 else "sys"
+        else:
+            mnem = _GROUP7[reg7] or "sys"
+        ins.mnem, ins.size = mnem, pos - start
+        ins.kind = "sys"
         return ins
     elif group == "grppop":
         if reg7 != 0:

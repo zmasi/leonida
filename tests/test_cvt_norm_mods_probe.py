@@ -32,6 +32,17 @@ def _eval_f32_src_mod(bits: int, expr: str) -> int:
     return bits & pr.M32
 
 
+_SWEEP_WORDS: dict[str, list[int]] = {}
+
+
+def _sweep_words(op: str) -> list[int]:
+    # expected_sweep_words is exact rational arithmetic over 65,536 inputs and takes over a second;
+    # FakeOracle needs it for every sweep kernel, so compute it once per op. Callers slice a copy.
+    if op not in _SWEEP_WORDS:
+        _SWEEP_WORDS[op] = pr.expected_sweep_words(op)
+    return _SWEEP_WORDS[op]
+
+
 def _eval_f16_src_mod(bits16: int, expr: str) -> int:
     bits16 &= pr.M16
     if "|" in expr:
@@ -67,7 +78,7 @@ class FakeOracle:
                 base_word = int(m_sweep.group(1))
                 m_op = re.search(r"(v_cvt_norm_[iu]16_f16)_e64", joined)
                 assert m_op is not None, joined
-                res = pr.expected_sweep_words(m_op.group(1))[base_word : base_word + 16384]
+                res = _sweep_words(m_op.group(1))[base_word : base_word + 16384]
                 if self.bad_word:
                     res[0] ^= 1
                 if self.wave64_diff and k.wave == 64:

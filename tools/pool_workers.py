@@ -16,4 +16,6 @@ MAX_PROCESS_WORKERS = 61 if os.name == "nt" else None
 
 def process_workers(jobs):
     """`jobs`, lowered to the most worker processes one pool can have here."""
+    if jobs is None:
+        return None if MAX_PROCESS_WORKERS is None else min(os.cpu_count() or 1, MAX_PROCESS_WORKERS)
     return jobs if MAX_PROCESS_WORKERS is None else min(jobs, MAX_PROCESS_WORKERS)

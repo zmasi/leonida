@@ -882,18 +882,20 @@ def _validate_json_out(raw_path):
     if raw_path.endswith(os.sep) or (os.altsep and raw_path.endswith(os.altsep)):
         return None, f"ERROR: --json path must name a file, not a directory: {raw_path}"
     out_path = os.path.abspath(raw_path)
-    if os.path.isdir(out_path):
-        return None, f"ERROR: --json path is a directory: {out_path}"
-    cur = os.path.dirname(out_path)
-    while cur:
-        if os.path.exists(cur):
-            if not os.path.isdir(cur):
-                return None, f"ERROR: --json parent path is not a directory: {cur}"
-            break
-        parent = os.path.dirname(cur)
-        if parent == cur:
-            break
-        cur = parent
+    dest = os.path.realpath(out_path)
+    for candidate in (out_path, dest):
+        if os.path.isdir(candidate):
+            return None, f"ERROR: --json path is a directory: {out_path}"
+        cur = os.path.dirname(candidate)
+        while cur:
+            if os.path.exists(cur) or os.path.islink(cur):
+                if not os.path.isdir(cur):
+                    return None, f"ERROR: --json parent path is not a directory: {cur}"
+                break
+            parent = os.path.dirname(cur)
+            if parent == cur:
+                break
+            cur = parent
     return out_path, None
 
 
@@ -951,7 +953,18 @@ def main(argv=None):
             print(f"{g:<22} ({n} cases)")
         return 0
 
+    if args.hw_arch is not None:
+        if not args.hw_arch.strip():
+            print("ERROR: --hw-arch must not be empty", file=sys.stderr)
+            return 2
+        if args.oracle == "translator":
+            print("ERROR: --hw-arch is only valid with --oracle hw or --oracle both", file=sys.stderr)
+            return 2
+
     if args.group:
+        if any(not g.strip() for g in args.group):
+            print("ERROR: --group must not be empty", file=sys.stderr)
+            return 2
         unknown = [g for g in args.group if g not in groups]
         if unknown:
             print(f"unknown group(s): {', '.join(unknown)}", file=sys.stderr)

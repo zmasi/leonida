@@ -34,6 +34,7 @@ import mmap
 import os
 import struct
 import sys
+import tempfile
 import time
 import zlib
 
@@ -41,7 +42,9 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import anim_index  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 from pool_workers import process_workers  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 SYSTEM = 0x50000000
 CHANNEL_NAMES = ("static_quat", "static_vec3", "static_float", "raw_float", "quantize_float",
@@ -1571,11 +1574,7 @@ def main():
     except OSError as e:
         sys.exit(f"{e.filename or a.archive}: {e.strerror or e}")
     try:
-        parent = os.path.dirname(os.path.abspath(a.out))
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": summary, "dictionaries": rows}, f, indent=1)
+        _write_json_atomic(a.out, {"summary": summary, "dictionaries": rows})
     except OSError as e:
         sys.exit(f"{a.out}: cannot write: {e.strerror or e}")
     c = summary["counts"]
@@ -1583,6 +1582,36 @@ def main():
     print(json.dumps({k: c.get(k, 0) for k in ("dictionaries", "clips", "animations", "animations_decoded",
                                                 "animations_failed", "sequences")}))
     return 0
+
+
+def _write_json_atomic(path, payload):
+    dest = os.path.realpath(path)
+    parent = os.path.dirname(dest) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".anim_clips-", suffix=".tmp")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=1)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, published_mode(dest))
+        replace_retry(tmp, dest)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 if __name__ == "__main__":

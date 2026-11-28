@@ -36,9 +36,12 @@ import json
 import os
 import struct
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import file_mode  # noqa: E402
+import replace_retry  # noqa: E402
 import shader_ir  # noqa: E402
 import shader_meta  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
@@ -59,9 +62,21 @@ class Skip(Exception):
 
 def stage_index(disasm_dir):
     path = os.path.join(os.path.dirname(os.path.abspath(disasm_dir)), "index.json")
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         rows = json.load(f)
-    return {e["file"][:-5]: e["stage"] for e in rows}
+    if not isinstance(rows, list):
+        raise ValueError("index.json must be a JSON array")
+    out = {}
+    for e in rows:
+        if not isinstance(e, dict):
+            raise ValueError("index.json entry must be an object")
+        fname, stage = e.get("file"), e.get("stage")
+        if not isinstance(fname, str) or not fname.endswith(".dxbc") or len(fname) <= 5:
+            raise ValueError(f"invalid index.json file entry: {fname!r}")
+        if not isinstance(stage, str) or not stage:
+            raise ValueError(f"invalid index.json stage entry: {stage!r}")
+        out[fname[:-5]] = stage
+    return out
 
 
 def sfi0_class(disasm_dir, name):
@@ -169,6 +184,17 @@ def _pointerish(tag):
     return t is not None and t[0] in ("in", "ld")
 
 
+def _mod_offset(ins):
+    """Inline SMEM `offset:N` modifier value (0 when absent, None when malformed)."""
+    for m in ins.get("mods", ()):
+        if m.startswith("offset:"):
+            try:
+                return int(m[7:], 0)
+            except ValueError:
+                return None
+    return 0
+
+
 def step(sym, ins, on_load=None, on_use=None):
     """Advance the SGPR tags over one instruction; report descriptor loads and their consumers."""
     op = shader_meta.base_op(ins["op"])
@@ -187,6 +213,11 @@ def step(sym, ins, on_load=None, on_use=None):
     if on_load is not None and op in DESC_LOADS and len(a) >= 2 and a[1]["k"] == "sgpr" and a[1].get("n") == 2:
         b = a[1]["r"]
         off = _src(sym, a[2]) if len(a) >= 3 else ("const", 0)
+        mod_off = _mod_offset(ins)
+        if mod_off is None:
+            off = None
+        elif off is not None and off[0] == "const":
+            off = ("const", off[1] + mod_off)
         on_load(ins["pc"], op, sym.get(b), sym.get(b + 1), off)
 
     _, writes = shader_meta._split_operands(ins)
@@ -198,8 +229,9 @@ def step(sym, ins, on_load=None, on_use=None):
             new[a[0]["r"] + i] = ("ld", ins["pc"], i)
     elif op in ("s_mov_b32", "s_movk_i32") and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         if op == "s_movk_i32":
-            v = a[1]["v"] & 0xFFFF
-            new[a[0]["r"]] = ("const", (v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF)
+            if a[1]["k"] == "imm":
+                v = a[1]["v"] & 0xFFFF
+                new[a[0]["r"]] = ("const", (v - 0x10000 if v & 0x8000 else v) & 0xFFFFFFFF)
         else:
             t = _src(sym, a[1])
             if t is not None:
@@ -213,24 +245,28 @@ def step(sym, ins, on_load=None, on_use=None):
             for i in (0, 1):
                 if a[1]["r"] + i in sym:
                     new[d + i] = sym[a[1]["r"] + i]
-    elif (op in ADDS or op in shader_meta.LSHL_ADD_SHIFT) and len(a) >= 3 and a[0]["k"] == "sgpr":
+    elif op in shader_meta.LSHL_ADD_SHIFT and len(a) >= 3 and a[0]["k"] == "sgpr":
+        # s_lshlK_add_u32 d, idx, base: a[1] is shifted left by K (scaled index), only a[2] can be a base pointer.
+        tidx, tbase = _src(sym, a[1]), _src(sym, a[2])
+        cidx = tidx[1] if tidx is not None and tidx[0] == "const" else None
+        cbase = tbase[1] if tbase is not None and tbase[0] == "const" else None
+        if cidx is not None and cbase is not None:
+            new[a[0]["r"]] = ("const", ((cidx << shader_meta.LSHL_ADD_SHIFT[op]) + cbase) & 0xFFFFFFFF)
+        elif _pointerish(tbase):
+            new[a[0]["r"]] = ("off", tbase, cidx is None)
+    elif op in ADDS and len(a) >= 3 and a[0]["k"] == "sgpr":
         tx, ty = _src(sym, a[1]), _src(sym, a[2])
-        if op in shader_meta.LSHL_ADD_SHIFT:
-            tx, ty = ty, tx            # s_lshlK_add_u32 d, idx, base: the base is the second source
         cx = tx[1] if tx is not None and tx[0] == "const" else None
         cy = ty[1] if ty is not None and ty[0] == "const" else None
         if cx is not None and cy is not None and op not in ("s_addc_u32", "s_subb_u32"):
-            if op in shader_meta.LSHL_ADD_SHIFT:
-                new[a[0]["r"]] = ("const", ((cy << shader_meta.LSHL_ADD_SHIFT[op]) + cx) & 0xFFFFFFFF)
-            else:
-                new[a[0]["r"]] = ("const", shader_meta._fold_scalar_alu(op, cx, cy))
+            new[a[0]["r"]] = ("const", shader_meta._fold_scalar_alu(op, cx, cy))
         elif cx == 0 and cy == 0:
             new[a[0]["r"]] = ("const", 0)          # high word of a pointer below 4 GB plus a carry of 0
         elif _pointerish(tx) and not _pointerish(ty):
             new[a[0]["r"]] = ("off", tx, cy is None)
         elif _pointerish(ty) and not _pointerish(tx) and not op.startswith(("s_sub", "s_subb")):
             new[a[0]["r"]] = ("off", ty, cx is None)
-    elif op == "s_addk_i32" and a[0]["k"] == "sgpr":
+    elif op == "s_addk_i32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[1]["k"] == "imm":
         old = sym.get(a[0]["r"])
         if old is not None and old[0] == "const":
             v = a[1]["v"] & 0xFFFF
@@ -269,6 +305,7 @@ def analyse(insns, stage, user_count):
                 work.append(s)
 
     loads = {}
+    uses = defaultdict(set)
 
     def on_load(pc, op, lo, hi, off):
         rlo, dyn_lo = root(lo)
@@ -296,8 +333,8 @@ def analyse(insns, stage, user_count):
         loads[pc] = {"op": op, "base": base, "ptr": ptr, "offset": offset, "roles": set()}
 
     def on_use(tag, role):
-        if tag is not None and tag[0] == "ld" and tag[2] == 0 and tag[1] in loads:
-            loads[tag[1]]["roles"].add(role)
+        if tag is not None and tag[0] == "ld" and tag[2] % 4 == 0:
+            uses[tag[1]].add(role)
 
     for b in range(len(blocks)):
         if entry[b] is None:
@@ -307,6 +344,9 @@ def analyse(insns, stage, user_count):
             if shader_meta.base_op(ins["op"]) == "s_endpgm":
                 break
             step(sym, ins, on_load, on_use)
+    for pc, roles in uses.items():
+        if pc in loads:
+            loads[pc]["roles"].update(roles)
     return [loads[pc] for pc in sorted(loads)]
 
 
@@ -323,7 +363,8 @@ def role_of(load):
 def census(disasm_dir, limit=None, progress=None, stages=None):
     if stages is None:
         stages = stage_index(disasm_dir)
-    names = sorted(n[:-2] for n in os.listdir(disasm_dir) if n.endswith(".s"))
+    names = sorted(n[:-2] for n in os.listdir(disasm_dir)
+                   if n.endswith(".s") and os.path.isfile(os.path.join(disasm_dir, n)))
     if limit:
         names = names[:limit]
     skipped = Counter()
@@ -341,7 +382,11 @@ def census(disasm_dir, limit=None, progress=None, stages=None):
         if stage is None or sfi0 is None:
             skipped["no stage or SFI0"] += 1
             continue
-        info = shader_ir.parse_file(os.path.join(disasm_dir, name + ".s"))
+        try:
+            info = shader_ir.parse_file(os.path.join(disasm_dir, name + ".s"))
+        except (OSError, ValueError):
+            skipped["unreadable listing"] += 1
+            continue
         if not info["insns"]:
             skipped["no instructions"] += 1
             continue
@@ -401,6 +446,29 @@ def print_report(out, top=6):
             print(f"  static {role:<6} " + ", ".join(f"{k} {v}" for k, v in st.items()))
 
 
+def _write_json_atomic(path, obj):
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    mode = file_mode.published_mode(path)
+    payload = json.dumps(obj, indent=1, sort_keys=True, allow_nan=False) + "\n"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", newline="\n", dir=parent,
+                prefix=f".{os.path.basename(path)}.", suffix=".tmp", delete=False) as f:
+            tmp_path = f.name
+            f.write(payload)
+        os.chmod(tmp_path, mode)
+        replace_retry.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("disasm", help="<work>/shaders/dxbc/disasm")
@@ -410,7 +478,10 @@ def main(argv=None):
     if not os.path.isdir(args.disasm):
         print(f"ERROR: {args.disasm} is not a folder", file=sys.stderr)
         return 2
-    if args.json:
+    if args.json is not None:
+        if not args.json.strip() or os.path.isdir(args.json):
+            print(f"ERROR: --json {args.json.strip() or '(empty)'} is not a file path", file=sys.stderr)
+            return 2
         # The census is written last, after every listing has been read, so a report replacing one of
         # them or the carve index would silently destroy what the run just used.
         index_path = os.path.join(os.path.dirname(os.path.abspath(args.disasm)), "index.json")
@@ -431,7 +502,7 @@ def main(argv=None):
     except (OSError, ValueError, KeyError, TypeError) as e:
         print(f"ERROR: cannot read the carve index next to {args.disasm}: {e}", file=sys.stderr)
         return 2
-    if args.json:
+    if args.json is not None:
         # Besides the listings and the carve index, the census reads each shader's DXBC container and
         # FSSM header next to the disasm folder. A report landing on one of those (or a hard link to it)
         # would destroy an input the run just used, so refuse those names too.
@@ -445,14 +516,10 @@ def main(argv=None):
     out = census(args.disasm, args.limit, stages=stages,
                  progress=lambda k, n: print(f"  {k}/{n}", file=sys.stderr, flush=True))
     print_report(out)
-    if args.json:
+    if args.json is not None:
         try:
-            d = os.path.dirname(os.path.abspath(args.json))
-            os.makedirs(d, exist_ok=True)
-            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(out, f, indent=1, sort_keys=True)
-                f.write("\n")
-        except OSError as e:
+            _write_json_atomic(args.json, out)
+        except (OSError, ValueError) as e:
             print(f"ERROR: cannot write {args.json}: {e}", file=sys.stderr)
             return 2
     return 0

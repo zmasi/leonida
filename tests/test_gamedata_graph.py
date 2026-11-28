@@ -426,6 +426,57 @@ class GamedataGraphTest(unittest.TestCase):
         self.assertEqual(gg.classify_target("../Item[@key='X']"),
                          ("relative/locator", "../Item[@key='X']", "relative_locator"))
 
+    def test_unparsed_manifest_and_rootless_payloads_keep_summary_totals_consistent(self):
+        docs = [
+            {"data": ALPHA, "complete": False},
+            {"data": b"<Item/></CDataFileMgr__ContentChangeSetDef>",
+             "complete": False, "root_hint": "CDataFileMgr__ContentChangeSetDef"},
+            {"data": b"not-xml", "complete": False, "root_hint": ""},
+        ]
+        s = gg.build_graph(docs)["summary"]
+        self.assertEqual(s["parsed"], 1)
+        self.assertEqual(s["documents"], 1)
+        self.assertEqual(s["manifest_documents"], 1)
+        self.assertEqual(s["categories"]["mount / content manifests"]["manifest_documents"], 1)
+        self.assertEqual(s["roots"]["CDataFileMgr__ContentChangeSetDef"]["manifest_documents"], 1)
+        self.assertEqual(s["root_count"], 1)
+        self.assertEqual(s["rootless"], 1)
+        self.assertEqual(s["categories"]["uncatalogued"]["roots"], 0)
+        self.assertEqual(sum(c["roots"] for c in s["categories"].values()), s["root_count"])
+
+    def test_empty_and_whitespace_json_path_is_refused(self):
+        self.finish()
+        for bad in ("", "   "):
+            with self.subTest(bad=bad):
+                r = self.run_tool(self.carve, "--json", bad)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("must not be empty", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+
+    def test_directory_mode_allows_existing_bin_report_and_carve_refuses_bk2(self):
+        directory = os.path.join(self.root, "dir_bin")
+        os.makedirs(directory)
+        with open(os.path.join(directory, "a.xml"), "wb") as f:
+            f.write(PLAIN)
+        existing_bin = os.path.join(directory, "out.bin")
+        with open(existing_bin, "wb") as f:
+            f.write(b"old")
+        r = self.run_tool(directory, "--json", existing_bin)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(existing_bin, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["summary"]["parsed"], 1)
+
+        self.add(ALPHA)
+        self.finish()
+        bk2 = os.path.join(self.carve, "000000002000.bk2")
+        with open(bk2, "wb") as f:
+            f.write(b"bk2-stream")
+        r2 = self.run_tool(self.carve, "--json", bk2)
+        self.assertEqual(r2.returncode, 2, r2.stderr)
+        self.assertIn("would overwrite an input file", r2.stderr)
+        with open(bk2, "rb") as f:
+            self.assertEqual(f.read(), b"bk2-stream")
+
 
 INHERIT = (
     b'<Root><Sets>'

@@ -1247,6 +1247,144 @@ class StageInterfacesAndLayoutTest(unittest.TestCase):
         with self.assertRaisesRegex(spv.InterfaceError, "overlap.*location 0, component 2, index 1"):
             b_ds.reflect()
 
+    def test_outer_indexed_array_length_must_be_valid_positive_constant(self):
+        for stage, storage, flags in (
+            ("gs", spv.STORAGE_INPUT, ()),
+            ("ms", spv.STORAGE_OUTPUT, ()),
+            ("ps", spv.STORAGE_INPUT, (spv.DEC_PER_VERTEX,)),
+        ):
+            with self.subTest(stage=stage, bad="zero"):
+                b = SpirvBuilder(stage)
+                zero = b.u32_const(0)
+                arr = b.emit_type(spv.OP_TYPE_ARRAY, b.numeric("f", 32, 4), zero)
+                b.variable(storage, arr, location=0, flags=flags)
+                with self.assertRaisesRegex(spv.InterfaceError, "must be positive"):
+                    b.reflect()
+
+            with self.subTest(stage=stage, bad="undefined_length"):
+                b = SpirvBuilder(stage)
+                arr = b.emit_type(spv.OP_TYPE_ARRAY, b.numeric("f", 32, 4), b.alloc())
+                b.variable(storage, arr, location=0, flags=flags)
+                with self.assertRaisesRegex(spv.InterfaceError, "not a literal OpConstant"):
+                    b.reflect()
+
+    def test_opvariable_initializer_id_must_be_within_bound(self):
+        for bad_init in (0, 999):
+            with self.subTest(bad_init=bad_init):
+                b = SpirvBuilder("vs")
+                b.variable(spv.STORAGE_OUTPUT, b.float_type(32), location=0, initializer=bad_init)
+                with self.assertRaisesRegex(spv.InterfaceError, f"ID %{bad_init} is outside the SPIR-V bound"):
+                    spv.Module(b.build(bound=20))
+
+    def test_member_decorate_cannot_target_decoration_group(self):
+        for dec, args in ((spv.DEC_LOCATION, (0,)), (DEC_FLAT, ())):
+            with self.subTest(dec=dec):
+                b = SpirvBuilder("vs")
+                g = b.decoration_group()
+                b.member_decorate(g, 0, dec, *args)
+                with self.assertRaisesRegex(spv.InterfaceError, "OpMemberDecorate cannot target a decoration group"):
+                    spv.Module(b.build())
+
+    def test_struct_type_modes_per_primitive_and_out_of_range_member_decorations(self):
+        # Patch / PassthroughNV on the struct type itself (top-level and nested) must be rejected.
+        for dec, pattern in ((spv.DEC_PATCH, "tessellation patch"), (spv.DEC_PASSTHROUGH_NV, "passthrough")):
+            with self.subTest(top_level=pattern):
+                b = SpirvBuilder("vs")
+                s = b.struct_type(b.numeric("f", 32))
+                b.decorate(s, dec)
+                b.variable(spv.STORAGE_OUTPUT, s, location=0)
+                with self.assertRaisesRegex(spv.InterfaceError, pattern):
+                    b.reflect()
+
+            with self.subTest(nested=pattern):
+                b = SpirvBuilder("vs")
+                inner = b.struct_type(b.numeric("f", 32))
+                b.decorate(inner, dec)
+                outer = b.struct_type(inner)
+                b.variable(spv.STORAGE_OUTPUT, outer, location=0)
+                with self.assertRaisesRegex(spv.InterfaceError, pattern):
+                    b.reflect()
+
+        # PerPrimitiveEXT on a mesh output block type propagates to its members.
+        ms = SpirvBuilder("ms")
+        blk = ms.struct_type(ms.numeric("u", 32))
+        ms.decorate(blk, spv.DEC_BLOCK)
+        ms.decorate(blk, spv.DEC_PER_PRIMITIVE)
+        ms.member_decorate(blk, 0, spv.DEC_LOCATION, 3)
+        ms.variable(spv.STORAGE_OUTPUT, ms.array(blk, 16))
+        self.assertTrue(ms.reflect().outputs[0].varyings[0].per_primitive)
+
+        # Out-of-range member decoration index on top-level and nested structs must be rejected.
+        b_top = SpirvBuilder("vs")
+        s_top = b_top.struct_type(b_top.numeric("f", 32))
+        b_top.decorate(s_top, spv.DEC_BLOCK)
+        b_top.member_decorate(s_top, 0, spv.DEC_LOCATION, 0)
+        b_top.member_decorate(s_top, 4, spv.DEC_LOCATION, 1)
+        b_top.variable(spv.STORAGE_OUTPUT, s_top)
+        with self.assertRaisesRegex(spv.InterfaceError, "member decoration index 4 is out of range"):
+            b_top.reflect()
+
+        b_nested = SpirvBuilder("vs")
+        s_inner = b_nested.struct_type(b_nested.numeric("f", 32))
+        b_nested.member_decorate(s_inner, 2, spv.DEC_LOCATION, 1)
+        b_nested.variable(spv.STORAGE_OUTPUT, b_nested.struct_type(s_inner), location=0)
+        with self.assertRaisesRegex(spv.InterfaceError, "member decoration index 2 is out of range"):
+            b_nested.reflect()
+
+    def test_index_per_primitive_and_per_vertex_stage_storage_restrictions(self):
+        # Index decoration is only valid on fragment outputs.
+        for stage, storage in (
+            ("vs", spv.STORAGE_INPUT),
+            ("vs", spv.STORAGE_OUTPUT),
+            ("gs", spv.STORAGE_OUTPUT),
+            ("ps", spv.STORAGE_INPUT),
+        ):
+            with self.subTest(bad_index=(stage, storage)):
+                b = SpirvBuilder(stage)
+                b.variable(storage, b.numeric("f", 32, 4), location=0, index=1)
+                with self.assertRaisesRegex(spv.InterfaceError, "Index decoration is only valid on fragment outputs"):
+                    b.reflect()
+
+        # PerPrimitiveEXT is only valid on mesh outputs and fragment inputs.
+        for stage, storage in (
+            ("vs", spv.STORAGE_OUTPUT),
+            ("gs", spv.STORAGE_OUTPUT),
+            ("ps", spv.STORAGE_OUTPUT),
+        ):
+            with self.subTest(bad_per_prim=(stage, storage)):
+                b = SpirvBuilder(stage)
+                b.variable(storage, b.numeric("f", 32), location=0, flags=(spv.DEC_PER_PRIMITIVE,))
+                with self.assertRaisesRegex(spv.InterfaceError, "PerPrimitiveEXT is only supported"):
+                    b.reflect()
+
+        # PerVertexKHR + PerPrimitiveEXT cannot both apply to the same fragment input.
+        b_both = SpirvBuilder("ps")
+        b_both.variable(
+            spv.STORAGE_INPUT, b_both.array(b_both.numeric("f", 32), 3),
+            location=0, flags=(spv.DEC_PER_VERTEX, spv.DEC_PER_PRIMITIVE),
+        )
+        with self.assertRaisesRegex(spv.InterfaceError, "PerVertexKHR and PerPrimitiveEXT"):
+            b_both.reflect()
+
+        # PerVertexKHR on a block member or struct type is rejected.
+        b_mem = SpirvBuilder("ps")
+        blk = b_mem.struct_type(b_mem.numeric("f", 32))
+        b_mem.decorate(blk, spv.DEC_BLOCK)
+        b_mem.member_decorate(blk, 0, spv.DEC_LOCATION, 0)
+        b_mem.member_decorate(blk, 0, spv.DEC_PER_VERTEX)
+        b_mem.variable(spv.STORAGE_INPUT, blk)
+        with self.assertRaisesRegex(spv.InterfaceError, "PerVertexKHR on structure members is unsupported"):
+            b_mem.reflect()
+
+        b_type = SpirvBuilder("ps")
+        blk2 = b_type.struct_type(b_type.numeric("f", 32))
+        b_type.decorate(blk2, spv.DEC_BLOCK)
+        b_type.decorate(blk2, spv.DEC_PER_VERTEX)
+        b_type.member_decorate(blk2, 0, spv.DEC_LOCATION, 0)
+        b_type.variable(spv.STORAGE_INPUT, blk2)
+        with self.assertRaisesRegex(spv.InterfaceError, "PerVertexKHR on structure types is unsupported"):
+            b_type.reflect()
+
 
 if __name__ == "__main__":
     unittest.main()

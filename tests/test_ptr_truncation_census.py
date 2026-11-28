@@ -10,6 +10,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import warnings
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -160,6 +161,7 @@ class SummaryTests(unittest.TestCase):
             for path in (out, idx):
                 with open(path, "rb") as f:
                     data = f.read()
+                self.assertTrue(data.endswith(b"\n"))
                 self.assertNotIn(b"\r\n", data)
                 self.assertNotIn(b"ps_table32", data)
             with open(idx, encoding="utf-8") as f:
@@ -222,6 +224,90 @@ class SummaryTests(unittest.TestCase):
                     sys.stderr = stderr
                 self.assertEqual(cm.exception.code, 2)
                 self.assertIn("argument --limit: must be at least 1", message)
+
+    def test_scan_one_catches_oserror_without_leaking_filename(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.mkdir(disasm)
+            path = os.path.join(disasm, "ps_secret_shader.s")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; ps_secret_shader\n\ts_endpgm\n")
+            with mock.patch.object(P.rdna2spirv, "translate",
+                                   side_effect=PermissionError(13, "denied", path)):
+                rec = P.scan_one(path)
+        self.assertEqual(rec["stage"], "ps")
+        self.assertEqual(rec["error"], "cannot read listing: PermissionError")
+        self.assertNotIn("ps_secret_shader", rec["error"])
+
+    def test_summarise_sorts_not_reached_ties_deterministically(self):
+        records_ba = [{"stage": "ps", "error": "Unsupported: b"}, {"stage": "ps", "error": "Unsupported: a"}]
+        records_ab = list(reversed(records_ba))
+        self.assertEqual(list(P.summarise(records_ba)["not_reached"]), ["Unsupported: a", "Unsupported: b"])
+        self.assertEqual(list(P.summarise(records_ab)["not_reached"]), ["Unsupported: a", "Unsupported: b"])
+
+    def test_output_path_guards_and_unreadable_src(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            fssm_dir = os.path.join(tmp, "fssm")
+            os.mkdir(disasm)
+            os.mkdir(fssm_dir)
+            write_listing(tmp, "ps_table32", LISTINGS["ps_table32"])
+            listing_path = os.path.join(disasm, "ps_table32.s")
+            dxbc_path = os.path.join(tmp, "ps_table32.dxbc")
+            index_path = os.path.join(tmp, "index.json")
+            fssm_path = os.path.join(fssm_dir, "ps_table32.fssm")
+            with open(index_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write('[{"file": "ps_table32.dxbc", "stage": "ps"}]\n')
+            with open(fssm_path, "wb") as f:
+                f.write(b"FSSM")
+            run_cwd = os.path.join(tmp, "cwd")
+            os.mkdir(run_cwd)
+            old_cwd = os.getcwd()
+            os.chdir(run_cwd)
+            try:
+                for flag in ("--json", "--index-out"):
+                    for bad in ("", "   ", disasm, os.path.join(tmp, "missing_dir", "out.json"),
+                                listing_path, dxbc_path, index_path, fssm_path):
+                        with self.subTest(flag=flag, bad=bad):
+                            stderr = io.StringIO()
+                            stdout = io.StringIO()
+                            old_err, old_out = sys.stderr, sys.stdout
+                            sys.stderr, sys.stdout = stderr, stdout
+                            try:
+                                with self.assertRaises(SystemExit) as cm:
+                                    P.main([disasm, "--jobs", "1", flag, bad])
+                            finally:
+                                sys.stderr, sys.stdout = old_err, old_out
+                            self.assertEqual(cm.exception.code, 2, stderr.getvalue())
+                self.assertEqual(os.listdir(run_cwd), [])
+            finally:
+                os.chdir(old_cwd)
+            with open(index_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '[{"file": "ps_table32.dxbc", "stage": "ps"}]\n')
+            with open(fssm_path, "rb") as f:
+                self.assertEqual(f.read(), b"FSSM")
+
+            stderr = io.StringIO()
+            old_err = sys.stderr
+            sys.stderr = stderr
+            try:
+                with mock.patch.object(P, "listings", side_effect=PermissionError("denied")):
+                    rc = P.main([disasm, "--jobs", "1"])
+            finally:
+                sys.stderr = old_err
+            self.assertEqual(rc, 2)
+            self.assertIn("denied", stderr.getvalue())
+
+    def test_write_json_atomic_preserves_existing_on_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "summary.json")
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": 1}\n')
+            with self.assertRaises(ValueError):
+                P._write_json_atomic(out, {"bad": float("nan")})
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": 1}\n')
+            self.assertEqual(os.listdir(tmp), ["summary.json"])
 
 
 if __name__ == "__main__":

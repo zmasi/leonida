@@ -20,6 +20,8 @@ import sys
 
 def normalize(fingerprint):
     """`fingerprint` as 40 upper-case hex digits, or None if it isn't a v4 fingerprint."""
+    if not isinstance(fingerprint, str):
+        return None
     digits = re.sub(r"\s+", "", fingerprint).upper()
     return digits if re.fullmatch(r"[0-9A-F]{40}", digits) else None
 
@@ -30,19 +32,26 @@ def primary_fingerprints(colons):
     expect_primary_fpr = False
     for line in colons.splitlines():
         fields = line.split(":")
-        if fields[0] == "pub":
+        tag = fields[0]
+        if tag == "pub":
+            if expect_primary_fpr:
+                out.append("")
             expect_primary_fpr = True
-        elif fields[0] == "fpr" and expect_primary_fpr:
-            out.append(fields[9].upper() if len(fields) > 9 else "")
+        elif tag == "fpr" and expect_primary_fpr:
+            out.append(fields[9].strip().upper() if len(fields) > 9 else "")
             expect_primary_fpr = False
-        elif fields[0] in ("sub", "ssb", "sec"):
+        elif tag in ("sub", "ssb", "sec"):
+            if expect_primary_fpr:
+                out.append("")
             expect_primary_fpr = False
+    if expect_primary_fpr:
+        out.append("")
     return out
 
 
 def show_keys(path, gpg=("gpg",)):
     """`gpg --show-keys --with-colons` output for the key file at `path` (it lists the file, importing nothing)."""
-    result = subprocess.run([*gpg, "--batch", "--show-keys", "--with-colons", path],
+    result = subprocess.run([*gpg, "--batch", "--show-keys", "--with-colons", "--", path],
                             capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0:
         raise ValueError(f"gpg could not read {path}: {result.stderr.strip() or 'exit ' + str(result.returncode)}")
@@ -52,20 +61,32 @@ def show_keys(path, gpg=("gpg",)):
 def check(path, expected, gpg=("gpg",)):
     """None if the key file at `path` holds exactly the one primary key `expected`, else why not. `gpg` is the command
     that runs GnuPG (a list, so a test can stand another program in)."""
+    norm_expected = normalize(expected)
+    if not norm_expected:
+        return f"not a 40-digit key fingerprint: {expected!r}"
     try:
-        found = primary_fingerprints(show_keys(path, gpg))
+        colons = show_keys(path, gpg)
     except (OSError, ValueError) as e:
         return str(e)
+    if any(line.split(":", 1)[0] in ("sec", "ssb") for line in colons.splitlines()):
+        return f"{path} holds secret key material; expected a public key only"
+    found = primary_fingerprints(colons)
     if not found:
         return f"{path} holds no public key"
     if len(found) > 1:
-        return f"{path} holds {len(found)} primary keys ({', '.join(found)}); expected only {expected}"
-    if found[0] != expected:
-        return f"{path} is key {found[0]}, expected {expected}"
+        labels = ", ".join(fp or "<missing>" for fp in found)
+        return f"{path} holds {len(found)} primary keys ({labels}); expected only {norm_expected}"
+    if found[0] != norm_expected:
+        got = found[0] or "<missing>"
+        return f"{path} is key {got}, expected {norm_expected}"
     return None
 
 
-def main(argv):
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv in (["-h"], ["--help"]):
+        print(__doc__)
+        return 0
     if len(argv) != 2:
         print("usage: check_apt_key.py KEYFILE FINGERPRINT", file=sys.stderr)
         return 2

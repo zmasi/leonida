@@ -26,7 +26,7 @@ of the x86-64 → arm64 groundwork.
 
 | Piece | Where | State |
 |---|---|---|
-| x86-64 decoder | `tools/x64_recomp.py` `disasm`/`decode_one` | prefixes/REX, ModRM+SIB, RIP-relative and moffs addressing, hi8 regs (`ah`/`ch`/`dh`/`bh`), `Iv`/`Iz`/`J` immediates incl. imm64, groups 1–5/8/15/1A/11, VEX stubs |
+| x86-64 decoder | `tools/x64_recomp.py` `disasm`/`decode_one` | prefixes/REX, ModRM+SIB, RIP-relative and moffs addressing, hi8 regs (`ah`/`ch`/`dh`/`bh`), `Iv`/`Iz`/`J` immediates incl. imm64, groups 1–8/11/15/1A, VEX stubs |
 | arm64 assembler | `tools/x64_recomp.py` `Asm` | integer/logical/bitfield/shift/multiply/load-store/branch/system encoders, label fixups, `li()` with `pad4` for self-referential constant materialization |
 | Translator | `tools/x64_recomp.py` `FunctionTranslator` | linear-sweep over decoded insns; lazy flag analysis picks arm-NZCV when one producer covers a consumer, else materializes canonical x86 EFLAGS in the ctx block; a shift or rotate by `cl` may leave the flags alone (x86 changes none for a count of 0), so a consumer behind one reads the ctx word and the writer before it stores its word too; unsupported insns emit `brk` and land in `stats["unhandled"]` |
 | Dispatch runtime | `tools/x64_recomp.py` `emit_rt` | `rt_dispatch` (guest pc → host pc through a generated table), `rt_mkflags` (NZCV+operands → canonical x86 EFLAGS; preserves NZCV), `rt_print` (semihosting result output) |
@@ -58,10 +58,21 @@ of the x86-64 → arm64 groundwork.
   beyond decode, x87, `rcl`/`rcr`, `std` (DF=1), system/privileged insns, `int`/`syscall`, far
   transfers. Real binaries are x87/SIMD-heavy, so coverage on the engine image will be far below
   the fixture suite until those lands — `recomp_census.py` is the tool that will measure it.
+- Instruction lengths are checked against the retail image: the same walk `objdump -d` makes is
+  run over every `.text` byte alongside the decoder's walk and the two lengths are compared
+  (26,674,180 instructions in the image). That differential found `0F 01 /r` missing from the
+  `0F` table. The group has a ModRM byte in every form, so the walk stopped after the two opcode
+  bytes and took the byte after them for the next instruction. All 16 sites the image uses (10
+  `clzero`, 2 `xgetbv`, 2 `monitorx`, 2 `mwaitx`) decoded one byte short and desynchronized the
+  rest of their function; with the group back, 9 `.pdata` functions decode 638 instructions
+  further and 7 of them have no unknown instruction left. Confirmed by that differential and by
+  the REA `gnu.objdump` section-header evidence
+  `ev_e29cbdffd0dc7c46889b2a1f955011ce9f2795017233c97107ded73f9186dd90`, which gives the `.text`
+  and `.pdata` extents the walk reads.
 - The engine image itself is still not in the repository (the exe obtained so far is a packaging
-  probe — `docs/boot.md`), so nothing here has run against real code. First real milestone is the
-  census over a genuine PE, then a same-behaviour run of a real function under qemu against a
-  native x86-64 run.
+  probe — `docs/boot.md`), so the port has not executed real code yet: the length differential
+  above is static analysis. First real milestone is the census over a genuine PE, then a
+  same-behaviour run of a real function under qemu against a native x86-64 run.
 
 ## Next steps
 

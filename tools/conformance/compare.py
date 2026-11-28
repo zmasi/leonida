@@ -26,6 +26,10 @@ import tempfile
 import zlib
 from dataclasses import dataclass
 
+# Isolated mode leaves the shared tools directory off sys.path.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+from report_paths import find_report_path_collision  # noqa: E402
+
 EXIT_PASSED = 0
 EXIT_FAILED = 1
 EXIT_ERROR = 2
@@ -1009,6 +1013,17 @@ def match_manifest_scenes(reference, candidate):
         )
 
 
+def check_heatmap_paths(input_paths, heatmap_paths):
+    """Reject collisions before writing any of the heatmaps."""
+    collision = find_report_path_collision(input_paths, heatmap_paths)
+    if collision is None:
+        return
+    output, other, is_input = collision
+    if is_input:
+        raise ToolError(f"heatmap '{output}' would overwrite comparison input '{other}'")
+    raise ToolError(f"heatmap '{output}' shares its destination with heatmap '{other}'")
+
+
 def command_diff(arguments):
     """Run the diff mode: metrics, heatmaps, thresholds and exit code."""
     reference = load_manifest(arguments.reference)
@@ -1016,6 +1031,18 @@ def command_diff(arguments):
     reference_directory = resolve_image_directory(reference, arguments.reference_dir)
     candidate_directory = resolve_image_directory(candidate, arguments.candidate_dir)
     match_manifest_scenes(reference, candidate)
+
+    # Each manifest names its own files. Plan every scene's paths before opening any output.
+    candidate_scenes_by_name = {scene.name: scene for scene in candidate.scenes}
+    input_paths = [reference.manifest_path, candidate.manifest_path]
+    scene_paths = []
+    for scene in reference.scenes:
+        reference_path = scene_image_path(reference_directory, scene.png_name)
+        candidate_path = scene_image_path(candidate_directory, candidate_scenes_by_name[scene.name].png_name)
+        heatmap_path = os.path.join(candidate_directory, f"{scene.name}.diff.png")
+        input_paths.extend((reference_path, candidate_path))
+        scene_paths.append((scene.name, reference_path, candidate_path, heatmap_path))
+    check_heatmap_paths(input_paths, [output for _, _, _, output in scene_paths])
 
     print(f"reference: {reference.manifest_path}")
     print(f"  renderer '{reference.renderer}', adapter '{reference.adapter}'")
@@ -1026,31 +1053,24 @@ def command_diff(arguments):
     # printed above the header it belongs to when output is redirected.
     sys.stdout.flush()
 
-    # Each manifest names its own files, so look up the candidate scene itself
-    # rather than assuming both renderers wrote the same PNG file name.
-    candidate_scenes_by_name = {scene.name: scene for scene in candidate.scenes}
     scene_column_width = max(len(scene.name) for scene in reference.scenes)
     failing_scenes = []
-    for scene in reference.scenes:
-        candidate_scene = candidate_scenes_by_name[scene.name]
-        reference_image = read_png(scene_image_path(reference_directory, scene.png_name))
-        candidate_image = read_png(
-            scene_image_path(candidate_directory, candidate_scene.png_name)
-        )
+    for name, reference_path, candidate_path, heatmap_path in scene_paths:
+        reference_image = read_png(reference_path)
+        candidate_image = read_png(candidate_path)
         stats = compare_rasters(reference_image, candidate_image)
         heatmap = build_heatmap(reference_image, candidate_image)
-        heatmap_path = os.path.join(candidate_directory, f"{scene.name}.diff.png")
         write_png(heatmap_path, heatmap)
 
         violation = threshold_violation(
             stats, arguments.max_differing_percent, arguments.max_mean_delta
         )
-        print(format_diff_line(scene.name, stats, scene_column_width, violation))
-        whole_frame_note = whole_frame_difference_note(scene.name, stats)
+        print(format_diff_line(name, stats, scene_column_width, violation))
+        whole_frame_note = whole_frame_difference_note(name, stats)
         if whole_frame_note:
             print(f"      {whole_frame_note}")
         if violation:
-            failing_scenes.append(scene.name)
+            failing_scenes.append(name)
 
     print()
     scene_count = len(reference.scenes)

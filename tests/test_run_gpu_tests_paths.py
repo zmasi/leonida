@@ -136,10 +136,12 @@ class WorkDirectory(unittest.TestCase):
                 blocker.parent.mkdir(exist_ok=True)
                 blocker.write_text("keep me", encoding="utf-8")
 
+                # The error quotes a localized OS message. -I ignores PYTHONUTF8, so without -X utf8 the child
+                # writes it in the ANSI code page, which a UTF-8 parent cannot decode (stderr comes back None).
                 result = subprocess.run(
-                    [sys.executable, "-I", run_gpu_tests.__file__, "--build", str(build),
+                    [sys.executable, "-I", "-X", "utf8", run_gpu_tests.__file__, "--build", str(build),
                      "--work", str(work), "--filter", "cs_lds"],
-                    capture_output=True, text=True, timeout=10,
+                    capture_output=True, encoding="utf-8", timeout=10,
                 )
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn("error: cannot prepare GPU test directory", result.stderr)

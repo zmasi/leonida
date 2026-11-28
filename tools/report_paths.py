@@ -12,8 +12,12 @@ exist and `os.path.samefile` says they are one file (a hard link, another spelli
 path has to exist: two report paths that don't exist yet still collide when they differ only in case on a volume that
 ignores case. Where the name rules cannot tell, `same_name_on_folding_volume` asks the volume itself with one
 scratch folder: a Linux mount that folds case (vfat, exFAT, CIFS) answers neither `normcase` nor `pathconf`.
+`find_report_path_collision` indexes possible aliases for a batch of inputs and outputs, then uses the same
+pairwise check for the candidates.
 Standard library only; no game data.
 """
+from collections import defaultdict
+from itertools import chain
 import os
 import posixpath
 import sys
@@ -67,12 +71,16 @@ def same_name_on_folding_volume(first, second):
     return _same_resolved_name(os.path.realpath(first), os.path.realpath(second))
 
 
+def _folded_basename(path):
+    return os.path.basename(path).casefold()
+
+
 def _same_resolved_name(first, second):
     """`same_name_on_folding_volume` for paths `os.path.realpath` has already resolved."""
+    if _folded_basename(first) != _folded_basename(second):
+        return False
     first_dir, first_name = os.path.split(first)
     second_dir, second_name = os.path.split(second)
-    if first_name.casefold() != second_name.casefold():
-        return False
     try:
         if not os.path.samefile(first_dir, second_dir):
             return False
@@ -96,6 +104,43 @@ def same_report_path(first, second):
         if _resolved_key(first) == _resolved_key(second):
             return sys.platform != "win32" or _same_windows_folded_path(first, second)
         return _same_resolved_name(first, second)
+
+
+def _possible_alias_keys(path):
+    """Each way same_report_path can match must share at least one of these keys."""
+    resolved = os.path.realpath(path)
+    yield "resolved", resolved
+    yield "normalized", _resolved_key(resolved)
+    yield "basename", _folded_basename(resolved)
+    try:
+        stat = os.stat(resolved)
+    except OSError:
+        return
+    # samefile compares these two stat fields. This also finds hard links with unrelated names.
+    yield "identity", stat.st_dev, stat.st_ino
+
+
+def find_report_path_collision(input_paths, output_paths):
+    """Return (output, conflicting path, conflict is an input), or None for distinct destinations.
+
+    Check outputs in order, comparing against inputs first and then earlier outputs. Index path data for this
+    call only. A shared key makes a pair a candidate, and same_report_path decides whether it really aliases.
+    """
+    inputs = tuple(input_paths)
+    known_paths = []
+    indices_by_key = defaultdict(list)
+    for index, path in enumerate(chain(inputs, output_paths)):
+        keys = tuple(_possible_alias_keys(path))
+        if index >= len(inputs):
+            candidates = {i for key in keys for i in indices_by_key.get(key, ())}
+            for i in sorted(candidates):
+                other = known_paths[i]
+                if same_report_path(path, other):
+                    return path, other, i < len(inputs)
+        known_paths.append(path)
+        for key in keys:
+            indices_by_key[key].append(index)
+    return None
 
 
 def _windows_directory_keeps_case(path):

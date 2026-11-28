@@ -3,6 +3,7 @@ lookup CLI, case-insensitivity, and collision handling.
 
     python -I tests/test_hashdict.py
 """
+import contextlib
 import errno
 import io
 import json
@@ -22,6 +23,7 @@ if os.path.join(ROOT, "tools") not in sys.path:
     sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import hashdict
+import report_paths
 
 
 class JenkinsHashTest(unittest.TestCase):
@@ -742,6 +744,91 @@ class OutputPathTest(unittest.TestCase):
                 self.assertNotIn("Traceback", p.stderr)
                 with open(out, "rb") as f:
                     self.assertEqual(f.read(), before)
+
+    def test_write_failure_preserves_existing_output_and_leaves_no_temp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": []}, f)
+            out = os.path.join(tmp, "hashes.json")
+            sentinel = b'{"sentinel":"keep"}'
+            with open(out, "wb") as f:
+                f.write(sentinel)
+
+            for attr_owner, attr, exc in (
+                (hashdict.json, "dump", OSError("disk full")),
+                (hashdict, "replace_retry", PermissionError(errno.EACCES, "locked", out)),
+            ):
+                with self.subTest(failing=attr):
+                    err = io.StringIO()
+                    with (mock.patch.object(attr_owner, attr, side_effect=exc),
+                          mock.patch.object(sys, "argv", [TOOL, carve, "--out", out]),
+                          mock.patch.object(sys, "stdout", new_callable=io.StringIO),
+                          contextlib.redirect_stderr(err)):
+                        rc = hashdict.main()
+                    self.assertEqual(rc, 2, err.getvalue())
+                    self.assertIn("cannot write", err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+                    with open(out, "rb") as f:
+                        self.assertEqual(f.read(), sentinel)
+                    leftover = [n for n in os.listdir(tmp) if n.startswith(".hashdict-")]
+                    self.assertEqual(leftover, [])
+
+    def test_out_rejects_empty_and_directory_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": []}, f)
+            existing_dir = os.path.join(tmp, "existing_dir")
+            os.makedirs(existing_dir)
+            trailing_dir = os.path.join(tmp, "new_dir")
+            for bad_out in ("", "   ", existing_dir, trailing_dir + os.sep):
+                with self.subTest(bad_out=bad_out):
+                    p = subprocess.run([sys.executable, "-I", TOOL, carve, "--out", bad_out],
+                                       cwd=tmp, capture_output=True, text=True)
+                    self.assertEqual(p.returncode, 2, p.stderr)
+                    self.assertIn("ERROR:", p.stderr)
+                    self.assertNotIn("Traceback", p.stderr)
+            self.assertFalse(os.path.exists(trailing_dir))
+
+    def test_out_refuses_case_only_input_alias_on_folding_volume(self):
+        def folding(first, second):
+            first_dir, first_name = os.path.split(first)
+            second_dir, second_name = os.path.split(second)
+            return (first_name.casefold() == second_name.casefold()
+                    and os.path.normcase(first_dir) == os.path.normcase(second_dir))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(os.path.join(carve, "common"))
+            index = os.path.join(carve, "common", "index.json")
+            original = b'{"files":[]}'
+            with open(index, "wb") as f:
+                f.write(original)
+            alias = os.path.join(carve, "common", "INDEX.json")
+            err = io.StringIO()
+            with (mock.patch.object(report_paths, "_same_resolved_name", side_effect=folding),
+                  mock.patch.object(sys, "argv", [TOOL, carve, "--out", alias]),
+                  mock.patch.object(sys, "stdout", new_callable=io.StringIO),
+                  contextlib.redirect_stderr(err)):
+                rc = hashdict.main()
+            self.assertEqual(rc, 2, err.getvalue())
+            self.assertIn("is one of the inputs", err.getvalue())
+            self.assertEqual(os.listdir(os.path.join(carve, "common")), ["index.json"])
+            with open(index, "rb") as f:
+                self.assertEqual(f.read(), original)
+
+    def test_lookup_accepts_utf8_bom_dictionary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bom_json = os.path.join(tmp, "hashes_bom.json")
+            with open(bom_json, "w", encoding="utf-8-sig", newline="\n") as f:
+                json.dump({"b779a091": "adder"}, f)
+            p = subprocess.run([sys.executable, "-I", TOOL, "--lookup", bom_json, "0xb779a091"],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            self.assertEqual(p.stdout.strip(), "0xb779a091 adder")
 
 
 if __name__ == "__main__":

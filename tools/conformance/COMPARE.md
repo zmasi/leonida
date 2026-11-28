@@ -11,14 +11,16 @@ box). Python 3.8 or newer is needed for the language features used.
 
 ```
 D:\conform\tools\
-    compare.py      the tool
-    README.md       this file
+    report_paths.py
+    conformance\
+        compare.py
+        COMPARE.md
 ```
 
 On the conformance box:
 
 ```powershell
-& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" D:\conform\tools\compare.py --help
+& "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" D:\conform\tools\conformance\compare.py --help
 ```
 
 Elsewhere, `python compare.py --help` is enough.
@@ -185,14 +187,17 @@ same size as the candidate:
   `(255, 0, 0)`, and the ramp passes through purple. Alpha differences count.
 
 Heatmaps are written for passing scenes too, so a clean run leaves a complete
-visual record. Existing files are overwritten. The tool is deterministic: the
-same inputs produce byte-identical heatmaps (verified with SHA-256 over two
-runs).
+visual record. Each heatmap replaces any existing file at its output path if
+that path is distinct from all inputs and other outputs. The same inputs
+produce byte-identical heatmaps (verified with SHA-256 over two runs).
 
 ### diff failures that are not pixel differences
 
 - Missing or extra scene names in the candidate manifest: error names them and
   exits 2. There is nothing meaningful to compare.
+- A heatmap path names either manifest, any input image or another heatmap:
+  error names both paths and exits 2 before writing any heatmaps. Path aliases
+  such as links count as collisions.
 - Different image sizes: error names both paths and their sizes and exits 2.
 - Unreadable or unsupported image: error names the file and exits 2.
 

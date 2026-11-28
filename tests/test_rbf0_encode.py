@@ -14,6 +14,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -302,6 +303,50 @@ class Refusals(unittest.TestCase):
         doc["tree"]["content"][0]["text"] = 123
         self.assertEqual(self.reason(doc=doc), "value")
 
+    def test_malformed_and_out_of_order_descriptors(self):
+        blob = Stream(True).open("root").int("id", 7).close().bytes()
+        for bad_descs in (
+            "not-a-list",
+            [17],
+            [{"index": True, "name": "root"}],
+            [{"index": 0, "name": "root"}, {"index": 0, "name": "other"}],
+        ):
+            with self.subTest(descriptors=bad_descs):
+                doc = rbf0_tree.parse_resource(blob)
+                doc["descriptors"] = bad_descs
+                self.assertEqual(self.reason(doc=doc), "descriptor")
+        # Omitted "index" with utf8_valid=False falls back to position instead of KeyError.
+        doc = rbf0_tree.parse_resource(blob)
+        doc["descriptors"] = [{"name": "root", "utf8_valid": False}]
+        self.assertEqual(self.reason(doc=doc), "utf8")
+        # Explicit out-of-order descriptor table entries map by their declared index.
+        doc = rbf0_tree.parse_resource(blob)
+        doc["descriptors"] = list(reversed(doc["descriptors"]))
+        self.assertEqual(rbf0_encode.encode(doc), blob)
+
+    def test_float_huge_int_overflow_and_vec3_malformed_specials(self):
+        doc = rbf0_tree.parse_resource(Stream(True).open("r").float("f", 1.5).close().bytes())
+        doc["tree"]["content"][0]["value"] = 10**400
+        self.assertEqual(self.reason(doc=doc), "value")
+        for bad_specials in (123, "nan"):
+            with self.subTest(float_special=bad_specials):
+                vdoc = rbf0_tree.parse_resource(Stream(True).open("r").vec3("v", 1.0, 2.0, 3.0).close().bytes())
+                vdoc["tree"]["content"][0]["float_special"] = bad_specials
+                self.assertEqual(self.reason(doc=vdoc), "value")
+
+    def test_bool_recorded_lengths_and_malformed_element_children(self):
+        sdoc = rbf0_tree.parse_resource(Stream(True).open("r").string("s", b"x").close().bytes())
+        sdoc["tree"]["content"][0]["byte_length"] = True
+        self.assertEqual(self.reason(doc=sdoc), "length")
+        tdoc = rbf0_tree.parse_resource(Stream(True).open("r").text(b"").close().bytes())
+        tdoc["tree"]["content"][0]["length"] = False
+        self.assertEqual(self.reason(doc=tdoc), "length")
+        for field, bad_val in (("attributes", None), ("attributes", [123]), ("content", None), ("content", ["bad"])):
+            with self.subTest(field=field, value=bad_val):
+                edoc = rbf0_tree.parse_resource(Stream(True).open("r").close().bytes())
+                edoc["tree"][field] = bad_val
+                self.assertEqual(self.reason(doc=edoc), "value")
+
 
 class Cli(unittest.TestCase):
     def setUp(self):
@@ -484,6 +529,39 @@ class Cli(unittest.TestCase):
         self.assertEqual(code, 1, out)
         self.assertIn("1 resource(s) written, 1 refused", out)
         self.assertTrue(os.path.isfile(os.path.join(out_dir, "00000000.rbf")))
+
+    def test_bom_report_whitespace_out_bool_offset_and_check_oserror(self):
+        blob = every_record(True)
+        doc = rbf0_tree.parse_resource(blob, offset=0x10)
+        bom_report = os.path.join(self.tmp.name, "bom.json")
+        with open(bom_report, "w", encoding="utf-8-sig", newline="\n") as f:
+            json.dump({"tool": "rbf0_tree", "resources": [doc, {"status": "bad", "offset": True}]}, f)
+        out_dir = os.path.join(self.tmp.name, "out-bom")
+        code, out = self.run_main(bom_report, out_dir)
+        self.assertEqual(code, 1, out)
+        self.assertIn("1 resource(s) written, 1 refused", out)
+        self.assertIn("  True: status:", out)
+        self.assertNotIn("0x1:", out)
+        with open(os.path.join(out_dir, "00000010.rbf"), "rb") as f:
+            self.assertEqual(f.read(), blob)
+
+        run_cwd = os.path.join(self.tmp.name, "cwd")
+        os.mkdir(run_cwd)
+        old_cwd = os.getcwd()
+        os.chdir(run_cwd)
+        try:
+            with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
+                self.run_main(bom_report, "   ")
+            self.assertEqual(os.listdir(run_cwd), [])
+        finally:
+            os.chdir(old_cwd)
+
+        with (mock.patch.object(rbf0_encode, "check", side_effect=PermissionError("denied")),
+              self.assertRaises(SystemExit) as cm,
+              redirect_stderr(io.StringIO()) as err):
+            rbf0_encode.main(["--check", self.carve])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertIn("denied", err.getvalue())
 
 
 if __name__ == "__main__":

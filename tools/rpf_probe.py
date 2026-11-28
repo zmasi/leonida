@@ -11,6 +11,7 @@ import argparse
 import json
 import math
 import os
+import stat
 import struct
 import sys
 import tempfile
@@ -41,9 +42,12 @@ def _write_json_report(path: str, rows: list) -> None:
     except FileNotFoundError:
         mode = None
     except OSError:
-        # Non-regular destinations (pipes/devices) keep a direct write.
+        mode = 0
+    if mode is not None and not stat.S_ISREG(mode):
+        # Non-regular destinations (pipes/devices like /dev/null) keep a direct write.
         with open(destination, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(rows, f, indent=1)
+            json.dump(rows, f, indent=1, allow_nan=False)
+            f.write("\n")
         return
     if mode is not None:
         # Retain the direct writer's permission check without truncating the report.
@@ -55,7 +59,8 @@ def _write_json_report(path: str, rows: list) -> None:
     )
     try:
         with staged:
-            json.dump(rows, staged, indent=1)
+            json.dump(rows, staged, indent=1, allow_nan=False)
+            staged.write("\n")
         if os.name != "nt":
             os.chmod(staged.name, published_mode(destination))
         replace_retry(staged.name, destination)
@@ -74,22 +79,29 @@ def probe(path: str) -> dict:
     version = magic[::-1].decode("latin-1") if magic[1:] == b"FPR" else None
     words = list(struct.unpack_from("<4I", head, 4)) if len(head) >= 20 else []
     body = head[16:]
+    h = entropy(body)
     return {
         "file": path,
         "size": os.path.getsize(path),
         "version": version,
         "header_words": [hex(w) for w in words],
-        "head_entropy": round(entropy(body), 3),
-        "looks_encrypted": entropy(body) > 7.9,
+        "head_entropy": round(h, 3),
+        "looks_encrypted": h > 7.9,
     }
 
 
-def main() -> int:
+def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("game_dir")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "rpf_probe.json"))
-    a = ap.parse_args()
-    if os.path.isdir(a.out):
+    a = ap.parse_args(argv)
+    if not a.game_dir.strip():
+        print("ERROR: game_dir must not be empty", file=sys.stderr)
+        return 2
+    if not a.out.strip():
+        print("ERROR: --out must not be empty", file=sys.stderr)
+        return 2
+    if os.path.isdir(a.out) or a.out.endswith(os.sep) or (os.altsep and a.out.endswith(os.altsep)):
         print(f"ERROR: {a.out}: is a directory, not a file", file=sys.stderr)
         return 2
     rows = []

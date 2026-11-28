@@ -3,6 +3,7 @@
     python -I tests/test_awc_markers.py
 """
 import contextlib
+import errno
 import io
 import json
 import os
@@ -18,6 +19,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "awc_markers.py")
 sys.path.insert(0, os.path.dirname(TOOL))
 import awc_markers  # noqa: E402
+import report_paths  # noqa: E402
 
 TRACK, TICK, SPAN = 0x11111111, 0x22222222, 0x33333333      # made-up type hashes
 NAME_A, NAME_B = 0x84000001, 0xB0000002                         # made-up value hashes (not sensible floats)
@@ -284,6 +286,135 @@ class ScanTest(unittest.TestCase):
         missing = subprocess.run([sys.executable, "-I", TOOL, path + ".missing"], capture_output=True, text=True,
                                  timeout=120)
         self.assertEqual(missing.returncode, 2)
+
+
+class OutputSafetyTest(unittest.TestCase):
+    def _sample_bank(self):
+        return speech_bank(0x55, 48000, event(TICK, 1.0, 0))
+
+    def test_out_rejects_empty_and_directory_paths(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "one.awc")
+            with open(src, "wb") as f:
+                f.write(self._sample_bank())
+            existing_dir = os.path.join(tmp, "existing_dir")
+            os.mkdir(existing_dir)
+            new_dir = os.path.join(tmp, "new_dir")
+            for bad_out in ("", "   ", existing_dir, new_dir + os.sep):
+                with self.subTest(bad_out=bad_out):
+                    proc = subprocess.run(
+                        [sys.executable, "-I", TOOL, src, "--out", bad_out],
+                        cwd=tmp, capture_output=True, text=True,
+                    )
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn("error:", proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+                    self.assertEqual(proc.stdout, "")
+            self.assertFalse(os.path.exists(new_dir))
+
+    def test_out_refuses_input_file_and_case_only_alias_on_folding_volume(self):
+        def folding(first, second):
+            first_dir, first_name = os.path.split(first)
+            second_dir, second_name = os.path.split(second)
+            return (first_name.casefold() == second_name.casefold()
+                    and os.path.normcase(first_dir) == os.path.normcase(second_dir))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            payload = self._sample_bank()
+            single = os.path.join(tmp, "single.awc")
+            with open(single, "wb") as f:
+                f.write(payload)
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
+                rc = awc_markers.main([single, "--out", single])
+            self.assertEqual(rc, 2, err.getvalue())
+            self.assertIn("overwrite", err.getvalue())
+            self.assertEqual(out.getvalue(), "")
+            with open(single, "rb") as f:
+                self.assertEqual(f.read(), payload)
+
+            banks = os.path.join(tmp, "banks")
+            os.mkdir(banks)
+            in_dir = os.path.join(banks, "a.awc")
+            with open(in_dir, "wb") as f:
+                f.write(payload)
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
+                rc = awc_markers.main([banks, "--out", in_dir])
+            self.assertEqual(rc, 2, err.getvalue())
+            self.assertIn("overwrite", err.getvalue())
+            self.assertEqual(out.getvalue(), "")
+            with open(in_dir, "rb") as f:
+                self.assertEqual(f.read(), payload)
+
+            alias = os.path.join(banks, "A.AWC")
+            err = io.StringIO()
+            with (mock.patch.object(report_paths, "_same_resolved_name", side_effect=folding),
+                  contextlib.redirect_stdout(io.StringIO()) as out,
+                  contextlib.redirect_stderr(err)):
+                rc = awc_markers.main([banks, "--out", alias])
+            self.assertEqual(rc, 2, err.getvalue())
+            self.assertIn("overwrite", err.getvalue())
+            self.assertEqual(out.getvalue(), "")
+            self.assertEqual(os.listdir(banks), ["a.awc"])
+            with open(in_dir, "rb") as f:
+                self.assertEqual(f.read(), payload)
+
+    def test_write_failure_preserves_existing_report_and_cleans_temp_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "one.awc")
+            with open(src, "wb") as f:
+                f.write(self._sample_bank())
+            report = os.path.join(tmp, "report.json")
+            sentinel = b'{"sentinel":"keep"}\n'
+            with open(report, "wb") as f:
+                f.write(sentinel)
+
+            for attr_owner, attr, exc in (
+                (awc_markers.json, "dump", OSError(errno.ENOSPC, "disk full")),
+                (awc_markers, "replace_retry", PermissionError(errno.EACCES, "locked", report)),
+            ):
+                with self.subTest(failing=attr):
+                    err = io.StringIO()
+                    with (mock.patch.object(attr_owner, attr, side_effect=exc),
+                          contextlib.redirect_stdout(io.StringIO()) as out,
+                          contextlib.redirect_stderr(err)):
+                        rc = awc_markers.main([src, "--out", report])
+                    self.assertEqual(rc, 1, err.getvalue())
+                    self.assertIn("cannot write", err.getvalue())
+                    self.assertNotIn("Traceback", err.getvalue())
+                    self.assertEqual(out.getvalue(), "")
+                    with open(report, "rb") as f:
+                        self.assertEqual(f.read(), sentinel)
+                    leftover = [n for n in os.listdir(tmp) if n.startswith(".awc_markers-")]
+                    self.assertEqual(leftover, [])
+
+    def test_out_creates_missing_parent_and_handles_unwritable_parent_cleanly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "one.awc")
+            with open(src, "wb") as f:
+                f.write(self._sample_bank())
+            nested = os.path.join(tmp, "nested", "deeper", "report.json")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = awc_markers.main([src, "--out", nested])
+            self.assertEqual(rc, 0, err.getvalue())
+            with open(nested, "rb") as f:
+                raw = f.read()
+            self.assertNotIn(b"\r", raw)
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertEqual(json.loads(raw)["banks"], 1)
+
+            not_a_dir = os.path.join(tmp, "not_a_dir")
+            with open(not_a_dir, "wb") as f:
+                f.write(b"x")
+            bad_out = os.path.join(not_a_dir, "report.json")
+            err = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
+                rc = awc_markers.main([src, "--out", bad_out])
+            self.assertEqual(rc, 1, err.getvalue())
+            self.assertIn("cannot write", err.getvalue())
+            self.assertNotIn("Traceback", err.getvalue())
+            self.assertEqual(out.getvalue(), "")
 
 
 if __name__ == "__main__":
