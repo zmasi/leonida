@@ -187,7 +187,7 @@ fn version_number(file: &str) -> Option<u64> {
 }
 
 /// The names in version folder `dir`: container, display, blobs; `None` if
-/// its manifest is missing or does not parse.
+/// its manifest is missing, does not parse, or its blob files are incomplete.
 fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     let bytes = match std::fs::read(dir.join(MANIFEST)) {
         Ok(bytes) => bytes,
@@ -199,6 +199,23 @@ fn load(dir: &Path) -> std::io::Result<Option<(String, String, Vec<String>)>> {
     };
     let blobs = names.split_off(2);
     let [name, display] = <[String; 2]>::try_from(names).expect("two names, checked by the parser");
+    if name.is_empty() || blobs.iter().any(String::is_empty) {
+        return Ok(None);
+    }
+    let mut unique: Vec<&str> = blobs.iter().map(String::as_str).collect();
+    unique.sort_unstable();
+    unique.dedup();
+    if unique.len() != blobs.len() {
+        return Ok(None);
+    }
+    for i in 0..blobs.len() {
+        match std::fs::symlink_metadata(dir.join(i.to_string())) {
+            Ok(meta) if meta.is_file() => {}
+            Ok(_) => return Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        }
+    }
     Ok(Some((name, display, blobs)))
 }
 
@@ -312,11 +329,11 @@ fn commit(
 fn containers(root: &Path) -> Vec<(String, PathBuf)> {
     let mut out = Vec::new();
     for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
-        let path = entry.path();
-        let file = entry.file_name().to_string_lossy().into_owned();
-        if !path.is_dir() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
+        let path = entry.path();
+        let file = entry.file_name().to_string_lossy().into_owned();
         if file.ends_with(".gone") {
             let _ = std::fs::remove_dir_all(&path);
         } else if file.contains('~') {
@@ -340,14 +357,18 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
     let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
     if !done {
         let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
-        let mut blobs: Vec<(String, Vec<u8>)> = std::fs::read_dir(old)
-            .ok()?
-            .flatten()
-            .filter_map(|e| {
-                let blob = decode(e.file_name().to_str()?)?;
-                Some((blob, std::fs::read(e.path()).ok()?))
-            })
-            .collect();
+        let mut blobs = Vec::new();
+        for entry in std::fs::read_dir(old).ok()? {
+            let entry = entry.ok()?;
+            let file = entry.file_name().into_string().ok()?;
+            let Some(blob) = decode(&file) else {
+                continue;
+            };
+            if !entry.file_type().ok()?.is_file() {
+                return None;
+            }
+            blobs.push((blob, std::fs::read(entry.path()).ok()?));
+        }
         blobs.sort();
         let sources: Vec<_> = blobs
             .iter()
@@ -440,7 +461,7 @@ fn remaining(root: &Path) -> u64 {
 /// new version is written before the old one goes, so nothing it replaces
 /// counts there).
 fn no_room(written: u64, replaced: u64, used: u64, free: u64) -> Option<HRESULT> {
-    if written > QUOTA.saturating_sub(used) + replaced {
+    if u128::from(used) + u128::from(written) > u128::from(QUOTA) + u128::from(replaced) {
         Some(QUOTA_EXCEEDED)
     } else if written > free {
         Some(OUT_OF_LOCAL_STORAGE)
@@ -561,10 +582,25 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
 /// One blob as the public API lays it out: name, size, data.
 const BLOB: usize = 24;
 
+fn layout_size(blobs: &[(String, Vec<u8>)]) -> Option<usize> {
+    let mut total = blobs.len().checked_mul(BLOB)?;
+    for (name, data) in blobs {
+        u32::try_from(data.len()).ok()?;
+        total = total
+            .checked_add(name.len())?
+            .checked_add(1)?
+            .checked_add(data.len())?;
+    }
+    (total <= isize::MAX as usize).then_some(total)
+}
+
 /// Blobs laid out as the title reads them: the blob array, then each name
 /// (NUL-terminated) and its data, with pointers `base` plus offset.
-fn layout(blobs: &[(String, Vec<u8>)], base: usize) -> Vec<u8> {
+fn layout(blobs: &[(String, Vec<u8>)], base: usize) -> Option<Vec<u8>> {
+    let total = layout_size(blobs)?;
+    base.checked_add(total)?;
     let mut out = vec![0u8; blobs.len() * BLOB];
+    out.reserve_exact(total - out.len());
     for (i, (name, data)) in blobs.iter().enumerate() {
         let name_at = base + out.len();
         out.extend_from_slice(name.as_bytes());
@@ -576,17 +612,41 @@ fn layout(blobs: &[(String, Vec<u8>)], base: usize) -> Vec<u8> {
         entry[8..12].copy_from_slice(&(data.len() as u32).to_le_bytes());
         entry[16..].copy_from_slice(&data_at.to_le_bytes());
     }
-    out
+    Some(out)
 }
 
-/// The names a title passes (`count` strings, or all blobs if null).
-fn names(names: *const *const c_char, count: u32) -> Option<Vec<String>> {
+/// The names a title passes (`count` strings, or all blobs if null and
+/// `require_zero_when_null` allows it).
+fn names(
+    names: *const *const c_char,
+    count: u32,
+    require_zero_when_null: bool,
+) -> Result<Option<Vec<String>>, HRESULT> {
     if names.is_null() {
-        return None;
+        return if require_zero_when_null && count != 0 {
+            Err(E_INVALIDARG)
+        } else {
+            Ok(None)
+        };
     }
-    // SAFETY: the title passes `count` strings.
-    let names = unsafe { std::slice::from_raw_parts(names, count as usize) };
-    Some(names.iter().map(|&n| text(n).unwrap_or_default()).collect())
+    let len = count as usize;
+    if (names as usize)
+        .checked_add(len.checked_mul(size_of::<*const c_char>()).ok_or(E_INVALIDARG)?)
+        .is_none()
+    {
+        return Err(E_INVALIDARG);
+    }
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        // SAFETY: `names` is non-null and `names + count` does not wrap; read
+        // unaligned in case the caller packed its pointer array.
+        let ptr = unsafe { names.add(i).read_unaligned() };
+        let Some(name) = text(ptr) else {
+            return Err(E_INVALIDARG);
+        };
+        out.push(name);
+    }
+    Ok(Some(out))
 }
 
 type This = *const Object;
@@ -662,6 +722,9 @@ extern "system" fn initialize_async(
     _sync_on_demand: bool,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    if block.is_null() {
+        return E_INVALIDARG;
+    }
     let saves = runtime::title().saves();
     let result = if saves.parent().is_none_or(|p| p.as_os_str().is_empty()) {
         Err(NO_ACCESS)
@@ -752,7 +815,7 @@ extern "system" fn create_container(
     name: *const c_char,
     out: *mut *mut Container,
 ) -> HRESULT {
-    let (Some(p), Some(name)) = (get(provider), text(name)) else {
+    let (Some(p), Some(name), false) = (get(provider), text(name), out.is_null()) else {
         return E_INVALIDARG;
     };
     if !valid_container(&name) {
@@ -801,22 +864,35 @@ extern "system" fn read_blobs(
     size: usize,
     out: *mut u8,
 ) -> HRESULT {
-    let Some(c) = get(container) else {
+    let (Some(c), false) = (get(container), count.is_null()) else {
         return E_INVALIDARG;
     };
-    // SAFETY: the title passes its count.
-    let wanted = unsafe { count.as_ref() }.copied().unwrap_or(0);
-    let blobs = match read(c, names(blob_names, wanted)) {
+    // SAFETY: checked non-null above.
+    let wanted = unsafe { count.read_unaligned() };
+    let wanted = match names(blob_names, wanted, false) {
+        Ok(names) => names,
+        Err(hr) => return hr,
+    };
+    let blobs = match read(c, wanted) {
         Ok(blobs) => blobs,
         Err(hr) => return hr,
     };
-    let bytes = layout(&blobs, out as usize);
-    if out.is_null() || size < bytes.len() {
+    let Some(needed) = layout_size(&blobs) else {
+        return E_INVALIDARG;
+    };
+    if out.is_null() || size < needed {
         return BUFFER_TOO_SMALL;
     }
-    // SAFETY: the buffer holds `size` bytes, checked above.
-    unsafe { out.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
-    put(count, blobs.len() as u32)
+    if needed > 0 {
+        let Some(bytes) = layout(&blobs, out as usize) else {
+            return E_INVALIDARG;
+        };
+        // SAFETY: `out` is non-null, `size >= bytes.len()`, and `out + bytes.len()` does not wrap.
+        unsafe { out.copy_from_nonoverlapping(bytes.as_ptr(), bytes.len()) };
+    }
+    // SAFETY: checked non-null above.
+    unsafe { count.write_unaligned(blobs.len() as u32) };
+    S_OK
 }
 
 /// Read at once; the result holds the layout with pointers relative to the
@@ -828,8 +904,13 @@ extern "system" fn read_async(
     count: u32,
     block: *mut AsyncBlock,
 ) -> HRESULT {
+    if block.is_null() {
+        return E_INVALIDARG;
+    }
     let result = match get(container) {
-        Some(c) => read(c, names(blob_names, count)).map(|blobs| layout(&blobs, 0)),
+        Some(c) => names(blob_names, count, true)
+            .and_then(|wanted| read(c, wanted))
+            .and_then(|blobs| layout(&blobs, 0).ok_or(E_INVALIDARG)),
         None => Err(E_INVALIDARG),
     };
     xasync::finished_with(block, (&raw const READ).cast(), result)
@@ -841,6 +922,19 @@ extern "system" fn read_result(
     out: *mut u8,
     count: *mut u32,
 ) -> HRESULT {
+    if count.is_null() {
+        return E_INVALIDARG;
+    }
+    if size > 0 && !out.is_null() {
+        let mut required = 0;
+        if xasync::XAsyncGetResultSize(block, &mut required) == S_OK
+            && required > 0
+            && size >= required
+            && (out as usize).checked_add(required).is_none()
+        {
+            return E_INVALIDARG;
+        }
+    }
     let mut used = 0;
     let hr = xasync::XAsyncGetResult(block, (&raw const READ).cast(), size, out.cast(), &mut used);
     // The documented error for a small buffer; the result stays for a
@@ -860,14 +954,16 @@ extern "system" fn read_result(
     };
     for i in 0..blobs {
         for field in [0, 16] {
-            // SAFETY: within the blob array just written.
+            // SAFETY: within the blob array just written; `out + used` was checked above.
             unsafe {
                 let p = out.add(i * BLOB + field).cast::<usize>();
                 p.write_unaligned(p.read_unaligned() + out as usize);
             }
         }
     }
-    put(count, blobs as u32)
+    // SAFETY: checked non-null above.
+    unsafe { count.write_unaligned(blobs as u32) };
+    S_OK
 }
 
 extern "system" fn create_update(
@@ -876,7 +972,7 @@ extern "system" fn create_update(
     display: *const c_char,
     out: *mut *mut Update,
 ) -> HRESULT {
-    let Some(c) = get(container) else {
+    let (Some(c), false) = (get(container), out.is_null()) else {
         return E_INVALIDARG;
     };
     put(
@@ -904,16 +1000,19 @@ extern "system" fn write_blob(
     let (Some(update), Some(name)) = (unsafe { update.as_mut() }, text(name)) else {
         return E_INVALIDARG;
     };
-    if name.is_empty() || (data.is_null() && size > 0) {
+    if name.is_empty() || (size > 0 && data.is_null()) {
         return E_INVALIDARG;
     }
     if size > MAX_UPDATE {
         return UPDATE_TOO_BIG;
     }
+    if size > 0 && (data as usize).checked_add(size).is_none() {
+        return E_INVALIDARG;
+    }
     let data = if size == 0 {
         Vec::new()
     } else {
-        // SAFETY: the title passes `size` bytes.
+        // SAFETY: `data` is non-null and `data + size` does not wrap.
         unsafe { std::slice::from_raw_parts(data, size) }.to_vec()
     };
     update.changes.push((name, Some(data)));
@@ -1488,5 +1587,226 @@ mod tests {
         assert_eq!(update(root, "two", &[("a", Some("new a"))]), NO_ACCESS);
         assert!(slot.join("v1").join("0").is_file());
         assert!(!slot.join("v2").exists());
+    }
+
+    #[test]
+    fn incomplete_newer_version_and_unreadable_legacy_blob_keep_saved_data() {
+        type Make = fn(&Path);
+        let incomplete: [(&str, Make); 3] = [
+            ("missing blob file", |v2| {
+                std::fs::create_dir(v2).unwrap();
+                std::fs::write(v2.join("0"), b"new a").unwrap();
+                std::fs::write(v2.join(MANIFEST), manifest("Slot", "two", &["a", "b"])).unwrap();
+            }),
+            ("directory in place of blob file", |v2| {
+                std::fs::create_dir_all(v2.join("0")).unwrap();
+                std::fs::write(v2.join(MANIFEST), manifest("Slot", "two", &["a"])).unwrap();
+            }),
+            ("duplicate blob names in manifest", |v2| {
+                std::fs::create_dir(v2).unwrap();
+                std::fs::write(v2.join("0"), b"x").unwrap();
+                std::fs::write(v2.join("1"), b"y").unwrap();
+                std::fs::write(v2.join(MANIFEST), manifest("Slot", "two", &["a", "a"])).unwrap();
+            }),
+        ];
+        for (what, make) in incomplete {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            assert_eq!(
+                update(root, "one", &[("a", Some("old a")), ("b", Some("old b"))]),
+                S_OK
+            );
+            let slot = container_dir(root, "Slot");
+            make(&slot.join("v2"));
+
+            assert_eq!(state(root), old_state(), "{what}: read keeps v1");
+            assert!(slot.join("v1").is_dir(), "{what}: v1 was removed");
+            assert!(slot.join("v2").is_dir(), "{what}: v2 was removed");
+
+            assert_eq!(
+                update(root, "three", &[("a", Some("newer a"))]),
+                S_OK,
+                "{what}: update above v2"
+            );
+            let expected = Some((
+                "three".into(),
+                vec![("a".into(), "newer a".into()), ("b".into(), "old b".into())],
+            ));
+            assert_eq!(state(root), expected, "{what}: after update");
+            assert!(slot.join("v3").is_dir(), "{what}: did not advance to v3");
+        }
+
+        // Legacy layout: if a decoded blob entry is not a readable regular file,
+        // migration must leave the legacy folder intact rather than drop that
+        // entry and delete `old`.
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves
+            .path()
+            .join(format!("{:016X}", xuser::XUID))
+            .join("scid");
+        let old = root.join("Player");
+        std::fs::create_dir_all(old.join("Save%20Game%20Subdir").join("nested")).unwrap();
+        std::fs::write(old.join("Save%20Game%20Data"), b"data").unwrap();
+        let _p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(old.join("Save%20Game%20Data").is_file(), "legacy blob was deleted");
+        assert!(
+            old.join("Save%20Game%20Subdir").join("nested").is_dir(),
+            "unmigrated entry was deleted"
+        );
+    }
+
+    #[test]
+    fn read_blobs_and_async_validate_counts_names_and_wrapping_buffers() {
+        let this: This = &OBJECT;
+        let saves = tempfile::tempdir().unwrap();
+        let provider = give(Provider::open(saves.path(), Some("scid")).unwrap());
+
+        assert_eq!(
+            initialize_async(this, std::ptr::null(), std::ptr::null(), false, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            create_container(this, provider, c"Slot_1".as_ptr(), std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+
+        let mut container = std::ptr::null_mut();
+        assert_eq!(
+            create_container(this, provider, c"Slot_1".as_ptr(), &mut container),
+            S_OK
+        );
+        assert_eq!(
+            create_update(this, container, c"Chapter 1".as_ptr(), std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+
+        let mut upd = std::ptr::null_mut();
+        assert_eq!(
+            create_update(this, container, c"Chapter 1".as_ptr(), &mut upd),
+            S_OK
+        );
+        assert_eq!(
+            write_blob(this, upd, c"world".as_ptr(), b"hello".as_ptr(), 5),
+            S_OK
+        );
+        let mut b = block();
+        assert_eq!(submit_async(this, upd, &mut b), S_OK);
+        assert_eq!(submit_result(this, &mut b), S_OK);
+        close_update(this, upd);
+
+        // Null `count` in synchronous `read_blobs` must return E_INVALIDARG.
+        assert_eq!(
+            read_blobs(
+                this,
+                container,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+            ),
+            E_INVALIDARG
+        );
+
+        // Size-probe (`size = 0`) with a non-null high pointer must return
+        // BUFFER_TOO_SMALL without overflowing `base + offset`.
+        let mut count = 0u32;
+        assert_eq!(
+            read_blobs(
+                this,
+                container,
+                std::ptr::null(),
+                &mut count,
+                0,
+                usize::MAX as *mut u8,
+            ),
+            BUFFER_TOO_SMALL
+        );
+
+        // Null C-string pointer inside `blob_names` must return E_INVALIDARG.
+        let bad_names = [std::ptr::null::<c_char>()];
+        count = 1;
+        let mut buf = vec![0u64; 16];
+        assert_eq!(
+            read_blobs(
+                this,
+                container,
+                bad_names.as_ptr(),
+                &mut count,
+                buf.len() * 8,
+                buf.as_mut_ptr().cast(),
+            ),
+            E_INVALIDARG
+        );
+
+        // `read_async` with null `blob_names` and non-zero `count` must fail.
+        let mut bad_async = block();
+        assert_eq!(
+            read_async(this, container, std::ptr::null(), 2, &mut bad_async),
+            S_OK
+        );
+        assert_eq!(
+            read_result(
+                this,
+                &mut bad_async,
+                buf.len() * 8,
+                buf.as_mut_ptr().cast(),
+                &mut count,
+            ),
+            E_INVALIDARG
+        );
+
+        // `read_result` with null `count` or wrapping `out` must fail with
+        // E_INVALIDARG without consuming the completed async result.
+        let mut ok_async = block();
+        assert_eq!(
+            read_async(this, container, std::ptr::null(), 0, &mut ok_async),
+            S_OK
+        );
+        let mut needed = 0;
+        assert_eq!(xasync::XAsyncGetResultSize(&mut ok_async, &mut needed), S_OK);
+        assert_eq!(
+            read_result(
+                this,
+                &mut ok_async,
+                needed,
+                buf.as_mut_ptr().cast(),
+                std::ptr::null_mut(),
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            read_result(
+                this,
+                &mut ok_async,
+                needed,
+                (usize::MAX - 7) as *mut u8,
+                &mut count,
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            read_result(
+                this,
+                &mut ok_async,
+                needed,
+                buf.as_mut_ptr().cast(),
+                &mut count,
+            ),
+            S_OK
+        );
+        assert_eq!(count, 1);
+
+        close_container(this, container);
+        close_provider(this, provider);
+    }
+
+    #[test]
+    fn over_quota_save_refuses_same_size_replacement_but_allows_shrinking() {
+        let mb = 1 << 20;
+        assert_eq!(
+            no_room(8 * mb, 8 * mb, QUOTA + 4 * mb, 100 * mb),
+            Some(QUOTA_EXCEEDED)
+        );
+        assert_eq!(no_room(2 * mb, 8 * mb, QUOTA + 4 * mb, 100 * mb), None);
     }
 }
