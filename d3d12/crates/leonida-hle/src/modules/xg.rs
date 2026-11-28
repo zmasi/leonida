@@ -74,15 +74,14 @@ pub extern "system" fn XGSuggestSwizzleMode(
     _flags: u32,
     out: *mut u32,
 ) -> HRESULT {
-    // SAFETY: the title passes a description and room for the layout
-    // (either may be null).
-    match unsafe { (desc.as_ref(), out.as_mut()) } {
-        (Some(desc), Some(out)) => {
-            *out = SWIZZLED | suggested(desc).0;
-            S_OK
-        }
-        _ => E_INVALIDARG,
+    if desc.is_null() || out.is_null() {
+        return E_INVALIDARG;
     }
+    // SAFETY: checked non-null; read `*desc` before writing `out` because the
+    // title passes `&desc.layout` as `out`.
+    let d = unsafe { desc.read_unaligned() };
+    unsafe { out.write_unaligned(SWIZZLED | suggested(&d).0) };
+    S_OK
 }
 
 #[repr(C)]
@@ -96,19 +95,20 @@ pub struct Computer {
 
 type This = *mut Computer;
 
-fn computer<'a>(this: This) -> &'a Computer {
-    // SAFETY: called from computer methods only.
-    unsafe { &*this }
+fn computer<'a>(this: This) -> Option<&'a Computer> {
+    // SAFETY: called from computer methods; null `this` is rejected.
+    unsafe { this.as_ref() }
 }
 
 pub extern "system" fn XGCreateTextureComputer(
     desc: *const ResourceDesc,
     out: *mut This,
 ) -> HRESULT {
-    // SAFETY: the title passes a description and room for a pointer.
-    let (Some(&desc), false) = (unsafe { desc.as_ref() }, out.is_null()) else {
+    if desc.is_null() || out.is_null() {
         return E_INVALIDARG;
-    };
+    }
+    // SAFETY: checked non-null; copied before writing `out`.
+    let desc = unsafe { desc.read_unaligned() };
     let Some(texture) = texture(&desc) else {
         tracing::warn!(?desc, "no texture layout");
         return E_INVALIDARG;
@@ -276,11 +276,19 @@ fn mip_out(desc: &ResourceDesc, l: &Layout, i: usize) -> MipOut {
 }
 
 extern "system" fn add_ref(this: This) -> u32 {
-    computer(this).refs.fetch_add(1, Ordering::Relaxed) + 1
+    let Some(c) = computer(this) else {
+        return 0;
+    };
+    c.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 extern "system" fn release(this: This) -> u32 {
-    let left = computer(this).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+    if this.is_null() {
+        return 0;
+    }
+    // SAFETY: checked non-null; access `refs` via raw pointer so no `&Computer`
+    // borrow spans `Box::from_raw` on the final release.
+    let left = unsafe { (*this).refs.fetch_sub(1, Ordering::AcqRel) } - 1;
     if left == 0 {
         // SAFETY: made by `Box::into_raw` in `XGCreateTextureComputer`; the
         // last reference is gone.
@@ -290,10 +298,9 @@ extern "system" fn release(this: This) -> u32 {
 }
 
 extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
-    if out.is_null() {
+    let (Some(c), false) = (computer(this), out.is_null()) else {
         return E_INVALIDARG;
-    }
-    let c = computer(this);
+    };
     // SAFETY: the title passes room for the layout; every field is plain
     // data, so zeroes are a valid start.
     let out = unsafe {
@@ -334,6 +341,7 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
 /// tiled bytes and the linear bytes the copy touches.
 struct CopyArgs<'a> {
     layout: &'a Layout,
+    plane_offset: usize,
     mip: u32,
     slice: u32,
     tiled: usize,
@@ -346,21 +354,82 @@ fn copy_args(
     subresource: u32,
     row: u32,
     depth: u32,
-) -> Option<CopyArgs<'_>> {
-    let p = c.texture.planes.get(plane as usize)?;
+    detile: bool,
+) -> Result<CopyArgs<'_>, HRESULT> {
+    if c.mips == 0 {
+        return Err(E_INVALIDARG);
+    }
+    let p = c.texture.planes.get(plane as usize).ok_or(E_INVALIDARG)?;
     let l = &p.layout;
     let (mip, slice) = (subresource % c.mips, subresource / c.mips);
-    let m = l.mips.get(mip as usize)?;
-    let bytes = m.width as usize * l.desc.element_bytes as usize;
+    let m = l.mips.get(mip as usize).ok_or(E_INVALIDARG)?;
+    let max_slices = if l.desc.dimension == Dimension::Tex3d {
+        1
+    } else {
+        l.slices
+    };
+    if slice >= max_slices {
+        return Err(E_INVALIDARG);
+    }
+    if !l.addressable() {
+        return Err(E_NOTIMPL);
+    }
+    let bytes = (m.width as usize)
+        .checked_mul(l.desc.element_bytes as usize)
+        .ok_or(E_INVALIDARG)?;
+    if (row as usize) < bytes {
+        return Err(E_INVALIDARG);
+    }
+    let slice_bytes = (m.height.saturating_sub(1) as usize)
+        .checked_mul(row as usize)
+        .and_then(|offset| offset.checked_add(bytes))
+        .ok_or(E_INVALIDARG)?;
     let depths = l.subresource_depth(mip) as usize;
-    let linear = (depths - 1) * depth as usize + (m.height as usize - 1) * row as usize + bytes;
-    Some(CopyArgs {
+    if depths > 1 && (depth as usize) < slice_bytes {
+        return Err(E_INVALIDARG);
+    }
+    let linear = depths
+        .saturating_sub(1)
+        .checked_mul(depth as usize)
+        .and_then(|offset| offset.checked_add(slice_bytes))
+        .ok_or(E_INVALIDARG)?;
+    let plane_offset = usize::try_from(p.offset).map_err(|_| E_INVALIDARG)?;
+    let tiled_bytes = if detile { l.bytes_from(mip) } else { l.size };
+    let tiled = usize::try_from(tiled_bytes).map_err(|_| E_INVALIDARG)?;
+    if tiled > isize::MAX as usize || linear > isize::MAX as usize {
+        return Err(E_INVALIDARG);
+    }
+    Ok(CopyArgs {
         layout: l,
+        plane_offset,
         mip,
         slice,
-        tiled: (p.offset + l.size) as usize,
+        tiled,
         linear,
     })
+}
+
+fn valid_disjoint_ranges(
+    tiled_base: *const u8,
+    plane_offset: usize,
+    tiled_len: usize,
+    linear_base: *const u8,
+    linear_len: usize,
+) -> bool {
+    if tiled_base.is_null() || linear_base.is_null() {
+        return false;
+    }
+    let Some(tiled_start) = (tiled_base as usize).checked_add(plane_offset) else {
+        return false;
+    };
+    let Some(tiled_end) = tiled_start.checked_add(tiled_len) else {
+        return false;
+    };
+    let linear_start = linear_base as usize;
+    let Some(linear_end) = linear_start.checked_add(linear_len) else {
+        return false;
+    };
+    !(tiled_len > 0 && linear_len > 0 && tiled_start < linear_end && linear_start < tiled_end)
 }
 
 fn result(r: Result<(), Error>) -> HRESULT {
@@ -381,18 +450,26 @@ extern "system" fn copy_into(
     row: u32,
     depth: u32,
 ) -> HRESULT {
-    let c = computer(this);
-    let Some(a) = copy_args(c, plane, subresource, row, depth) else {
+    let Some(c) = computer(this) else {
         return E_INVALIDARG;
     };
     if tiled.is_null() || linear.is_null() {
         return E_INVALIDARG;
     }
-    let offset = c.texture.planes[plane as usize].offset as usize;
-    // SAFETY: the title's memory holds the whole texture and its rows.
+    let a = match copy_args(c, plane, subresource, row, depth, false) {
+        Ok(a) => a,
+        Err(hr) => {
+            tracing::warn!(hr, desc = ?c.desc, subresource, "copy into a texture failed");
+            return hr;
+        }
+    };
+    if !valid_disjoint_ranges(tiled.cast_const(), a.plane_offset, a.tiled, linear, a.linear) {
+        return E_INVALIDARG;
+    }
+    // SAFETY: bounds, address wraparound, and non-overlap were checked above.
     let (tiled, linear) = unsafe {
         (
-            std::slice::from_raw_parts_mut(tiled.add(offset), a.tiled - offset),
+            std::slice::from_raw_parts_mut(tiled.add(a.plane_offset), a.tiled),
             std::slice::from_raw_parts(linear, a.linear),
         )
     };
@@ -413,23 +490,33 @@ extern "system" fn copy_from(
     linear: *mut u8,
     plane: u32,
     subresource: u32,
-    _sample: u32,
+    sample: u32,
     tiled: *const u8,
     row: u32,
     depth: u32,
 ) -> HRESULT {
-    let c = computer(this);
-    let Some(a) = copy_args(c, plane, subresource, row, depth) else {
+    let Some(c) = computer(this) else {
         return E_INVALIDARG;
     };
     if tiled.is_null() || linear.is_null() {
         return E_INVALIDARG;
     }
-    let offset = c.texture.planes[plane as usize].offset as usize;
-    // SAFETY: the title's memory holds the whole texture and its rows.
+    let a = match copy_args(c, plane, subresource, row, depth, true) {
+        Ok(a) => a,
+        Err(hr) => {
+            tracing::warn!(hr, desc = ?c.desc, subresource, "copy out of a texture failed");
+            return hr;
+        }
+    };
+    if sample >= a.layout.desc.samples
+        || !valid_disjoint_ranges(tiled, a.plane_offset, a.tiled, linear.cast_const(), a.linear)
+    {
+        return E_INVALIDARG;
+    }
+    // SAFETY: bounds, address wraparound, and non-overlap were checked above.
     let (tiled, linear) = unsafe {
         (
-            std::slice::from_raw_parts(tiled.add(offset), a.tiled - offset),
+            std::slice::from_raw_parts(tiled.add(a.plane_offset), a.tiled),
             std::slice::from_raw_parts_mut(linear, a.linear),
         )
     };
@@ -476,7 +563,9 @@ extern "system" fn tiling(
     first: u32,
     out: *mut SubresourceTiling,
 ) -> HRESULT {
-    let c = computer(this);
+    let Some(c) = computer(this) else {
+        return E_INVALIDARG;
+    };
     let l = &c.texture.planes[0].layout;
     if l.alignment != TILE {
         return E_FAIL;
@@ -492,47 +581,56 @@ extern "system" fn tiling(
         _ => 0,
     };
     let block = l.desc.block;
-    // SAFETY: each output is null or room for its value; `out` has room
-    // for `*count` entries.
+    // SAFETY: each output pointer is checked non-null before writing; when
+    // `out` is non-null it has room for `*count` entries.
     unsafe {
-        if let Some(t) = tiles.as_mut() {
-            *t = (l.size / TILE) as u32;
+        if !tiles.is_null() {
+            tiles.write_unaligned((l.size / TILE) as u32);
         }
-        if let Some(p) = packed.as_mut() {
-            *p = PackedMips {
+        if !packed.is_null() {
+            packed.write_unaligned(PackedMips {
                 standard: standard as u8,
                 packed: (c.mips - standard) as u8,
                 tiles: tail_tiles as u32,
                 start: 0,
-            };
+            });
         }
-        if let Some(s) = shape.as_mut() {
-            *s = [l.block[0] * block, l.block[1] * block, l.block[2]];
+        if !shape.is_null() {
+            shape.write_unaligned([l.block[0] * block, l.block[1] * block, l.block[2]]);
         }
-        if let Some(n) = count.as_mut() {
+        if !count.is_null() {
+            let requested = count.read_unaligned();
             let slices = if tail { l.slices.min(2) } else { l.slices };
-            let wanted = (standard * slices).saturating_sub(first).min(*n);
-            for i in 0..wanted {
-                let (slice, mip) = ((first + i) / standard, (first + i) % standard);
-                let m = &l.mips[mip as usize];
-                let entry = if tail && slice > 0 {
-                    SubresourceTiling {
-                        width: 0,
-                        height: 0,
-                        depth: 0,
-                        start: 0,
-                    }
-                } else {
-                    SubresourceTiling {
-                        width: m.pitch / l.block[0],
-                        height: (m.rows / l.block[1]) as u16,
-                        depth: 1,
-                        start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
-                    }
-                };
-                out.add(i as usize).write(entry);
+            let total = u64::from(standard) * u64::from(slices);
+            let wanted = total
+                .saturating_sub(u64::from(first))
+                .min(u64::from(requested)) as u32;
+            if out.is_null() {
+                count.write_unaligned(0);
+            } else {
+                for i in 0..wanted {
+                    let sub = first + i;
+                    let (slice, mip) = (sub / standard, sub % standard);
+                    let m = &l.mips[mip as usize];
+                    let entry = if tail && slice > 0 {
+                        SubresourceTiling {
+                            width: 0,
+                            height: 0,
+                            depth: 0,
+                            start: 0,
+                        }
+                    } else {
+                        SubresourceTiling {
+                            width: m.pitch / l.block[0],
+                            height: (m.rows / l.block[1]) as u16,
+                            depth: 1,
+                            start: ((u64::from(slice) * l.slice_size + m.offset) / TILE) as u32,
+                        }
+                    };
+                    out.add(i as usize).write_unaligned(entry);
+                }
+                count.write_unaligned(wanted);
             }
-            *n = wanted;
         }
     }
     S_OK
@@ -554,9 +652,12 @@ extern "system" fn element_offset(
 ) -> u64 {
     if !bit.is_null() {
         // SAFETY: the caller passes room for the bit position or null.
-        unsafe { bit.write(0) };
+        unsafe { bit.write_unaligned(0) };
     }
-    let Some(p) = computer(this).texture.planes.get(plane as usize) else {
+    let Some(c) = computer(this) else {
+        return 0;
+    };
+    let Some(p) = c.texture.planes.get(plane as usize) else {
         return 0;
     };
     let x = u32::try_from(x).unwrap_or(u32::MAX);
@@ -572,7 +673,9 @@ extern "system" fn element_offset(
 /// Slots the title does not call: size, alignment, offsets, coordinates,
 /// view descriptor, tiled-resource query.
 extern "system" fn unused(this: This) -> HRESULT {
-    tracing::warn!(desc = ?computer(this).desc, "unimplemented texture computer method");
+    if let Some(c) = computer(this) {
+        tracing::warn!(desc = ?c.desc, "unimplemented texture computer method");
+    }
     E_NOTIMPL
 }
 
@@ -780,5 +883,247 @@ mod tests {
         let bad = desc(256, 256, 1, 28, 0x103);
         assert_eq!(XGCreateTextureComputer(&bad, &mut c), E_INVALIDARG);
         assert!(module().exports.len() == 2);
+    }
+
+    #[test]
+    fn tiling_handles_null_output_and_out_of_range_first() {
+        type Tiling = extern "system" fn(
+            This,
+            *mut u32,
+            *mut PackedMips,
+            *mut [u32; 3],
+            *mut u32,
+            u32,
+            *mut SubresourceTiling,
+        ) -> HRESULT;
+        let c = create(&desc(256, 256, 0, 98, 0x10a));
+        let get_tiling: Tiling = slot(c, 10);
+
+        let (mut tiles, mut shape, mut n) = (0, [0; 3], 4);
+        let mut packed = PackedMips {
+            standard: 0,
+            packed: 0,
+            tiles: 0,
+            start: 99,
+        };
+        assert_eq!(
+            get_tiling(
+                c,
+                &mut tiles,
+                &mut packed,
+                &mut shape,
+                &mut n,
+                0,
+                std::ptr::null_mut(),
+            ),
+            S_OK
+        );
+        assert_eq!(
+            (tiles, packed.standard, packed.packed, packed.tiles, packed.start, shape, n),
+            (2, 1, 8, 1, 0, [256, 256, 1], 0)
+        );
+
+        let mut subs = [SubresourceTiling {
+            width: 0,
+            height: 0,
+            depth: 0,
+            start: 0xdead_beef,
+        }];
+        n = 1;
+        assert_eq!(
+            get_tiling(
+                c,
+                &mut tiles,
+                &mut packed,
+                &mut shape,
+                &mut n,
+                u32::MAX,
+                subs.as_mut_ptr(),
+            ),
+            S_OK
+        );
+        assert_eq!((n, subs[0].start), (0, 0xdead_beef));
+        assert_eq!(
+            tiling(
+                std::ptr::null_mut(),
+                &mut tiles,
+                &mut packed,
+                &mut shape,
+                &mut n,
+                0,
+                subs.as_mut_ptr(),
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(release(c), 0);
+    }
+
+    #[test]
+    fn copy_rejects_invalid_subresources_pitches_overlap_and_bad_sample() {
+        type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type From =
+            extern "system" fn(This, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
+
+        let mut aliased = desc(64, 64, 1, 28, 0);
+        assert_eq!(
+            XGSuggestSwizzleMode(&raw const aliased, 0, &raw mut aliased.layout),
+            S_OK
+        );
+        assert_eq!(aliased.layout, 0x105);
+
+        let c2d = create(&aliased);
+        let (into, from): (Into, From) = (slot(c2d, 8), slot(c2d, 9));
+        let mut tiled = vec![0u8; 16384];
+        let mut linear = vec![0u8; 16384];
+        let tiny = [0u8; 1];
+
+        // Non-zero sample index on a single-sampled texture must fail.
+        assert_eq!(
+            from(c2d, linear.as_mut_ptr(), 0, 0, 1, tiled.as_ptr(), 256, 0),
+            E_INVALIDARG
+        );
+
+        // Out-of-range subresource and short row pitch must fail before slicing `tiny`.
+        assert_eq!(
+            into(c2d, tiled.as_mut_ptr(), 0, 1, tiny.as_ptr(), 256, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            from(c2d, linear.as_mut_ptr(), 0, 1, 0, tiny.as_ptr(), 256, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            into(c2d, tiled.as_mut_ptr(), 0, 0, tiny.as_ptr(), 128, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            into(
+                c2d,
+                tiled.as_mut_ptr(),
+                0,
+                0,
+                (usize::MAX - 7) as *const u8,
+                256,
+                0,
+            ),
+            E_INVALIDARG
+        );
+
+        // Overlapping tiled and linear ranges must fail instead of creating aliasing slices.
+        assert_eq!(
+            into(c2d, tiled.as_mut_ptr(), 0, 0, tiled.as_ptr(), 256, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            from(c2d, tiled.as_mut_ptr(), 0, 0, 0, tiled.as_ptr(), 256, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            into(
+                c2d,
+                tiled.as_mut_ptr(),
+                0,
+                0,
+                unsafe { tiled.as_ptr().add(128) },
+                256,
+                0,
+            ),
+            E_INVALIDARG
+        );
+
+        // 3D textures only have slice 0 (subresource < mips) and require depth_pitch >= slice_bytes.
+        let mut d3d = desc(32, 32, 1, 28, 0x100);
+        d3d.dimension = TEXTURE_3D;
+        d3d.depth_or_array = 4;
+        let c3d = create(&d3d);
+        let into3d: Into = slot(c3d, 8);
+        let mut tiled3d = vec![0u8; 32768];
+        assert_eq!(
+            into3d(c3d, tiled3d.as_mut_ptr(), 0, 1, tiny.as_ptr(), 128, 4096),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            into3d(c3d, tiled3d.as_mut_ptr(), 0, 0, tiny.as_ptr(), 128, 2048),
+            E_INVALIDARG
+        );
+        assert_eq!(release(c3d), 0);
+
+        // XOR render-target swizzle modes remain E_NOTIMPL without slicing `tiny`.
+        let mut rt = desc(64, 64, 1, 28, 0x11b);
+        rt.flags = ALLOW_RENDER_TARGET;
+        let crt = create(&rt);
+        let into_rt: Into = slot(crt, 8);
+        assert_eq!(
+            into_rt(crt, tiled.as_mut_ptr(), 0, 0, tiny.as_ptr(), 256, 0),
+            E_NOTIMPL
+        );
+        assert_eq!(release(crt), 0);
+
+        // Null `this` guards.
+        assert_eq!(add_ref(std::ptr::null_mut()), 0);
+        assert_eq!(release(std::ptr::null_mut()), 0);
+        assert_eq!(layout(std::ptr::null_mut(), std::ptr::null_mut()), E_INVALIDARG);
+        assert_eq!(
+            copy_into(std::ptr::null_mut(), tiled.as_mut_ptr(), 0, 0, linear.as_ptr(), 256, 0),
+            E_INVALIDARG
+        );
+        assert_eq!(
+            copy_from(std::ptr::null_mut(), linear.as_mut_ptr(), 0, 0, 0, tiled.as_ptr(), 256, 0),
+            E_INVALIDARG
+        );
+        let mut bit = 5;
+        assert_eq!(
+            element_offset(std::ptr::null_mut(), 0, 0, 0, 0, 0, 0, &mut bit),
+            0
+        );
+        assert_eq!(bit, 0);
+
+        assert_eq!(release(c2d), 0);
+    }
+
+    #[test]
+    fn copy_from_coarse_mip_uses_prefix_footprint() {
+        type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
+        type From =
+            extern "system" fn(This, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
+
+        // 256x256 BC7 SW_64KB_D: full texture is 128 KiB, while mips 1..=8 live in the first 64 KiB tile.
+        let c = create(&desc(256, 256, 0, 98, 0x10a));
+        let (into, from): (Into, From) = (slot(c, 8), slot(c, 9));
+        let mut full_tiled = vec![0u8; 131072];
+        let mip1_row = 32 * 16;
+        let mip1_src: Vec<u8> = (0..mip1_row * 32).map(|i| (i * 5 + 11) as u8).collect();
+        assert_eq!(
+            into(
+                c,
+                full_tiled.as_mut_ptr(),
+                0,
+                1,
+                mip1_src.as_ptr(),
+                mip1_row as u32,
+                0,
+            ),
+            S_OK
+        );
+
+        // Place the linear output immediately after the 64 KiB coarse-mip prefix in one arena.
+        let prefix = 65536usize;
+        let mut arena = vec![0u8; prefix + 65536];
+        arena[..prefix].copy_from_slice(&full_tiled[..prefix]);
+        let dst = unsafe { arena.as_mut_ptr().add(prefix) };
+
+        assert_eq!(
+            from(c, dst, 0, 1, 0, arena.as_ptr(), mip1_row as u32, 0),
+            S_OK
+        );
+        assert_eq!(&arena[prefix..prefix + mip1_src.len()], mip1_src.as_slice());
+
+        // Mip 0 needs all 128 KiB of tiled memory, which overlaps `dst` at +64 KiB and must fail.
+        assert_eq!(
+            from(c, dst, 0, 0, 0, arena.as_ptr(), 1024, 0),
+            E_INVALIDARG
+        );
+
+        assert_eq!(release(c), 0);
     }
 }
