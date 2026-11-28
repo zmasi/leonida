@@ -137,6 +137,14 @@ public:
     void* load_runtime_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
     void* resolve_module_export(void* module_handle, const std::string& sym, bool& owns_handle);
     bool owns_module_handle(void* module_handle) const;
+    // LEONIDA_COMPAT_DIR for a run-time LoadLibrary / GetModuleHandle (shims::BundledModuleOps::compat_module): the
+    // same DLL, and the same handle, a static import of `basename` binds to. `name` is the caller's: one with a
+    // directory is handled only when it names the compat file. DONT_RESOLVE_DLL_REFERENCES in `flags` is refused, as
+    // for bundled DLLs. owns_compat_handle: whether `module` is a DLL from the folder, including one Windows loaded
+    // there as another's dependency (it is then kept, as the others are).
+    void* runtime_compat_module(const std::wstring& basename, const std::wstring& name, bool load, uint32_t flags,
+                                bool& handled);
+    bool owns_compat_handle(void* module);
 
 private:
     void initialise(Module& m);
@@ -153,6 +161,12 @@ private:
     // owns every import of that DLL; `out` is the export, or null when the DLL lacks it. Caller holds mutex_.
     bool resolve_compat(const std::string& key, const std::string& dll, const std::string& name, uint16_t ordinal,
                         bool by_ordinal, void*& out);
+    // The file in compat_dir_ named `basename` (case-insensitively, as Windows matches module names), or null.
+    const std::filesystem::path* compat_file(const std::wstring& basename) const;
+    // The handle of `file` (a compat_file() entry): the one already in use (looked up before, or loaded by Windows on
+    // its own, as another compat DLL's dependency), else loaded by Windows when `load`. Null with `error` (a Windows
+    // error code) when Windows refused the file, or when it is not loaded and `load` is false. Caller holds mutex_.
+    void* compat_handle(const std::filesystem::path& file, bool load, uint32_t& error);
     void* resolve_forwarder(const std::string& spec, Binding& binding, int depth);
     void parse_exports(Module& m);
     void protect_sections(Module& m);
@@ -162,8 +176,10 @@ private:
     std::filesystem::path game_dir_;
     // LEONIDA_COMPAT_DIR, read when the Loader is made; empty = no compat step. Drop-in DLLs named like console
     // modules (runtime/README.md, "Compat modules"), loaded by Windows from there and kept for the process lifetime.
+    // The folder's file names are listed once, then, so a lookup by name never touches the disk.
     std::filesystem::path compat_dir_;
-    std::map<std::string, void*> compat_modules_;  // lower-case DLL name -> HMODULE
+    std::vector<std::filesystem::path> compat_files_;  // file names in compat_dir_
+    std::map<std::string, void*> compat_modules_;  // file name (UTF-8, ASCII lower case) -> HMODULE
     std::map<std::filesystem::path::string_type, Module*> by_name_;  // native basename, ASCII case folded
     std::vector<Module*> order_;       // mapping order; owns the modules
     std::vector<Module*> init_order_;  // dependencies first, see initialisation_order()
