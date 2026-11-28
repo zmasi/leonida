@@ -37,7 +37,9 @@ pub enum PolicyError {
 /// `path` does not have to exist yet. Two checks are made:
 /// 1. it is not below the source tree this binary was built from;
 /// 2. none of its ancestors contains the [`ROOT_MARKER`] file (catches
-///    other clones/copies of the repository).
+///    other clones/copies of the repository). The repository's root holds
+///    one as well as its `d3d12/` workspace, so the folders around the
+///    workspace (`runtime/`, `tools/`, the root itself) are refused too.
 pub fn ensure_outside_repo(path: &Path) -> Result<(), PolicyError> {
     let resolved = resolve(path)?;
 
@@ -147,6 +149,32 @@ mod tests {
             .join("not-yet-created")
             .join("out");
         assert!(ensure_outside_repo(&path).is_err());
+    }
+
+    /// The workspace is the repository's `d3d12/` folder. The rest of the
+    /// repository (its root, `runtime/`, `tools/`) is as much the source tree,
+    /// and game-derived output there could be committed just the same.
+    #[test]
+    fn rejects_the_rest_of_the_repository_around_the_workspace() {
+        let repository = compiled_workspace_root().join("..");
+        assert!(
+            repository.join("d3d12").join(ROOT_MARKER).is_file(),
+            "the workspace is the repository's d3d12 folder"
+        );
+        for path in [
+            repository.join("cache"),
+            repository.join("runtime").join("not-yet-created"),
+            repository.join("tools").join("..").join("out"),
+        ] {
+            assert!(
+                matches!(ensure_outside_repo(&path), Err(PolicyError::InsideRepo { .. })),
+                "{} is inside the repository",
+                path.display()
+            );
+        }
+        // Beside the repository is still outside it.
+        let beside = repository.join("..").join("leonida-policy-not-yet-created");
+        ensure_outside_repo(&beside).unwrap();
     }
 
     #[test]

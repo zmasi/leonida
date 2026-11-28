@@ -1,0 +1,6 @@
+This marker file identifies the root of the Leonida repository.
+
+Tools refuse to write game-derived output (caches, converted assets, prepared
+images, logs containing game data) anywhere below a directory that contains
+this file. d3d12/.leonida-root marks the D3D12 workspace the same way; this
+one covers the rest of the repository around it. See d3d12/docs/asset-policy.md.
