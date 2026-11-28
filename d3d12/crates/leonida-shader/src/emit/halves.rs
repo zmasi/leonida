@@ -179,14 +179,26 @@ impl<'a> Lower<'a> {
     /// `floor_zero` and capping overflow at `0xFFFF` otherwise). Uses unsigned
     /// `IUGT` for `u16` so `v_pk_mad_u16` sums up to `0xFFFF_0000` (bit 31 set)
     /// saturate rather than comparing negative.
+    ///
+    /// Signed saturation is computed in `[0, 0xFFFF]` biased unsigned space
+    /// (`clamp(r + 0x8000, 0, 0xFFFF) ^ 0x8000`) so bits `[31:16]` are `0` by
+    /// construction: NVIDIA's Ampere D3D12 driver JIT folds signed
+    /// `clamp(r, -32768, 32767) & 0xFFFF` to a sign-extending 16-bit saturating
+    /// op and elides `& 0xFFFF` when the high half reduces to `v & 0xFFFF_0000`
+    /// or an immediate OR, leaking `0xFFFF` into bits `[31:16]` on negative `lo`.
     fn clamp_int16(&mut self, r: V, signed: bool, floor_zero: bool) -> V {
         let c = self.cur;
         if signed {
-            let (lo, hi) = (self.s.m.i32((-32768i32) as u32), self.s.m.i32(0x7FFF));
-            let gt = self.s.m.cmp(c, pred::SGT, r, hi);
-            let r = self.s.m.select(c, gt, hi, r);
-            let lt = self.s.m.cmp(c, pred::SLT, r, lo);
-            self.s.m.select(c, lt, lo, r)
+            use crate::emit::lower::Bin;
+            let zero = self.s.m.i32(0);
+            let bias = self.s.m.i32(0x8000);
+            let max_u16 = self.s.m.i32(0xFFFF);
+            let u = self.s.m.bin(c, Bin::Add, r, bias);
+            let neg = self.s.m.cmp(c, pred::SLT, u, zero);
+            let u = self.s.m.select(c, neg, zero, u);
+            let ov = self.s.m.cmp(c, pred::IUGT, u, max_u16);
+            let u = self.s.m.select(c, ov, max_u16, u);
+            self.s.m.bin(c, Bin::Xor, u, bias)
         } else {
             let hi = self.s.m.i32(0xFFFF);
             let sat = self.s.m.i32(if floor_zero { 0 } else { 0xFFFF });

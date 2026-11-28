@@ -612,6 +612,66 @@ fn packed_int16_clamp_handles_sgpr_and_inline_operands() {
 }
 
 #[test]
+fn packed_mad_i16_clamp_constant_hi_preserves_high_half_on_negative_lo() {
+    // Regression test for NVIDIA Ampere D3D12 JIT `& 0xFFFF` elision:
+    // Case A (`mad_const_hi`): inline `2` (`lo = 2, hi = 0`) + inline `16` folds `halves[1]`
+    // to constant `0x0010` (`hi = 0x0010_0000`).
+    // Case B (`add_zero_hi`): `v2 = v2 & 0xFFFF` makes `v2.hi == 0`, so `v_pk_add_i16 v0, v1, v2 clamp`
+    // simplifies `hi` in NVVM to `v1 & 0xFFFF_0000`, forming the exact
+    // `(clamp_s16(v1.lo + v2.lo) & 0xFFFF) | (v1 & 0xFFFF_0000)` pattern where Ampere's JIT
+    // elides `& 0xFFFF` on sign-extended `clamp_s16`.
+    let mad_const_hi = build_cs(&vop3p(
+        0x000,
+        0,
+        vgpr(1),
+        0x80 + 2,
+        0x80 + 16,
+        0b000,
+        0b011,
+        0,
+        0,
+        true,
+    ));
+    let inputs: &[[u32; 4]] = &[
+        [pack16((-20000i16) as u16, 0x7FFF), 0, 0, 0], // lo: -40000 + 16 -> -32768 (0x8000); hi: 0x0010
+        [pack16((-50i16) as u16, 0x8000), 0, 0, 0],    // lo: -100 + 16 = -84 (0xFFAC); hi: 0x0010
+        [pack16(20000, 0x1234), 0, 0, 0],              // lo: +40016 -> +32767 (0x7FFF); hi: 0x0010
+    ];
+    let wants = [
+        pack16(0x8000, 0x0010),
+        pack16((-84i16) as u16, 0x0010),
+        pack16(0x7FFF, 0x0010),
+    ];
+    run_cases(&mad_const_hi, inputs, |backend, i, _, got| {
+        assert_eq!(
+            got, wants[i],
+            "{backend} v_pk_mad_i16 constant-hi clamp case {i}: got {got:#010x}, want {:#010x}",
+            wants[i]
+        );
+    });
+
+    // Case B: v_and_b32_e32 v2, 0xFFFF, v2 (VOP2 opcode 0x1B, src0=0xFF literal 0xFFFF)
+    // followed by v_pk_add_i16 v0, v1, v2 op_sel:[0,0] op_sel_hi:[1,1] clamp.
+    let v_and_low16: [u32; 2] = [0x00FFu32 | (2 << 9) | (2 << 17) | (0x1B << 25), 0x0000_FFFF];
+    let mut body = Vec::new();
+    body.extend_from_slice(&v_and_low16);
+    body.extend_from_slice(&vop3p(0x002, 0, vgpr(1), vgpr(2), 0, 0b000, 0b011, 0, 0, true));
+    let add_zero_hi = build_cs(&body);
+    let inputs_b: &[[u32; 4]] = &[
+        [pack16(0x8000, 0xDEAD), pack16(0xFFFF, 0x1234), 0, 0], // lo: -32768 + (-1) -> 0x8000; hi: 0xDEAD + 0 = 0xDEAD
+        [pack16((-50i16) as u16, 0x1234), pack16((-25i16) as u16, 0x5678), 0, 0], // lo: -75 (0xFFB5); hi: 0x1234
+    ];
+    let wants_b = [pack16(0x8000, 0xDEAD), pack16((-75i16) as u16, 0x1234)];
+    run_cases(&add_zero_hi, inputs_b, |backend, i, _, got| {
+        assert_eq!(
+            got, wants_b[i],
+            "{backend} v_pk_add_i16 zero-hi clamp case {i}: got {got:#010x}, want {:#010x}",
+            wants_b[i]
+        );
+    });
+}
+
+#[test]
 fn unmeasured_int16_clamp_and_neg_omod_remain_unsupported() {
     // Packed shifts with `clamp` are unmeasured and rejected by `tools/rdna2spirv.py`.
     for opcode in [0x004u16, 0x005, 0x006] {
