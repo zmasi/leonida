@@ -1,0 +1,35 @@
+GPU:        NVIDIA GeForce RTX 3090 (Ampere / GA102, PCI 10de:2204), subgroup 32..32
+Driver:     NVIDIA 621.40 (proprietary), Vulkan 1.4.357 (conformance 1.4.3.3)
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
+OS:         Windows 11, build 26320 (26H2)
+Commit:     db1a22d290f5e86fff9282fce3d4e02e788b05b4 (main, 2026-11-25)
+Tools:      llvm-mc 23.1.6 (native build with the AMDGPU target), SPIRV-Tools v2026.4 (Vulkan SDK 1.4.363.1),
+            CMake 4.3.1-msvc1 + Ninja 1.13.2 (Visual Studio 18 Community), MSVC 19.52.37029, Windows SDK 10.0.26100,
+            Python 3.13.13
+run_gpu_tests.py: 274 shaders: 274 translated, 274 pass spirv-val
+            native:                 209/264 passed, 54 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:  243/264 passed, 20 skipped, 1 failed
+Failed:     cs_imgatomic_ext (native and emulated alike): "6 of 64 sint words differ; first word 32: got
+            0x0badf00d, expected 0x00000101". This is the fixture's stale volume T# key, the same failure seen on
+            every device on this main. With #1518 applied it passes in both modes ("all 64 words of the uint
+            image, the sint image and the volume exact").
+Skipped:    native: 33 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this device" and
+            1 "cannot require a 64-wide fragment subgroup" (the wave64 fixtures, which the emulated run covers),
+            plus 19 "run by d3d12_*_test / w64_graphics.py" cases.
+            Emulated: the same 19, plus the 64-wide fragment one.
+ctest:      455 registered; 453 run: 452 passed, 1 failed; 14 skipped and 2 disabled (gameinput, gameinput_script: no SDL3).
+            Failed: xmem_write_watch, "writing to 512 of them charges about those 512 pages". The check reads
+            system-wide commit (GetPerformanceInfo), so it is flaky under ctest -j 4. Run alone it passed 3/3
+            (with xmem and xmem_no_write_watch). With #1316 applied, the full ctest -j 4 passed 453/453 and
+            ctest -R ^xmem --repeat until-fail:10 passed.
+            Skipped: shader_library_corpus, bink_decode, bink_abi, bink_play_headless, bink_audio,
+            d3d12_boot_movie, d3d12_first_light (retail package / LEONIDA_GAME_DIR unset); fsr_dispatch,
+            bvh_builder, vk_sync_validation, vk_host_region_import_validation, d3d12_sparse_queue_family_contract,
+            d3d12_rgb9e5_rtv, d3d12_bindless_churn_validated.
+Notes:
+- Built with cmake -S runtime -B runtime/build3090 -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+  -DLEONIDA_REQUIRE_VULKAN=ON, cl.exe as the compiler, with the Vulkan SDK's Bin folder and llvm-mc on PATH so the
+  llvm-mc / spirv-as / glslangValidator tests register. Cargo was kept off PATH, so the XMA2 decoder was not built.
+- LEONIDA_VK_DEVICE=3090, VK_LOADER_LAYERS_DISABLE=~implicit~. LEONIDA_VK_VALIDATION was not set in this pass.
+- w64_graphics.py and vk_pipeline_check were not run.
+- No game files involved. AI-assisted (Grok Bot).

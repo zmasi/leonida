@@ -1,0 +1,62 @@
+GPU:        AMD Radeon RX 9060 XT (RDNA4 / GFX1200, Navi 44, PCI 1002:7590), subgroup 32..64
+Driver:     AMD proprietary 26.11.2 (LLPC), driver version 32.0.32029.2010, Vulkan 1.4.359
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default 64, subgroupSizeControl)
+OS:         Windows 11, 10.0.26300.9974
+Commit:     73516a2902a9872e4d21d1bdbbde4e26059497c5 (main, 2026-11-26)
+Tools:      llvm-mc LLVM 23.1.6 (conda-forge llvm-tools, AMDGPU target), SPIRV-Tools v2026.4
+            (Vulkan SDK 1.4.363.0), CMake 3.31.6-msvc6 + Ninja from Visual Studio 2022
+            (scripts\build_runtime.ps1), MSVC 14.44.35207, Python 3.14.10
+run_gpu_tests.py: 277 shaders: 277 translated, 277 pass spirv-val
+            native:                 247/268 passed, 19 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  247/268 passed, 19 skipped, 2 failed
+build.py:   on main it stops at cs_dpp_cmp.asm ("dpp variant of this instruction is not
+            supported"): the fixture is marked text-only, which run_gpu_tests.py reads and
+            build.py does not yet, so check.py then finds no modules (0 of 233). With #1444
+            (head ae4e7d75) applied: exit 0, native and LEONIDA_W64_EMULATE=1; wave64 VS/PS/GS
+            on 32-wide subgroups: tier A 13, tier B 8, tier C 13. Not built (need a DXBC
+            container with signatures): ms_clip, ms_f16_pack, ms_tri, ms_v5_workgroup,
+            ms_w64x_ballot, ms_wave_info_s3.
+check.py:   with #1444 and #1518 applied: 230 of 234 pass, 3 skipped, 1 failed (native and
+            LEONIDA_W64_EMULATE=1 alike). The failure is cs_texture_uav (below); the skips are
+            the mesh fixtures build.py does not build (ms_w64x_ballot, ms_wave_info_s3,
+            ms_v5_workgroup), which run_gpu_tests.py builds and passes.
+Failed:     run_gpu_tests.py, both modes, the two known failures on main:
+            - cs_imgatomic_ext: "6 of 64 sint words differ; first word 32: got 0x0badf00d,
+              expected 0x00000101", the fixture's volume T# key. With #1518 (head 1bbf8a9b)
+              applied, cs_imgatomic, cs_imgatomic3d and cs_imgatomic_ext pass in both modes.
+            - cs_texture_uav: "kind 0 mip 0 first 0 count 1 texel 0: got 0x11, expected
+              0x3f9" (line 650), the tagged descriptor table a bare .spv does not get. The
+              runner's summary shows the first of the last lines, one of the test's deliberate
+              CreateCommittedResource refusals; the failing check is the one above. With
+              #2261 (head 409da28d) applied and d3d12_texture_uav_test rebuilt, cs_texture_uav
+              passes in both modes and the d3d12_texture_uav ctest passes.
+Skipped:    19, all "run by d3d12_*_test / w64_graphics.py": cs_buf_counter, cs_buf_typed,
+            cs_m4_fill, cs_m4_indirect, ps_live_width, ps_m15, ps_m15_dual, ps_m2, ps_m2_array,
+            ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post, ps_m3_query, ps_quad_flat, vs_m15,
+            vs_m2, vs_m3, vs_quad_inst.
+ctest:      479 tests, 2 disabled (gameinput, gameinput_script); with -j 4: 459 passed,
+            13 skipped, 5 failed. Run again one at a time (twice), vk_queue_query_sync passes
+            and these four fail every time, each with an open pull request:
+            - d3d12_texture_tiles: "row-major alias tile 0 at (0,0): got 0x20000cc, expected
+              0xcc020000", the native D3D12 half; the same line as the RX 7900 XT in #964.
+            - pipeline_cache_seed: "vk_pipeline_check cache does not hit on the runtime's
+              device"; the robustness features #1833 matches.
+            - d3d12_clear: "depth clear with NaN: layer cleared 1, expected nan" on all 15
+              texels; the AMD driver's NaN depth clear, #787.
+            - d3d12_set_descriptor_heaps: "line 353: CHECK failed: recorded_commands(...)", the
+              dispatch with no PSO bound that #2153 fixes.
+            These four were not rerun with their pull requests applied.
+            Skipped: shader_library_corpus, bink_decode, bink_abi, bink_play_headless,
+            fsr_dispatch, bvh_builder, bink_audio (no LEONIDA_GAME_DIR), vk_sync_validation,
+            d3d12_b5g5r5a1_uav, d3d12_b4g4r4a4_target, d3d12_boot_movie, d3d12_first_light,
+            d3d12_conservative_tier3.
+Notes:
+- The first record of a GFX1200 (Navi 44) part. Same driver build as the RX 9070 and
+  RX 9070 XT records; no failure here is particular to this GPU.
+- Built with scripts\build_runtime.ps1 (Ninja into runtime\build, RelWithDebInfo);
+  run_gpu_tests.py --build runtime\build, then build.py <out> and check.py <out>
+  runtime\build, once without and once with LEONIDA_W64_EMULATE=1.
+- No implicit Vulkan layer beyond the SDK's; validation was not enabled.
+- The translator suite (scripts/run_semantic_tests.py tests/semantic) passed on the same
+  commit under Python 3.14.10: 498 files, 6351 tests, 0 files failed.
+- AI-assisted: yes (Claude Code).

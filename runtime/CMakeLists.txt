@@ -965,6 +965,7 @@ if(BUILD_TESTING)
       test/loader_test.cpp
       src/pe_loader.cpp
       shims/registry.cpp
+      shims/library_loader.cpp  # the run-time LEONIDA_COMPAT_DIR cases call its LoadLibrary / GetProcAddress
     )
     target_compile_definitions(loader_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
     target_compile_options(loader_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
@@ -1154,7 +1155,7 @@ if(BUILD_TESTING)
     endif()
     add_executable(tiny_atexit test/fixtures/tiny_atexit.cpp)
     target_compile_definitions(tiny_atexit PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    target_compile_options(tiny_atexit PRIVATE /W4 /permissive- /utf-8)
+    target_compile_options(tiny_atexit PRIVATE /W4 /permissive- /utf-8 /EHsc)  # a handler that throws
     set_target_properties(tiny_atexit PROPERTIES
       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
     )
@@ -4094,13 +4095,21 @@ if(TARGET Vulkan::Headers)
                            d3d12_stateful_indirect_nonindexed_counted_pixels PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       add_test(NAME d3d12_title_index_window COMMAND d3d12_draw_test --title-index-window)
       add_test(NAME d3d12_title_vertex_window COMMAND d3d12_draw_test --title-vertex-window)
-      # LEONIDA_STUB_PIPELINES: a pipeline with no translated shader is a no-op stub when the switch is on.
+      # LEONIDA_STUB_PIPELINES: a pipeline with no translated shader is a stub when the switch is on.
       add_executable(d3d12_stub_pipelines_test test/d3d12_stub_pipelines_test.cpp)
       target_link_libraries(d3d12_stub_pipelines_test PRIVATE gta6rt_d3d12_com)
       target_compile_definitions(d3d12_stub_pipelines_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
       target_compile_options(d3d12_stub_pipelines_test PRIVATE /W4 /permissive- /utf-8)
       add_test(NAME d3d12_stub_pipelines COMMAND d3d12_stub_pipelines_test)
       set_tests_properties(d3d12_stub_pipelines PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+      # MVP-GPU-04: a stub graphics pipeline is real (src/stub_pipeline.h); draws with =1 and =color, read back.
+      add_executable(d3d12_stub_draw_test test/d3d12_stub_draw_test.cpp shims/d3d12_xs_device.cpp
+                     shims/d3d12_xs_pso_stream.cpp)
+      target_link_libraries(d3d12_stub_draw_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_stub_draw_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+      target_compile_options(d3d12_stub_draw_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_stub_draw COMMAND d3d12_stub_draw_test)
+      set_tests_properties(d3d12_stub_draw PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
       set_tests_properties(d3d12_draw d3d12_title_index_window d3d12_title_vertex_window PROPERTIES SKIP_RETURN_CODE 77)
       # Graphics & compute PSO descriptor validation parity against live Windows D3D12 (WARP and HW).
       add_executable(d3d12_pso_validation_test test/d3d12_pso_validation_test.cpp ${LEONIDA_TEST_VS}
