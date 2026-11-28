@@ -1135,7 +1135,103 @@ def _region_has_cycle(region, succ):
     return False
 
 
-def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_writes=frozenset()):
+_TID_EQ = frozenset(f"v_cmp{x}_eq_{t}32" for x in ("", "x") for t in ("i", "u"))
+_VGPR_READ_ONLY = ("exp", "buffer_store", "tbuffer_store", "image_store", "global_store", "flat_store", "scratch_store",
+                   "ds_write", "ds_store", "v_cmp", "v_readlane", "v_readfirstlane")
+
+
+def _one_key(x, cmp_dest=False):
+    """The mask an operand names for `_one_lane_in`: "exec", "vcc" or the first SGPR of a pair (else None)."""
+    t = x.get("t") if x.get("k") == "special" else None
+    if t == "exec" or t == "vcc" or (cmp_dest and t == "vcc_lo"):
+        return "vcc" if t.startswith("vcc") else t
+    return _sgpr_pair(x)
+
+
+def _one_lane_step(ins, st):
+    """`_one_lane_in` across one instruction: `st` = (VGPRs still the thread id, masks with at most one lane set)."""
+    tid, one = st
+    meta = _get_op_meta(ins["op"])
+    op, a = meta[0], ins["args"]
+    if meta[1]:
+        return st
+    if op.startswith(("v_movrel", "v_swaprel")):
+        tid = frozenset()
+    elif a and a[0].get("k") == "vgpr" and not op.startswith(_VGPR_READ_ONLY):
+        # A memory result can be one register longer than its operand says (tfe); a swap writes both operands.
+        vdst = a[:2] if op.startswith("v_swap") else a[:1]
+        tid = tid - {x["r"] + i for x in vdst if x.get("k") == "vgpr"
+                     for i in range(x.get("n", 1) + (not op.startswith("v_")))}
+    may_w = _scalar_rw_with_meta(ins, meta)[1]
+    writes_exec = bool(meta[8] & _FLAG_WRITES_EXEC_OP) or (
+        bool(a) and a[0].get("k") == "special" and a[0].get("t", "").startswith("exec"))
+    if not writes_exec and not may_w & (_ALL_SGPRS | 1 << _BIT_VCC):
+        return tid, one
+
+    def is_one(x):
+        k = _one_key(x)
+        return k is not None and k in one
+
+    dest, val, exec_val = None, False, False
+    if op.startswith("v_cmp"):
+        # A compare writes 0 in every inactive lane, so its result is within EXEC; `== c` of the thread id is true
+        # in at most one lane of the wave.
+        val = "exec" in one
+        if op in _TID_EQ and not ins.get("mods") and not ins["op"].endswith("_sdwa") and len(a) >= 2:
+            x, y = a[-2:]
+            if x.get("k") == "vgpr":
+                x, y = y, x
+            val = val or (x.get("k") == "imm" and isinstance(x.get("v"), int) and y.get("k") == "vgpr"
+                          and y.get("n", 1) == 1 and y["r"] in tid)
+        exec_val = val
+        if not op.startswith("v_cmpx"):
+            dest = "vcc" if len(a) == 2 else _one_key(a[0], cmp_dest=True)
+    elif op in ("s_and_saveexec_b64", "s_andn2_saveexec_b64") and len(a) == 2:
+        dest, val = _one_key(a[0]), "exec" in one            # the old EXEC
+        exec_val = is_one(a[1]) or (op == "s_and_saveexec_b64" and "exec" in one)
+    elif op in ("s_mov_b64", "s_and_b64", "s_andn2_b64") and len(a) >= 2:
+        # The result is within the first source (and within the second for s_and_b64).
+        val = is_one(a[1]) or (op == "s_and_b64" and len(a) > 2 and is_one(a[2]))
+        dest = _one_key(a[0])
+        exec_val = val
+    if any(x.get("k") == "special" and x.get("t") in ("exec_lo", "exec_hi") for x in a[:2]):
+        # One half of EXEC (a compare into exec_lo, s_mov_b32 exec_hi, a carry out): the other half keeps its lanes,
+        # so EXEC stays at most one lane only if it already was and the half written is within it (a compare).
+        exec_val = exec_val and "exec" in one
+    out = {k for k in one if k != "exec" and not may_w & (1 << _BIT_VCC if k == "vcc" else 3 << k)}
+    if not writes_exec and "exec" in one:
+        out.add("exec")
+    if writes_exec and exec_val:
+        out.add("exec")
+    if dest not in (None, "exec") and val:
+        out.add(dest)
+    return tid, frozenset(out)
+
+
+def _one_lane_in(active_blocks, succ, tid):
+    """Per block, whether EXEC is certainly at most one lane of the wave on entry (forward must-analysis, merge =
+    intersection). `tid`: VGPRs whose entry value no two lanes of a wave share (the thread id); one holds that
+    value until it is written. `v_cmp(x)_eq_{i,u}32 <constant>, <that VGPR>` is true in at most one lane, and a
+    mask stays at most one lane through a copy, an AND with anything, `s_andn2_b64` of it and a saveexec of it."""
+    n = len(active_blocks)
+    state_in = [None] * n
+    state_in[0] = (frozenset(tid), frozenset())
+    work = collections.deque([0])
+    while work:
+        b = work.popleft()
+        st = state_in[b]
+        for ins in active_blocks[b]:
+            st = _one_lane_step(ins, st)
+        for v in succ[b]:
+            old = state_in[v]
+            new = st if old is None else (old[0] & st[0], old[1] & st[1])
+            if new != old:
+                state_in[v] = new
+                work.append(v)
+    return [s is not None and "exec" in s[1] for s in state_in]
+
+
+def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_writes=frozenset(), tid=frozenset()):
     """Find safe lane-local `s_cbranch_execz`/`nz` regions to fold inline under --wave64-emulate.
 
     Allows read-only regions (including regions with internal scalar-counted loops) AND acyclic
@@ -1145,7 +1241,7 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
     Returns `(folds, fold_chain, absorbed)`:
       - `folds`: dict `head_block -> {"run": int, "skip": int, "region": frozenset[int],
                  "order": list[int], "sub_tree": list | None, "mem_reads": frozenset[str],
-                 "mem_writes": frozenset[str], "mem_stats": tuple}`
+                 "mem_writes": frozenset[str], "mem_stats": tuple, "one_lane": bool}`
                  containing only the maximal (outermost) folded regions.
       - `fold_chain`: dict `head_block -> skip_block` when `skip_block` has no predecessors outside
                  `{head_block} | region` and can be emitted directly after the fold in the same block.
@@ -1182,6 +1278,7 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
         may_w = 0
         exec_writes = []
         sgpr_write_ops = []
+        first_lane = False
         term = ("fall", None)
 
         for ins in insns:
@@ -1202,9 +1299,12 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                 clean = False
                 continue
             flags = m[8]
-            if flags & _FLAG_FORBIDDEN_FOLD or _vcc_pair_collects_mask(ins, lane_masks):
+            # A v_readfirstlane_b32 only in a fold that at most one lane runs and that leaves EXEC alone (below).
+            rfl = bool(tid) and m[0] == "v_readfirstlane_b32"
+            if (flags & _FLAG_FORBIDDEN_FOLD and not rfl) or _vcc_pair_collects_mask(ins, lane_masks):
                 clean = False
                 continue
+            first_lane = first_lane or rfl
             acc = m[9]
             if acc is not None:
                 kind, r, w = acc
@@ -1268,11 +1368,13 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
         kill[b] = k_mask
         terms[b] = term
         if clean:
-            blk_info[b] = (True, (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w), may_w, exec_writes, sgpr_write_ops)
+            blk_info[b] = (True, (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w), may_w, exec_writes, sgpr_write_ops,
+                           first_lane)
         else:
-            blk_info[b] = (False, _EMPTY_MEM_STATS, 0, (), ())
+            blk_info[b] = (False, _EMPTY_MEM_STATS, 0, (), (), False)
 
     scalar_live_in = _solve_scalar_liveness(use, kill, preds)
+    one_lane_in = None
 
     # Gather candidate s_cbranch_execz / s_cbranch_execnz blocks with single-entry/single-exit post-dominated regions.
     candidates = []
@@ -1324,10 +1426,16 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
             lds_ops += lo
             lds_r = lds_r or lr
             lds_w = lds_w or lw
-        if (mem_w and mem_ops > 1) or (lds_w and lds_ops > 1):
-            continue
-        if (mem_w or lds_w) and _region_has_cycle(region, succ):
-            continue
+        # With at most one lane in EXEC (kept so by the EXEC check below) the lane's own order of its accesses is
+        # the wave's, and v_readfirstlane_b32 reads the lane's own value as long as the region leaves EXEC alone.
+        first_lane = any(blk_info[u][5] for u in region)
+        one = (first_lane or (mem_w and mem_ops > 1) or (lds_w and lds_ops > 1)
+               or ((mem_w or lds_w) and _region_has_cycle(region, succ)))
+        if one:
+            if one_lane_in is None:
+                one_lane_in = _one_lane_in(active_blocks, succ, tid)
+            if not one_lane_in[run] or (first_lane and any(blk_info[u][3] for u in region)):
+                continue
         # No scalar written in R may be live-in at `skip`.
         region_may_w = 0
         for u in region:
@@ -1338,12 +1446,12 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
         if not _exec_writes_stay_inactive(region, blk_info, scalar_live_in[run]):
             continue
         candidates.append((len(region), b, run, skip, frozenset(region),
-                           (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w)))
+                           (mem_ops, mem_r, mem_w, lds_ops, lds_r, lds_w), bool(one)))
 
     # Validate innermost regions first so nested s_cbranch_execz/nz inside an outer region are already verified.
     candidates.sort(key=lambda item: (item[0], item[1]))
     valid = {}
-    for _, b, run, skip, region, mem_stats in candidates:
+    for _, b, run, skip, region, mem_stats, one in candidates:
         ok = True
         for u in region:
             tkind, top = terms[u]
@@ -1360,8 +1468,9 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
                         break
         if not ok:
             continue
-        # Build local sub-CFG and verify reducibility (multi-block regions use cfg_structure.structure).
-        if len(region) == 1:
+        # Build local sub-CFG and verify reducibility (multi-block regions and a one-block loop use
+        # cfg_structure.structure; emitted straight, a block that branches back to itself would run once).
+        if len(region) == 1 and run not in succ[run]:
             order = [run]
             sub_tree = None
         else:
@@ -1400,6 +1509,7 @@ def find_local_exec_folds(blocks, raw_edges, succ, lane_masks, scc_live, mask_wr
             "mem_reads": mem_reads,
             "mem_writes": mem_writes,
             "mem_stats": mem_stats,
+            "one_lane": one,    # at most one lane runs it: no order between lanes, v_readfirstlane_b32 is a copy
         }
 
     # Select maximal (non-overlapping outermost) folded regions.

@@ -872,6 +872,56 @@ class TestProgramThatDiesBeforeItsVerdict(unittest.TestCase):
         self.assertIn("PASS  cs_imgstore           cs_imgstore: 64 texels match", out)
 
 
+class DumpRowThatExitsNonZero(unittest.TestCase):
+    """A "dump" row whose program printed the right words and then exited non-zero (validation errors, under the
+    validation layer) fails with the program's output, not with the words alone (TEST-GPU-OOB-AND-HARNESS-MSG)."""
+    ERROR = "validation: vkCmdDispatch(): Out of bounds: trying to write 4 bytes"
+
+    def run_one(self, name, code, printed):
+        envs = []
+        with tempfile.TemporaryDirectory() as tmp:
+            args = SimpleNamespace(filter=name + ".asm", build=tmp, llvm_mc="unused", require_pass=False)
+
+            def launch(cmd, **kwargs):
+                if cmd[:3] == [sys.executable, "-I", rgt.TRANSLATOR]:
+                    (Path(tmp) / "spirv" / f"{name}.spv").touch()
+                    return SimpleNamespace(returncode=0, stdout="", stderr="")
+                envs.append(kwargs.get("env") or {})
+                return SimpleNamespace(returncode=code, stdout=printed, stderr="")
+
+            output = io.StringIO()
+            with (patch.object(rgt, "assemble_to_s", side_effect=lambda _mc, _src, dst, _name: Path(dst).touch()),
+                  patch.object(rgt, "spirv_as"),
+                  patch.object(rgt.subprocess, "run", side_effect=launch),
+                  contextlib.redirect_stdout(output), contextlib.redirect_stderr(output)):
+                rc = rgt.run_suite(args, tmp)
+        return rc, output.getvalue(), envs
+
+    def test_the_fail_line_keeps_the_message(self):
+        words = "out[0..7] = " + " ".join(map(str, check.PK_MUL_LO_WORDS)) + "\n"
+        for name, printed in (("cs_pk_mul_lo_const", words), ("cs_user_sgprs", "out[0..7] = "
+                              + " ".join(map(str, check.USER_SGPRS_WORDS)) + "\n")):
+            with self.subTest(name=name):
+                rc, out, _ = self.run_one(name, 1, printed + self.ERROR + "\n")
+                self.assertEqual(rc, 1, out)
+                fail = [ln for ln in out.splitlines() if ln.startswith("  FAIL")]
+                self.assertEqual(len(fail), 1, out)
+                self.assertIn("exit 1:", fail[0], out)
+                self.assertIn(self.ERROR, out)
+
+    def test_the_words_alone_still_pass(self):
+        rc, out, _ = self.run_one("cs_pk_mul_lo_const", 0,
+                                  "out[0..7] = " + " ".join(map(str, check.PK_MUL_LO_WORDS)) + "\n")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PASS  cs_pk_mul_lo_const", out)
+
+    def test_pk_mul_lo_const_gets_its_128_words(self):
+        # 32 lanes store 16 bytes each: the default 64-word buffer let lanes 16-31 write past its end (GPU-AV).
+        _rc, out, envs = self.run_one("cs_pk_mul_lo_const", 0,
+                                      "out[0..7] = " + " ".join(map(str, check.PK_MUL_LO_WORDS)) + "\n")
+        self.assertEqual([e.get("VKC_OUT_WORDS") for e in envs], ["128"], out)
+
+
 class FmaFusedSuite(unittest.TestCase):
     """run_gpu_tests.py runs cs_fma_fused under --filter, honoring LEONIDA_FMA=khr vs default glsl."""
     RADV_SPLIT = [0x00000000, 0xA8800000, 0x3A000000, 0x00000000, 0x00000000, 0x00000000, 0x28800000, 0x00007351]

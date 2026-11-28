@@ -331,6 +331,12 @@ bool title_shadow_buffer(ID3D12Resource* resource);
 std::uint64_t title_host_imports(ID3D12Device* device);
 // VirtualQuery calls made by the title-buffer shadows in their latest refresh. For tests.
 std::uint64_t title_shadow_refresh_queries(ID3D12Device* device);
+// The device's title windows now: how many and their bytes, how many were retired with their pages, and how many of
+// those still wait for the GPU before their memory is freed. For tests.
+struct TitleWindows {
+    std::uint64_t count = 0, bytes = 0, retired = 0, waiting = 0;
+};
+TitleWindows title_windows(ID3D12Device* device);
 // The trackers behind the title-buffer shadows and title windows (copies whose pages overlap or touch share one).
 // For tests.
 std::uint64_t title_shadow_trackers(ID3D12Device* device);

@@ -94,19 +94,14 @@ jobs:
       - name: Tests (standard library only, no game data)
         shell: bash
         run: |
-          # Run every file, then fail: stopping at the first failure would hide the files after it.
-          failed=()
+          # Keep the pytest selection predicate, but run the selected files two at a time.
+          # The runner reports every failure instead of stopping at the first one.
           while IFS= read -r t; do
             if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
               continue
             fi
-            echo "== $t"
-            python -I "$t" || failed+=("$t")
-          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)  # pytest-based files run in the translator-tests job
-          if (( ${#failed[@]} )); then
-            for t in "${failed[@]}"; do echo "::error file=$t::$t failed"; done
-            exit 1
-          fi
+            printf '%s\n' "$t"
+          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort) | python -I scripts/run_standalone_tests.py -j 2
       - name: Build rpf9dump
         run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
       - name: Test TTPF export retry

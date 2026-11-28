@@ -99,6 +99,10 @@ FLOAT_CONTROLS = True    # False (--no-float-controls): no SignedZeroInfNanPrese
 # in push-constant dwords 36..37 (the block grows from 144 to 152 bytes). The slot layout is mesh_compute_layout();
 # the index records it as "mesh_compute". tools/mesh_compute_vs.py writes the vertex shader that draws the slots.
 MESH_COMPUTE = False
+# --mesh-serial-waves (with --wave64-emulate): a mesh shader of more than 64 threads whose waves do not share LDS
+# runs its waves one after the other in 64 invocations, one pass per wave, so each pass is a single wave (the
+# inline_all structured form) instead of several waves side by side under mini-schedulers. See assemble().
+MESH_SERIAL_WAVES = False
 # --pc-tail-ubo: for devices with 128 bytes of push constants, Vulkan's minimum (AMD's Windows driver on RDNA2 iGPUs,
 # some Intel Arc drivers; D3D-14's push_constants_need_fallback). The push-constant block keeps s0..s31 (128 bytes).
 # The tail that follows them by default (dwords 32..35: heap base, code base; 36..37: the --mesh-compute output
@@ -535,6 +539,7 @@ class Gen:
         self.emulate = False       # --wave64-emulate: exact wave64 on any subgroup size (cs/ms; see x_round)
         self.emulate_inline = False  # emulate: current block emits direct inline barriers (no x_split)
         self.emulate_plan = None   # emulate: structured plan from wave64_emulate_opt.plan_structured_emulation
+        self.x_one_lane = False    # emulate: emitting a fold that at most one lane of the wave runs ("one_lane")
         self.mini_segs = defaultdict(list)  # emulate_plan: mini_idx -> continuation segment ids
         self.tail_segs = []        # emulate_plan: continuation segment ids belonging to tail_scheduler
         self.x_seg = 0             # emulate: number of the next continuation segment (past the block numbers)
@@ -550,6 +555,7 @@ class Gen:
         self.lane_either = {}      # id(instruction) -> SGPRs holding constant 0/-1 (EITHER) there
         self.cur_either = ()
         self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
+        self.ms_serial = 0         # --mesh-serial-waves: number of passes (waves run one after the other), or 0
         self.scc_live = None       # emulate: set of id(ins) whose SCC write is live-out (wave64_emulate_opt)
         self.cur_scc_live = True   # emulate: whether the current instruction's SCC result is live-out
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
@@ -6174,7 +6180,8 @@ class Gen:
         store = "store" in op or op.startswith("ds_write")
         reads = not store
         writes = store or "atomic" in op or (kind == "lds" and not op.startswith("ds_read"))
-        if (kind, "w") in self.x_dirty or (writes and (kind, "r") in self.x_dirty):
+        # In a fold that at most one lane of the wave runs, that lane's own order is the wave's.
+        if not self.x_one_lane and ((kind, "w") in self.x_dirty or (writes and (kind, "r") in self.x_dirty)):
             self.x_order_barrier()
         if reads:
             self.x_dirty.add((kind, "r"))
@@ -8149,6 +8156,10 @@ class Gen:
             if a[1]["k"] == "vgpr" and ("v", a[1]["r"]) in self.cur_masks:
                 # A lane mask that went through the vector unit (three SGPRs ORed with v_or3_b32, say). The
                 # hardware reads the first lane's copy of the whole mask; here the lane's own copy is its bit.
+                self.dst(a[0], self.src_u(a[1]))
+                return
+            if self.x_one_lane:
+                # A fold that at most one lane runs and that leaves EXEC alone: this lane is the first in EXEC.
                 self.dst(a[0], self.src_u(a[1]))
                 return
             if self.wave32_fragment:
@@ -10417,11 +10428,7 @@ class Gen:
         elif op in ("v_add_co_u32", "v_add_co_ci_u32", "v_sub_co_u32", "v_sub_co_ci_u32", "v_subrev_co_u32",
                     "v_subrev_co_ci_u32"):
             # Lane masks are all-ones/zero: carry in = (vcc or the named mask) != 0, carry out stored the same way.
-            if op.endswith("ci_u32") and len(a) == 3:
-                # the assembler's short form v_add_co_ci_u32 vD, src0, src1: carry out and in are VCC (llvm-mc and the
-                # disassembler print it as v_add_co_ci_u32_e32 vD, vcc_lo, src0, src1, vcc_lo)
-                vcc = {"k": "special", "t": "vcc"}
-                a = [a[0], vcc, a[1], a[2], vcc]
+            # (The short form v_add_co_ci_u32 vD, src0, src1 has its VCC operands from explicit_carry_vcc.)
             vd, cd = a[0], a[1]
             srcs = a[2:]
             x, y = self.src_u(srcs[0]), self.src_u(srcs[1])
@@ -16174,6 +16181,76 @@ def insert_late_constants(gen, out, written):
                   [f"{gen.fconsts[v]} = OpConstant %float {float_literal(v)}" for v in late_f])
 
 
+def ms_serial_passes(gen, fn, lists):
+    """--mesh-serial-waves: the function's variables, then a loop over the passes around the prologue (and, appended
+    by the caller, the body). Returns the new `fn`, the lines that close the loop after the body, and the export
+    variables with their per-pass twins.
+
+    Pass w runs the invocations as lanes 64 * w .. 64 * w + 63 of the workgroup: `%local_index` is a Function variable
+    here, the built-in (now `%real_local_index`) plus 64 * w, so the launch state (v5, the wave id in s3), the lane
+    and everything else that reads it see wave w. Every initialised Function variable gets its initial value again at
+    the start of a pass. What a pass exported sits in Function variables (`%ms_pos`, `%ms_prim`, ...): they are copied
+    to the pass's twins before the next pass overwrites them, and the epilogue writes each pass's outputs from its
+    twins after the loop, once the counts are known."""
+    w_count = gen.ms_serial
+    for lines in lists:
+        for i, l in enumerate(lines):
+            if "%local_index" in l:
+                lines[i] = re.sub(r"%local_index\b", "%real_local_index", l)
+    last_var = max(i for i, l in enumerate(fn) if " = OpVariable " in l)
+    head, rest = fn[:last_var + 1], fn[last_var + 1:]
+    var = re.compile(r"^(%\w+) = OpVariable (\S+) Function(?: (\S+))?$")
+    reinit, exports, twins = [], [], []
+    for l in head:
+        m = var.match(l)
+        if not m:
+            continue
+        name, ptr, init = m.groups()
+        if init:
+            reinit.append(f"OpStore {name} {init}")
+        if name.startswith("%ms_"):
+            exports.append(name)
+            twins += [f"{name}__w{w} = OpVariable {ptr} Function" + (f" {init}" if init else "") for w in range(w_count)]
+    c = gen.cu
+    head = head + ["%local_index = OpVariable %_ptr_Function_uint Function " + c(0),
+                   "%msw_pass = OpVariable %_ptr_Function_uint Function " + c(0)] + twins
+    open_loop = ["OpBranch %msw_head", "%msw_head = OpLabel", "OpLoopMerge %msw_exit %msw_cont None",
+                 "OpBranch %msw_body", "%msw_body = OpLabel"] + reinit + [
+                 "%msw_w = OpLoad %uint %msw_pass", "%msw_rl = OpLoad %uint %real_local_index",
+                 f"%msw_off = OpIMul %uint %msw_w {c(64)}", "%msw_li = OpIAdd %uint %msw_rl %msw_off",
+                 "OpStore %local_index %msw_li"]
+    close = []
+    for w in range(w_count):
+        close += [f"%msw_is{w} = OpIEqual %bool %msw_w {c(w)}",
+                  f"OpSelectionMerge %msw_sv_end{w} None", f"OpBranchConditional %msw_is{w} %msw_sv{w} %msw_sv_end{w}",
+                  f"%msw_sv{w} = OpLabel"]
+        close += [f"OpCopyMemory {name}__w{w} {name}" for name in exports]
+        close += [f"OpBranch %msw_sv_end{w}", f"%msw_sv_end{w} = OpLabel"]
+    close += ["OpBranch %msw_cont", "%msw_cont = OpLabel", f"%msw_n = OpIAdd %uint %msw_w {c(1)}",
+              "OpStore %msw_pass %msw_n", f"%msw_more = OpULessThan %bool %msw_n {c(w_count)}",
+              "OpBranchConditional %msw_more %msw_head %msw_exit", "%msw_exit = OpLabel"]
+    return head + open_loop + rest, close, exports
+
+
+def ms_serial_epilogue(gen, lines, exports):
+    """--mesh-serial-waves: the mesh epilogue for passes. `lines` is the epilogue of one invocation: the barrier,
+    the counts and OpSetMeshOutputsEXT, then (from the load of `%local_index` on) the writes of what the invocation
+    exported. The first part stays as it is, once; the writes are repeated per pass w with the pass's twins of the
+    export variables and the output index real index + 64 * w, every id of the block renamed per pass."""
+    cut = lines.index("%mli = OpLoad %uint %local_index")
+    once, writes = lines[:cut], lines[cut + 1:]
+    defined = set(re.findall(r"^(%\w+) = ", "\n".join(writes), re.M))
+    out = list(once) + ["%msw_erl = OpLoad %uint %real_local_index"]
+    for w in range(gen.ms_serial):
+        names = {d: f"{d}_w{w}" for d in defined}
+        names.update({e: f"{e}__w{w}" for e in exports})
+        names["%mli"] = f"%mli_w{w}"
+        out.append(f"%mli_w{w} = OpIAdd %uint %msw_erl {gen.cu(64 * w)}")
+        for l in writes:
+            out.append(re.sub(r"%\w+", lambda m: names.get(m.group(0), m.group(0)), l))
+    return out
+
+
 def assemble(gen):
     store_dims = gen.uses_store_views | gen.uses_store_reads
     vs = gen.stage == "vs"
@@ -16205,6 +16282,8 @@ def assemble(gen):
         x_zero = x_sink - x_mask           # mask and schedule words: zeroed before the first round
         x_threads = (gen.cs or gen.ms)["size"]
         x_threads = x_threads[0] * x_threads[1] * x_threads[2]
+        if gen.ms_serial:
+            x_threads = 64               # the invocations of one pass
         sx, sy, _ = (gen.cs or gen.ms)["size"]
         for v in (0, 1, 2, 3, 6, 31, 63, 0x948, x_mask, x_sched, x_sink, x_sink + 1, x_zero - 1, x_threads,
                   x_waves, sx, sx * sy, 0xFFFFFFC0):
@@ -16364,7 +16443,7 @@ def assemble(gen):
     if msc:
         hdr.append("OpExecutionMode %main LocalSize {} {} {}".format(*gen.ms["size"]))
     elif ms:
-        hdr += ["OpExecutionMode %main LocalSize {} {} {}".format(*gen.ms["size"]),
+        hdr += ["OpExecutionMode %main LocalSize {} {} {}".format(*((64, 1, 1) if gen.ms_serial else gen.ms["size"])),
                 f"OpExecutionMode %main OutputVertices {gen.ms['maxv']}",
                 f"OpExecutionMode %main OutputPrimitivesEXT {gen.ms['maxp']}",
                 "OpExecutionMode %main OutputTrianglesEXT"]
@@ -17152,6 +17231,9 @@ def assemble(gen):
         gen.body =["         " + l if not (l.startswith("%") and " = OpLabel" in l) else l for l in flow + body]
     if pops:
         fn.append("OpBeginInvocationInterlockEXT")   # end of the entry block: uniform, executed once
+    serial_close, serial_exports = [], []
+    if ms and not msc and gen.ms_serial:
+        fn, serial_close, serial_exports = ms_serial_passes(gen, fn, (hdr, dec, gvars))
     out = hdr + dec + types + gvars + helpers + fn
     end_lock = "         OpEndInvocationInterlockEXT\n" if pops else ""
     if msc:
@@ -17228,6 +17310,8 @@ def assemble(gen):
                       f"%m{tag}p = OpAccessChain %_ptr_Out_int_ms %ms_cull %mli {c(member)}",
                       f"OpStore %m{tag}p %m{tag}v"]
         L += ["OpBranch %ms_pend", "%ms_pend = OpLabel"]
+        if gen.ms_serial:
+            L = ms_serial_epilogue(gen, L, serial_exports)
         end_lock = "".join(("         " + l if " = OpLabel" not in l else l) + "\n" for l in L) + end_lock
     if gen.uses_active and gen.stage == "ps":
         # A pixel is written when its lane was on in EXEC at the last `vm` export the path ran (if it ran one) and
@@ -17260,6 +17344,8 @@ def assemble(gen):
                 "%live = OpLabel\n         OpReturn\n         OpFunctionEnd\n")
     else:
         tail = end_lock + "         OpReturn\n         OpFunctionEnd\n"
+    if serial_close:
+        gen.body = list(gen.body) + [("         " + l if " = OpLabel" not in l else l) for l in serial_close]
     insert_late_constants(gen, out, written)
     return split_big_switch(no_contraction(dedupe_types(
         "\n".join("         " + l if not l.startswith("%") or " = " not in l else l for l in out) +
@@ -18161,6 +18247,16 @@ def restore_vcc_tuples(insns, blob, code_start, code_end, wave32=True):
     return sorted(kept + restored, key=lambda i: i["pc"])
 
 
+def explicit_carry_vcc(insns):
+    """In place: the assembler's short form v_add_co_ci_u32 vD, src0, src1 (also v_sub_co_ci_u32, v_subrev_co_ci_u32)
+    gets its carry-out and carry-in operands, VCC, as llvm-mc and the disassembler print it
+    (v_add_co_ci_u32_e32 vD, vcc_lo, src0, src1, vcc_lo). Every analysis then sees the VCC it writes."""
+    for ins in insns:
+        a = ins["args"]
+        if base_op(ins["op"]) in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32") and len(a) == 3:
+            ins["args"] = [a[0], {"k": "special", "t": "vcc"}, a[1], a[2], {"k": "special", "t": "vcc"}]
+
+
 def widen_wave64_masks(insns):
     """In place: the lane-mask SGPR operands of VALU instructions become the pairs they are in wave64.
 
@@ -18626,6 +18722,7 @@ def _translate(path):
         g.wave64 = fspx_ws == 64
     else:
         g.wave64 = marker_wave64(path, info["name"], stage, insns)
+    explicit_carry_vcc(insns)
     if g.wave64:
         widen_wave64_masks(insns)
     # A wave32 program using VCC as an SMEM pointer needs both scalar words. Mark its pair producers
@@ -18841,6 +18938,18 @@ def _translate(path):
         g.emulate = True
         size = (g.cs or g.ms)["size"]
         g.x_lanes = -(-size[0] * size[1] * size[2] // 64) * 64
+        threads = size[0] * size[1] * size[2]
+        if (MESH_SERIAL_WAVES and stage == "ms" and not MESH_COMPUTE and threads > 64 and threads % 64 == 0
+                and not any(i["op"].startswith("ds_") or "store" in i["op"] or "atomic" in i["op"] for i in insns)):
+            # The waves of such a program cannot pass each other anything: no LDS, and no store or atomic to
+            # memory another wave could read (ms_wave_info_s3 counts lanes in LDS across an s_barrier and keeps
+            # the side-by-side form). What is left between them is the allocation request and the exports, which
+            # assemble() orders itself. The order of the waves is then not observable.
+            g.ms_serial = threads // 64      # passes; every pass is one whole wave
+            g.x_lanes = 64
+            for k in range(g.ms_serial + 1):
+                g.cu(k)
+                g.cu(64 * k)
     insns = fold_far_branches(insns)
     branchy = any(base_op(i["op"]) in BRANCHES for i in insns)
     if stage == "ps":
@@ -18947,8 +19056,12 @@ def _translate(path):
     folds, fold_chain, absorbed = {}, {}, set()
     if g.emulate:
         g.scc_live = wave64_emulate_opt.scc_live_outs(blocks, succ)
+        # v0 is LocalInvocationId.x (the prologue) and a wave is 64 consecutive threads, so no two lanes of a wave
+        # share v0 when the group is one row of x or a row is a whole number of waves.
+        sx, sy, sz = g.cs["size"] if stage == "cs" else (0, 0, 0)
+        tid = frozenset({0}) if stage == "cs" and (sy * sz == 1 or sx % 64 == 0) else frozenset()
         folds, fold_chain, absorbed = wave64_emulate_opt.find_local_exec_folds(
-            blocks, raw_edges, succ, g.lane_masks, g.scc_live, g.mask_writes)
+            blocks, raw_edges, succ, g.lane_masks, g.scc_live, g.mask_writes, tid)
         if STRUCTURED and WAVE64_PLAN:
             g.emulate_plan = wave64_emulate_opt.plan_structured_emulation(
                 blocks, raw_edges, succ, folds, fold_chain, absorbed, g.lane_masks, g.scc_live, g.x_lanes)
@@ -18975,6 +19088,7 @@ def _translate(path):
         g.emit(f"{lbl_do} = OpLabel")
         marks_before = len(g.x_marks)
         body_before = len(g.body)
+        g.x_one_lane = fd["one_lane"]
         if fd["sub_tree"] is None:
             for ins in blocks[fd["run"]]:
                 op = base_op(ins["op"])
@@ -19068,6 +19182,7 @@ def _translate(path):
                     g.emit(f"{again} = OpIEqual %bool {v} {g.cu(sub_id)}")
                     g.emit(f"OpBranchConditional {again} {head} {end}")
                     g.emit(f"{end} = OpLabel")
+        g.x_one_lane = False
         assert len(g.x_marks) == marks_before, "wave64 emulation: x_split inside a folded lane-local region"
         assert not any("OpControlBarrier" in l for l in g.body[body_before:]), \
             "wave64 emulation: OpControlBarrier inside a folded lane-local region"
@@ -19392,7 +19507,9 @@ def x_prologue(gen, threads):
          "%done = OpVariable %_ptr_Function_bool Function %false"]
     # This invocation's place: index in the workgroup, lane and wave (the same split as Gen.wave_lane).
     if gen.stage == "ms":
-        L += ["%x_li = OpLoad %uint %local_index"]
+        # --mesh-serial-waves: the exchange is one wave's, so its place in %x_buf comes from the invocation's own index
+        # (0-63), not from the workgroup index of the lane it runs in this pass (ms_serial_passes).
+        L += ["%x_li = OpLoad %uint " + ("%real_local_index" if gen.ms_serial else "%local_index")]
     else:
         L += ["%x_lid = OpLoad %v3uint %local_id", "%x_lx = OpCompositeExtract %uint %x_lid 0",
               "%x_ly = OpCompositeExtract %uint %x_lid 1", "%x_lz = OpCompositeExtract %uint %x_lid 2",
@@ -19809,6 +19926,8 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
                             "bytes": 24 if getattr(g, "msc_layout", None) else 16}
     if g.ms:
         m["local_size"] = list(g.ms["size"])
+        if g.ms_serial:     # the program's thread count stays in local_size; the module declares 64 invocations
+            m["mesh_serial_waves"] = g.ms_serial
         m["max_vertices"], m["max_primitives"] = g.ms["maxv"], g.ms["maxp"]
         m["params"] = sorted(g.ms_params)
     if g.gs:
@@ -20197,6 +20316,10 @@ def main():
                     help="mesh shaders become compute shaders that write their vertices and primitives to a buffer "
                          "(metadata: mesh_compute), drawn by tools/mesh_compute_vs.py, for devices without "
                          "VK_EXT_mesh_shader (e.g. NVIDIA Pascal)")
+    ap.add_argument("--mesh-serial-waves", action="store_true",
+                    help="with --wave64-emulate: a mesh shader of more than 64 threads whose waves cannot pass each "
+                         "other anything (no LDS, no store or atomic) runs its waves one after the other in 64 "
+                         "invocations, one single-wave pass per wave, instead of side by side (docs/design.md)")
     ap.add_argument("--shader-clock", choices=("off", "khr"), default="off",
                     help="s_memtime / s_memrealtime: off = Unsupported (default), khr = OpReadClockKHR (needs "
                          "VK_KHR_shader_clock; feature shaderSubgroupClock / shaderDeviceClock in the metadata)")
@@ -20263,6 +20386,7 @@ def main():
     LOOP_LIMIT = a.loop_limit
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
+    global MESH_SERIAL_WAVES
     global PC_TAIL_UBO, ADDRESS_GUARD
     PC_TAIL_UBO = a.pc_tail_ubo
     ADDRESS_GUARD = a.address_guard
@@ -20278,6 +20402,7 @@ def main():
     BARY_FALLBACK = a.bary_fallback
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
+    MESH_SERIAL_WAVES = a.mesh_serial_waves
     F16_HALVES = a.f16_interp_fallback
     OPT_SPIRV = a.opt
     if a.merge:

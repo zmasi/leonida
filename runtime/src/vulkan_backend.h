@@ -2931,6 +2931,31 @@ public:
         return context_.observe_result(context_.vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle") == VK_SUCCESS;
     }
 
+    // Waits on the CPU until what this queue has submitted so far is done: its own timeline, without the device's
+    // submit lock, so other queues keep submitting, and without waiting for anything submitted after (review D9;
+    // idle() waits for the whole VkQueue, which D3D12 queues may share, and blocks every submission meanwhile).
+    bool wait_submitted() {
+        std::uint64_t value = 0;
+        {
+            std::lock_guard state(state_mutex_);
+            value = submitted_;
+        }
+        if (!value) return true;
+        VkSemaphoreWaitInfo wait{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+        wait.semaphoreCount = 1;
+        wait.pSemaphores = &progress_;
+        wait.pValues = &value;
+        constexpr std::uint64_t slice_ns = 100'000'000;  // 100 ms
+        for (;;) {  // bounded slices: a lost device wakes the wait
+            if (context_.is_device_lost()) return false;
+            const VkResult res = context_.vk.vkWaitSemaphores(context_.device(), &wait, slice_ns);
+            if (res == VK_SUCCESS) return true;
+            if (res == VK_TIMEOUT) continue;
+            if (res == VK_ERROR_DEVICE_LOST) context_.mark_device_lost();
+            return false;
+        }
+    }
+
 private:
     // Completed stages, reused by later ARRAY_OF_POINTERS builds. Only execute_now() touches the pool, and it holds
     // state_mutex_ (including the deferred/held release paths), so no extra lock is needed.
@@ -4461,8 +4486,7 @@ private:
             semaphores = sparse_waits;
             values = sparse_values;
         }
-        const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
-        VkResult res = VK_SUCCESS;
+        const std::vector<VkPipelineStageFlags> stages(semaphores.size(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);        VkResult res = VK_SUCCESS;
         {
             std::lock_guard lock(context_.submit_mutex());
             VkSemaphore signals[2]{progress_, VK_NULL_HANDLE};

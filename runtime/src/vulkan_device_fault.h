@@ -2,6 +2,7 @@
 
 #include <vulkan/vulkan.h>
 
+#include "compile_gate_policy.h"
 #include "vulkan_device_markers.h"
 
 #include <algorithm>
@@ -482,8 +483,10 @@ public:
     // device was lost; waiting here starves the title as long, but keeps the device. Graphics creates pass the gate
     // since this split (adaptive and LEONIDA_COMPILE_GATE=1; the classic gate, as before, only compute ones). On a
     // device loss, report_creates_on_loss names the creates in the driver and the verdicts.
-    // classic (the default): the gate as on main before the adaptive one, compute creates only, no limit, no probes.
-    enum class GateMode { off, classic, adaptive, always };
+    // classic: the gate as on main before the adaptive one, compute creates only, no limit, no probes. The default
+    // (`auto`) is adaptive where the calibration at device creation saw the driver not hold a submission behind a
+    // create, and classic elsewhere (compile_gate_policy.h).
+    using GateMode = CompileGateMode;
     enum class GateVerdict { pending, driver_does_not_hold, driver_holds };
     static constexpr std::int64_t kProbeQuickMs = 250;
     static constexpr std::int64_t kProbeHeldMs = 2000;
@@ -531,18 +534,37 @@ public:
     };
 
     // LEONIDA_COMPILE_GATE: 0 off, 1 always (both kinds, and compute builds hold the submit lock, compute_driver_turn
-    // in shims/d3d12_vulkan_device.cpp), `adaptive` the adaptive gate, anything else (unset) classic. Classic stays
-    // the default until the adaptive gate has run on a driver that holds submissions (630.20): there its first probe
-    // of a kind enters the driver after the probe budget and loses the device if the create stays 10 s more.
-    static GateMode compile_gate_mode() {
-        static const GateMode mode = [] {
+    // in shims/d3d12_vulkan_device.cpp), `adaptive` the adaptive gate, `classic` the classic one, anything else
+    // classic, and unset or `auto` what the calibration at device creation finds (compile_gate_policy.h): adaptive
+    // where submissions came back quickly beside a create, classic where one was held and wherever it could not tell.
+    // The adaptive gate is not forced on everywhere because of what it costs on a driver that holds submissions
+    // (630.20): there its first probe of a kind enters the driver after the probe budget and loses the device if the
+    // create stays 10 s more. Read once.
+    static compile_gate_policy::Setting compile_gate_setting() {
+        static const compile_gate_policy::Setting setting = [] {
             const char* value = std::getenv("LEONIDA_COMPILE_GATE");
-            if (value && !std::strcmp(value, "0")) return GateMode::off;
-            if (value && !std::strcmp(value, "1")) return GateMode::always;
-            if (value && !std::strcmp(value, "adaptive")) return GateMode::adaptive;
-            return GateMode::classic;
+            const compile_gate_policy::ParsedSetting parsed = compile_gate_policy::parse_setting(value);
+            if (parsed.unknown)
+                std::fprintf(stderr, "[rt] compile-gate: LEONIDA_COMPILE_GATE=%s is none of auto, classic, adaptive, "
+                                     "0, 1; classic\n", value);
+            return parsed.setting;
         }();
-        return mode;
+        return setting;
+    }
+    // The gate in use. With `auto`, classic until decide_auto_gate: the device calls it once, after the calibration
+    // and before it creates the VulkanContext (and its SubmitMutex), so nothing is gated before the decision, and
+    // anything that were would get the classic gate, as before `auto`.
+    static GateMode compile_gate_mode() { return gate_mode_slot().load(std::memory_order_acquire); }
+    // With `auto`: the gate the calibration chose (adaptive or classic), for the rest of the process; the first call
+    // decides. A forced setting keeps its mode. Returns the gate in use.
+    static GateMode decide_auto_gate(GateMode mode) {
+        if (compile_gate_setting() != compile_gate_policy::Setting::automatic) return compile_gate_mode();
+        static std::once_flag once;
+        std::call_once(once, [mode] {
+            gate_mode_slot().store(mode == GateMode::adaptive ? GateMode::adaptive : GateMode::classic,
+                                   std::memory_order_release);
+        });
+        return compile_gate_mode();
     }
     static bool compile_gate_enabled() { return compile_gate_mode() != GateMode::off; }
     // Whether graphics (and mesh) creates pass the gate: not in the classic gate, where only compute ones did.
@@ -559,45 +581,63 @@ public:
         std::int64_t wait_ms;
         std::int64_t probe_ms;
     };
+    // One set per mode, each read and logged once: with `auto` the mode is known only once the driver is.
     static GateDefaults gate_defaults() {
-        static const GateDefaults defaults = [] {
-            const auto read = [](const char* name, std::int64_t fallback) -> std::int64_t {
-                const char* value = std::getenv(name);
-                if (!value || !*value) return fallback;
-                char* end = nullptr;
-                const long long n = std::strtoll(value, &end, 10);
-                if (end && !*end && n >= 0) return n;
-                std::fprintf(stderr, "[rt] compile-gate: %s=%s is not a number of milliseconds; ignored\n", name, value);
-                return fallback;
-            };
-            const GateMode mode = compile_gate_mode();
-            const bool always = mode == GateMode::always;
-            const bool adaptive = mode == GateMode::adaptive;  // classic and always: no limit by default
-            const std::int64_t wait_ms = read("LEONIDA_COMPILE_GATE_WAIT_MS", adaptive ? kDefaultGateWaitMs : 0);
-            const GateDefaults d{wait_ms, read("LEONIDA_COMPILE_GATE_PROBE_MS", wait_ms ? kDefaultProbeBudgetMs : 0)};
-            if (mode == GateMode::classic && d.wait_ms)
-                std::fprintf(stderr, "[rt] compile-gate: classic (compute creates); a submission waits at most %lld ms "
-                                     "for them to leave the driver (LEONIDA_COMPILE_GATE_WAIT_MS; "
-                                     "LEONIDA_COMPILE_GATE=adaptive for the adaptive gate)\n",
-                             static_cast<long long>(d.wait_ms));
-            else if (always && d.wait_ms)
-                std::fprintf(stderr, "[rt] compile-gate: always (LEONIDA_COMPILE_GATE=1); a submission waits at most "
-                                     "%lld ms for pipeline creates to leave the driver (LEONIDA_COMPILE_GATE_WAIT_MS)\n",
-                             static_cast<long long>(d.wait_ms));
-            else if (always)
-                std::fprintf(stderr, "[rt] compile-gate: always (LEONIDA_COMPILE_GATE=1); a submission waits for "
-                                     "pipeline creates to leave the driver, however long they take\n");
-            else if (adaptive)
-                std::fprintf(stderr, "[rt] compile-gate: adaptive (LEONIDA_COMPILE_GATE=adaptive), off once "
-                                     "submissions come back quickly with a create in the driver; a submission goes "
-                                     "ahead after %lld ms of waiting (0: no limit, LEONIDA_COMPILE_GATE_WAIT_MS) or, "
-                                     "until that is known, once the waits of the last "
-                                     "%lld s add up to %lld ms (0: never, LEONIDA_COMPILE_GATE_PROBE_MS)\n",
-                             static_cast<long long>(d.wait_ms), static_cast<long long>(kProbeWindowMs / 1000),
-                             static_cast<long long>(d.probe_ms));
+        switch (compile_gate_mode()) {
+        case GateMode::off: {
+            static const GateDefaults d = make_gate_defaults(GateMode::off);
             return d;
-        }();
-        return defaults;
+        }
+        case GateMode::adaptive: {
+            static const GateDefaults d = make_gate_defaults(GateMode::adaptive);
+            return d;
+        }
+        case GateMode::always: {
+            static const GateDefaults d = make_gate_defaults(GateMode::always);
+            return d;
+        }
+        case GateMode::classic: break;
+        }
+        static const GateDefaults d = make_gate_defaults(GateMode::classic);
+        return d;
+    }
+    static GateDefaults make_gate_defaults(GateMode mode) {
+        const auto read = [](const char* name, std::int64_t fallback) -> std::int64_t {
+            const char* value = std::getenv(name);
+            if (!value || !*value) return fallback;
+            char* end = nullptr;
+            const long long n = std::strtoll(value, &end, 10);
+            if (end && !*end && n >= 0) return n;
+            std::fprintf(stderr, "[rt] compile-gate: %s=%s is not a number of milliseconds; ignored\n", name, value);
+            return fallback;
+        };
+        const bool always = mode == GateMode::always;
+        const bool adaptive = mode == GateMode::adaptive;  // classic and always: no limit by default
+        const std::int64_t wait_ms = read("LEONIDA_COMPILE_GATE_WAIT_MS", adaptive ? kDefaultGateWaitMs : 0);
+        const GateDefaults d{wait_ms, read("LEONIDA_COMPILE_GATE_PROBE_MS", wait_ms ? kDefaultProbeBudgetMs : 0)};
+        if (mode == GateMode::classic && d.wait_ms)
+            std::fprintf(stderr, "[rt] compile-gate: classic (compute creates); a submission waits at most %lld ms "
+                                 "for them to leave the driver (LEONIDA_COMPILE_GATE_WAIT_MS; "
+                                 "LEONIDA_COMPILE_GATE=adaptive for the adaptive gate)\n",
+                         static_cast<long long>(d.wait_ms));
+        else if (always && d.wait_ms)
+            std::fprintf(stderr, "[rt] compile-gate: always (LEONIDA_COMPILE_GATE=1); a submission waits at most "
+                                 "%lld ms for pipeline creates to leave the driver (LEONIDA_COMPILE_GATE_WAIT_MS)\n",
+                         static_cast<long long>(d.wait_ms));
+        else if (always)
+            std::fprintf(stderr, "[rt] compile-gate: always (LEONIDA_COMPILE_GATE=1); a submission waits for "
+                                 "pipeline creates to leave the driver, however long they take\n");
+        else if (adaptive)
+            std::fprintf(stderr, "[rt] compile-gate: adaptive (%s), off once "
+                                 "submissions come back quickly with a create in the driver; a submission goes "
+                                 "ahead after %lld ms of waiting (0: no limit, LEONIDA_COMPILE_GATE_WAIT_MS) or, "
+                                 "until that is known, once the waits of the last "
+                                 "%lld s add up to %lld ms (0: never, LEONIDA_COMPILE_GATE_PROBE_MS)\n",
+                         compile_gate_setting() == compile_gate_policy::Setting::automatic
+                             ? "auto" : "LEONIDA_COMPILE_GATE=adaptive",
+                         static_cast<long long>(d.wait_ms), static_cast<long long>(kProbeWindowMs / 1000),
+                         static_cast<long long>(d.probe_ms));
+        return d;
     }
     static std::int64_t default_gate_wait_limit_ms() { return gate_defaults().wait_ms; }
     static std::int64_t default_gate_probe_budget_ms() { return gate_defaults().probe_ms; }
@@ -1040,6 +1080,12 @@ private:
                      what.first.trigger ? what.first.trigger : "-", double(diagnostic_ms()) / 1000.0,
                      static_cast<unsigned long long>(stats_.submits), static_cast<long long>(stats_.submit_ms),
                      static_cast<long long>(stats_.submit_max_ms));
+    }
+
+    // The gate in use: the forced setting's mode, or with `auto` classic until decide_auto_gate.
+    static std::atomic<GateMode>& gate_mode_slot() {
+        static std::atomic<GateMode> slot{compile_gate_policy::forced_mode(compile_gate_setting())};
+        return slot;
     }
 
     std::mutex mutex_;
