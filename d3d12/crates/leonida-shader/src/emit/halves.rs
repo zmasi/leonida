@@ -5,7 +5,22 @@
 
 use std::collections::HashSet;
 
-use super::{Fields, Inst, Lower, Operand, Reg, Role, RootType, Source, Value};
+use super::{Fields, Inst, Lower, Operand, Reg, Role, RootType, Source, V, Value, pred};
+
+/// Whether VOP3 `clamp` is defined on 16-bit integer instruction `name`
+/// (`docs/design.md` and `tools/rdna2spirv.py`: unsigned 16-bit add/sub
+/// saturate to `[0, 0xFFFF]`; unmeasured ops stay `Unsupported`).
+pub(super) fn vop3_int16_clamps(name: &str) -> bool {
+    matches!(name, "v_add_nc_u16" | "v_sub_nc_u16" | "v_subrev_nc_u16")
+}
+
+/// Whether VOP3P `clamp` is defined on packed 16-bit integer `op`
+/// (`docs/design.md`, `tools/pk16_diff.py`, and `tools/pk_int16_clamp_probe.py`:
+/// add/sub/mad saturate per half, `mul_lo_u16` and `min`/`max` are hardware
+/// no-ops on `gfx1036`, and unmeasured shifts stay `Unsupported`).
+pub(super) fn packed_int16_clamps(op: &str) -> bool {
+    !matches!(op, "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16")
+}
 
 impl<'a> Lower<'a> {
     /// Whether every use of `value`, a typed buffer load's result, reads
@@ -144,5 +159,50 @@ impl<'a> Lower<'a> {
         }
         halves.retain(|p| !other.contains(p) && !picked.contains(&p.0));
         halves
+    }
+
+    /// Saturates a 32-bit exact integer intermediate `r` to `[-32768, 32767]`
+    /// (`signed`) or `[0, 0xFFFF]` (`!signed`, flooring borrow at `0` when
+    /// `floor_zero` and capping overflow at `0xFFFF` otherwise). Uses unsigned
+    /// `IUGT` for `u16` so `v_pk_mad_u16` sums up to `0xFFFF_0000` (bit 31 set)
+    /// saturate rather than comparing negative.
+    fn clamp_int16(&mut self, r: V, signed: bool, floor_zero: bool) -> V {
+        let c = self.cur;
+        if signed {
+            let (lo, hi) = (self.s.m.i32((-32768i32) as u32), self.s.m.i32(0x7FFF));
+            let gt = self.s.m.cmp(c, pred::SGT, r, hi);
+            let r = self.s.m.select(c, gt, hi, r);
+            let lt = self.s.m.cmp(c, pred::SLT, r, lo);
+            self.s.m.select(c, lt, lo, r)
+        } else {
+            let hi = self.s.m.i32(0xFFFF);
+            let sat = self.s.m.i32(if floor_zero { 0 } else { 0xFFFF });
+            let ov = self.s.m.cmp(c, pred::IUGT, r, hi);
+            self.s.m.select(c, ov, sat, r)
+        }
+    }
+
+    /// Applies VOP3 `clamp` to a 16-bit unsigned add/sub intermediate `r`.
+    pub(super) fn clamp_vop3_int16(&mut self, name: &str, r: V, clamp: bool) -> V {
+        if clamp && vop3_int16_clamps(name) {
+            self.clamp_int16(r, false, name != "v_add_nc_u16")
+        } else {
+            r
+        }
+    }
+
+    /// Applies VOP3P `clamp` to one half `r` of a packed 16-bit integer `op`
+    /// (`mul_lo_u16` and `min`/`max` are no-ops on RDNA2 hardware).
+    pub(super) fn clamp_packed_int16(&mut self, op: &str, r: V, clamp: bool) -> V {
+        if clamp
+            && matches!(
+                op,
+                "add_u16" | "sub_u16" | "mad_u16" | "add_i16" | "sub_i16" | "mad_i16"
+            )
+        {
+            self.clamp_int16(r, op.ends_with("_i16"), op == "sub_u16")
+        } else {
+            r
+        }
     }
 }

@@ -10869,7 +10869,7 @@ impl<'a> Lower<'a> {
             return self.write_half(inst, r, guard);
         }
         // 16-bit integers: computed on the low halves, the low 16 bits kept.
-        if v.clamp || v.omod != 0 || v.abs != 0 || v.neg != 0 {
+        if v.omod != 0 || v.abs != 0 || v.neg != 0 || v.clamp && !halves::vop3_int16_clamps(name) {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = {
@@ -10916,6 +10916,7 @@ impl<'a> Lower<'a> {
                 }
             }
         };
+        let r = self.clamp_vop3_int16(name, r, v.clamp);
         self.write_half(inst, r, guard)
     }
 
@@ -11055,7 +11056,9 @@ impl<'a> Lower<'a> {
             | "max_u16" | "min_u16" | "max_i16" | "min_i16" => 2,
             _ => return Err("a packed 16-bit operation"),
         };
-        if v.omod != 0 || !float && (v.clamp || v.neg != 0 || v.neg_hi != 0) {
+        if v.omod != 0
+            || !float && (v.neg != 0 || v.neg_hi != 0 || v.clamp && !halves::packed_int16_clamps(op))
+        {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
@@ -11143,6 +11146,7 @@ impl<'a> Lower<'a> {
                     }
                 }
             };
+            let r = self.clamp_packed_int16(op, r, !float && v.clamp);
             let m = self.s.m.i32(0xFFFF);
             halves.push(self.s.m.bin(c, Bin::And, r, m));
         }

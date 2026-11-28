@@ -106,6 +106,8 @@ pub mod validator;
 #[cfg(all(test, windows))]
 mod pack_tests;
 #[cfg(all(test, windows))]
+mod pk16_clamp_tests;
+#[cfg(all(test, windows))]
 mod paired_tests;
 #[cfg(all(test, windows))]
 mod probe_tests;
