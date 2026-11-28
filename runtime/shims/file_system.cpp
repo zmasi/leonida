@@ -1570,6 +1570,135 @@ BOOL WINAPI set_file_attributes_a(LPCSTR name, DWORD attributes) {
     return set_file_attributes_w(wide.c_str(), attributes);
 }
 
+BOOL WINAPI get_disk_free_space_ex_w(LPCWSTR directory_name,
+                                     PULARGE_INTEGER free_bytes_available_to_caller,
+                                     PULARGE_INTEGER total_number_of_bytes,
+                                     PULARGE_INTEGER total_number_of_free_bytes) {
+    if (!directory_name) {
+        return ::GetDiskFreeSpaceExW(nullptr, free_bytes_available_to_caller, total_number_of_bytes,
+                                     total_number_of_free_bytes);
+    }
+
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(directory_name, parts);
+    if (parsed == Parsed::Host) {
+        return ::GetDiskFreeSpaceExW(directory_name, free_bytes_available_to_caller, total_number_of_bytes,
+                                     total_number_of_free_bytes);
+    }
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+
+    const Roots r = roots();
+    size_t prefix_length = 0;
+    const Drive drive = console_drive(directory_name, prefix_length);
+
+    if (!r.game.empty() || !r.overlay.empty()) {
+        const View v = view(r, parts);
+        if (v.kind != Kind::Directory) {
+            return fail_bool(ERROR_PATH_NOT_FOUND);
+        }
+        std::filesystem::path host_dir;
+        if (drive == Drive::Scratch || v.in_overlay) {
+            host_dir = disk_path(r.overlay, parts);
+        } else {
+            host_dir = disk_path(r.game, parts);
+        }
+        return ::GetDiskFreeSpaceExW(win32_io_path(host_dir).c_str(), free_bytes_available_to_caller,
+                                     total_number_of_bytes, total_number_of_free_bytes);
+    }
+
+    if (!drive_root(directory_name, parts)) {
+        return fail_bool(ERROR_PATH_NOT_FOUND);
+    }
+
+    constexpr ULONGLONG kDefaultFree = 500ULL * 1024 * 1024 * 1024;
+    constexpr ULONGLONG kDefaultTotal = 1000ULL * 1024 * 1024 * 1024;
+    if (free_bytes_available_to_caller) free_bytes_available_to_caller->QuadPart = kDefaultFree;
+    if (total_number_of_bytes) total_number_of_bytes->QuadPart = kDefaultTotal;
+    if (total_number_of_free_bytes) total_number_of_free_bytes->QuadPart = kDefaultFree;
+    return TRUE;
+}
+
+BOOL WINAPI get_disk_free_space_ex_a(LPCSTR directory_name,
+                                     PULARGE_INTEGER free_bytes_available_to_caller,
+                                     PULARGE_INTEGER total_number_of_bytes,
+                                     PULARGE_INTEGER total_number_of_free_bytes) {
+    if (!directory_name) {
+        return get_disk_free_space_ex_w(nullptr, free_bytes_available_to_caller, total_number_of_bytes,
+                                        total_number_of_free_bytes);
+    }
+    const std::wstring wide = widen_ansi(directory_name);
+    return get_disk_free_space_ex_w(wide.c_str(), free_bytes_available_to_caller, total_number_of_bytes,
+                                    total_number_of_free_bytes);
+}
+
+BOOL WINAPI get_disk_free_space_w(LPCWSTR root_path_name,
+                                  LPDWORD sectors_per_cluster,
+                                  LPDWORD bytes_per_sector,
+                                  LPDWORD number_of_free_clusters,
+                                  LPDWORD total_number_of_clusters) {
+    if (!root_path_name) {
+        return ::GetDiskFreeSpaceW(nullptr, sectors_per_cluster, bytes_per_sector,
+                                   number_of_free_clusters, total_number_of_clusters);
+    }
+
+    std::vector<std::wstring> parts;
+    const Parsed parsed = parse_console(root_path_name, parts);
+    if (parsed == Parsed::Host) {
+        return ::GetDiskFreeSpaceW(root_path_name, sectors_per_cluster, bytes_per_sector,
+                                   number_of_free_clusters, total_number_of_clusters);
+    }
+    if (parsed == Parsed::Refused) return fail_bool(ERROR_INVALID_NAME);
+
+    const Roots r = roots();
+    size_t prefix_length = 0;
+    const Drive drive = console_drive(root_path_name, prefix_length);
+
+    if (!r.game.empty() || !r.overlay.empty()) {
+        const View v = view(r, parts);
+        if (v.kind != Kind::Directory) {
+            return fail_bool(ERROR_PATH_NOT_FOUND);
+        }
+        std::filesystem::path host_dir;
+        if (drive == Drive::Scratch || v.in_overlay) {
+            host_dir = disk_path(r.overlay, parts);
+        } else {
+            host_dir = disk_path(r.game, parts);
+        }
+        std::filesystem::path root_path = host_dir.root_path();
+        if (root_path.empty()) root_path = host_dir;
+        std::wstring root_str = root_path.wstring();
+        if (!root_str.empty() && root_str.back() != L'\\' && root_str.back() != L'/') {
+            root_str += L'\\';
+        }
+        return ::GetDiskFreeSpaceW(win32_io_path(root_str).c_str(), sectors_per_cluster, bytes_per_sector,
+                                   number_of_free_clusters, total_number_of_clusters);
+    }
+
+    if (!drive_root(root_path_name, parts)) {
+        return fail_bool(ERROR_PATH_NOT_FOUND);
+    }
+
+    if (sectors_per_cluster) *sectors_per_cluster = 8;
+    if (bytes_per_sector) *bytes_per_sector = 512;
+    if (number_of_free_clusters) *number_of_free_clusters = 500ULL * 1024 * 1024 / 4;
+    if (total_number_of_clusters) *total_number_of_clusters = 1000ULL * 1024 * 1024 / 4;
+    return TRUE;
+}
+
+BOOL WINAPI get_disk_free_space_a(LPCSTR root_path_name,
+                                  LPDWORD sectors_per_cluster,
+                                  LPDWORD bytes_per_sector,
+                                  LPDWORD number_of_free_clusters,
+                                  LPDWORD total_number_of_clusters) {
+    if (!root_path_name) {
+        return get_disk_free_space_w(nullptr, sectors_per_cluster, bytes_per_sector,
+                                     number_of_free_clusters, total_number_of_clusters);
+    }
+    const std::wstring wide = widen_ansi(root_path_name);
+    return get_disk_free_space_w(wide.c_str(), sectors_per_cluster, bytes_per_sector,
+                                 number_of_free_clusters, total_number_of_clusters);
+}
+
 }  // namespace rt::fs
 
 namespace {
@@ -1639,6 +1768,10 @@ BOOL WINAPI read_file_scatter(HANDLE file, FILE_SEGMENT_ELEMENT segments[], DWOR
         {dll, "CopyFile2", reinterpret_cast<void*>(&copy_file2)},                                        \
         {dll, "SetFileAttributesA", reinterpret_cast<void*>(&set_file_attributes_a)},                    \
         {dll, "SetFileAttributesW", reinterpret_cast<void*>(&set_file_attributes_w)},                    \
+        {dll, "GetDiskFreeSpaceA", reinterpret_cast<void*>(&get_disk_free_space_a)},                      \
+        {dll, "GetDiskFreeSpaceW", reinterpret_cast<void*>(&get_disk_free_space_w)},                      \
+        {dll, "GetDiskFreeSpaceExA", reinterpret_cast<void*>(&get_disk_free_space_ex_a)},                \
+        {dll, "GetDiskFreeSpaceExW", reinterpret_cast<void*>(&get_disk_free_space_ex_w)},                \
         {dll, "ReadFile", reinterpret_cast<void*>(&read_file)},                                          \
         {dll, "ReadFileEx", reinterpret_cast<void*>(&read_file_ex)},                                     \
         {dll, "ReadFileScatter", reinterpret_cast<void*>(&read_file_scatter)}

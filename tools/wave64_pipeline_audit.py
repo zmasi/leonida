@@ -49,8 +49,8 @@ class Device:
                                               for i, v in enumerate(values) if i != 5):
             raise ValueError("invalid subgroup capability values")
         info = cls(*values)
-        if info.minimum > info.maximum or (info.minimum and info.default and
-                                           not info.minimum <= info.default <= info.maximum):
+        if (bool(info.minimum) != bool(info.maximum) or info.minimum > info.maximum
+                or (info.minimum and info.default and not info.minimum <= info.default <= info.maximum)):
             raise ValueError("inconsistent device subgroup size range")
         if any(v and v & (v - 1) for v in (info.default, info.minimum, info.maximum)):
             raise ValueError("device subgroup sizes must be powers of two")
@@ -64,7 +64,9 @@ class Assessment:
 
 
 def assess(entry, caps, *, in_chain=False):
-    stage = entry["stage"]
+    stage = entry.get("stage")
+    if not isinstance(stage, str) or stage not in STAGE_BITS:
+        return Assessment("unknown", "unknown-stage")
     if stage == "ms" and entry.get("mesh_compute"):
         if in_chain:
             return Assessment("unsupported", "mesh-compute-is-not-a-graphics-stage")
@@ -87,7 +89,7 @@ def assess(entry, caps, *, in_chain=False):
         return Assessment("unsupported", "no-subgroup-operations-in-stage")
     if caps.minimum == caps.maximum == wanted:
         return Assessment("exact", "fixed-width")
-    if caps.control and caps.required & STAGE_BITS[stage] and caps.minimum <= wanted <= caps.maximum:
+    if caps.control and caps.required & STAGE_BITS[stage] and caps.minimum and caps.minimum <= wanted <= caps.maximum:
         if stage in ("ms", "cs"):
             size = entry.get("local_size")
             if not isinstance(size, list) or len(size) != 3 or any(type(v) is not int or v <= 0 for v in size):
@@ -144,6 +146,8 @@ def build_report(index, caps, chains=None):
     if chains is not None:
         chain_counts = empty_counts()
         for chain in chains:
+            if not chain.modules:
+                raise ValueError("pipeline chain has no shader stages")
             worst = max((results[module.path.stem].outcome for module in chain.modules), key=SEVERITY.__getitem__)
             chain_counts[worst] += 1
     return {"version": 1, "device": asdict(caps), "shaders": total, "stages": dict(sorted(by_stage.items())),
@@ -154,7 +158,7 @@ def load_json(path):
     try:
         with path.open(encoding="utf-8-sig") as source:
             return json.load(source)
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, RecursionError) as exc:
         raise ValueError(f"cannot read JSON input {path}: {exc}") from exc
 
 
@@ -163,11 +167,18 @@ def main(argv=None):
     parser.add_argument("index", type=Path, help="the translator's spirv/index.json")
     parser.add_argument("--manifest", type=Path, help="audit only the chains from this shader-link manifest")
     parser.add_argument("--device-info", type=Path, help="use saved vk_subgroup_info.py --stage-caps JSON")
-    parser.add_argument("--report", type=Path, help="save a JSON report with aggregate counts")
+    parser.add_argument("--report", help="save a JSON report with aggregate counts")
     parser.add_argument("--strict", action="store_true",
                         help="exit 1 for a result other than exact or partition-invariant")
     args = parser.parse_args(argv)
     try:
+        report_path = None
+        if args.report is not None:
+            if not args.report.strip():
+                raise ValueError("--report path must not be empty")
+            report_path = Path(args.report)
+            if report_path.exists() and report_path.is_dir():
+                raise ValueError(f"report path is a directory: {report_path}")
         index = load_json(args.index)
         if not isinstance(index, dict) or any(not isinstance(row, dict) for row in index.values()):
             raise ValueError("expected a translator index object whose entries are objects")
@@ -178,12 +189,12 @@ def main(argv=None):
         report = build_report(index, caps, chains)
         if not sum(report["shaders"].values()):
             raise ValueError("the selection contains no graphics shaders")
-        if args.report:
+        if report_path is not None:
             inputs = [path for path in (args.index, args.manifest, args.device_info) if path]
             inputs.extend(args.index.parent / (name + ".spv") for name in index
                           if is_shader_stem(name))
-            ensure_report_is_separate(args.report, inputs)
-            write_report(args.report, report)
+            ensure_report_is_separate(report_path, inputs)
+            write_report(report_path, report)
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"wave64_pipeline_audit: {exc}", file=sys.stderr)
         return 2

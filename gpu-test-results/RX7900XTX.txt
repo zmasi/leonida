@@ -1,0 +1,125 @@
+UPDATE 2026-11-25, re-run on current main. The sections below are the earlier measurement at 21625bca8
+(2026-11-24) and are kept for reference; where they differ, THIS block is current.
+
+Commit:     5fab93967 (main, 2026-11-25, merge of #1630); same container, driver, llvm-mc 19.1.1, system
+            Vulkan headers (VK_HEADER_VERSION 275), CMake + Ninja Release build as below
+run_gpu_tests.py: 277 shaders: 277 translated, 277 pass spirv-val (both modes)
+            native:                 242/268 passed, 24 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  242/268 passed, 24 skipped, 2 failed (identical lines in both modes)
+Failed:     cs_imgatomic_ext: "6 of 64 sint words differ; first word 32: got 0x0badf00d, expected 0x00000101"
+            (also fails on the RTX 5060 and Arrow Lake here; open fix #1518).
+            cs_w32_salu64: same eight words as below (the documented RADV Mesa 25.2 bug).
+            cs_imgload_tfe and cs_imgload_d16_tfe PASS now (they failed at 21625bca8); cs_signed_zero_nan and
+            cs_fmt_int_narrow pass; ms_wave_info_s3 passes 4096/4096.
+Device:     the runner reports "AMD Radeon RX 7900 XTX (RADV NAVI31) (subgroup 32..64)" (this container
+            also enumerates the Arrow Lake iGPU and llvmpipe; the harness picked the XTX).
+AI-assisted (Claude Code): rebuilt main at 5fab93967 on this GPU and ran run_gpu_tests.py native and
+under LEONIDA_W64_EMULATE=1; counts and FAIL lines are copied from those runs. The skip lists and per-fixture
+notes further down were NOT re-derived for this commit.
+------------------------------------------------------------------------------
+
+GPU:        AMD Radeon RX 7900 XTX (RADV NAVI31, RDNA3 / gfx1100, PCI 1002:744c, discrete),
+            host CPU Intel Core Ultra 7 255H
+Driver:     RADV (Mesa 25.2.8-0ubuntu0.24.04.5), Vulkan 1.4.318
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default subgroupSize 64, subgroupSizeControl,
+            requiredSubgroupSizeStages = compute, task and mesh only, no fragment stage)
+OS:         Ubuntu 24.04.4 LTS container, kernel 7.3.3-300.fc45.x86_64
+Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31 (main, 2026-11-24)
+Tools:      llvm-mc 19.1.1 (Ubuntu LLVM, /usr/lib/llvm-19/bin; not on PATH), SPIRV-Tools v2025.1
+            (Ubuntu spirv-tools, "unknown hash"), CMake 3.28.3 + Ninja 1.11.1, GCC 13.3.0, Python 3.12.3,
+            system Ubuntu Vulkan headers (VK_HEADER_VERSION 275), not the pinned 1.4.363 SDK;
+            docs/testing.md says older headers still build but skip what needs VK_KHR_maintenance8
+RAM:        30 GiB (free -h: 30Gi total, 17Gi available)
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val (both modes)
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 1, tier C: 1 (tier C is not exact there)
+            native:                 225/248 passed, 20 skipped, 3 failed
+            LEONIDA_W64_EMULATE=1:  225/248 passed, 20 skipped, 3 failed
+            Arithmetic: native 225 + 20 + 3 = 248; emulated 225 + 20 + 3 = 248. The runner prints
+            "225/248 passed, 20 skipped" and no failure count; the three FAIL lines below are the
+            third term.
+Failed:     cs_imgload_d16_tfe and cs_imgload_tfe, byte-identical in both modes:
+            "exit 1: r32 sint (sint view): 64 bad, texel(5,3) = 2071". That is the known #31 pair
+            and the same words as RTX5070.txt and IntelMTL.txt; docs/gpu_test_results.md records
+            both passing with #98 on the same main. #98 was not measured here, so the pass is that
+            record's result, not this machine's.
+            cs_w32_salu64, the same eight words in both modes:
+            "510274632 4660 0 4008636142 4008636142 4008636142 4008636142 4008636142".
+            Word 2 reads 0, want 0xFFFFFFFF, and words 3..7 all read 4008636142 (0xEEEEEEEE, the unwritten
+            fill) rather than a computed value: the RADV Mesa 25.2 bug of the "Two Mesa bugs, not
+            translator bugs" row in docs/testing.md (#166). ACO's combine_add_sub_b2i reads a
+            temporary without counting the use, dead-code elimination removes it (ACO ERROR with
+            MESA_SHADER_CACHE_DISABLE=true) and RADV_DEBUG=llvm passes. Not a translator bug.
+Skipped:    native 20 = 16 documented "run by d3d12_*_test / w64_graphics.py" cases
+            (cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width, ps_m15,
+            ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post, ps_m3_query,
+            vs_m15, vs_m2, vs_m3)
+            + 3 "unsupported: VK_KHR_maintenance8 (non-constant texel Offset)"
+            (ps_texoff, ps_texoff_forms, ps_texoff_implicit)
+            + 1 "this device cannot require a 64-wide fragment subgroup: subgroup 32..64"
+            (ps_w64x_readlane).
+            The skip histogram is identical in both modes, which is the whole 20:
+            4 "run by d3d12_m3_frame_test" (ps_m3, ps_m3_post, ps_m3_query, vs_m3),
+            4 "run by d3d12_m2_textured_test" (ps_m2, ps_m2_literal, ps_m2_uoff, vs_m2),
+            3 maintenance8, 2 "run by d3d12_translated_draw_test" (ps_m15, vs_m15),
+            2 "run by d3d12_m4_compute_test", 2 "run by d3d12_buffer_uav_test",
+            1 fragment-subgroup, 1 "run by w64_graphics.py", 1 "run by d3d12_m2_formats_test".
+            Emulated 20 = the same names, histogram and count; no wave64 case skips in either mode,
+            so LEONIDA_W64_EMULATE=1 changes nothing here.
+Notes:
+- Built with cmake -S runtime -B runtime/build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release, the
+  distribution's Vulkan headers (LEONIDA_VULKAN_HEADERS_FETCH=OFF).
+- RDNA3 runs wave64 natively, so both logs list the same 248 results. Diffing the PASS/SKIP/FAIL
+  lines of the two logs leaves only the temp directory name of five raw dumps
+  (/tmp/leonida_gpu_tests_<random>/raw/...). The 31 compute wave64 fixtures and the wave64 mesh
+  fixture all run natively and pass: cs_wave64_ballot "32 16 24 40 8 48", cs_w64x_ballot
+  "2053 2061 2069 2077 2085 2093 2101 2109", cs_w64_exec_computed "291 1028 11264 771 8192 4132 0 3",
+  ms_w64x_ballot 4096/4096 pixels exact - the same under LEONIDA_W64_EMULATE=1.
+- Mesh support is exposed (VK_EXT_mesh_shader, revision 1) and all six ms_* fixtures run natively
+  and pass: ms_clip 2048/4096 pixels covered (expected 2048), ms_f16_pack f16 halves and f32 control
+  within 2e-3, ms_tri 4096/4096 exact, ms_v5_workgroup 24/24 workgroup coordinates (2 x 3 x 4),
+  ms_w64x_ballot and ms_wave_info_s3 4096/4096 exact. So the mesh regression the other RDNA records
+  report (RX9070GRE.txt: ms_wave_info_s3 flaky, 1 failed; RX9070XT.txt: #6172 in both modes) does
+  not appear on this GPU at this commit.
+- The three maintenance8 skips are a header limit, not a driver one: vulkaninfo advertises
+  VK_KHR_maintenance8 (revision 1) on this RADV, but the system headers (VK_HEADER_VERSION 275)
+  declare no VK_KHR_MAINTENANCE_8_EXTENSION_NAME, vk_texture_test.cpp guards the whole block with
+  "#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME", and VKT_NEED_MAINTENANCE8 then exits 77. Same
+  conclusion, and the same three fixtures, as RTX5060Laptop.txt on the same machine.
+- ps_w64x_readlane is the only fragment-subgroup skip and it is not the 32..32 story of the NVIDIA
+  records: maxSubgroupSize is 64 here, but requiredSubgroupSizeStages lists compute, task and mesh
+  with no fragment stage, so vk_harness never prints "fragment subgroup size: 64" and check.py's
+  wide_pixel_skip() reports the skip. RX9070GRE.txt (RADV Mesa 26.3.1) skips only 16 and therefore
+  runs that fixture; not measured here.
+- VK_KHR_fragment_shader_barycentric (revision 1, fragmentShaderBarycentric = true) is advertised,
+  so ps_bary, ps_persp_bary, ps_ij_computed, ps_interp_f16_high, ps_scc_mask32, ps_uniform_branch and
+  ms_f16_pack run natively and pass, and neither log mentions a barycentric or f16-interp fallback.
+- cs_signed_zero_nan passes here, with word 5 = 1
+  (0x80000000 0x80000000 0x80008000 0x8000 0x1 0x1 0x1 0x7c00), although the "Two Mesa bugs" row of
+  docs/testing.md gives word 5 = 0 for RADV Mesa 25.2 (25.2.8 measured) and IntelARL.txt on ANV
+  25.2.8 fails it. Only the ACO half of that row reproduced on this GPU at the same Mesa version.
+  cs_fmt_int_narrow passes too (136/136 dumped words exact), unlike IntelARL.txt on this machine.
+  Both look like driver differences rather than the translator: cs_signed_zero_nan is the NIR bug
+  the same row names, and #98 (which makes the tfe pair pass) is a separate patch that was not
+  applied in these runs.
+- The remaining cases are exact: 77 cases print a full-frame readback (75 "4096/4096 pixels exact",
+  2 "4096/4096 pixels match"), ps_flat and vs_base_ids print "flat IDs exact, uv within 0", ps_tex
+  reports 24 bindless draws read back with 0 bad pixels, and ps_ssharp 8 S#/T# cases of 4096 exact
+  pixels each. No case printed an inexact pixel result outside the three FAIL lines, and none of the
+  three is a pixel case.
+- Compared with RTX5060Laptop.txt (same container, kernel, CPU and commit): 225/248 native against
+  194/248, i.e. +31 net: the 31 compute wave64 cases plus ms_w64x_ballot (the mesh case) skip on a 32..32
+  device and run here, +32 passes, minus the cs_w32_salu64 pass the 5060 has and this GPU lacks;
+  skipped 20 against 52 (52 - 31 compute - 1 mesh = 20, the same 16 documented + 3 maintenance8 +
+  1 fragment-subgroup set); 3 failures against 2, the extra one being cs_w32_salu64, which only RADV
+  has because only RADV runs ACO. Emulated: 225/248, 3 failed here against 226/248, 2 failed on
+  the 5060 (same extra cs_w32_salu64 failure, so one pass fewer).
+- First 7900 XTX entry here. The landed RDNA3/RDNA4 siblings are RX9070XT.txt (Windows, AMD LLPC
+  26.11.2, 224/241 native, 16 skipped, ms_wave_info_s3) and RX9070GRE.txt (RADV Mesa 26.3.1,
+  218/235, 16 skipped, ms_wave_info_s3), so the 241/235-case builds predate this 248-case suite.
+  gfx1100 (Navi 31) is also a different chip from gfx1201 (Navi 48), so the stack differs in both
+  Mesa version and hardware.
+- The logs hold synthetic fixture output only: fixture names, printed words and pixel counts. No
+  shader source, SPIR-V bytes or game data are kept here.
+- AI-assisted (pi coding agent operated by the repo contributor): built main at 21625bca
+  (CMake+Ninja on this GPU), ran run_gpu_tests.py native and under LEONIDA_W64_EMULATE=1, and
+  extracted the numbers above from the run logs.

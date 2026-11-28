@@ -202,6 +202,21 @@ class VersionedLlvmMcTest(unittest.TestCase):
         self.assertNotIn("build_llvm_mc.ps1", message)
 
 
+    def test_no_tool_pins_the_plain_name_as_its_default(self):
+        # run_gpu_tests.py once defaulted --llvm-mc to os.environ.get("LLVM_MC", "llvm-mc"), so with only
+        # Ubuntu's llvm-21 installed it never reached versioned_llvm_mc() and failed with the very message that
+        # says /usr/lib/llvm-21/bin/llvm-mc is found without further setup.
+        import re
+        pinned = re.compile(r"""get\(\s*["']LLVM_MC["']\s*,\s*["']llvm-mc["']\s*\)""")
+        found = []
+        for folder in ("scripts", "tools", os.path.join("runtime", "test", "shaders")):
+            for name in sorted(os.listdir(os.path.join(ROOT, folder))):
+                if name.endswith(".py"):
+                    with open(os.path.join(ROOT, folder, name), encoding="utf-8") as f:
+                        if pinned.search(f.read()):
+                            found.append(f"{folder}/{name}")
+        self.assertEqual(found, [], "use mc_command.mc_command() (or an empty LLVM_MC) instead of a literal llvm-mc")
+
 class MissingLlvmMcTest(unittest.TestCase):
     """An llvm-mc that can't be started ends each tool with one line, not a FileNotFoundError traceback."""
 

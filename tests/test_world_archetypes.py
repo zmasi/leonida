@@ -12,6 +12,7 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 from contextlib import redirect_stdout
 
@@ -196,6 +197,31 @@ class ParseTest(unittest.TestCase):
         table = WA.member_table(maptypes([(ROCK, 2, *ROCK_BOX)], LAYOUT_B), BASE)
         self.assertEqual([off for _, off, _ in table], sorted(LAYOUT_B.values()))
 
+    def test_truncated_schema_table_does_not_emit_zero_padded_entries(self):
+        raw = bytearray(0x70)
+        struct.pack_into("<Q", raw, 0x28, SYS | 0x60)
+        struct.pack_into("<Q", raw, 0x38, SYS | 0x60)
+        struct.pack_into("<HHH", raw, 0x48, 3, 0, 3)
+        structs, blocks = WA.schema(bytes(raw))
+        self.assertEqual(structs, {})
+        self.assertEqual(len(blocks), 1)
+
+    def test_nameless_archetypes_do_not_pollute_defs_or_names_count(self):
+        layout = {k: v for k, v in LAYOUT_A.items() if k != "name"}
+        members = [(J(n), off, TYPES[n]) for n, off in layout.items()]
+        p1 = archetype(LAYOUT_A, ROCK, 2, *ROCK_BOX)
+        p2 = archetype(LAYOUT_A, CRATE, 1, *CRATE_BOX)
+        raw = build([(WA.MAPTYPES, 0x50, []), (BASE, SIZE, members)],
+                    [(WA.MAPTYPES, bytes(0x50)), (BASE, p1 + p2)])
+        with tempfile.TemporaryDirectory() as tmp:
+            fp = os.path.join(tmp, "nameless.bin")
+            with open(fp, "wb") as f:
+                f.write(raw)
+            doc = WA.run(fp)
+        self.assertEqual(doc["summary"]["archetypes"], 2)
+        self.assertEqual(doc["summary"]["names"], 0)
+        self.assertEqual(doc["summary"]["names_with_differing_boxes"], 0)
+
 
 class TransformTest(unittest.TestCase):
     def test_conjugate_and_stored_rotate_opposite_ways(self):
@@ -279,6 +305,17 @@ class ExtentsTest(unittest.TestCase):
                 self.assertEqual(res["maps_fully_defined"], 1)
                 self.assertEqual(res["scale"]["maps"], 0)
 
+    def test_negative_and_unnormalized_identity_quaternions_are_not_rotated(self):
+        defs = {CRATE: {"bb_min": CRATE_BOX[0], "bb_max": CRATE_BOX[1]},
+                None: {"bb_min": CRATE_BOX[0], "bb_max": CRATE_BOX[1]}}
+        row = {"entities_min": CRATE_BOX[0], "entities_max": CRATE_BOX[1]}
+        for q in ((0.0, 0.0, 0.0, -1.0), (0.0, 0.0, 0.0, 2.0), (0.0, 0.0, 0.0, 0.0)):
+            with self.subTest(rotation=q):
+                res = WA.check_extents([(row, [{"archetype": CRATE, "rotation": q}])], defs)
+                self.assertEqual(res["maps_fully_defined"], 1)
+                self.assertEqual(res["rotation"]["maps"], 0)
+        self.assertEqual(WA.check_extents([(row, [{"archetype": None}])], defs)["maps_fully_defined"], 0)
+
 
 class CliTest(unittest.TestCase):
     def setUp(self):
@@ -347,6 +384,43 @@ class CliTest(unittest.TestCase):
                 WA.main([os.path.join(self.tmp.name, "nope")])
             finally:
                 sys.stderr = saved
+
+    def test_cli_validates_window_guards_folder_inputs_and_writes_atomically(self):
+        defs, m = scene()
+        folder = os.path.join(self.tmp.name, "carved_guard")
+        os.makedirs(folder)
+        a_path = os.path.join(folder, "a.bin")
+        with open(a_path, "wb") as f:
+            f.write(defs)
+        with open(os.path.join(folder, "b.bin"), "wb") as f:
+            f.write(m)
+
+        for argv, needle in (
+            ([folder, "--start", "-1"], "--start"),
+            ([folder, "--limit", "0"], "--limit"),
+            ([folder, "--limit", "-5"], "--limit"),
+            ([folder, "--out", ""], "must not be empty"),
+            ([folder, "--out", "   "], "must not be empty"),
+            ([folder, "--out", a_path], "overwrite the input"),
+        ):
+            with self.subTest(argv=argv):
+                self.assertIn(needle, self.cli_error(argv))
+        with open(a_path, "rb") as f:
+            self.assertEqual(f.read(), defs)
+
+        out = os.path.join(self.tmp.name, "out.json")
+        with open(out, "w", encoding="utf-8", newline="\n") as f:
+            f.write("keep-me\n")
+        with mock.patch.object(WA.replace_retry, "replace", side_effect=OSError("disk full")):
+            self.assertIn("disk full", self.cli_error([folder, "--out", out]))
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "keep-me\n")
+        self.assertEqual([n for n in os.listdir(self.tmp.name) if n.endswith(".tmp")], [])
+
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(WA.main([folder, "--out", out]), 0)
+        with open(out, "rb") as f:
+            self.assertTrue(f.read().endswith(b"\n"))
 
 
 if __name__ == "__main__":

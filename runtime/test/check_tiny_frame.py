@@ -52,7 +52,9 @@ def ordered_subsequence(expected, entries):
 def parse_trace(lines):
     """[(method, outcome)] from the `[d3d12-trace] #N method outcome` lines; raises ValueError on a gap."""
     entries = []
-    for line in lines:
+    for idx, line in enumerate(lines):
+        if idx == 0:
+            line = line.lstrip("\ufeff")
         if not line.startswith("[d3d12-trace]"):
             continue
         match = re.fullmatch(r"\[d3d12-trace\] #(\d+) (.+) (called|ok|failed|unsupported|ignored|refused)", line)
@@ -65,7 +67,7 @@ def parse_trace(lines):
 def check_output(code, output):
     """A list of problems with one run's exit code and combined output; empty when it is what the test expects."""
     problems = []
-    lines = output.replace("\r\n", "\n").split("\n")
+    lines = output.lstrip("\ufeff").replace("\r\n", "\n").split("\n")
     if code != 0:
         problems.append(f"exit code {code}")
     if "tiny_frame: OK" not in lines:
@@ -95,7 +97,7 @@ QUEUE_TEST_SETTINGS = {"LEONIDA_VK_MAX_QUEUES_PER_FAMILY": "1", "LEONIDA_VK_GRAP
 
 def check_queue_test_settings_ignored(output):
     """Problems if the game's device applied a queue test setting instead of saying it ignores it."""
-    lines = output.replace("\r\n", "\n").split("\n")
+    lines = output.lstrip("\ufeff").replace("\r\n", "\n").split("\n")
     problems = []
     for name in QUEUE_TEST_SETTINGS:
         if any(line.startswith(f"[rt] d3d12: {name}: ") for line in lines):
@@ -106,7 +108,7 @@ def check_queue_test_settings_ignored(output):
     return problems
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("loader")
     parser.add_argument("guest")
@@ -115,14 +117,34 @@ def main():
                         help="also set the queue test settings (docs/testing.md), which the game's device must ignore")
     parser.add_argument("--runner", action="append", default=[],
                         help="run Windows executables through this command (repeat for its arguments), e.g. wine")
-    options = parser.parse_args()
+    options = parser.parse_args(argv)
+    for name, path in (("loader", options.loader), ("guest", options.guest)):
+        if not path.strip():
+            parser.error(f"{name} path must not be empty")
+        if not os.path.isfile(path):
+            print(f"ERROR: {name} is not a file: {path}", file=sys.stderr)
+            return 2
+    if options.probe is not None:
+        if not options.probe.strip():
+            parser.error("--probe path must not be empty")
+        if not os.path.isfile(options.probe):
+            print(f"ERROR: --probe is not a file: {options.probe}", file=sys.stderr)
+            return 2
     timeout = 180 if options.runner else 90  # a first start of Wine in a fresh prefix can take tens of seconds
 
     if options.probe:
-        probe = subprocess.run([*options.runner, options.probe], capture_output=True, timeout=timeout)
+        try:
+            probe = subprocess.run([*options.runner, options.probe], capture_output=True, text=True,
+                                   encoding="utf-8", errors="replace", timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(f"FAIL: --probe failed to run: {exc}", file=sys.stderr)
+            return 1
         if probe.returncode == SKIP:
             print("SKIP: no usable Vulkan device (the probe test skipped)")
             return SKIP
+        if probe.returncode != 0:
+            print(f"FAIL: --probe exited with code {probe.returncode}", file=sys.stderr)
+            return 1
 
     # The fixture is compiled against the PC headers, so it calls the command list through PC vtable
     # indices; LEONIDA_D3D12_LISTS=pc asks the proxy for PC-shaped lists. The console-shaped device,
@@ -130,10 +152,16 @@ def main():
     environment = dict(os.environ, LEONIDA_D3D12="vulkan", LEONIDA_D3D12_LISTS="pc")
     if options.queue_test_settings:
         environment.update(QUEUE_TEST_SETTINGS)
-    run = subprocess.run([*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],
-                         cwd=os.path.dirname(os.path.abspath(options.guest)), env=environment, capture_output=True,
-                         text=True, encoding="utf-8", errors="replace", timeout=timeout)
-    output = run.stdout + run.stderr
+    try:
+        run = subprocess.run([*options.runner, options.loader, "--run", os.path.basename(options.guest), "--trace-d3d12"],
+                             cwd=os.path.dirname(os.path.abspath(options.guest)), env=environment, capture_output=True,
+                             text=True, encoding="utf-8", errors="replace", timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"FAIL: runner failed: {exc}", file=sys.stderr)
+        return 1
+    stdout = run.stdout or ""
+    stderr = run.stderr or ""
+    output = f"{stdout}\n{stderr}" if stdout and stderr and not stdout.endswith("\n") else stdout + stderr
     problems = check_output(run.returncode, output)
     if options.queue_test_settings:
         problems += check_queue_test_settings_ignored(output)

@@ -22,6 +22,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -332,11 +333,24 @@ def write_json_report(path, data):
             os.makedirs(parent, exist_ok=True)
         except OSError as e:
             return f"cannot create directory for --json {path}: {e.strerror or e}"
+    tmp_path = None
     try:
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline="\n",
+            dir=parent or ".", prefix=".buffer_store_probe-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp_path = f.name
             json.dump(data, f, indent=2)
+        os.replace(tmp_path, path)
+        tmp_path = None
     except OSError as e:
         return f"cannot write --json {path}: {e.strerror or e}"
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     return None
 
 

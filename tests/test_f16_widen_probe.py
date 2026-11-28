@@ -199,7 +199,9 @@ class Contracts(unittest.TestCase):
                     hw_runner, "open_oracle", return_value=FakeOracle()
                 ),
                 unittest.mock.patch.object(hw_asm, "family", return_value="gfx10"),
-                unittest.mock.patch("builtins.open", side_effect=OSError("disk full")),
+                unittest.mock.patch.object(
+                    probe.tempfile, "NamedTemporaryFile", side_effect=OSError("disk full")
+                ),
                 redirect_stdout(out),
                 redirect_stderr(err),
             ):
@@ -262,6 +264,23 @@ class Contracts(unittest.TestCase):
             )
         )
         self.assertIn("v_mov_b32 v4, 0x7ddb", t.lines)
+
+    def test_atomic_json_write_and_replace_failure_preserves_existing(self):
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "report.json")
+            self.assertIsNone(probe.write_json_report(out, {"ok": True}))
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": true}\n')
+            with mock.patch.object(probe.os, "replace", side_effect=OSError("replace denied")):
+                err = probe.write_json_report(out, {"ok": False})
+            self.assertIsNotNone(err)
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": true}\n')
 
 
 if __name__ == "__main__":

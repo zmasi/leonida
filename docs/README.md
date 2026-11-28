@@ -20,6 +20,7 @@ method, scope and caveats. No game data is included.
 | [progress_dashboard.md](progress_dashboard.md) | A local page of what works, what changed since it last passed and what blocks next: unit and runtime tests, the translator contract by confirmation method, measured imports, corpus counts and, with `--github`, CI and the D3D- items (`tools/progress_dashboard.py`). |
 | [dev-tools.md](dev-tools.md) | The development CLI `scripts/dev.py`: `discover` (text or `--json`, schema version 1) lists the boot-trace analyzer and the guest-scene runner with their help commands and prerequisites, without running them; live attach, pause, step and screenshots are not available through it. |
 | [agent_collaboration.md](agent_collaboration.md) | How contributors' coding agents work together through GitHub: which machine profile takes which work, the `AGENT-MSG`, `RUN` and `TEST-WANTED` blocks, and the evidence tags. A convention, not a measurement. |
+| [history/README.md](history/README.md) | The original repository's surviving history as portable, hashed text: the 251 `old-pr/*` branch tips and the 135 indexed old issues, with the script that regenerates them ([#563](https://github.com/ubiquitarianism/leonida/issues/563)). |
 
 ## Archives and assets
 

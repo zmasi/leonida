@@ -41,13 +41,13 @@ class GitError(Exception):
     pass
 
 
-def git(repo, *args, check=True):
+def git(repo, *args, check=True, stdout_errors="replace"):
     try:
         r = subprocess.run(["git", "-C", repo, *args], capture_output=True)
     except OSError as e:  # git is not on PATH, or cannot be executed: a usage error (exit 2), not a traceback
         raise GitError(f"cannot run git: {e.strerror or e}") from None
     # Decode without universal-newline translation: a bare CR inside a Git line is content.
-    r.stdout = r.stdout.decode("utf-8", "replace")
+    r.stdout = r.stdout.decode("utf-8", stdout_errors)
     r.stderr = r.stderr.decode("utf-8", "replace")
     if check and r.returncode != 0:
         raise GitError(f"git {' '.join(args)}: {r.stderr.strip() or r.returncode}")
@@ -132,7 +132,8 @@ def duplicates(repo, main, tree, min_length, block=3):
 
     def windows(rev, path):
         # New files are already left out above (--- /dev/null), so a failed read is a real Git error, not a new file.
-        r = git(repo, "show", f"{rev}:{path}", "--")
+        # Keep undecodable bytes distinct while comparing lines from legacy-encoded documents.
+        r = git(repo, "show", f"{rev}:{path}", "--", stdout_errors="surrogateescape")
         lines = [(number, text) for number, raw in enumerate(r.stdout.split("\n"), 1) if (text := raw.strip())]
         content = [text for _, text in lines]
         return lines, Counter(tuple(content[i:i + block]) for i in range(len(content) - block + 1))
@@ -153,7 +154,8 @@ def duplicates(repo, main, tree, min_length, block=3):
             if before[run] and after[run] > before[run]:
                 marked.update(number for number, _ in window)
         if marked:
-            found[path] = [text for number, text in after_lines if number in marked]
+            found[path] = [text.encode("utf-8", "surrogateescape").decode("utf-8", "replace")
+                           for number, text in after_lines if number in marked]
     return found
 
 

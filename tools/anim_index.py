@@ -21,18 +21,22 @@ Usage: `python -I tools/anim_index.py --help` lists the options.
 import argparse
 import bisect
 import collections
+from contextlib import suppress
 import csv
+import errno
 import json
 import mmap
 import os
 import re
 import struct
 import sys
+import tempfile
 import zlib
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from zero_span import gap_split  # noqa: E402
 
@@ -170,6 +174,8 @@ def _fd_string(data, at):
     if n is None or not 1 <= n <= 300:
         return None
     raw = data[at + 6:at + 6 + n]
+    if len(raw) != n:
+        return None
     if raw.endswith(b"\x00"):
         raw = raw[:-1]
     if not raw or not all(32 <= c < 127 for c in raw):
@@ -230,6 +236,10 @@ def parse_rbf0(data, offset=0):
         if k < 0:
             continue
         end = sources[n + 1][0] if n + 1 < len(sources) else len(data)
+        if k + 1 < len(rigset_offsets):
+            end = min(end, rigset_offsets[k + 1])
+        if rig_at >= end:
+            continue
         group = ""
         p = rig_at + 6 + len(rig) + 1
         while p < end:
@@ -385,6 +395,10 @@ def collect_rbf0_dir(path):
 
 def scan_rpf(path, start=None, limit=None, progress=None):
     """Walk an RPF9 data area. Returns (records, summary). No tables of contents are read or decrypted."""
+    if start is not None and (isinstance(start, bool) or not isinstance(start, int)):
+        raise ValueError("start offset must be an integer")
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise ValueError("limit must be at least 1")
     rows = []
     if os.path.getsize(path) == 0:
         raise ValueError("empty file")
@@ -398,7 +412,7 @@ def scan_rpf(path, start=None, limit=None, progress=None):
         pos = start if start is not None else first
         if not 0 <= pos <= size:
             raise ValueError("start offset is outside the archive")
-        end = min(size, pos + limit) if limit else size
+        end = min(size, pos + limit) if limit is not None else size
         span_start = pos
         last, zero, unread = pos, 0, 0
         while pos < end:
@@ -498,19 +512,54 @@ def summarise(rows, span, zero, unread):
     }
 
 
+def _has_trailing_sep(path):
+    seps = tuple(s for s in (os.sep, os.altsep) if s)
+    return bool(seps) and path.endswith(seps)
+
+
+def _write_text_atomic(path, writer, *, newline="\n"):
+    """Publish UTF-8 text at `path` via a sibling temp file, preserving symlink target and file mode."""
+    if _has_trailing_sep(path):
+        raise IsADirectoryError(errno.EISDIR, "Is a directory", path)
+    destination = os.path.realpath(path)
+    if os.path.islink(destination):
+        raise OSError(errno.ELOOP, "Too many levels of symbolic links", path)
+    if os.path.isdir(destination):
+        raise IsADirectoryError(errno.EISDIR, "Is a directory", path)
+    directory = os.path.dirname(os.path.abspath(destination))
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline=newline, dir=directory,
+            prefix=".anim_index-", delete=False,
+        ) as f:
+            staged = f.name
+            writer(f)
+        os.chmod(staged, published_mode(destination))
+        os.replace(staged, destination)
+        staged = None
+    finally:
+        if staged is not None:
+            with suppress(OSError):
+                os.chmod(staged, 0o600)
+                os.unlink(staged)
+
+
 def write_output(path, rows, summary):
     """Write CSV or JSON from the file extension. CSV writes one summary line to stderr."""
     ext = os.path.splitext(path)[1].lower()
     if ext == ".json":
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"summary": summary, "files": rows}, f, indent=1)
+        _write_text_atomic(path, lambda f: json.dump({"summary": summary, "files": rows}, f, indent=1))
         return
-    with open(path, "w", encoding="utf-8", newline="") as f:
+
+    def _write_csv(f):
         w = csv.writer(f, lineterminator="\n")
         w.writerow(COLUMNS)
         for r in rows:
             w.writerow([f"0x{r['offset']:x}" if i == 0 else ("" if r[c] is None else r[c])
                         for i, c in enumerate(COLUMNS)])
+
+    _write_text_atomic(path, _write_csv, newline="")
 
 
 def offset(text):
@@ -551,12 +600,13 @@ def main():
             ap.error("--rigs must not overwrite the source")
         if same_report_path(a.out, a.rigs):
             ap.error("index and --rigs must use different paths")
-    if os.path.isdir(a.out):
+    if os.path.isdir(a.out) or _has_trailing_sep(a.out):
         ap.error(f"{a.out} is a folder, not a .csv or .json file")
-    if a.rigs and os.path.isdir(a.rigs):
+    if a.rigs and (os.path.isdir(a.rigs) or _has_trailing_sep(a.rigs)):
         ap.error(f"{a.rigs} is a folder, not a JSON file")
     if os.path.isdir(a.source):
         manifest = os.path.join(a.source, "index.json")
+        source_entries = None
         for flag, path in (("output", a.out), ("--rigs", a.rigs)):
             if not path:
                 continue
@@ -564,7 +614,12 @@ def main():
             if same_report_path(manifest, path):
                 ap.error(f"{flag} would overwrite the carve manifest: {path}")
             if os.path.isfile(path):
-                for name in os.listdir(a.source):
+                if source_entries is None:
+                    try:
+                        source_entries = os.listdir(a.source)
+                    except OSError as e:
+                        sys.exit(f"{e.filename or a.source}: {e.strerror or e}")
+                for name in source_entries:
                     inp = os.path.join(a.source, name)
                     if os.path.isfile(inp) and not name.lower().endswith((".json", ".csv")):
                         if same_report_path(inp, path):
@@ -594,29 +649,36 @@ def main():
         sys.exit(f"{a.source}: {e}")
     except OSError as e:        # missing, a folder that can't be listed, a file that can't be read
         sys.exit(f"{e.filename or a.source}: {e.strerror or e}")
-    try:
-        write_output(a.out, rows, summary)
-    except OSError as e:
-        sys.exit(f"{a.out}: cannot write: {e.strerror or e}")
+    rigs_payload = None
     if a.rigs:
-        if os.path.isdir(a.source):
-            blob = collect_rbf0_dir(a.source)
-            skeletons = collect_skeletons_dir(a.source)
-        else:
-            blob = collect_rbf0(a.source, rows)
-            skeletons = collect_skeletons(a.source, rows)
+        try:
+            if os.path.isdir(a.source):
+                blob = collect_rbf0_dir(a.source)
+                skeletons = collect_skeletons_dir(a.source)
+            else:
+                blob = collect_rbf0(a.source, rows)
+                skeletons = collect_skeletons(a.source, rows)
+        except OSError as e:
+            sys.exit(f"{e.filename or a.source}: {e.strerror or e}")
+        except zlib.error as e:
+            sys.exit(f"{a.source}: {e}")
         if blob is None:
             print("no RBF0 stream found; --rigs needs the archive or carved folder that contains it", file=sys.stderr)
             return 2
         try:
             rbf0 = parse_rbf0(blob)
         except ValueError as e:
-            # Parse before opening --rigs, so a failed parse leaves an existing file as it was.
+            # Parse before writing either output, so a failed parse leaves existing files untouched.
             print(f"{a.source}: RBF0 stream: {e}", file=sys.stderr)
             return 2
+        rigs_payload = {"rbf0": rbf0, "skeletons": skeletons}
+    try:
+        write_output(a.out, rows, summary)
+    except OSError as e:
+        sys.exit(f"{a.out}: cannot write: {e.strerror or e}")
+    if rigs_payload is not None:
         try:
-            with open(a.rigs, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"rbf0": rbf0, "skeletons": skeletons}, f, indent=1)
+            _write_text_atomic(a.rigs, lambda f: json.dump(rigs_payload, f, indent=1))
         except OSError as e:
             sys.exit(f"{a.rigs}: cannot write: {e.strerror or e}")
     top = dict(sorted(summary["signatures"].items(), key=lambda kv: -kv[1]["files"])[:15])

@@ -9,25 +9,107 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
+import time
 
 
 def exact_acp(text: str) -> bytes | None:
     try:
         encoded = text.encode("mbcs", "strict")
         return encoded if encoded.decode("mbcs", "strict") == text else None
-    except UnicodeError:
+    except (UnicodeError, LookupError):
         return None
 
 
-def main() -> int:
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _preflight_paths(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    for name in ("loader", "guest", "importer", "dependency"):
+        raw = str(getattr(args, name))
+        if not raw.strip():
+            parser.error(f"--{name} path must not be empty")
+        if not Path(raw).is_file():
+            parser.error(f"--{name} is not an existing file: {raw}")
+    raw_work = str(args.work_dir)
+    if not raw_work.strip():
+        parser.error("--work-dir must not be empty")
+    work_abs = Path(os.path.abspath(raw_work))
+    if (work_abs.exists() or work_abs.is_symlink()) and not work_abs.is_dir():
+        parser.error(f"--work-dir is not a directory: {raw_work}")
+    probe = work_abs.parent
+    while str(probe) and not (probe.exists() or probe.is_symlink()):
+        if probe.parent == probe:
+            break
+        probe = probe.parent
+    if str(probe) and not probe.is_dir():
+        parser.error(f"--work-dir parent is not a directory: {probe}")
+    if args.report is not None:
+        raw_rep = str(args.report)
+        if not raw_rep.strip():
+            parser.error("--report path must not be empty")
+        if raw_rep.endswith(("/", "\\")) or (os.sep and raw_rep.endswith(os.sep)):
+            parser.error(f"--report must name a file, not a directory: {raw_rep}")
+        for cand in (Path(os.path.abspath(raw_rep)), Path(os.path.realpath(raw_rep))):
+            if cand.is_dir():
+                parser.error(f"--report is a directory: {raw_rep}")
+            anc = cand.parent
+            while str(anc) and not (anc.exists() or anc.is_symlink()):
+                if anc.parent == anc:
+                    break
+                anc = anc.parent
+            if str(anc) and not anc.is_dir():
+                parser.error(f"--report parent is not a directory: {anc}")
+
+
+def _write_report_atomic(path: Path, payload: dict) -> None:
+    dest = Path(os.path.realpath(path))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".report-", suffix=".tmp")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name == "posix":
+            try:
+                shutil.copymode(dest, tmp)
+            except FileNotFoundError:
+                pass
+        for delay in (0.01, 0.02, 0.04) if _is_windows() else ():
+            try:
+                os.replace(tmp, dest)
+                return
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) not in (5, 32, 33):
+                    raise
+                time.sleep(delay)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("loader", "guest", "importer", "dependency", "work-dir"):
         parser.add_argument("--" + name, required=True, type=Path)
     parser.add_argument("--report", type=Path)
-    args = parser.parse_args()
-    if os.name != "nt":
+    args = parser.parse_args(argv)
+    if not _is_windows():
         parser.error("this comparison needs native Windows")
+    _preflight_paths(args, parser)
     args.work_dir.mkdir(parents=True, exist_ok=True)
     page = ctypes.windll.kernel32.GetACP()
     # The guest also looks up the upper-case spelling through GetModuleHandleA.
@@ -66,9 +148,9 @@ def main() -> int:
                 stdout = child.stdout.decode("utf-8", "replace")
                 stderr = child.stderr.decode("utf-8", "replace")
                 code = child.returncode
-            except subprocess.TimeoutExpired:
+            except (OSError, subprocess.TimeoutExpired) as exc:
                 code, stdout, stderr = None, "", ""
-                errors.append("child exceeded 15 seconds")
+                errors.append(f"failed to run child: {exc}")
             if code != 0:
                 errors.append(f"exit code {code}")
             entry = next((line for line in stdout.splitlines() if line.startswith("NAME_PROBE ")), None)
@@ -91,7 +173,7 @@ def main() -> int:
             mapped_names: list[str] = []
             if mode != "native":
                 try:
-                    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+                    events = [json.loads(line) for line in trace.read_text(encoding="utf-8-sig", errors="replace").splitlines() if line.strip()]
                     mapped_names = [event["module"] for event in events if event.get("kind") == "map"]
                     if set(mapped_names) != modules or len(mapped_names) != len(modules):
                         errors.append(f"map trace names differ: {mapped_names!r}")
@@ -156,11 +238,11 @@ def main() -> int:
                                      for name in ("loader", "guest", "importer", "dependency")},
                       fixture_sha256=hashes, rows=rows)
         if args.report:
-            args.report.write_text(json.dumps(result, indent=2) + "\n", encoding="utf-8", newline="\n")
+            _write_report_atomic(args.report, result)
     for skip in skips:
         print("SKIP", skip)
     print(f"module names: {len(rows)} native/mapped children, {len(failures)} failures, ACP {page}")
-    return bool(failures)
+    return int(bool(failures))
 
 
 if __name__ == "__main__":

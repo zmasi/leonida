@@ -11,6 +11,26 @@ import os
 import re
 
 _INCLUDE = re.compile(r'^\s*#\s*include\s*"([^"]+)"', re.MULTILINE)
+_TOKENS = re.compile(
+    r'R"([^\s()\\]{0,16})\(.*?\)\1"'
+    r'|"(?:\\.|[^"\\\r\n])*"'
+    r"|'(?:\\.|[^'\\\r\n])*'"
+    r'|/\*.*?\*/'
+    r'|//[^\r\n]*',
+    re.DOTALL,
+)
+
+
+def _strip_comments(text):
+    """Remove C/C++ comments and raw string literals while preserving line breaks and quoted #include lines."""
+    def replace(match):
+        tok = match.group(0)
+        if tok.startswith('R"'):
+            return '""'
+        if tok[0] == "/":
+            return "\n" if ("\n" in tok or "\r" in tok) else " "
+        return tok
+    return _TOKENS.sub(replace, text)
 
 # The include directories runtime/CMakeLists.txt gives the runtime/test programs, searched after the directory of the
 # including file: runtime/src and runtime/shims (target_include_directories of pe_loader_test, lines 657-660, which
@@ -32,10 +52,14 @@ def _resolve_include(root, path, inc):
     looks there first and nowhere else), otherwise every match in _INCLUDE_DIRS. CMake orders those directories per
     target, so which match the compiler takes can differ from one program to the next; following all of them can add a
     rebuild but never miss one. Empty when nothing has it (a system or generated header)."""
-    local = os.path.join(os.path.dirname(path), inc)
+    inc = inc.replace("\\", "/")
+    if not inc or inc.startswith("/") or os.path.isabs(inc) or os.path.splitdrive(inc)[0]:
+        return []
+    parts = inc.split("/")
+    local = os.path.join(os.path.dirname(path), *parts)
     if os.path.isfile(local):
         return [local]
-    matches = (os.path.join(root, directory, inc) for directory in _INCLUDE_DIRS)
+    matches = (os.path.join(root, *directory.split("/"), *parts) for directory in _INCLUDE_DIRS)
     return [candidate for candidate in matches if os.path.isfile(candidate)]
 
 
@@ -47,16 +71,19 @@ def program_sources(root, name):
     seen = set()
     while pending:
         path = os.path.normpath(pending.pop())
-        if path in seen or not os.path.isfile(path):
+        if not os.path.isfile(path):
             continue
-        seen.add(path)
+        key = os.path.normcase(os.path.realpath(path))
+        if key in seen:
+            continue
+        seen.add(key)
         found.append(path)
         try:
-            with open(path, encoding="utf-8", errors="replace") as f:
+            with open(path, encoding="utf-8-sig", errors="replace") as f:
                 text = f.read()
         except OSError:
             continue
-        for inc in _INCLUDE.findall(text):
+        for inc in _INCLUDE.findall(_strip_comments(text)):
             pending.extend(_resolve_include(root, path, inc))
     return found
 
@@ -65,14 +92,14 @@ def newer_sources(exe, root, name):
     """The sources of program `name` changed after `exe` was built, relative to `root`; empty when `exe` is current
     or isn't there to compare."""
     try:
-        built = os.path.getmtime(exe)
+        built = os.stat(exe).st_mtime_ns
     except OSError:
         return []
     newer = []
     for path in program_sources(root, name):
         try:
-            if os.path.getmtime(path) > built:
+            if os.stat(path).st_mtime_ns > built:
                 newer.append(os.path.relpath(path, root).replace(os.sep, "/"))
         except OSError:
             pass
-    return newer
+    return sorted(newer)

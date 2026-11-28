@@ -730,3 +730,113 @@ def test_main_refuses_to_overwrite_input_index_as_export_log(tmp_path, monkeypat
         err = capsys.readouterr().err
         assert "ERROR:" in err and "must not overwrite" in err, err
         assert index.read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize("we,he", [(0, 1), (1, -2), (True, 1)])
+def test_detile_offsets_rejects_invalid_dimensions(eq, we, he):
+    eq(4)
+    with pytest.raises(ValueError):
+        T.detile_offsets(4, we, he)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"w": 0, "h": 4},
+    {"w": True, "h": 4},
+    {"archive": "../escape"},
+    {"archive": "/abs/escape"},
+    {"fmt_name": "sub/name"},
+])
+def test_export_one_rejects_bad_dimensions_and_path_traversal(eq, tmp_path, overrides):
+    eq(4)
+    row = texture(28, "R8G8B8A8_UNORM", 4, 4, 1)
+    row.update(overrides)
+    with pytest.raises(ValueError):
+        T.export_one(row, str(tmp_path / "carve"), str(tmp_path / "out"), {})
+    assert not (tmp_path / "out").exists()
+
+
+def test_failed_dds_write_removes_partial_file(eq, tmp_path, monkeypatch):
+    carve, _ = build_case(eq, tmp_path, 28, top_first=True)
+    out = tmp_path / "out"
+    t = texture(28, "R8G8B8A8_UNORM", 64, 64, mips=2)
+    real_open = open
+
+    class FailingWriter:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            self._inner.close()
+            return False
+
+        def write(self, _data):
+            raise OSError("disk full")
+
+    def fail_dds(path, mode="r", *args, **kwargs):
+        inner = real_open(path, mode, *args, **kwargs)
+        if mode == "wb" and str(path).endswith(".dds"):
+            return FailingWriter(inner)
+        return inner
+
+    monkeypatch.setattr("builtins.open", fail_dds)
+    with pytest.raises(OSError, match="disk full"):
+        T.export_one(t, carve, str(out), {})
+    assert list(out.rglob("*.dds")) == []
+
+
+def test_main_rejects_whitespace_paths_and_deep_json(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    monkeypatch.chdir(cwd)
+    for bad in [(str(index), str(tmp_path), "   "), (str(index), "", str(tmp_path / "out")),
+                ("   ", str(tmp_path), str(tmp_path / "out"))]:
+        _argv(monkeypatch, *bad)
+        assert T.main() == 2
+        assert "ERROR:" in capsys.readouterr().err
+    assert os.listdir(cwd) == []
+
+    monkeypatch.setattr(T.json, "load", lambda _f: (_ for _ in ()).throw(RecursionError("deep")))
+    _argv(monkeypatch, index, tmp_path, tmp_path / "out")
+    assert T.main() == 2
+    assert "ERROR: cannot read" in capsys.readouterr().err
+
+
+def test_export_log_write_is_atomic_on_failure(tmp_path, monkeypatch, capsys):
+    index = tmp_path / "textures_index.json"
+    index.write_text("[]", encoding="utf-8")
+    out = tmp_path / "out"
+    out.mkdir()
+    report = out / "export_log.json"
+    prior = '[{"prior": true}]'
+    report.write_text(prior, encoding="utf-8", newline="\n")
+    real_open = open
+
+    class FailingWriter:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def write(self, _data):
+            raise OSError("disk full")
+
+    def fail_report(path, mode="r", *args, **kwargs):
+        if "w" in mode and os.path.abspath(str(path)) == os.path.abspath(str(report)):
+            real_open(path, "w", encoding="utf-8", newline="\n").close()
+            return FailingWriter()
+        return real_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", fail_report)
+    if hasattr(T, "replace_retry"):
+        monkeypatch.setattr(T, "replace_retry", lambda *a, **k: (_ for _ in ()).throw(OSError("disk full")))
+    _argv(monkeypatch, index, tmp_path, out)
+    assert T.main() == 1
+    assert "ERROR: cannot write" in capsys.readouterr().err
+    assert report.read_text(encoding="utf-8") == prior
+    assert list(out.glob("*.tmp")) == []

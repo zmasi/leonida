@@ -7,6 +7,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -146,6 +147,56 @@ void write_xma_packet(uint8_t* packet, uint32_t frames, uint8_t packet_skip,
         put(0, 1);                        // Frame padding bit.
         put(frame + 1 < frames ? 1 : 0, 1);
     }
+}
+
+constexpr uint32_t kTestXmaPacketBits = 2048 * 8;
+constexpr uint32_t kTestXmaHeaderBits = 32;
+
+uint32_t first_xma_frame_length(const uint8_t* packet) {
+    return (static_cast<uint32_t>(packet[4]) << 7) | (packet[5] >> 1);
+}
+
+void copy_xma_bits(uint8_t* dest, uint32_t dest_bit, const uint8_t* source, uint32_t source_bit, uint32_t count) {
+    for (uint32_t i = 0; i < count; ++i, ++dest_bit, ++source_bit) {
+        const uint8_t mask = static_cast<uint8_t>(0x80u >> (dest_bit % 8));
+        const bool bit = (source[source_bit / 8] & (0x80u >> (source_bit % 8))) != 0;
+        dest[dest_bit / 8] = static_cast<uint8_t>((dest[dest_bit / 8] & ~mask) | (bit ? mask : 0u));
+    }
+}
+
+void write_xma_header(uint8_t* packet, uint32_t frames, uint32_t leading_bits, uint8_t packet_skip) {
+    const uint32_t header = (frames << 26) | (leading_bits << 11) | (1u << 8) | packet_skip;
+    for (uint32_t i = 0; i < 4; ++i) {
+        packet[i] = static_cast<uint8_t>(header >> (24 - 8 * i));
+    }
+}
+
+struct SpanningFrame {
+    uint32_t start;
+    uint32_t next_frame;
+};
+
+// Split one compressed frame between two linked packets, then put a complete
+// frame after the continuation. Input starts at the split frame in packet 0.
+SpanningFrame write_spanning_xma_frame(uint8_t* packet, uint8_t* next_packet,
+                                      uint32_t first_piece_bits = 32, bool following_frame = true) {
+    const uint32_t start = kTestXmaPacketBits - first_piece_bits;
+    std::array<uint8_t, kTestXmaPacketBits / 8> source{};
+    write_xma_packet(source.data(), 1, 0);
+    const uint32_t frame_bits = first_xma_frame_length(source.data());
+    const uint32_t continuation_bits = frame_bits - first_piece_bits;
+    std::memset(packet, 0xFF, source.size());
+    std::memset(next_packet, 0xFF, source.size());
+    write_xma_header(packet, 1, start - kTestXmaHeaderBits, 1);
+    write_xma_header(next_packet, following_frame ? 1 : 0, continuation_bits, 0);
+    copy_xma_bits(packet, start, source.data(), kTestXmaHeaderBits, first_piece_bits);
+    copy_xma_bits(next_packet, kTestXmaHeaderBits, source.data(),
+                  kTestXmaHeaderBits + first_piece_bits, continuation_bits);
+    if (following_frame) {
+        copy_xma_bits(next_packet, kTestXmaHeaderBits + continuation_bits, source.data(),
+                      kTestXmaHeaderBits, frame_bits);
+    }
+    return {start, kTestXmaHeaderBits + continuation_bits};
 }
 
 }  // namespace
@@ -589,8 +640,7 @@ int main(int argc, char** argv) {
         check(release_ctx(&xma_ctx) == S_OK, "Release XMA SHAPE contexts joins decoder cleanly");
     }
 
-    // 8b. Loops are rounded to whole packets: the loop end packet plays in full and the read
-    //     restarts at the packet holding the loop start. One 1-frame packet = 512 samples = 4 blocks.
+    // 8b. Loop positions address frames and subframes. A mono frame is four 128-sample ring blocks.
     {
         TestShapeContexts xma_ctx{};
         xma_ctx.numXmaContexts = 4;
@@ -609,8 +659,8 @@ int main(int argc, char** argv) {
 
         void* out_va = nullptr;
         uint32_t out_apu = 0;
-        check(alloc(&out_va, &out_apu, 0x1000, 0x100, 2) == S_OK && out_va != nullptr,
-              "ApuAlloc 16-block loop output ring");
+        check(alloc(&out_va, &out_apu, 0x2000, 0x100, 2) == S_OK && out_va != nullptr,
+              "ApuAlloc output storage for the packet loop tests");
 
         // Voice index 2.
         const XmaWords words{static_cast<uint32_t*>(xma_ctx.xmaContextArray) + 32};
@@ -629,14 +679,14 @@ int main(int argc, char** argv) {
 
         auto configure_voice = [&](uint32_t loops, uint32_t input_0_packets, uint32_t ring_size,
                                    uint32_t write, uint32_t read) {
-            std::memset(out_va, 0x55, 0x1000);
+            std::memset(out_va, 0x55, 0x2000);
             const uint32_t input_1_packets = 3u - input_0_packets;
             words[0] = input_0_packets | (loops << 12) |
                        ((input_1_packets != 0 ? 3u : 1u) << 20) | (ring_size << 22) | (write << 27);
             words[1] = (1u << 31) | (3u << 27) | input_1_packets;
             words[2] = 32u;                       // read at packet 0
             words[3] = 32u;                       // loop start: packet 0
-            words[4] = 100u;                      // loop end: packet 0
+            words[4] = 32u;                       // loop end: first frame of packet 0
             words[5] = in_apu;
             words[6] = in_apu + input_0_packets * 2048u;
             words[7] = out_apu;
@@ -644,11 +694,21 @@ int main(int argc, char** argv) {
         };
 
         const uint32_t voice_index = 2u;
+        struct LoopBounds {
+            uint32_t read = kTestXmaHeaderBits;
+            uint32_t start = kTestXmaHeaderBits;
+            uint32_t end = kTestXmaHeaderBits;
+            uint32_t end_subframe = 3;
+        };
         // Returns the number of blocks written before input exhaustion, or -1 on timeout.
         auto run_blocks = [&](uint32_t loops, uint32_t input_0_packets = 3,
-                              uint32_t initial_skip = 0, uint32_t loop_skip = 0) -> int {
-            configure_voice(loops, input_0_packets, 16, 0, 0);
-            words[1].fetch_or((initial_skip << 24) | (loop_skip << 17));
+                              uint32_t initial_skip = 0, uint32_t loop_skip = 0,
+                              LoopBounds bounds = {}) -> int {
+            configure_voice(loops, input_0_packets, 31, 0, 0);
+            words[1].fetch_or((initial_skip << 24) | (loop_skip << 17) | (bounds.end_subframe << 12));
+            words[2] = bounds.read;
+            words[3] = bounds.start;
+            words[4] = bounds.end;
             check(fn_submit(x_acp, 5, 0xf3, 0xffffffffu, &voice_index, 0) == S_OK,
                   "ENABLE_XMA voice 2 succeeds");
             int wait = 0;
@@ -686,6 +746,63 @@ int main(int argc, char** argv) {
         check(has_signal(ring_bytes) && has_signal(ring_bytes + 0x400),
               "Rust produces signal on both sides of the buffer switch");
 #endif
+
+        for (uint32_t end = 0; end < 4; ++end) {
+            const int expected = 9 + static_cast<int>(end);
+            const int blocks = run_blocks(1, 3, 0, 0, {.end_subframe = end});
+            std::printf("XMA loop end subframe %u: %d blocks, expected %d\n", end, blocks, expected);
+            check(blocks == expected, "Only the repeated pass is truncated at the loop end subframe");
+        }
+
+        write_xma_packet(packets, 2, 1);
+        const uint32_t second_frame = kTestXmaHeaderBits + first_xma_frame_length(packets);
+        const int multi_frame = run_blocks(1, 3, 0, 0, {.start = second_frame, .end = second_frame, .end_subframe = 1});
+        std::printf("XMA two frames in one loop packet: %d blocks, expected 14\n", multi_frame);
+        check(multi_frame == 14, "Loop start and end select the second frame without repeating the first");
+
+        const auto spanning = write_spanning_xma_frame(packets, packets + 0x1000);
+        const LoopBounds split_bounds{
+            .read = spanning.start, .start = spanning.start, .end = spanning.start, .end_subframe = 1};
+        const int across_packet = run_blocks(1, 3, 0, 0, split_bounds);
+        std::printf("XMA loop end frame spanning linked packets: %d blocks, expected 10\n", across_packet);
+        check(across_packet == 10, "Finish the spanning frame before rewinding without playing the next frame early");
+        const int across_input = run_blocks(1, 1, 0, 0, split_bounds);
+        std::printf("XMA loop end frame spanning two input buffers: %d blocks, expected 10\n", across_input);
+        check(across_input == 10, "Keep the loop-end input until its continuation in the other input is decoded");
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+        constexpr std::size_t two_blocks = 2 * 256;
+        check(has_signal(ring_bytes) && std::memcmp(ring_bytes, ring_bytes + two_blocks, two_blocks) == 0,
+              "Rust PCM after a spanning rewind starts with the same two decoded subframes");
+#endif
+
+        const uint32_t next_frame = 2 * kTestXmaPacketBits + spanning.next_frame;
+        const int followed_split = run_blocks(1, 3, 0, 0,
+            {.read = spanning.start, .start = next_frame, .end = next_frame, .end_subframe = 1});
+        std::printf("XMA loop end after a pending continuation: %d blocks, expected 10\n", followed_split);
+        check(followed_split == 10, "Keep the carried frame before the loop-end frame's two subframes");
+
+        const auto length_split = write_spanning_xma_frame(packets, packets + 0x1000, 9, false);
+        const int split_prefix = run_blocks(1, 3, 0, 0,
+            {.read = length_split.start, .start = length_split.start, .end = length_split.start, .end_subframe = 1});
+        std::printf("XMA frame length split across packets: %d blocks, expected 6\n", split_prefix);
+        check(split_prefix == 6, "A continuation-only packet can finish a frame whose length prefix is split");
+#if defined(LEONIDA_HAVE_XMA2_DECODER)
+        const auto rejected = write_spanning_xma_frame(packets, packets + 0x1000);
+        // The next frame still has a valid length. Its subframe error bit makes the codec emit only the
+        // carried frame, so the continuation probe cannot use the returned PCM count for precise looping.
+        const uint32_t error_bit = rejected.next_frame + 27u;
+        packets[0x1000 + error_bit / 8] |= static_cast<uint8_t>(0x80u >> (error_bit % 8));
+        const int reference_blocks = run_blocks(0, 3, 0, 0, {.read = rejected.start});
+        std::array<uint8_t, 4 * 256> reference_pcm{};
+        std::memcpy(reference_pcm.data(), ring_bytes, reference_pcm.size());
+        const int fallback_blocks = run_blocks(1, 3, 0, 0,
+            {.read = rejected.start, .start = rejected.start, .end = rejected.start, .end_subframe = 1});
+        check(reference_blocks == 4 && fallback_blocks == reference_blocks && has_signal(ring_bytes) &&
+                  std::memcmp(ring_bytes, reference_pcm.data(), reference_pcm.size()) == 0,
+              "A rejected continuation probe does not change fallback playback after the rewind");
+#endif
+        write_xma_packet(packets, 1, 1);
+        write_xma_packet(packets + 0x1000, 1, 0);
 
         configure_voice(255, 3, 4, 7, 9);
         check(fn_submit(x_acp, 5, 0xf3, 0xffffffffu, &voice_index, 0) == S_OK,

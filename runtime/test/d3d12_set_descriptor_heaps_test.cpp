@@ -4,10 +4,14 @@
 #include "vk_test_device.h"
 #include "d3d12_copy_compare.h"
 #include "d3d12_test_shaders.h"
+#include "shader_fixture_path.h"
+#include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
+#include "../src/shader_library.h"
 
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -248,7 +252,8 @@ bool check_bundle_parity(DeviceHeaps& ours, DeviceHeaps* host, const std::string
     return true;
 }
 
-bool check_tracking_lifetime_and_direct_indexing(DeviceHeaps& ours) {
+bool check_tracking_lifetime_and_direct_indexing(DeviceHeaps& ours,
+                                                 const std::vector<std::uint8_t>& compute_shader_container) {
     Ptr<ID3D12CommandAllocator> al;
     Ptr<ID3D12GraphicsCommandList> list;
     Ptr<ID3D12CommandQueue> queue;
@@ -344,10 +349,20 @@ bool check_tracking_lifetime_and_direct_indexing(DeviceHeaps& ours) {
     const rt::d3d12::RootArgumentLayout* layout = rt::d3d12::root_signature_layout(root.p);
     CHECK(layout && (layout->flags & di_flags) == di_flags);
 
+#ifdef LEONIDA_TEST_CS_SPV
+    // A dispatch without a PSO is rejected by the command list and records no command. Bind a synthetic pipeline so
+    // the following assertions exercise the direct-heap words that replay will actually receive.
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pso_desc{};
+    pso_desc.pRootSignature = root.p;
+    pso_desc.CS = {compute_shader_container.data(), compute_shader_container.size()};
+    Ptr<ID3D12PipelineState> pso;
+    CHECK(SUCCEEDED(ours.device->CreateComputePipelineState(&pso_desc, IID_PPV_ARGS(&pso.p))));
+
     // Direct heap indexing passes remapped console_descriptor_table_va into recorded user data.
     ID3D12DescriptorHeap* heaps[2] = {ours.cbv1.p, ours.smp1.p};
     list->SetDescriptorHeaps(2, heaps);
     list->SetComputeRootSignature(root.p);
+    list->SetPipelineState(pso.p);
     list->Dispatch(1, 1, 1);
     std::vector<leonida::Command> cmds;
     CHECK(rt::d3d12::recorded_commands(list.p, cmds) && !cmds.empty());
@@ -357,6 +372,9 @@ bool check_tracking_lifetime_and_direct_indexing(DeviceHeaps& ours) {
     const auto expected_smp = static_cast<std::uint32_t>(rt::d3d12::console_descriptor_table_va(smp1_va));
     CHECK(disp->user_data[layout->compute_arguments_end] == expected_cbv);
     CHECK(disp->user_data[layout->compute_arguments_end + 1] == expected_smp);
+#else
+    (void)compute_shader_container;
+#endif
 
     CHECK(!rt::d3d12::bound_descriptor_heap_bases(nullptr, got_cbv, got_smp));
     return true;
@@ -376,6 +394,26 @@ int main() {
         return 77;
     }
 
+#ifdef LEONIDA_TEST_CS_SPV
+    testfiles::ScratchDir scratch("leonida_set_descriptor_heaps");
+    const auto program = d3d12test::fssm_program({0x53444801u, 0xbf810000u});
+    const auto compute_shader_container = d3d12test::shader_container(program);
+    REQUIRE(testfiles::copy_file(vktest::shader_fixture_path(LEONIDA_TEST_CS_SPV),
+                                 scratch.path() / "cs_set_descriptor_heaps.spv"));
+    {
+        std::ofstream index(scratch.path() / "index.json", std::ios::binary);
+        REQUIRE(bool(index));
+        index << "{\"cs_set_descriptor_heaps\": {\"stage\": \"cs\", \"fssm_sha256\": \""
+              << leonida::sha256_hex(program)
+              << "\", \"bindings\": [], \"push_constant_bytes\": 144, \"local_size\": [64, 1, 1], "
+                 "\"uses_code_base\": true, \"wave64\": false}}";
+        index.close();
+        REQUIRE(bool(index));
+    }
+#else
+    const std::vector<std::uint8_t> compute_shader_container;
+#endif
+
     rt::d3d12::VulkanDeviceInfo info{};
     info.get_instance_proc = d.instance_proc;
     info.instance = d.instance;
@@ -386,6 +424,9 @@ int main() {
     info.buffer_device_address = d.buffer_device_address;
     info.features = d.enabled;
     info.subgroup = d.subgroup;
+#ifdef LEONIDA_TEST_CS_SPV
+    info.shader_dir = scratch.path().string();
+#endif
 
     int rc = 0;
     {
@@ -420,7 +461,7 @@ int main() {
             rc = 1;
         if (!check_bundle_parity(ours_heaps, has_host ? &host_heaps : nullptr, host_name))
             rc = 1;
-        if (!check_tracking_lifetime_and_direct_indexing(ours_heaps))
+        if (!check_tracking_lifetime_and_direct_indexing(ours_heaps, compute_shader_container))
             rc = 1;
 
         if (rc == 0) {

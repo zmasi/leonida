@@ -52,6 +52,7 @@
 #include <vector>
 
 #include "gameinput.h"
+#include "gameinput_clip.h"
 #include "gameinput_abi.h"
 #include "gameinput_script.h"
 #include "keyboard_pad_connection.h"
@@ -1783,11 +1784,29 @@ bool is_keyboard_pad(SDL_JoystickID jid) { return jid != 0 && jid == g_keyboard.
 // Keeps the cursor inside the game window while it has focus, so a click cannot land on another window, and releases
 // it on focus loss. Only with raw input (a clipped plain cursor would stop the stick at the window edge) and only for
 // a real foreground window of this process: not KeyboardPadMode::Always over a terminal, nor a test's fake focus.
-// Re-applied every 100 ms, because Windows drops the clip on some focus and resize changes.
+// Re-applied every 100 ms, because Windows drops the clip on some focus and resize changes. Never while the window is
+// dragged or sized, or a press that began on its title bar or border is held (gameinput_clip.h has why).
 bool g_clipped = false;
 uint64_t g_clip_at = 0;
+rt::gameinput::detail::CursorClipGate g_clip_gate;
 
 void clip_cursor(bool want) {
+    const HWND w = want ? GetForegroundWindow() : nullptr;
+    if (w) {
+        GUITHREADINFO gui{};
+        gui.cbSize = sizeof(gui);
+        const bool modal_loop = GetGUIThreadInfo(GetWindowThreadProcessId(w, nullptr), &gui) &&
+                                (gui.flags & (GUI_INMOVESIZE | GUI_INMENUMODE | GUI_SYSTEMMENUMODE));
+        const bool button_down = ((GetAsyncKeyState(VK_LBUTTON) | GetAsyncKeyState(VK_RBUTTON) |
+                                   GetAsyncKeyState(VK_MBUTTON)) & 0x8000) != 0;
+        POINT cursor;
+        RECT client;
+        const bool in_client = GetCursorPos(&cursor) && ScreenToClient(w, &cursor) && GetClientRect(w, &client) &&
+                               PtInRect(&client, cursor);
+        want = g_clip_gate.update(true, modal_loop, button_down, in_client);
+    } else {
+        want = g_clip_gate.update(false, false, false, false);
+    }
     if (!want) {
         if (g_clipped) ClipCursor(nullptr);
         g_clipped = false;
@@ -1795,9 +1814,8 @@ void clip_cursor(bool want) {
     }
     const uint64_t now = now_us();
     if (g_clipped && now - g_clip_at < 100'000) return;
-    const HWND w = GetForegroundWindow();
     RECT r;
-    if (!w || !GetClientRect(w, &r)) return;
+    if (!GetClientRect(w, &r)) return;
     POINT top_left{r.left, r.top}, bottom_right{r.right, r.bottom};
     if (!ClientToScreen(w, &top_left) || !ClientToScreen(w, &bottom_right)) return;
     const RECT screen{top_left.x, top_left.y, bottom_right.x, bottom_right.y};
@@ -1871,13 +1889,17 @@ void update_keyboard_pad() {
         int x = 0, y = 0;
         const bool have = g_cursor_pos.load()(&x, &y);
         const bool moved = have && g_keyboard.have_cursor;
+        // Raw input exposes the low bits of a running total. Keep subtraction modular across a wrap.
+        auto delta = [](int current, int previous) {
+            return static_cast<int>(static_cast<unsigned>(current) - static_cast<unsigned>(previous));
+        };
         auto step = [sens](int v, int pixels) {
             const long long n = static_cast<long long>(v) * kMouseDecayNum / kMouseDecayDen +
-                                std::lround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
+                                std::llround(static_cast<long long>(pixels) * kMouseAxisPerPixel * sens);
             return static_cast<int>(std::clamp<long long>(n, -kStickFull, kStickFull));
         };
-        g_keyboard.right_x = step(g_keyboard.right_x, moved ? x - g_keyboard.cursor_x : 0);
-        g_keyboard.right_y = step(g_keyboard.right_y, moved ? y - g_keyboard.cursor_y : 0);
+        g_keyboard.right_x = step(g_keyboard.right_x, moved ? delta(x, g_keyboard.cursor_x) : 0);
+        g_keyboard.right_y = step(g_keyboard.right_y, moved ? delta(y, g_keyboard.cursor_y) : 0);
         if (have) g_keyboard.cursor_x = x, g_keyboard.cursor_y = y;
         g_keyboard.have_cursor = have;
     } else {

@@ -104,7 +104,7 @@ class BufferStoreProbeTests(unittest.TestCase):
                  unittest.mock.patch.object(hw_asm, "family", return_value="gfx10"), \
                  unittest.mock.patch.object(probe, "probe_norm", return_value=fake_norm), \
                  unittest.mock.patch.object(probe, "probe_two_comp", return_value=fake_two), \
-                 unittest.mock.patch("builtins.open", side_effect=OSError("disk full")), \
+                 unittest.mock.patch.object(probe.tempfile, "NamedTemporaryFile", side_effect=OSError("disk full")), \
                  redirect_stdout(out), redirect_stderr(err):
                 rc = probe.main(["--waves", "32", "--json", out_path])
             self.assertEqual(rc, 1)
@@ -197,6 +197,20 @@ class SummaryLineTests(unittest.TestCase):
         self.assertIn("exact, first mismatch f32 0x", out)
         self.assertIn("unorm16 tbuffer_store_format_x:", out)
         self.assertNotIn("unorm8 buffer_store_format_x:", out)
+
+    def test_atomic_json_write_and_replace_failure_preserves_existing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "report.json")
+            self.assertIsNone(probe.write_json_report(out, {"ok": True}))
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": true}\n')
+            with unittest.mock.patch.object(probe.os, "replace", side_effect=OSError("replace denied")):
+                err = probe.write_json_report(out, {"ok": False})
+            self.assertIsNotNone(err)
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": true}\n')
 
 
 if __name__ == "__main__":

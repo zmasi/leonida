@@ -21,6 +21,12 @@
 ;          --fma glsl and --fma khr.
 ; The operands come in through s4..s7 (VKC_SGPRS=0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002: a, 1+2^-23, 1-2^-23,
 ; -(1+2^-22)), so a driver cannot fold the multiply-adds at compile time; only the fmaak/fmamk constants are literals.
+; The f16 triple is a XOR a literal each (0x3f800800 ^ 0x3f8064e1 = 0x6ce1, ^ 0x3f804a00 = 0x4200, ^ 0x3f808804 =
+; 0x8004) for the same reason (TEST-FMA-FUSED-F16-RUNTIME). As three literals the whole f16 multiply-add was a
+; compile-time constant, and MoltenVK 1.4.2 gave the wrong one: word 7 read 0x0000 on an Apple M5 (0x3c00 in an
+; earlier report), while the same translation with any one of the three taken at run time gave 0x7351.
+; Computed at run time the word reads 0x7352 on KosmicKrisp (Mesa 26.3.1, Apple M3), the product-rounded-first
+; value: docs/testing.md, Known problems.
 ; Run: VKC_SGPRS=0x3f800800,0x3f800001,0x3f7ffffe,0xbf800002 vk_compute_test cs_fma_fused.spv 1 dump
 ; out[0..7] = 33800000 a8800000 3a000400 33800000 33800000 33800000 28800000 00007351 (hex)
 ; group: 1,1,1
@@ -47,9 +53,9 @@ buffer_store_dword v12, v20, s[0:3], 0 offen offset:20
 v_mov_b32_e32 v13, s7
 v_fma_f32 v14, v5, v5, v13
 buffer_store_dword v14, v20, s[0:3], 0 offen offset:24
-v_mov_b32_e32 v15, 0x6ce1
-v_mov_b32_e32 v16, 0x4200
-v_mov_b32_e32 v17, 0x8004
+v_xor_b32_e32 v15, 0x3f8064e1, v0
+v_xor_b32_e32 v16, 0x3f804a00, v0
+v_xor_b32_e32 v17, 0x3f808804, v0
 v_fma_f16 v18, v15, v16, v17
 v_and_b32_e32 v18, 0xffff, v18
 buffer_store_dword v18, v20, s[0:3], 0 offen offset:28

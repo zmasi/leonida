@@ -331,6 +331,82 @@ class FogVolumesTests(unittest.TestCase):
         self.assertEqual((offs, complete, incomplete), ([], 0, 0))
         self.assertEqual(seen, [61])
 
+    def test_failed_replace_over_readonly_report_cleans_staging_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_file = os.path.join(td, "report.json")
+            fv._write_json_atomic(out_file, {"test": 1})
+            os.chmod(out_file, 0o444)
+            try:
+                with mock.patch.object(fv.os, "replace", side_effect=PermissionError("replace failed")):
+                    with self.assertRaisesRegex(PermissionError, "replace failed"):
+                        fv._write_json_atomic(out_file, {"test": 2})
+            finally:
+                try:
+                    os.chmod(out_file, 0o600)
+                except OSError:
+                    pass
+            self.assertEqual([n for n in os.listdir(td) if n.startswith(".fog-volumes-")], [])
+            with open(out_file, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"test": 1})
+
+    @unittest.skipUnless(os.name == "nt", "Windows enforces read-only file replace and unlink")
+    def test_windows_readonly_report_failure_cleans_staging_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_file = os.path.join(td, "report.json")
+            fv._write_json_atomic(out_file, {"test": 1})
+            os.chmod(out_file, 0o444)
+            try:
+                with self.assertRaises(PermissionError):
+                    fv._write_json_atomic(out_file, {"test": 2})
+            finally:
+                try:
+                    os.chmod(out_file, 0o600)
+                except OSError:
+                    pass
+            self.assertEqual([n for n in os.listdir(td) if n.startswith(".fog-volumes-")], [])
+            with open(out_file, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"test": 1})
+
+    def test_fdopen_failure_closes_descriptor_and_cleans_staging_file(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_file = os.path.join(td, "report.json")
+            real_mkstemp = fv.tempfile.mkstemp
+            real_close = os.close
+            created = []
+            closed = []
+
+            def spy_mkstemp(*args, **kwargs):
+                fd, temp = real_mkstemp(*args, **kwargs)
+                created.append((fd, temp))
+                return fd, temp
+
+            def spy_close(fd):
+                closed.append(fd)
+                return real_close(fd)
+
+            try:
+                with (
+                    mock.patch.object(fv.tempfile, "mkstemp", side_effect=spy_mkstemp),
+                    mock.patch.object(fv.os, "fdopen", side_effect=OSError("fdopen failed")),
+                    mock.patch.object(fv.os, "close", side_effect=spy_close),
+                ):
+                    with self.assertRaisesRegex(OSError, "fdopen failed"):
+                        fv._write_json_atomic(out_file, {"test": 1})
+                self.assertEqual(len(created), 1)
+                self.assertIn(created[0][0], closed)
+                self.assertEqual([n for n in os.listdir(td) if n.startswith(".fog-volumes-")], [])
+            finally:
+                for fd, temp in created:
+                    if fd not in closed:
+                        try:
+                            real_close(fd)
+                        except OSError:
+                            pass
+                    try:
+                        os.unlink(temp)
+                    except OSError:
+                        pass
+
 
 if __name__ == "__main__":
     unittest.main()

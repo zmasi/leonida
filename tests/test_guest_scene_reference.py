@@ -87,9 +87,10 @@ class GuestSceneReferenceTest(unittest.TestCase):
             (root / "spirv").mkdir()
             placeholder = root / "placeholder.txt"
             placeholder.write_bytes(b"synthetic input")
-            out = placeholder / "output"
+            out = placeholder / "output-\u00f8"
             result = subprocess.run(
-                [sys.executable, "-I", str(path), "--wine", sys.executable,
+                # UTF-8 mode: a piped stderr is the ANSI code page on Windows, and the error names the path.
+                [sys.executable, "-I", "-X", "utf8", str(path), "--wine", sys.executable,
                  "--loader", str(placeholder), "--guest", str(placeholder),
                  "--shaders", str(root), "--out", str(out)],
                 capture_output=True, encoding="utf-8", errors="replace", timeout=20,

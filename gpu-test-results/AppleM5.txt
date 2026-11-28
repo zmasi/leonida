@@ -1,0 +1,53 @@
+GPU:        Apple M5 (Apple GPU, 8 cores, Metal 4), 16 GB unified memory
+Driver:     MoltenVK 1.4.2 (Homebrew bottle), Vulkan 1.4.357
+Subgroup:   4..32 (default 32; subgroupSizeControl without a required size; no native 64-wide, no mesh,
+            no shaderFloat64, no geometry stage, no PerVertexKHR)
+OS:         macOS 27.2.1 (26B131), arm64
+Commit:     47c651174 (main, 2026-11-24)
+Tools:      llvm-mc 23.1.6 (Homebrew, AMDGPU target), SPIRV-Tools v2026.4, Apple clang 21.0.0,
+            CMake 4.5.1, Python 3.14.7, Vulkan headers and loader 1.4.363 (Homebrew)
+build.py:   281 shaders: 281 translated, 281 pass spirv-val
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 11, tier B: 8, tier C: 13
+            not built: the six ms_* fixtures that need a DXBC container (run_gpu_tests.py builds them)
+check.py:   175 of 220 pass, 39 skipped, 6 failed
+run_gpu_tests.py: 258 shaders: 257 translated, 257 pass spirv-val
+            native:                 185/249 passed, 61 skipped, 3 failed
+            LEONIDA_W64_EMULATE=1:  215/249 passed, 30 skipped, 4 failed
+ctest:      72/72 passed, 2 skipped (shader_library_corpus, vk_sync_validation)
+Failed:     cs_fma_fused, in every run: word 7 (f16) reads 0x00000000, want 0x00007351. It is the
+            MoltenVK 1.4.2 row of docs/testing.md and in the macOS job's EXPECTED_FAILURES. That row
+            quotes 0x3c00 for the word; this device and the Apple M5 Pro record read 0x00000000.
+            cs_imgload_tfe and cs_imgload_d16_tfe, in every run: vk_store_test reports
+            "r32 sint (sint view): 64 bad, texel(5,3) = 2071" where 71 is expected. That is #31, the
+            same words as the 780M, Intel MTL and Apple M5 Pro records. #291 is open for it and was
+            not applied here.
+            ps_imgatomic, intermittent: 12 of 20 single native runs fail, with 1 to 5 of 256
+            image-atomic texels wrong. In both full passes it passed natively, failed under
+            LEONIDA_W64_EMULATE=1 (1 texel) and failed in check.py (2 texels); the render target was
+            exact each time (0 of 4096 pixels wrong). The same signature as #543 on the Apple M5 Pro,
+            where 11 of 20 single runs fail.
+check.py only: ps_ij_computed and ps_interp_f16_high report "vk_harness failed or returned no pixels":
+            the device has no PerVertexKHR inputs. run_gpu_tests.py translates with
+            --f16-interp-fallback by itself; there ps_interp_f16_high passes and ps_ij_computed is
+            skipped.
+Skipped:    native 61 = 31 that need a 64-wide compute subgroup, which this device does not have;
+            LEONIDA_W64_EMULATE=1 runs all 31 and all 31 pass
+            + 16 documented "run by d3d12_*_test / w64_graphics.py" cases
+            + 6 mesh fixtures (no VK_EXT_mesh_shader), 4 Float64 fixtures (no shaderFloat64) and
+            gs_tri (no geometryShader)
+            + 3 the device cannot run as written, in both modes: ps_vcmpx_forms (fragment subgroups
+            may run narrower than 32 on a 4..32 device), ps_w64x_readlane (no 64-wide fragment
+            subgroup can be required) and ps_ij_computed (no PerVertexKHR inputs).
+            check.py's 39 are the 31 wave64 compute tests, 3 mesh fixtures, 2 Float64 fixtures,
+            ps_vcmpx_forms, ps_w64x_readlane and cs_exec64 (64 lanes on request).
+Notes:
+- Built with cmake -S runtime -B runtime/build/linux -DVulkan_INCLUDE_DIR=/opt/homebrew/include, with
+  LLVM_MC set to Homebrew's keg-only llvm-mc. The test programs load MoltenVK directly.
+- Two full passes of build.py, check.py, run_gpu_tests.py (native and emulated) and ctest gave the
+  same counts and the same failures.
+- Every other case passed: 71 native cases read 4096/4096 pixels back exact. Among them and the
+  compute tests, cs_dpp_ops (100 10 11 12 13 14 15 16), cs_bvh and cs_bvh32 (word 3 = 0xffffffff),
+  ps_ssharp (8 S#/T# cases, 4096 pixels each), ps_cndmask_sign_mods and ps_valu16_mad_sel pass here.
+- The second Apple chip in gpu-test-results/, after the M5 Pro: the base M5 on a newer macOS (27.2.1
+  against 26.7.3) fails the same four tests as that record's MoltenVK run. KosmicKrisp was not run.
+- AI-assisted (Claude Code): built main at 47c651174 and ran the scripts above on this GPU.

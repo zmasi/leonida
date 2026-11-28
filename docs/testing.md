@@ -11,6 +11,78 @@ This page collects the setup steps and the problems testers have run into so far
 
 [claims]: https://github.com/ubiquitarianism/leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
 
+## Quick start on Windows
+
+The shortest path from a fresh Windows PC to a result you can post. The rest of this page has the details and the
+problems testers have hit; the steps below link to them.
+
+1. Install, in this order:
+   - Visual Studio 2022 (Community or Build Tools) with "Desktop development with C++", the "C++ CMake tools for
+     Windows" component and Windows SDK 10.0.26100 or newer.
+   - The [Vulkan SDK](https://vulkan.lunarg.com/). It sets `VULKAN_SDK` and puts `spirv-as`, `spirv-val`,
+     `glslangValidator` and `vulkaninfo` on `PATH`.
+   - [Python 3.12+](https://www.python.org/downloads/), with "Add python.exe to PATH" ticked, and git.
+   - Optional but needed for the full suite: `llvm-mc` with the AMDGPU target (see [What you need](#what-you-need)).
+     `powershell -ExecutionPolicy Bypass -File scripts\build_llvm_mc.ps1` builds one and sets `LLVM_MC` for you.
+2. Open a new PowerShell window (so it sees the new `PATH`), clone the repository and build the test programs:
+
+   ```powershell
+   git clone --recursive https://github.com/ubiquitarianism/leonida
+   cd leonida
+   powershell -ExecutionPolicy Bypass -File scripts\build_runtime.ps1
+   ```
+
+   The script uses the newest Visual Studio it finds. If Visual Studio 2026 is also installed and the link step
+   fails there, build from a "Developer PowerShell for VS 2022" instead:
+   `cmake -S runtime -B runtime\build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DLEONIDA_REQUIRE_VULKAN=ON`, then
+   `cmake --build runtime\build`.
+3. Run the suite twice, once as your GPU runs it and once with wave64 emulation (this matters on NVIDIA and Intel,
+   whose subgroups are 32 wide, see [GPUs with 32-wide subgroups](#gpus-with-32-wide-subgroups-nvidia-intel-apple)):
+
+   ```powershell
+   python -I scripts\run_gpu_tests.py
+   $env:LEONIDA_W64_EMULATE = "1"; python -I scripts\run_gpu_tests.py; Remove-Item Env:LEONIDA_W64_EMULATE
+   ```
+
+   Without `llvm-mc`, add `--disasm-dir tests/semantic/fixtures/disasm` to both commands. That runs the
+   pre-disassembled subset only, so say "subset" in your result.
+
+   Using a prebuilt `runtime-windows` artifact instead of building? Check out the commit that built it and read
+   this page at that commit (see [Without a compiler](#without-a-compiler-a-ci-built-runtime)): an older
+   `run_gpu_tests.py` may not take every option shown here. `python -I scripts\run_gpu_tests.py --help`, run from
+   that checkout, lists the options it does take.
+4. Collect what the record needs:
+
+   ```powershell
+   git rev-parse HEAD                      # the commit you built
+   vulkaninfo --summary                    # GPU name, driver version, Vulkan version
+   python -I tools\vk_subgroup_info.py     # subgroup range (min_subgroup_size, max_subgroup_size)
+   cmd /c ver                              # Windows build
+   ```
+
+5. Copy a Windows file in [`gpu-test-results/`](../gpu-test-results) (`RTX3060Ti-Windows.txt` is a complete one), fill
+   in your GPU, driver, subgroup range, OS build, commit, tool versions and the last line each run printed
+   (`N/M passed, K skipped`), and list every `FAIL` line. Then follow [Posting your result](#posting-your-result).
+
+A `FAIL` is worth reporting, not a reason to stop: check [Known problems](#known-problems) first, and say in the
+record whether it matched a row there.
+
+### Testing someone else's pull request
+
+Once your GPU has a record, testing open pull requests on it helps more than a second record: review and testing
+are what most pull requests wait for. Pick one that changes the translator, the runtime or a GPU test, then:
+
+```powershell
+git fetch origin pull/<N>/head:pr-<N>
+git checkout pr-<N>
+powershell -ExecutionPolicy Bypass -File scripts\build_runtime.ps1   # always rebuild after switching
+python -I scripts\run_gpu_tests.py                                  # add --filter <name> for the tests it touches
+```
+
+Run `main` the same way for comparison (`git checkout main`, rebuild, run). Then comment on the pull request with
+one line per mode, in the form `<GPU>, <driver>, Windows <build>: X of Y passed, K skipped, F failed (native);
+main at <commit>: ...`, plus any `FAIL` lines that differ from `main`.
+
 ## What you need
 
 - **Python 3.12+**, which `make_game.py` requires (it stops with "Python 3.12 or newer is needed" on an older one, so
@@ -54,6 +126,32 @@ This page collects the setup steps and the problems testers have run into so far
     for `VK_KHR_maintenance8`; older ones still build, but skip what needs it.
   - macOS: `brew install llvm molten-vk vulkan-headers vulkan-loader spirv-tools vulkan-tools`. The test programs
     load MoltenVK directly; set `LEONIDA_VULKAN_LOADER` to use the Vulkan loader instead.
+
+## Source-only smoke verification (DX-07)
+
+To verify a checkout quickly on any platform without game files, retail binaries, or hardware prerequisites:
+
+```bash
+# Standard-library sanity and toolchain discovery (Windows, Linux, macOS)
+python -I scripts/smoke.py --prereqs-only
+
+# Fast source-only smoke suite (< 1 second)
+python -I scripts/smoke.py --quick
+
+# Full synthetic smoke validation (compileall, no-game-data, CLI help, unit tests)
+python -I scripts/smoke.py
+
+# Machine-readable output for scripts and CI
+python -I scripts/smoke.py --json
+
+# Also available through the unified developer entry point
+python -I scripts/dev.py smoke --quick
+```
+
+Exit codes:
+- `0`: all requested synthetic checks passed.
+- `1`: one or more synthetic checks or tests failed.
+- `2`: required environment prerequisites missing (e.g., Python < 3.10) or invalid options.
 
 ## Build the test programs
 
@@ -336,12 +434,13 @@ of those fail for that reason.
 
 ### Run a Windows CI artifact under Wine
 
-The `Runtime` workflow uploads `runtime-windows` for seven days. It contains the Windows executables, DLLs,
+The [Runtime workflow](https://github.com/ubiquitarianism/leonida/actions/workflows/runtime.yml) uploads
+`runtime-windows` for seven days. It contains the Windows executables, DLLs,
 synthetic test shaders, CTest inventory and the path of the Windows checkout. From a clean checkout of the commit
 used by the Windows job, set `run_id` to the Actions run ID and download the artifact to `runtime/build`:
 
 ```sh
-gh run download "$run_id" --repo ItsNotRexed/Leonida --name runtime-windows --dir runtime/build
+gh run download "$run_id" --repo ubiquitarianism/leonida --name runtime-windows --dir runtime/build
 
 WINE=wine WINEPREFIX="$(mktemp -d)" WINEDLLOVERRIDES="mscoree,mshtml=" WINEDEBUG=-all \
   bash scripts/run_wine_session.sh python3 -I scripts/run_wine_tests.py \
@@ -628,7 +727,7 @@ constant `false` there instead makes the emulated `ms_tri` draw a frame byte-ide
 `ms_tri`, `ms_wave_info_s3`, `ms_w64x_ballot` and `ms_v5_workgroup` byte-identical to NVIDIA's at both widths (Mesa
 26.0.3, [measured by @TreXito](https://github.com/ItsNotRexed/Leonida/pull/3838#issuecomment-7086696759), with a 42-line reduced
 reproducer). llvmpipe is not a substitute for a result from a
-real GPU in [#166](https://github.com/ItsNotRexed/Leonida/issues/166): it catches regressions, not hardware
+real GPU in [gpu-test-results/](../gpu-test-results/): it catches regressions, not hardware
 differences.
 
 ## Macs in CI
@@ -743,6 +842,22 @@ exits 77, so CI skips it. `image_fuzz.py --oracle hw` loads a linear texture thr
 its CPU model; add `--negative-control` to check that wrong models are caught. A gfx1150 (RDNA3.5) is not RDNA2: a
 match supports the model and does not prove RDNA2. Run these one at a time: a second job on the same GPU can hang it.
 
+## Model oracle on any Vulkan GPU (no AMD hardware)
+
+`pk16_diff.py`, `vint_diff.py` and `sdwa_diff.py` judge their translated programs on a Vulkan GPU only against the words
+a native AMD GPU produced (`--oracle hw,vk`). `tools/vk_model_fuzz.py` runs the same programs, for the same seed, on
+whatever Vulkan GPU you have and judges them against the fuzzer's reference model instead:
+
+```sh
+python -I tools/vk_model_fuzz.py pk16_diff --programs 1500 --seed 11 --build runtime/build
+```
+
+`--build` is the folder with `vk_compute_test`; `llvm-mc` with the AMDGPU target is needed as for `valu_fuzz.py`. It exits
+0 when every judged program matched, 1 on a mismatch (the first few programs are printed), 2 when `vk_compute_test` is
+missing and 77 when nothing could be judged. A program the model declines counts as a skip. A mismatch here is the GPU
+disagreeing with the model, which is a driver difference, a translator bug or a model bug: re-read the program with
+the fuzzer itself (`pk16_diff.py --seed S --programs N`) before reporting it.
+
 ## Choosing the GPU
 
 With more than one GPU, pick one through the Vulkan loader, for example
@@ -796,13 +911,14 @@ game's device ignores it`, so leaving them set cannot slow a game down (`run_tin
 | On a Mac, a translated shader's GPU time is 1.5 to 16 times what it would be without the precise-arithmetic overhead | MoltenVK's SPIRV-Cross turns every `NoContraction` float add, subtract and multiply into a call to an `[[clang::optnone]]` helper that Metal does not inline. MoltenVK 1.4.2 and `main` up to at least `5189f8de` are affected (SHADER-234, [design notes](design.md#translator-status-and-runtime-contract)) | Expected with these MoltenVK versions, and the output is still exact. Before you time shaders on a Mac, build MoltenVK with SPIRV-Cross `98cbb7c0` or newer in `ExternalRevisions/SPIRV-Cross_repo_revision` (KhronosGroup/MoltenVK#2917 moves it to `57e4efcc`), and point `LEONIDA_VULKAN_LOADER` at its `libMoltenVK.dylib` |
 | `d3d12_descriptor_test` reports that the set had room for fewer than 5001 2D views and 2100 samplers, and the device logs that the bindless set holds fewer samplers than a full shader-visible sampler heap | The device's descriptor limits, or its `vkGetDescriptorSetLayoutSupport`, allow no bigger bindless set ([d3d12_vulkan.md](d3d12_vulkan.md) section 5). MoltenVK's answer is ignored, since it rejects every layout of `maxPerSetDescriptors` (1212) or more although it runs the full set | Expected where the limits are low. The test still checks the last index of each array and that the next view and sampler are refused |
 | `cs_dpp_ops` fails on a Mac with MoltenVK 1.4.2: `out[0..7] = 100 100 11 ...`, want `100 10 11 ...` | MoltenVK 1.4.2's SPIRV-Cross moves the DPP lowering's subgroup ballot and shuffle into a short-circuiting `&&` and `?:`, so only some lanes run them and lane 1 sees its source lane 0 as inactive. SPIRV-Cross `5c372ffb` (in MoltenVK `main`) keeps them out of `?:`; a ballot on the right of `&&` is still moved there in SPIRV-Cross `57e4efcc` | Fixed in the translator (SHADER-529, #3227): it stores the ballot and the shuffle to variables of their own, so the MSL that MoltenVK 1.4.2 generates (`MVK_CONFIG_DEBUG=1`) runs each as a statement in every lane. Translate again with current `main`; MoltenVK `main` and KosmicKrisp are no longer needed for it. A pass alone does not show the fix: an Apple M5 Pro (macOS 26.5.1) returns the right words with 1.4.2 even when the ballot is on the right of `&&` |
-| `check.py`'s `cs_fma_fused` fails on a Mac with MoltenVK 1.4.2: word 7 reads `15360` (`0x3c00`), want `29521` (`0x7351`) | The f16 multiply-add (round to odd). The MSL of 1.4.2 and of MoltenVK `main` differ only in SPIRV-Cross's precise-arithmetic helpers (`[[clang::optnone]]` and `fma(l, r, 0)` against `math_mode(safe)` and `fma(l, r, -0.0)`, the SHADER-182 / SHADER-234 change) | Expected with MoltenVK 1.4.2; it passes with MoltenVK `main` |
+| On a Mac with MoltenVK 1.4.2, an f16 multiply-add whose three operands are all constants gives a wrong constant: while `cs_fma_fused` had literals there, its word 7 read `15360` (`0x3c00`), or `0` on an Apple M5 and M5 Pro, want `29521` (`0x7351`) | The f16 multiply-add (round to odd), evaluated at compile time. With any one of the three operands taken at run time the same translation gives `0x7351` (Apple M5). The MSL of 1.4.2 and of MoltenVK `main` differ only in SPIRV-Cross's precise-arithmetic helpers (`[[clang::optnone]]` and `fma(l, r, 0)` against `math_mode(safe)` and `fma(l, r, -0.0)`, the SHADER-182 / SHADER-234 change) | `cs_fma_fused` takes its f16 operands at run time since TEST-FMA-FUSED-F16-RUNTIME, as it does its f32 ones, and passes with MoltenVK 1.4.2 on an Apple M5 and on the `macos` job's runner (Apple Paravirtual device), which no longer lists it in `EXPECTED_FAILURES`. The all-literal form passes with MoltenVK `main` |
 | `ps_imgatomic` fails in about two of three runs on a Mac with MoltenVK 1.4.2: 1 to 6 of the 256 image-atomic texels are wrong while the render target is exact, for example `2D umax texel 48: got 0x00000d45, want 0x00000dc7` | MoltenVK 1.4.2 lowers the four `OpAtomic*` on image texels to Metal's texture atomics (`atomic_fetch_max`, `atomic_fetch_min` and `atomic_fetch_or` on `access::read_write` textures), and the texels read back the way a read-modify-write that is not atomic between two groups of fragment threads leaves them. A wrong `umax` texel always holds the id of one of its own 64 pixels, the largest of only some of them: on an Apple M5 it was the last pixel of the texel's first four rows in 43 of 90 cases, with all 32 larger ids gone. A wrong `umin` texel mirrors that (the first pixel of its last four rows in 39 of 48). The `or` image did not differ in 150 runs there. It is not the translator's first-lane broadcast of the descriptor index (54 of 60 runs fail with the index used directly) and not the readback (42 of 60 fail with the copies in a submission of their own after the draw). Measured on an Apple M5 (macOS 27.2.1, 101 of 150 runs fail) and an M5 Pro (#543) | Expected with MoltenVK 1.4.2. KosmicKrisp passed the same module and binary 10 times of 10 on the M5 Pro (#543). The macOS CI job does not reach it: on the runner's paravirtual device the test skips because its bindless set does not fit the descriptor limits. Do not weaken the test's expected texels |
 | `gs_tri` and `ms_tri` fail on a Mac | MoltenVK has no geometry stage and no `VK_EXT_mesh_shader` | Current `main` reports them as skipped |
 | With `LEONIDA_W64_EMULATE=1` on llvmpipe, the `ms_*` tests fail. Measured with Mesa 26.3.1: on x86_64 at 256-bit vectors (the default there) all six abort with "LLVM ERROR: Cannot emit physreg copy instruction"; on arm64 (128-bit) `ms_tri` draws nothing (the frame stays at the clear color); on x86_64 at 128 bits (`LP_NATIVE_VECTOR_WIDTH=128`) `ms_tri` happened to draw correctly, but with Mesa 26.0.3 `ms_wave_info_s3` and `ms_v5_workgroup` draw nothing there (4 of 6 pass, [measured by @TreXito](https://github.com/ItsNotRexed/Leonida/pull/3838#issuecomment-7086696759)) ([measured runs](https://github.com/ItsNotRexed/Leonida/issues/3127#issuecomment-7086469679)) | An llvmpipe bug: a mesh shader's runtime `CullPrimitiveEXT` is stored through an invalid `bitcast <N x i1> to <N x float>` (TEST-782, #3127; see "Without a GPU: Mesa llvmpipe") | Run the mesh tests on llvmpipe without `LEONIDA_W64_EMULATE`, or add `LEONIDA_MESH_COMPUTE=1` (the compute fallback): with it all 6 `ms_*` pass emulated on llvmpipe (x86_64, 256-bit) |
 | On a Mac, `valu_fuzz.py --family f16` reads `+0` where the model wants `-0`, from a multiply whose exact product is -0 (`v_mul_f16`, `v_pk_mul_f16`) or from an FMA whose product and addend are both -0 (`v_fma_f16`, `v_fmac_f16`, `v_pk_fma_f16`) | MoltenVK computes a `NoContraction` multiply as `fma(l, r, +0)`, which drops the sign. MoltenVK 1.4.2 and `main` up to at least `5189f8de` are affected (SHADER-182, [design notes](design.md#translator-status-and-runtime-contract)) | Expected with these MoltenVK versions. To run the rest of the fuzzer clean, add `--skip-op` for each of the five ops. To see them match, install Homebrew's `mesa` and use its KosmicKrisp driver: `LEONIDA_VULKAN_LOADER=/opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib VK_DRIVER_FILES=/opt/homebrew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json python3 -I tools/valu_fuzz.py --family f16 --build runtime/build/linux`. Or build MoltenVK with SPIRV-Cross `300681bb` or newer in `ExternalRevisions/SPIRV-Cross_repo_revision`, and point `LEONIDA_VULKAN_LOADER` at its `libMoltenVK.dylib` |
 | A pixel shader exporting non-canonical f32 NaNs reads back `0x7fc00000` from an RGBA32F color attachment | KosmicKrisp (Mesa 26.3.1), reproduced on Apple M3 Max, M2 Ultra and M1 Pro ([#3125](https://github.com/ItsNotRexed/Leonida/issues/3125)): `nir_to_msl` emits `(NAN)` for `float`-typed NaN constants (`MESA_KK_DEBUG=msl`); MoltenVK 1.4.2 preserved both tested payloads on the same hardware | `ps_nan_payload` allows the measured canonical word only for the NaN channels and only when `vk_harness` reports `driver: KosmicKrisp`. Finite channels and other drivers still require exact words. Integer or storage-buffer readback still canonicalizes constants that NIR infers as `float` (see the `cs_bvh` row below). |
 | `cs_bvh` and `cs_bvh32` fail on a Mac with KosmicKrisp: `out[3]` reads `0x7fc00000`, want `0xffffffff` | KosmicKrisp's `nir_to_msl` compiler (Mesa 26.3.1, measured on Apple M2 Ultra, macOS 27.3), not the translator or the buffer format. The triangle branch writes bitcast `float` words and the box branch writes `OpSelect %uint` with `0xffffffff` (`-1`) into the same VGPRs; NIR erases `OpBitcast`, type inference marks the shared register and `bcsel` as `float`, and `nir_to_msl` prints any `float`-typed 32-bit constant in the IEEE-754 NaN range (`0x7f800001..0x7fffffff`, `0xff800001..0xffffffff`) as `(NAN)` (`0x7fc00000`) | Expected with KosmicKrisp in Mesa 26.3.1; MoltenVK 1.4.2 and llvmpipe (Mesa 26.3.1) return `0xffffffff` on the same machine. Do not weaken `vk_compute_test`'s expected BVH words |
+| `cs_fma_fused` fails on a Mac with KosmicKrisp: word 7 reads `0x7352`, want `0x7351` | The f16 multiply-add (round to odd), computed at run time, comes out as if the product were rounded first: the exact product, 14988, is halfway between the f16 values 14984 (`0x7351`) and 14992 (`0x7352`), the addend is -2^-22, and one rounding gives `0x7351`. Measured on an Apple M3 with Mesa 26.3.1, 20 of 20 runs (the review of #1724). While the fixture's f16 operands were literals the constant was folded exactly, so the test passed there | Expected with KosmicKrisp in Mesa 26.3.1; MoltenVK 1.4.2 and llvmpipe (Mesa 26.3.1) give `0x7351` on the same machine. The f32 words KosmicKrisp splits are accepted under `--fma glsl`; the f16 word is not, since it does not use `Fma` |
 | CMake stops with "needs the Windows SDK 10.0.26100 or newer", or MSVC reports `'Desc_1_2': is not a member of 'D3D12_VERSIONED_ROOT_SIGNATURE_DESC'` | A Windows SDK older than 10.0.26100 (10.0.22621 is the common one), which has no version 1.2 root signatures | `winget install Microsoft.WindowsSDK.10.0.26100`, or add it in the Visual Studio Installer, then delete `runtime/build` and configure again |
 | `scripts/build_runtime.ps1` stops at once: "The checkout path ... contains '%'" (`build_llvm_mc.ps1`: "-Temp ... contains '%'") | A `%` in the checkout's path (or in `-Temp`). cmd.exe expands `%...%` in the generated `_build.cmd` (twice on a `CALL` line), and even with that escaped, `cl` rejects a `%` in the path-valued `/D` definitions of the test targets (`D8038: invalid argument`) however it is quoted. Older scripts failed in configure or a few hundred steps into Ninja instead | Move or clone the checkout (or choose a `-Temp`) in a folder without `%` in its path |
 | `ctest` lists `fsr_dispatch` and `bvh_builder` as failed (`Not Run`) after clang-cl hits an internal compiler error in `fsr_dispatch_test.cpp` and `bvh_builder_test.cpp` | clang-cl 22.1.8 on Fedora (Linux cross-build) and Windows, plus 22.1.7 on Windows | Use clang-cl 23.1.6 (both files compile on Windows) |

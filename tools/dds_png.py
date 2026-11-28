@@ -657,19 +657,20 @@ def _bc_interp_lut(v0: int, v1: int) -> tuple[int, int, int, int, int, int, int,
 
 
 def _bc_interp_lut_snorm(b0: int, b1: int) -> tuple[int, int, int, int, int, int, int, int]:
-    """Build the 8-entry BC4_SNORM / BC5_SNORM table mapped from [-1, 1] to [0, 255]."""
-    s0 = b0 - 256 if b0 >= 128 else b0
-    s1 = b1 - 256 if b1 >= 128 else b1
-    if s0 == -128:
-        s0 = -127
-    if s1 == -128:
-        s1 = -127
+    """Build the 8-entry BC4_SNORM / BC5_SNORM table mapped from [-1, 1] to [0, 255].
+
+    The eight- or six-value ramp is chosen by comparing the stored int8 endpoints, as D3D's BC4_SNORM rule does;
+    -128 is read as -127 only once it becomes a value. So 0x81, 0x80 (-127 > -128) is an eight-value block, which
+    clamping before the compare would turn into a six-value one with +1.0 at index 7."""
+    r0 = b0 - 256 if b0 >= 128 else b0
+    r1 = b1 - 256 if b1 >= 128 else b1
+    s0, s1 = max(r0, -127), max(r1, -127)
 
     def to_u8(v: float) -> int:
         # Map [-127.0, 127.0] -> [0, 255]
         return int(round((v / 127.0 * 0.5 + 0.5) * 255.0))
 
-    if s0 > s1:
+    if r0 > r1:
         return (
             to_u8(s0),
             to_u8(s1),

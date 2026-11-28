@@ -1,0 +1,37 @@
+GPU:        NVIDIA GeForce RTX 3050 6GB Laptop GPU (Ampere / GA107, PCI 10de:25ec), subgroup 32..32
+Driver:     NVIDIA 621.24 (Windows, DCH), Vulkan 1.4.357
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
+OS:         Windows 11 Home 26300.9974 (hybrid laptop: Intel UHD Graphics 770 iGPU alongside)
+Commit:     8f481cf16f261c7f37458aeb45e8f4e19994146d (main, 2026-11-24)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools, native Windows), SPIRV-Tools from Vulkan SDK 1.4.363.0,
+            MSVC 14.44.35207 + Windows SDK 10.0.26100, CMake 4.4.4 + Ninja 1.13.2, Python 3.13.17
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val (native and emulated alike)
+            native:                 197/248 passed, 49 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  229/248 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (native and emulated alike): the tfe status VGPR is
+            read but never written. With #291 (head de87b1a9e) on the same build, both pass natively
+            and under LEONIDA_W64_EMULATE=1 (--filter tfe: 2/2 each), and
+            tests/semantic/test_image_load_tfe.py passes.
+Skipped:    native: 31 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this
+            device" and 1 "cannot require a 64-wide fragment subgroup" (the wave64 fixtures, which the
+            emulated run covers), plus the 16
+            documented "run by d3d12_*_test / w64_graphics.py" cases. Emulated: the same 16, plus the
+            64-wide fragment one.
+Notes:
+- Built with scripts\build_runtime.ps1 (VS 2022 Build Tools, CMake + Ninja, RelWithDebInfo) with
+  VULKAN_SDK set; the NVIDIA GPU was picked by the harness without any loader overrides.
+- Same checkout: ctest -j 6, 304 registered: 290 passed, 11 skipped, 2 failed, and gameinput disabled
+  (built without SDL3):
+  - d3d12_execute_indirect_validation: 5 of 49 parity cases, the same five as the RTX 3080 Ti finding in
+    the coordination issue (arg_offset past the buffer with max=0, and three stride overruns): the layer
+    returns E_INVALIDARG where WARP and the driver both return S_OK.
+  - d3d12_bindless_churn_validated: a test race, not a GPU result. It and d3d12_bindless_churn run the
+    same executable with one fixed %TEMP%\leonida_bindless_churn_test folder, so under -j the first to
+    finish removes the other's index.json. Both pass run alone; fixed in a separate pull request.
+  Skipped: the game-file tests (no LEONIDA_GAME_DIR / LEONIDA_SHADERS / LEONIDA_FIRST_LIGHT_DIR),
+  vk_sync_validation (LEONIDA_VK_VALIDATION unset) and d3d12_rgb9e5_rtv (RGB9E5 render targets
+  unavailable on this adapter).
+- Translator suite: 465 files / 6,104 tests / 0 failed (with the Vulkan SDK's spirv-val on PATH).
+- AI-assisted (Claude Code): installed the toolchain, built main, ran run_gpu_tests.py native and
+  emulated, ctest and the translator suite, and reran the two tfe failures with #291 checked out.
+  No game files, nothing online.

@@ -43,6 +43,10 @@ class Layout(unittest.TestCase):
         self.assertEqual(X.ptr_type(0x136AC), X.BOX16)
         with self.assertRaises(ValueError):
             X.ptr(32, X.TRI0)
+        for bad_off, bad_kind in ((-64, X.BOX16), (False, X.TRI0), (64, -1), (64, 8), (64, True)):
+            with self.subTest(offset=bad_off, kind=bad_kind):
+                with self.assertRaises(ValueError):
+                    X.ptr(bad_off, bad_kind)
 
     def test_header_fields(self):
         data, info = X.build_blas([TRI])
@@ -310,6 +314,10 @@ class ClosestHit(unittest.TestCase):
         self.assertEqual(struct.unpack_from("<4f", tlas, off + 64), (1.0, 0.0, 0.0, -5.0))
         with self.assertRaises(ValueError):
             X.build_tlas([X.Instance(inst.transform, 0x12340, info["root"], info["bounds"])])
+        for bad_va in (-256, 1 << 40, False, True):
+            with self.subTest(blas_va=bad_va):
+                with self.assertRaises(ValueError):
+                    X.build_tlas([X.Instance(inst.transform, bad_va, info["root"], info["bounds"])])
 
     def test_inactive_nan_triangles_produce_empty_boxes_and_valid_blas(self):
         # D3D12 marks inactive triangles with a NaN vertex (e.g. v0.x = NaN); xdxr_build.comp gives them an empty
@@ -420,6 +428,35 @@ class ClosestHit(unittest.TestCase):
                 off = X.ptr_offset(struct.unpack_from("<I", tlas, X.ptr_offset(info["root"]))[0])
                 self.assertEqual(struct.unpack_from("<12f", tlas, off + 64), (0.0,) * 12)
 
+    def test_singular_transform_with_valid_blas_is_inactive_in_tlas_and_brute_force(self):
+        # Matches xdxr_build.comp / docs/bvh.md 7a: a singular transform with a real BLAS gets an empty box and zero
+        # inverse so neither build_tlas nor brute_force fails on it, and rays skip it cleanly.
+        blas, blas_info = X.build_blas([TRI])
+        mem = X.Memory()
+        va_blas = mem.place(0x100000, blas)
+        zero = [[0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0]]
+        flat = [[1, 0, 0, 0], [0, 0, 0, 0], [0, 0, 1, 0]]
+        shifted = [[1, 0, 0, 4], [0, 1, 0, 0], [0, 0, 1, 0]]
+        insts = [
+            X.Instance(zero, va_blas, blas_info["root"], blas_info["bounds"], mask=0xFF),
+            X.Instance(flat, va_blas, blas_info["root"], blas_info["bounds"], mask=0xFF),
+            X.Instance(shifted, va_blas, blas_info["root"], blas_info["bounds"], mask=0xFF),
+        ]
+        tlas, info = X.build_tlas(insts)
+        self.assertEqual(X.validate(tlas, expect_bottom=False), [])
+        self.assertEqual(info["bounds"], ([4.0, 0.0, 0.0], [5.0, 1.0, 0.0]))
+        root = X.ptr_offset(info["root"])
+        for slot in (0, 1):
+            inst_off = X.ptr_offset(struct.unpack_from("<I", tlas, root + 4 * slot)[0])
+            self.assertEqual(struct.unpack_from("<12f", tlas, inst_off + 64), (0.0,) * 12)
+        va_tlas = mem.place(0x200000, tlas)
+        scene = [(zero, 0xFF, [TRI]), (flat, 0xFF, [TRI]), (shifted, 0xFF, [TRI])]
+        for o, d in (([0.25, 0.25, -1.0], [0.0, 0.0, 1.0]), ([4.25, 0.25, -1.0], [0.0, 0.0, 1.0])):
+            got = X.trace(mem, va_tlas, o, d)
+            want = X.brute_force(scene, o, d)
+            self.assertTrue(same_hit(got, want), (o, got, want))
+        self.assertEqual(X.trace(mem, va_tlas, [4.25, 0.25, -1.0], [0.0, 0.0, 1.0])["instance"], 2)
+
 
 class Validate(unittest.TestCase):
     def setUp(self):
@@ -468,6 +505,39 @@ class Validate(unittest.TestCase):
         root = X.ptr_offset(info["root"])
         struct.pack_into("<f", b, root + 16, math.nan)
         self.assertTrue(any("NaN" in e for e in X.validate(bytes(b), expect_bottom=True)))
+
+    def test_misaligned_offset_to_parents_is_rejected(self):
+        errs = self.corrupt(56, "<i", -63)
+        self.assertTrue(any("offsetToParents" in e and "4-byte aligned" in e for e in errs), errs)
+
+    def test_cyclic_and_short_buffers_terminate_cleanly_across_walkers(self):
+        data, info = X.build_blas(X.grid_mesh(3), box16=True, pair=True)
+        root_ptr = info["root"]
+        root_off = X.ptr_offset(root_ptr)
+        cyc = bytearray(data)
+        struct.pack_into("<I", cyc, root_off, root_ptr)
+        cyc_bytes = bytes(cyc)
+
+        self.assertTrue(any("cycle" in e for e in X.box16_rounding(cyc_bytes)))
+        self.assertEqual(X.box16_rounding(b"\0" * 10), ["buffer shorter than the 64-byte header"])
+        self.assertIn(X.BOX16, X.node_census(cyc_bytes))
+        self.assertEqual(X.node_census(b"\0" * 10), {})
+        self.assertIsInstance(X.pair_rotations(cyc_bytes), set)
+        self.assertEqual(X.pair_rotations(b"\0" * 10), set())
+
+        mem = X.Memory()
+        mem.place(0x10000, cyc_bytes)
+        lo, hi = X.decode_box16(struct.unpack_from("<3I", cyc_bytes, root_off + 16))
+        mid = [(lo[c] + hi[c]) * 0.5 for c in range(3)]
+        with self.assertRaisesRegex(ValueError, "cycle"):
+            X.trace(mem, 0x10000, [mid[0], mid[1], lo[2] - 5.0], [0.0, 0.0, 1.0])
+
+        # Out-of-bounds root pointer is reported cleanly without struct.error.
+        oob = bytearray(data)
+        struct.pack_into("<I", oob, 48, X.ptr(len(data) + 64, X.BOX16))
+        self.assertTrue(any("outside the buffer" in e for e in X.box16_rounding(bytes(oob))))
+        self.assertEqual(X.node_census(bytes(oob)), {})
+        self.assertEqual(X.pair_rotations(bytes(oob)), set())
 
 
 
@@ -696,6 +766,66 @@ class Cli(unittest.TestCase):
             text = self.check_build_stderr(d)
             self.assertIn("broken.json", text)
             self.assertIn("no 'instances' key", text)
+
+    def test_check_build_accepts_utf8_bom_case_json(self):
+        import json
+        blas, _ = X.build_blas([TRI])
+        with tempfile.TemporaryDirectory() as d:
+            with open(os.path.join(d, "bom.bin"), "wb") as f:
+                f.write(blas)
+            with open(os.path.join(d, "bom.json"), "w", encoding="utf-8-sig") as f:
+                json.dump({"kind": "blas", "address": 0x10000, "triangles": [TRI + [0, 0]]}, f)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = X.main(["check-build", d, "--rays", "20"])
+            self.assertEqual(rc, 0, out.getvalue())
+
+    def test_check_build_rejects_bool_indices_and_bad_transform_or_rays(self):
+        import json
+        blas, info = X.build_blas([TRI])
+        m = [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]]
+        tlas, _ = X.build_tlas([X.Instance(m, 0x10000, info["root"], info["bounds"])])
+        cases = [
+            ("bool_blas", {"kind": "tlas", "address": 0x20000, "blas": ["b"],
+                           "instances": [{"transform": sum(m, []), "mask": 255, "blas": False}]}),
+            ("short_xform", {"kind": "tlas", "address": 0x20000, "blas": ["b"],
+                             "instances": [{"transform": [1, 0, 0], "mask": 255, "blas": 0}]}),
+            ("zero_rays", {"kind": "blas", "address": 0x10000, "rays": 0, "triangles": [TRI + [0, 0]]}),
+            ("bool_addr", {"kind": "blas", "address": True, "triangles": [TRI + [0, 0]]}),
+        ]
+        for label, payload in cases:
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as d:
+                    with open(os.path.join(d, "b.bin"), "wb") as f:
+                        f.write(blas)
+                    with open(os.path.join(d, "b.json"), "w", encoding="utf-8") as f:
+                        json.dump({"kind": "blas", "address": 0x10000, "triangles": [TRI + [0, 0]]}, f)
+                    with open(os.path.join(d, "bad.bin"), "wb") as f:
+                        f.write(tlas if payload["kind"] == "tlas" else blas)
+                    with open(os.path.join(d, "bad.json"), "w", encoding="utf-8") as f:
+                        json.dump(payload, f)
+                    text = self.check_build_stderr(d)
+                    self.assertIn("bad.json", text)
+
+    def test_check_build_corrupt_truncated_or_cyclic_bin_exits_1_not_2(self):
+        import json
+        blas, info = X.build_blas(X.grid_mesh(3))
+        cyc = bytearray(blas)
+        struct.pack_into("<I", cyc, X.ptr_offset(info["root"]), info["root"])
+        for label, payload in (("truncated", b"\0" * 10), ("cyclic", bytes(cyc))):
+            with self.subTest(label=label):
+                with tempfile.TemporaryDirectory() as d:
+                    with open(os.path.join(d, "bad.bin"), "wb") as f:
+                        f.write(payload)
+                    with open(os.path.join(d, "bad.json"), "w", encoding="utf-8") as f:
+                        json.dump({"kind": "blas", "address": 0x10000,
+                                   "triangles": [t + [0, i] for i, t in enumerate(X.grid_mesh(3))]}, f)
+                    out, err = io.StringIO(), io.StringIO()
+                    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                        rc = X.main(["check-build", d, "--rays", "20"])
+                    self.assertEqual(rc, 1, (out.getvalue(), err.getvalue()))
+                    self.assertEqual(err.getvalue(), "")
+                    self.assertIn("problems", out.getvalue())
 
     def test_selftest(self):
         with contextlib.redirect_stdout(io.StringIO()):

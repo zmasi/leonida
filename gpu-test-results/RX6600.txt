@@ -1,0 +1,68 @@
+GPU:        AMD Radeon RX 6600 (RDNA2, Navi 23, PCI 1002:73FF), subgroup 32..64
+Driver:     AMD proprietary 26.11.2 (Windows driver 32.0.21045.29003; vulkaninfo driverInfo
+            "26.11.2 (AMD proprietary shader compiler)"), Vulkan 1.4.315
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default 64)
+OS:         Windows 11 Pro, 10.0.26300.10075
+Commit:     6293c1c4f88c7ea2088ec595fea51362f1759996 (main, 2026-11-24)
+Tools:      llvm-mc 21.1.8 (built by scripts\build_llvm_mc.ps1, AMDGPU target), SPIRV-Tools
+            v2026.4 (Vulkan SDK 1.4.363.0), CMake 4.2.3-msvc3 + Ninja 1.12.1 (Visual Studio
+            Build Tools 2026), MSVC 19.50.35726.0, Python 3.14.3
+run_gpu_tests.py: 261 shaders: 261 translated, 261 pass spirv-val (every run)
+            native:                 235/252 passed, 17 skipped, 0 failed (3 of 3 full runs)
+            LEONIDA_W64_EMULATE=1:  235/252 passed, 17 skipped, 0 failed (1 full run)
+Failed:     none in run_gpu_tests.py.
+Skipped:    16 skips are the documented "run by d3d12_*_test / w64_graphics.py" cases:
+            cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width,
+            ps_m15, ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post,
+            ps_m3_query, vs_m15, vs_m2, vs_m3.
+            ps_w64x_readlane: "this device cannot require a 64-wide fragment subgroup:
+            subgroup 32..64". It skips with LEONIDA_W64_EMULATE=1 too.
+ctest:      ctest --test-dir runtime\build -C RelWithDebInfo on the same build: 309 tests
+            registered, 292 passed, 12 skipped, 1 disabled (gameinput), 4 failed. The same
+            four fail in the full run and in three reruns of those four alone:
+            d3d12_texture_tiles: "row-major alias tile 0 at (0,0): got 0x20000cc, expected
+              0xcc020000". The test is claimed in the coordination issue as
+              D3D-TILES-AMD-BYTE-OFFSET (RX 7900 XT, same driver release).
+            d3d12_execute_indirect_validation: "49 parity cases (WARP=live, HW=AMD Radeon
+              RX 6600), positive GPU dispatch ok, 0 validation errors, 5 failures"; each of
+              the five reads "layer=0 warp=1 hw=1 expected=0". The same five cases are
+              reported on other Windows 11 26300 machines (#1069).
+            d3d12_clear: "depth clear with NaN (x,y): layer cleared 1, expected nan" for
+              all 15 texels. #787, which describes this on AMD and proposes the fix, was
+              not applied here.
+            d3d12_mesh: "line 482: mixed.GSInvocations == 0 && mixed.GSPrimitives == 0 &&
+              mixed.HSInvocations == 0 && mixed.DSInvocations == 0 && mixed.CSInvocations
+              == 0". The line it prints after that is "statistics, mixed: IA 6/2 VS 6 C 2/2
+              PS 3328 CS 0; mesh only: C 0/0 PS 1024; vertex only: C 2 PS 2048", so the
+              non-zero counter is one of the GS, HS or DS ones, which the test does not
+              print. vulkaninfo reports meshShader = true, meshShaderQueries = false. I
+              found no report of this failure; the RX 7900 XTX ctest list in #787 does not
+              have it. Not investigated further.
+            Skipped: shader_library_corpus, bink_decode, bink_abi, bink_play_headless,
+            fsr_dispatch, bvh_builder, bink_audio, vk_sync_validation, d3d12_b5g5r5a1_uav,
+            d3d12_boot_movie, d3d12_first_light, d3d12_conservative_tier3.
+Earlier run: at 8f05e09e2, before #892, the same machine gave 258 shaders and 230/249
+            passed with cs_imgload_tfe and cs_imgload_d16_tfe failing in all five full runs
+            ("r32 sint (sint view): 64 bad, texel(5,3) = 2071"); both pass here. In the
+            first of four full native runs there, cs_w32_buffer_store_sub also failed: the
+            runner's detail was the program's own "device: ..." line with no result words,
+            and the exit status was not captured. It passed in the other four full runs at
+            that commit, in 15 of 15 isolated --filter runs, and in all four full runs at
+            this commit. Not reproduced and not explained.
+Translator suite: python -I scripts/run_semantic_tests.py tests/semantic was run at
+            8f05e09e2 only, not at this commit: 465 files, 6108 tests, 1606 s with 12 jobs.
+            Two files failed, test_sopc_validation and test_unary_f16_validation, only with
+            "spirv-as / spirv-val not found on PATH": that run started before the Vulkan
+            SDK was installed. With the SDK's Bin on PATH both pass (11 and 5 tests).
+Notes:
+- Built with scripts\build_runtime.ps1 (CMake + Ninja, RelWithDebInfo, into runtime\build),
+  with LLVM_MC and VULKAN_SDK set, so the d3d12_* tests that need translated shaders are
+  registered and the 16 "run by d3d12_*_test" cases above were run by ctest; none of the
+  four failures is one of those tests.
+- build.py and check.py (the two D3D12-side columns in the table) were not run on their
+  own; the counts come from run_gpu_tests.py.
+- Implicit Vulkan layers present on this machine and enabled in every run at this commit:
+  VK_LAYER_AMD_switchable_graphics, VK_LAYER_OBS_HOOK, VK_LAYER_ROCKSTAR_GAMES_social_club,
+  VK_LAYER_VALVE_steam_fossilize, VK_LAYER_VALVE_steam_overlay.
+- CPU: AMD Ryzen 5 3600. No game files were used.
+- AI-assisted (Claude Code).

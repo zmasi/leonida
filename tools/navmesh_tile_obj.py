@@ -15,6 +15,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from navmesh_nodes import navmesh_resources, tile_geometry
 from report_paths import same_report_path
+from file_mode import published_mode
 
 
 def write_obj(out, geometry, ordinal):
@@ -61,6 +62,7 @@ def main(argv=None):
                                          dir=args.out.parent, delete=False) as out:
             temp = Path(out.name)
             write_obj(out, geometry, ordinal)
+        os.chmod(temp, published_mode(args.out))
         os.replace(temp, args.out)
         temp = None
     except (OSError, ValueError) as exc:
@@ -68,7 +70,15 @@ def main(argv=None):
         return 2
     finally:
         if temp is not None:
-            temp.unlink(missing_ok=True)
+            try:
+                # The staged file may carry a read-only destination's mode; make it deletable first.
+                os.chmod(temp, 0o600)
+            except OSError:
+                pass
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
     return 0
 
 

@@ -1,0 +1,56 @@
+GPU:        AMD Radeon RX 6900 XT (RDNA2 / GFX1030, Navi 21, PCI 1002:73bf), subgroup 32..64
+Driver:     RADV, Mesa 26.2.4, Vulkan 1.4.354 (conformance 1.4.5.3)
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; subgroupSizeControl true)
+OS:         Nobara Linux 44 (Fedora 44), kernel 7.2.10-200.nobara.fc44.x86_64
+Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31 (main, 2026-11-24)
+Tools:      llvm-mc 22.1.8 (Fedora llvm package, AMDGPU target; unpacked from the RPM into a
+            local prefix, so no root on this host), SPIRV-Tools v2026.1,
+            CMake 3.31.10, GCC 16.2.1, Python 3.14.9
+build.py:   280 shaders: 280 translated, 280 pass spirv-val
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 11, tier B: 8, tier C: 13
+            not built: the six ms_* fixtures that need a DXBC container (ms_clip, ms_f16_pack,
+            ms_tri, ms_v5_workgroup, ms_w64x_ballot, ms_wave_info_s3)
+check.py:   214 of 219 pass, 3 skipped, 2 failed
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
+            native:                 230/248 passed, 16 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  230/248 passed, 16 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe: exit 1, "r32 sint (sint view): 64 bad,
+            texel(5,3) = 2071" (check.py and run_gpu_tests.py alike, native and emulated).
+            The fixture stores 100 + 8y + x in the r32 uint image (129 at (5,3)) and
+            -2 (8y + x) in the r32 sint image (-58 there) and expects their sum, 71. It seeds
+            each of the two tfe status VGPRs with 1000 (0x3e8), so a status dword that is read
+            but never written moves the texel by 1000 or 2000: 2071 - 71 = 2000 here, both
+            seeds. The uint view is exact in the same run (0 bad, texel 129), so only the two
+            status dwords differ. Whether the translator or the fixture's expected value is
+            wrong is the open SHADER-1266 / #31 question in the coordination issue, where #98
+            was closed unmerged and a fixture-only correction is pending; this run adds the
+            RDNA2 words to that record and nothing RDNA2-specific.
+Skipped:    16 skips are the documented "run by d3d12_*_test / w64_graphics.py" cases:
+            cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width,
+            ps_m15, ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post,
+            ps_m3_query, vs_m15, vs_m2, vs_m3.
+            check.py's 3 skips are the mesh fixtures only run_gpu_tests.py can build
+            (ms_w64x_ballot, ms_wave_info_s3, ms_v5_workgroup).
+Notes:
+- Built with cmake -S runtime -B runtime/build/linux and
+  cmake --build runtime/build/linux --parallel (GCC 16.2.1); no Windows/gta6rt surface on this host.
+- The suite ran on RADV with the project's own vk_harness / vk_compute_test / vk_store_test
+  binaries. The overlay layers this host would inject are not RTSS or OBS, so
+  DISABLE_RTSS_LAYER=1 and DISABLE_VULKAN_OBS_CAPTURE=1 are no-ops here; what is installed is
+  MangoHud, vkBasalt and gamescope WSI, and Mesa's own device_select, which the loader does
+  insert (VK_LOADER_DEBUG=layer). As a control the whole native suite was rerun under
+  VK_LOADER_LAYERS_DISABLE='~implicit~' and gave the identical 230/248 with the same two
+  failures, so no layer changes a result.
+- Every pixel and compute case not named above was exact, including the wave64 exchange,
+  wqm, vint/vcmp and texture-offset families.
+- The translator index reports "wave64 VS/PS/GS on 32-wide subgroups: tier A: 1, tier C: 1"
+  for this 32..64 device; RDNA2 ran the whole suite at its default 64-wide subgroup, and
+  LEONIDA_W64_EMULATE=1 changed no result.
+- This matches the 610M record (gfx1036, also RADV) on every count: 230/248 passed, 16
+  skipped, the same two tfe fixtures. Two RDNA2 devices under RADV now agree, which is what
+  makes the pair look like the fixture question rather than a driver or GPU-generation one.
+- AI-assisted (Hermes Agent): built main at 21625bc, ran build.py, check.py and
+  run_gpu_tests.py native and under LEONIDA_W64_EMULATE=1, reproduced the two failures on
+  their own with --filter tfe, and reran the native suite with implicit layers disabled. The
+  first pass of this entry was taken at 1c93c86; main moved 42 commits while it was written,
+  so every count here is from 21625bc.

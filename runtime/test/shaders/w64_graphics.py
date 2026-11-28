@@ -12,9 +12,9 @@ hardware wave, the reference) and to 32 (the halves) through VKH_SUBGROUP_SIZE o
   tier C      the words the header names differ between the two sizes, which shows the translator's detector is
               right to flag the shader (the other words stay equal)
 
-A device that can require only one size (NVIDIA: 32 only) cannot run the comparison. There the default-size image is
-checked against the derived words (tiers A, B), the tier C check is skipped, and two environment variables let a
-second device stand in for the missing size: W64G_SAVE_REF=<dir> stores the 64-lane run after its available checks
+A device that can require only one size (NVIDIA: 32 only) still checks the words with a known value in every tier.
+Tier C skips the comparison between sizes if the other width is unavailable. Two environment variables let a second
+device stand in for the missing size: W64G_SAVE_REF=<dir> stores the 64-lane run after its available checks
 pass, including on devices with 64 as their only size (AMD GCN). W64G_REF=<dir> compares every run of the other
 device with those files (equal for A and B, different for C).
 
@@ -357,6 +357,8 @@ def expected_problem(name, words, heap):
             wrong.append((i, w, want))
     if wrong:
         i, w, want = wrong[0]
+        if tier == "C":
+            return f"a partition-invariant word differs in {len(wrong)} of {len(words)} records, first at {i}: got {w}, want {want}"
         return f"{len(wrong)} of {len(words)} pixels differ from the derived words, first ({_x(i)},{_y(i)}): got {w}, want {want}"
     if name.endswith("_b_ballot_atomic"):
         want = sorted(i + 1 for i in range(len(words)) if _x(i) % 4 == 1)
@@ -420,13 +422,13 @@ def check(tools, spirv, name):
             if live is not None and live < need:
                 return Skip(f"SKIP (the fragment stage has {live} live lanes per subgroup here, measured with "
                             f"ps_live_width; this fixture needs {need})")
+        for size, (words, heap) in runs.items():
+            if tier != "C" and size is None and len(runs) > 1:
+                continue                          # the default draw repeats one of the forced sizes for tiers A and B
+            p = expected_problem(name, words, heap)
+            if p:
+                return f"{size or 'default size'}: {p}"
         if tier in ("A", "B"):
-            for size, (words, heap) in runs.items():
-                if size is None and len(runs) > 1:
-                    continue                      # the default draw repeats one of the forced sizes
-                p = expected_problem(name, words, heap)
-                if p:
-                    return f"{size or 'default size'}: {p}"
             if 64 in runs and 32 in runs and comparable(name, *runs[64]) != comparable(name, *runs[32]):
                 return "the images at required subgroup size 64 and 32 differ"
         elif 64 in runs and 32 in runs:

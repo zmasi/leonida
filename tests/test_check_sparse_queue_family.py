@@ -411,6 +411,33 @@ class MainTest(unittest.TestCase):
             with self.subTest(name), self.assertRaises(AssertionError):
                 self.run_main_with_trace(trace)
 
+    def test_main_accepts_argv_writes_lf_settings_reads_bom_and_handles_oserror(self) -> None:
+        settings_bytes = []
+
+        def fake_run(argv, cwd, env, **kwargs):
+            settings_bytes.append((Path(cwd) / "vk_layer_settings.txt").read_bytes())
+            if env.get("VK_INSTANCE_LAYERS") == "VK_LAYER_LUNARG_api_dump":
+                # Emit sorted trace with UTF-8 BOM on disk.
+                (Path(cwd) / "sparse_create_info.log.0").write_bytes(
+                    b"\xef\xbb\xbf" + MULTI_FAMILY_OK_TRACE.encode("utf-8")
+                )
+                return Completed(0, PASS_OUT)
+            return Completed(0, PASS_OUT)
+
+        with tempfile.TemporaryDirectory() as td:
+            exe = Path(td) / "t.exe"
+            exe.write_bytes(b"")
+            with mock.patch.object(checker.subprocess, "run", side_effect=fake_run), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                rc = checker.main([str(exe)])
+        self.assertEqual(rc, 0)
+        self.assertTrue(settings_bytes)
+        self.assertNotIn(b"\r\n", settings_bytes[0])
+
+        with self.assertRaises(AssertionError):
+            with mock.patch.object(checker.subprocess, "run", side_effect=FileNotFoundError("no binary")):
+                checker.run_pass(Path("missing.exe"), {}, Path("."))
+
 
 if __name__ == "__main__":
     unittest.main()

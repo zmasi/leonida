@@ -28,6 +28,7 @@ if _TOOLS_DIR not in sys.path:
 import pool_workers  # noqa: E402
 import world_census as WC  # noqa: E402
 import world_index as WI  # noqa: E402
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
@@ -409,14 +410,21 @@ def _write_json_atomic(path: str, doc: dict) -> None:
     os.makedirs(parent, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".fog-volumes-", suffix=".tmp", dir=parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
             json.dump(doc, f, indent=1, sort_keys=True)
             f.write("\n")
             f.flush()
             os.fsync(f.fileno())
+        os.chmod(tmp, published_mode(out_abs))
         os.replace(tmp, out_abs)
-    except Exception:
+    except BaseException:
         try:
+            os.chmod(tmp, 0o600)
             os.unlink(tmp)
         except OSError:
             pass

@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import sys
 import tempfile
 
@@ -28,16 +29,26 @@ if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 import dds_png  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 CHANNELS = "RGBA"
 
 
+def _validate_dimensions(width: int, height: int) -> int:
+    if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+        raise ValueError(f"image dimensions must be positive integers (got {width!r}x{height!r})")
+    return width * height
+
+
 def blobs(mask: bytearray, width: int, height: int) -> list[int]:
     """Sizes of the 4-connected blobs of set texels in a row-major mask, largest first."""
-    seen = bytearray(len(mask))
+    texels = _validate_dimensions(width, height)
+    if len(mask) != texels:
+        raise ValueError(f"mask length {len(mask)} does not match {width}x{height} ({texels})")
+    seen = bytearray(texels)
     sizes = []
-    for start in range(len(mask)):
+    for start in range(texels):
         if not mask[start] or seen[start]:
             continue
         seen[start] = 1
@@ -47,7 +58,7 @@ def blobs(mask: bytearray, width: int, height: int) -> list[int]:
             n += 1
             x = i % width
             for j in (i - 1 if x else -1, i + 1 if x < width - 1 else -1, i - width, i + width):
-                if 0 <= j < len(mask) and mask[j] and not seen[j]:
+                if 0 <= j < texels and mask[j] and not seen[j]:
                     seen[j] = 1
                     stack.append(j)
         sizes.append(n)
@@ -56,7 +67,9 @@ def blobs(mask: bytearray, width: int, height: int) -> list[int]:
 
 def channel_counts(width: int, height: int, rgba: bytes, thresholds=(64, 128, 192)) -> dict:
     """Counts for each channel of an RGBA8 image (see the module docstring)."""
-    texels = width * height
+    texels = _validate_dimensions(width, height)
+    if len(rgba) != texels * 4:
+        raise ValueError(f"RGBA buffer length {len(rgba)} does not match {width}x{height}x4 ({texels * 4})")
     out = {}
     for c, name in enumerate(CHANNELS):
         values = rgba[c::4]
@@ -72,6 +85,34 @@ def channel_counts(width: int, height: int, rgba: bytes, thresholds=(64, 128, 19
     return out
 
 
+def _write_json_report(path: str, payload: dict) -> None:
+    """Publish complete JSON atomically, preserving symlinks, non-regular targets, and prior reports on failure."""
+    destination = os.path.realpath(path)
+    out_dir = os.path.dirname(destination) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    except OSError:
+        mode = 0
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(destination, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(payload, fh, indent=2, allow_nan=False)
+            fh.write("\n")
+        return
+    if mode is not None:
+        os.close(os.open(destination, os.O_WRONLY))
+    with tempfile.TemporaryDirectory(prefix=".mask-json-", dir=out_dir) as staging:
+        staged = os.path.join(staging, "masks.json")
+        with open(staged, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(payload, fh, indent=2, allow_nan=False)
+            fh.write("\n")
+        if os.name != "nt":
+            os.chmod(staged, published_mode(destination))    # tempfile creates 0600; the report gets the usual bits
+        replace_retry(staged, destination)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("dds", help="an exported .dds texture")
@@ -84,11 +125,14 @@ def main(argv=None) -> int:
         ap.error("--thresholds takes integers")
     if not thresholds or any(not 0 < t <= 255 for t in thresholds):
         ap.error("--thresholds must be within 1..255")
-    if a.json and same_report_path(a.dds, a.json):
-        ap.error("--json names the input texture; writing it would replace the DDS")
-    if a.json and os.path.isdir(a.json):
-        print(f"error: --json path is a directory: {a.json}", file=sys.stderr)
-        return 2
+    if a.json is not None:
+        if not a.json.strip():
+            ap.error("--json must not be empty")
+        if same_report_path(a.dds, a.json):
+            ap.error("--json names the input texture; writing it would replace the DDS")
+        if os.path.isdir(a.json) or a.json.endswith(os.sep) or (os.altsep and a.json.endswith(os.altsep)):
+            print(f"error: --json path is a directory: {a.json}", file=sys.stderr)
+            return 2
     try:
         with open(a.dds, "rb") as fh:
             width, height, rgba = dds_png.decode_dds(fh.read())
@@ -96,27 +140,20 @@ def main(argv=None) -> int:
         print(f"error: cannot read {a.dds}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
         return 2
     counts = channel_counts(width, height, rgba, thresholds)
+    if a.json is not None:
+        try:
+            _write_json_report(a.json, {"width": width, "height": height, "channels": counts})
+        except OSError as error:
+            # A failed write must not leave a half-written report where the last good one was.
+            reason = error.strerror or str(error)
+            print(f"ERROR: {a.json}: {reason}", file=sys.stderr)
+            return 2
     print(f"{width}x{height}")
     for name, row in counts.items():
         parts = [f"{t}: cover {v['cover']:.3f} blobs {v['blobs']} largest {v['largest_share']:.3f}"
                  for t, v in row["thresholds"].items()]
         print(f"{name} min {row['min']} max {row['max']} mean {row['mean']} distinct {row['distinct']} | "
               + " | ".join(parts))
-    if a.json:
-        out_dir = os.path.dirname(os.path.abspath(a.json))
-        try:
-            os.makedirs(out_dir, exist_ok=True)
-            with tempfile.TemporaryDirectory(prefix=".mask-json-", dir=out_dir) as staging:
-                staged = os.path.join(staging, "masks.json")
-                with open(staged, "w", encoding="utf-8", newline="\n") as fh:
-                    json.dump({"width": width, "height": height, "channels": counts}, fh, indent=2)
-                os.chmod(staged, published_mode(a.json))    # tempfile creates 0600; the report gets the usual bits
-                os.replace(staged, a.json)
-        except OSError as error:
-            # A failed write must not leave a half-written report where the last good one was.
-            reason = error.strerror or str(error)
-            print(f"ERROR: {a.json}: {reason}", file=sys.stderr)
-            return 2
     return 0
 
 

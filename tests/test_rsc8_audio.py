@@ -748,6 +748,48 @@ class AwcAndArchiveScanTest(unittest.TestCase):
                     rep = json.load(f)
                 self.assertEqual(rep["records"], [])
 
+    def test_failed_replace_over_readonly_report_cleans_staging_file(self):
+        previous = '{"previous": true}\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            out_json = os.path.join(tmp, "report.json")
+            with open(out_json, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            os.chmod(out_json, 0o444)
+            try:
+                with mock.patch.object(rsc8_audio.os, "replace", side_effect=PermissionError("replace failed")):
+                    with self.assertRaisesRegex(PermissionError, "replace failed"):
+                        rsc8_audio.write_report(out_json, [], {"adat_banks": 0})
+                with open(out_json, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), previous)
+                self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".rsc8_audio.")], [])
+            finally:
+                for entry in os.listdir(tmp):
+                    try:
+                        os.chmod(os.path.join(tmp, entry), 0o600)
+                    except OSError:
+                        pass
+
+    @unittest.skipUnless(os.name == "nt", "Windows enforces read-only file replace and unlink")
+    def test_windows_readonly_report_failure_cleans_staging_file(self):
+        previous = '{"previous": true}\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            out_json = os.path.join(tmp, "report.json")
+            with open(out_json, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+            os.chmod(out_json, 0o444)
+            try:
+                with self.assertRaises(PermissionError):
+                    rsc8_audio.write_report(out_json, [], {"adat_banks": 0})
+                with open(out_json, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), previous)
+                self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".rsc8_audio.")], [])
+            finally:
+                for entry in os.listdir(tmp):
+                    try:
+                        os.chmod(os.path.join(tmp, entry), 0o600)
+                    except OSError:
+                        pass
+
 # The packed blocks are anim_clips sequences, so the synthetic ones come from that tool's test encoder.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_anim_clips import encode_sequence  # noqa: E402

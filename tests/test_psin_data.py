@@ -133,6 +133,16 @@ class TestBlockTable(unittest.TestCase):
         record = D.psin_index.parse(blob)
         self.assertEqual((record["version"], record["table_bytes"]), (0x16, 0x230))
 
+    def test_first_section_out_of_range_and_overrunning_end_padding_rejected(self):
+        with self.assertRaisesRegex(ValueError, "outside"):
+            D.block_table(b"PSIN" + b"\0" * 12, 32)
+        with self.assertRaisesRegex(ValueError, "outside"):
+            D.block_table(b"PSIN" + b"\0" * 12, 4)
+        # first = 28: one 16-byte row at 8..24, then end padding at 24..32 overruns first.
+        overrun = b"PSIN" + struct.pack(">I", 28) + struct.pack("<II", 0x15, 0) + b"\xaa" * 8 + b"\x70" * 8
+        with self.assertRaisesRegex(ValueError, "0x70"):
+            D.block_table(overrun, 28)
+
 
 class TestWalk(unittest.TestCase):
     def setUp(self):
@@ -338,6 +348,77 @@ class TestMeasure(unittest.TestCase):
         tree2 = D.Walker(D.Container(blob2), stats2, keep=True).run()
         self.assertEqual(tree2, {f"{joaat('short'):08x}": None})
         self.assertEqual(stats2["member past block end"], 1)
+
+    def test_self_referential_array_and_map_cycles_terminate_and_dag_sharing_works(self):
+        # Branching 0x5C array cycle: element 0 is a 0x5C pointing back to block 2 (count=2).
+        arr_schema = [(0xAAAA0020, 1, 16, 3, [
+            (0x00000100, 0, 0x5C, 0, 0, 0),            # element 0: recursive 0x5C array
+            (joaat("loop"), 0, 0x5C, 0, 0, 0),
+        ])]
+        hdr = struct.pack("<IIQ", 2, 2, ptr(2, 0))
+        blob_arr = make_container([(0xAAAA0020, hdr), (0x5C, hdr + hdr)], arr_schema, [])
+        st_arr = __import__("collections").Counter()
+        self.assertTrue(D.measure(blob_arr, st_arr))
+        self.assertGreater(st_arr["container cycle"], 0)
+
+        # Self-referential 0x71 map cycle: value descriptor is a 0x71 map pointing back to block 2.
+        # Pair layout: key u32 (4 bytes) + 4-byte pad + value 0x71 (24 bytes) = 32-byte slot.
+        map_schema = [(0xAAAA0021, 1, 24, 3, [
+            (0x00000100, 0, 0x15, 0, 0, 0),                    # 0: key u32
+            (0x00000100, 0, 0x71, 0, 0, 0 | (1 << 16)),        # 1: value is self-referential map 0x71
+            (joaat("mloop"), 0, 0x71, 0, 0, 0 | (1 << 16)),
+        ])]
+        mhdr = struct.pack("<QQHHI", 1, ptr(2, 0), 1, 1, 0)
+        slot_bytes = struct.pack("<II", 7, 0) + mhdr
+        blob_map = make_container([(0xAAAA0021, mhdr), (0x100, slot_bytes)], map_schema, [])
+        st_map = __import__("collections").Counter()
+        self.assertTrue(D.measure(blob_map, st_map))
+        self.assertGreater(st_map["container cycle"], 0)
+
+        # Non-cyclic DAG sharing (two fields pointing to the same read-only 0x5C array) still decodes both.
+        dag_schema = [(0xAAAA0022, 1, 32, 3, [
+            (0x00000100, 0, 0x15, 0, 0, 0),
+            (joaat("a"), 0, 0x5C, 0, 0, 0),
+            (joaat("b"), 16, 0x5C, 0, 0, 0),
+        ])]
+        shared_hdr = struct.pack("<IIQ", 2, 2, ptr(2, 0))
+        blob_dag = make_container(
+            [(0xAAAA0022, shared_hdr + shared_hdr), (0x15, struct.pack("<2I", 11, 22))],
+            dag_schema, [],
+        )
+        st_dag = __import__("collections").Counter()
+        tree_dag = D.Walker(D.Container(blob_dag), st_dag, keep=True).run()
+        self.assertEqual(tree_dag[f"{joaat('a'):08x}"], [11, 22])
+        self.assertEqual(tree_dag[f"{joaat('b'):08x}"], [11, 22])
+        self.assertEqual(st_dag["container cycle"], 0)
+
+    def test_excessive_align_log2_rejected_and_collect_limit_validated(self):
+        bad_align_schema = [
+            (0xAAAA0030, 1, 24, 3, [
+                (0x00000100, 0, 0x15, 0, 0, 0),
+                (0x00000100, 0, 0x05, 0, 0, 0xAAAA0031),
+                (joaat("m"), 0, 0x71, 0, 0, 0 | (1 << 16)),
+            ]),
+            (0xAAAA0031, 2, 8, 250, [(joaat("v"), 0, 0x15, 0, 0, 0)]),
+        ]
+        mhdr = struct.pack("<QQHHI", 1, ptr(2, 0), 1, 1, 0)
+        blob = make_container([(0xAAAA0030, mhdr), (0x100, bytes(32))], bad_align_schema, [])
+        container = D.Container(blob)
+        members = container.structs[0xAAAA0030]["members"]
+        self.assertIsNone(container.align_of(members[1]))
+        self.assertIsNone(container.slot(members[0], members[1]))
+        stats = __import__("collections").Counter()
+        self.assertTrue(D.measure(blob, stats))
+        self.assertEqual(stats["map of undecoded types 15/05"], 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "one.bin")
+            with open(p, "wb") as f:
+                f.write(sample())
+            for bad_limit in (0, -1, True, False):
+                with self.subTest(limit=bad_limit):
+                    with self.assertRaises(ValueError):
+                        D.collect(p, limit=bad_limit)
 
 
 class TestCli(unittest.TestCase):

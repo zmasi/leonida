@@ -99,9 +99,13 @@ class HungProgram(unittest.TestCase):
                 self.assertIn("0/1 passed", out.getvalue())
 
     def test_quick_program_is_unaffected(self):
-        self.assertEqual(run_gpu_tests.run_cmd(QUICK), (0, "ok"))
-        rc, out = check.run(*QUICK)
-        self.assertEqual((rc, out.strip()), (0, "ok"))
+        # A limit is still in force, but not the hang cases' 0.5 s: starting a Python child alone can take longer than
+        # that on a loaded Windows host, which killed the quick program and failed this test for the wrong reason.
+        with patch.dict(os.environ, {"LEONIDA_GPU_TEST_TIMEOUT": "60"}):
+            self.assertEqual(check.gpu_test_timeout(), 60)
+            self.assertEqual(run_gpu_tests.run_cmd(QUICK), (0, "ok"))
+            rc, out = check.run(*QUICK)
+            self.assertEqual((rc, out.strip()), (0, "ok"))
 
     def test_translator_step_has_no_limit(self):
         seen = {}

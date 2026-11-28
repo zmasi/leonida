@@ -176,6 +176,10 @@ instruction family per file; the list below describes some of them, not every fi
   modifiers on `v_cvt_f32_ubyte*`/`u32`/`f16` and `v_rcp_iflag_f32`), found by `tools/f32_fuzz.py` (FUZZ-3), and
   tests the interpreter's float operations against GLSL.std.450 (signed zeros, undefined inputs, a single-rounding
   `Fma`).
+- `test_fma_fused_fixture.py` (TEST-FMA-FUSED-F16-RUNTIME) runs the GPU test `cs_fma_fused` in the interpreter with
+  the four operand words of its header and expects the header's eight words, and checks that every register one of
+  its multiply-adds reads comes from `s4..s7`: with three literal operands the f16 one was a compile-time constant,
+  which MoltenVK 1.4.2 gets wrong (`docs/testing.md`, Known problems).
 - `test_fixtures.py` checks `tests/semantic/fixtures/disasm/*.s` equals what `regen_fixtures.py` makes from
   `runtime/test/shaders/*.asm` (`python tests/semantic/regen_fixtures.py` rewrites them).
 - `test_dpp_eager_subgroup.py` (SHADER-529) checks that no DPP ballot or shuffle is left where SPIRV-Cross

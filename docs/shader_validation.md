@@ -5,7 +5,7 @@ the corpus is correct. The CPU differential oracle in `tools/shader_diff.py` is 
 tested (`tests/test_shader_diff.py`): it compares the ISA model in `tools/cpu_ref.py` against
 translated SPIR-V run in `tests/semantic/spirv_mini_interp.py` over seeded straight-line programs.
 Run it with `python -I tools/shader_diff.py --programs 200 --seed 7` (`--self-test` checks the
-harness itself). The GPU-side runners are described below: `tools/valu_fuzz.py` (16-bit and memory ops), `tools/lds_fuzz.py`, `tools/crosslane_fuzz.py`, `tools/cf_diff.py` and `tools/ab_control_flow.py` (corpus pixel shaders in both control-flow forms).
+harness itself). The GPU-side runners are described below: `tools/valu_fuzz.py` (16-bit and memory ops), `tools/lds_fuzz.py`, `tools/crosslane_fuzz.py`, `tools/cf_diff.py`, `tools/cf_gpu_run.py` (its programs on a GPU) and `tools/ab_control_flow.py` (corpus pixel shaders in both control-flow forms).
 
 ## Why `spirv-val` is not enough
 
@@ -2390,6 +2390,14 @@ covers the operations most shaders use. Then add, in order:
    loops, two-entry cycles), run by `tools/cf_ref.py` (cpu_ref plus branches, compares and saveexec)
    and by `tests/semantic/spirv_wave_interp.py` (every invocation of a subgroup, with structured
    reconvergence), compared lane by lane in both the structured and the dispatch-loop form.
+   `tools/cf_gpu_run.py` runs the same generated programs on a Vulkan GPU, each as a one-wave compute
+   program that stores v8..v11 of every lane, and compares every lane with `cf_ref`: it shows what the
+   driver makes of the translated control flow (reconvergence after a divergent if/else, per-lane loops
+   with a break mask, the saveexec idioms). It needs `runtime/build/vk_compute_test` and no `llvm-mc`
+   (the listings carry `cf_diff`'s `; encoding:` byte counts), runs wave64 programs on a 32-wide GPU
+   with `LEONIDA_W64_EMULATE=1`, and checks itself before each campaign with a deliberately wrong
+   reference (a flipped branch must show as a mismatch). It exits 1 on a mismatch, 2 when nothing ran
+   and 3 when that check fails; a skipped program is counted with its reason, never as a pass.
    The corpus-side counterpart is `tools/ab_control_flow.py`: it renders branchy pixel shaders
    translated both ways (real loops and conditionals, and `--dispatch-loop`) and compares the two
    images byte for byte. It needs a finished shaders stage and `runtime/build/vk_texture_test`, and

@@ -257,11 +257,13 @@ class GamedataSps1Test(unittest.TestCase):
 
     def test_missing_input_path_is_a_usage_error_naming_it(self):
         """BUILD-1046: a path that does not exist is exit 2 and one ERROR line, not a failed run."""
-        missing = os.path.join(self.root, "no-such-input")
+        missing = os.path.join(self.root, "no-such-input-\u00f8")
         self.assertFalse(os.path.exists(missing))
-        for cmd in ([sys.executable, "-I", TOOL, missing],
-                    [sys.executable, "-I", TOOL, self.carve, "--shaders", missing]):
-            with self.subTest(cmd=cmd[3:]):
+        # UTF-8 mode: a piped stderr is the ANSI code page on Windows, and the error names the path.
+        python = [sys.executable, "-I", "-X", "utf8"]
+        for cmd in ([*python, TOOL, missing],
+                    [*python, TOOL, self.carve, "--shaders", missing]):
+            with self.subTest(cmd=cmd[len(python):]):
                 p = subprocess.run(cmd, cwd=self.root, capture_output=True, text=True,
                                    encoding="utf-8", errors="replace")
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)

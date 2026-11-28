@@ -1,0 +1,30 @@
+GPU:        NVIDIA GeForce RTX 2070 SUPER (Turing / TU104, PCI 10de:1e84), subgroup 32..32
+Driver:     NVIDIA 620.70.06 (proprietary), Vulkan 1.4.357
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
+OS:         Fedora Linux 44, kernel 7.3.4-200.fc44.x86_64
+Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31 (main, 2026-11-24)
+Tools:      llvm-mc 22.1.8 (Fedora llvm, AMDGPU target), SPIRV-Tools v2026.1 (Fedora spirv-tools),
+            glslang 16.2.0, Vulkan headers 1.4.341, CMake 4.3.0 + GCC 16.2.1 (Ninja, RelWithDebInfo),
+            Python 3.14.10
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
+            native:                 197/248 passed, 49 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  229/248 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (native and emulated alike): exit 1, "r32 sint (sint view):
+            64 bad, texel(5,3) = 2071"; the tfe status VGPR is read but never written (#31), the same
+            pair and the same numbers as the other records.
+Skipped:    native: 31 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this
+            device" and 1 "cannot require a 64-wide fragment subgroup" (the wave64 fixtures, which the
+            emulated run covers), plus the 16 documented "run by d3d12_*_test / w64_graphics.py" cases.
+            Emulated: the same 16, plus the 64-wide fragment one.
+Notes:
+- Built with cmake -S runtime -B runtime/build/linux -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo and
+  cmake --build runtime/build/linux --parallel; Linux builds only the Vulkan tools.
+- The system also exposes llvmpipe (Mesa 26.2.7); the runner picked the RTX 2070 SUPER, as its
+  "device:" line reports.
+- wave64 VS/PS/GS on this 32-wide-subgroup device: tier A: 1, tier C: 1 (tier C is not exact there;
+  see wave64_graphics_reasons in the index).
+- No game files involved: run_gpu_tests.py assembles its own RDNA2 fixtures with llvm-mc and runs the
+  translated SPIR-V on the Vulkan device.
+- AI-assisted (Claude Code): built main, ran run_gpu_tests.py native and under LEONIDA_W64_EMULATE=1
+  and collected the header data on the owner's machine. The numbers above are the runner's own
+  output. No game data.

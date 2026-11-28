@@ -11,10 +11,13 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "psocache_extract.py")
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import psocache_extract as pe  # noqa: E402
 
 HEADER = 0x80
 GRAPHICS = 1
@@ -159,6 +162,111 @@ class PsocacheExtractTest(unittest.TestCase):
         p = run(os.path.join(self.tmp.name, "absent.rpf"), self.out)
         self.assertEqual(p.returncode, 2)
         self.assertNotIn("Traceback", p.stderr)
+
+    def test_max_streams_stops_before_opening_later_archives(self):
+        folder = os.path.join(self.tmp.name, "archives")
+        os.mkdir(folder)
+        with open(os.path.join(folder, "01.rpf"), "wb") as f:
+            f.write(build_archive(self.cache))
+        with open(os.path.join(folder, "02.rpf"), "wb") as f:
+            f.write(build_archive(self.cache))
+        p = run(folder, self.out, "--max-streams", "1")
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("no cache found", p.stderr)
+        self.assertNotIn("archive #2", p.stdout)
+
+    def test_output_cannot_overwrite_source_or_be_dir_or_whitespace(self):
+        with open(self.archive, "rb") as f:
+            original = f.read()
+        p = run(self.archive, self.archive)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("must not overwrite", p.stderr)
+        with open(self.archive, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+        folder = os.path.join(self.tmp.name, "dir_src")
+        os.mkdir(folder)
+        arc2 = os.path.join(folder, "01.rpf")
+        with open(arc2, "wb") as f:
+            f.write(original)
+        p2 = run(folder, arc2)
+        self.assertEqual(p2.returncode, 2)
+        self.assertIn("must not overwrite", p2.stderr)
+        with open(arc2, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+        existing_dir = os.path.join(self.tmp.name, "out_dir")
+        os.mkdir(existing_dir)
+        p3 = run(self.archive, existing_dir)
+        self.assertEqual(p3.returncode, 2)
+        self.assertIn("is a directory", p3.stderr)
+
+        missing_parent = os.path.join(self.tmp.name, "no_parent", "cache.bin")
+        p4 = run(self.archive, missing_parent)
+        self.assertEqual(p4.returncode, 2)
+        self.assertIn("parent directory does not exist", p4.stderr)
+
+        run_cwd = os.path.join(self.tmp.name, "cwd")
+        os.mkdir(run_cwd)
+        p5 = subprocess.run(
+            [sys.executable, "-I", TOOL, self.archive, "   "],
+            capture_output=True, text=True, cwd=run_cwd,
+        )
+        self.assertEqual(p5.returncode, 2)
+        self.assertEqual(os.listdir(run_cwd), [])
+
+    def test_inside_tempdir_handles_root_and_empty_paths(self):
+        self.assertFalse(pe.inside_tempdir(""))
+        self.assertFalse(pe.inside_tempdir("   "))
+        with (mock.patch.object(pe.tempfile, "gettempdir", return_value="/"),
+              mock.patch.object(pe.os.path, "realpath", side_effect=lambda p: p),
+              mock.patch.object(pe.os.path, "abspath", side_effect=lambda p: p)):
+            self.assertTrue(pe.inside_tempdir("/cache.bin"))
+            self.assertFalse(pe.inside_tempdir("/"))
+
+    def test_exact_max_gap_padding_accepted_and_over_gap_rejected(self):
+        def archive_with_gap(gap_bytes):
+            body = bytearray()
+            body += zlib.compress(self.cache[:SPLIT])
+            body += b"\x00" * gap_bytes
+            body += zlib.compress(self.cache[SPLIT:])
+            data = bytearray(0x40)
+            data[0:4] = b"9FPR"
+            struct.pack_into("<I", data, 4, 0x40)
+            return bytes(data + body)
+
+        with mock.patch.object(pe, "MAX_GAP", 16):
+            ok_arc = os.path.join(self.tmp.name, "gap_exact.rpf")
+            with open(ok_arc, "wb") as f:
+                f.write(archive_with_gap(16))
+            idx, report, _ = pe.extract(ok_arc, self.out, quiet=True)
+            self.assertEqual(idx, 1)
+            self.assertEqual(report["problems"], [])
+
+            bad_arc = os.path.join(self.tmp.name, "gap_over.rpf")
+            with open(bad_arc, "wb") as f:
+                f.write(archive_with_gap(17))
+            with self.assertRaisesRegex(ValueError, "contiguous streams"):
+                pe.extract(bad_arc, self.out, quiet=True)
+
+    def test_unreadable_source_folder_privacy_and_atomic_write(self):
+        secret_dir = os.path.join(self.tmp.name, "secret_game_dir")
+        os.mkdir(secret_dir)
+        with mock.patch.object(pe.os, "listdir", side_effect=PermissionError(13, "denied", secret_dir)):
+            with self.assertRaises(ValueError) as cm:
+                pe.archives(secret_dir)
+        self.assertIn("source folder cannot be listed", str(cm.exception))
+        self.assertNotIn("secret_game_dir", str(cm.exception))
+
+        out = os.path.join(self.tmp.name, "existing.bin")
+        with open(out, "wb") as f:
+            f.write(b"KEEP")
+        with mock.patch.object(pe, "replace_file", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                pe._write_bytes_atomic(out, b"NEW")
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), b"KEEP")
+        self.assertEqual([n for n in os.listdir(self.tmp.name) if n.startswith(".psocache-")], [])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,54 @@
+GPU:        Apple M4 (Apple GPU, 8 cores, Metal family Apple7), subgroup 4..32
+Driver:     MoltenVK 1.4.2 (Homebrew bottle), Vulkan 1.4.357 (loader), driverUUID 4d564b00-0000-28a2-1b03-020900000000
+Subgroup:   4..32 (default 32; subgroupSizeControl, requiredSubgroupSizeStages none; no native 64-wide, no mesh
+            (VK_EXT_mesh_shader absent), no geometry stage, no shaderFloat64, no PerVertexKHR; VK_KHR_shader_fma
+            present with shaderFmaFloat32/Float16 true)
+OS:         macOS 27.3 (26C5047e), arm64
+Commit:     1c93c8697078c3ccbd6f374caf5bb3ab0b6bc8e4 (main, 2026-11-24)
+Tools:      llvm-mc 23.1.6 (Homebrew, AMDGPU target), SPIRV-Tools v2026.4, Apple clang 21.0.0,
+            CMake 4.5.1, Python 3.13.14, Vulkan loader 1.4.357 (Homebrew vulkan-loader)
+build.py:   280 shaders: 280 translated, 280 pass spirv-val (six mesh fixtures not built: no VK_EXT_mesh_shader)
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 11, tier B: 8, tier C: 13
+check.py:   174 of 219 pass, 39 skipped, 6 failed
+run_gpu_tests.py: 257 shaders: 256 translated, 256 pass spirv-val
+            native:                 183/248 passed, 61 skipped, 4 failed (two full runs, identical words)
+            LEONIDA_W64_EMULATE=1:  214/248 passed, 30 skipped, 4 failed
+ctest:      72/72 passed, 2 skipped (shader_library_corpus, vk_sync_validation)
+Failed:     cs_fma_fused: word 7 (f16) reads 0x00000000, want 0x00007351. The known MoltenVK 1.4.2 row of
+            docs/testing.md (passes with MoltenVK main). Same on this machine under LEONIDA_FMA=khr despite
+            the device having shaderFmaFloat32/Float16: word 7 still 0x00000000, so the split is in
+            MoltenVK's own lowering, not in the emitted OpFmaKHR.
+            cs_imgload_tfe and cs_imgload_d16_tfe: vk_store_test reports "r32 uint (uint view): 0 bad,
+            texel(5,3) = 129 / r32 sint (sint view): 64 bad, texel(5,3) = 2071" where the expected sint is 71,
+            the 2000 the fixture seeds the tfe status VGPR with. That is #31; on a clean worktree at this main
+            with #291 (de87b1a) checked out, all four cs_imgload* fixtures pass (4/4), so #291 fixes them here
+            too, as on the Meteor Lake and 780M records.
+            ps_ssharp (point bias +1): (0,0) = (1.0, 0.0, 0.502, 0.502) where (0.502, 0.502, 0.502, 0.502) is
+            wanted: image_sample_lz through the descriptor path comes back as the red LOD-0 quadrant, where the
+            implicit sample in the same shader and the RDNA2 words want LOD 1. Deterministic: 3 single-filter
+            runs, same words each time. The closest old-repo row is #7587 (MoltenVK ignores sampler mip LOD
+            bias on explicit samples, old index #18); not looked into further.
+            ps_ij_computed and ps_interp_f16_high report "vk_harness failed or returned no pixels" in check.py
+            alone: no PerVertexKHR inputs; run_gpu_tests.py covers the device with its own --f16-interp-fallback,
+            which is why these two are not in the four failures above.
+Skipped:    native 61 = 16 documented "run by d3d12_*_test / w64_graphics.py" cases
+            (cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width, ps_m15, ps_m2,
+            ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post, ps_m3_query, vs_m15, vs_m2, vs_m3)
+            + 31 that need a 64-wide compute subgroup, which this device does not have;
+            LEONIDA_W64_EMULATE=1 runs them and all 31 pass
+            + the four Float64 fixtures (no shaderFloat64: cs_div_fmas_f64, cs_f64_add, ps_f64_mods,
+            ps_f64_round), the six mesh fixtures and gs_tri (no VK_EXT_mesh_shader, no geometry stage),
+            ps_w64x_readlane and ps_vcmpx_forms (no 64-wide fragment subgroup can be required: sizes 4..32)
+            and ps_ij_computed (computed I/J pair: no PerVertexKHR, so --f16-interp-fallback refuses it).
+            emulated 30 = the same device-limit list minus the 31 wave64 compute cases it runs; the exact
+            names are those 30 plus ps_vcmpx_forms, which skips in both modes here.
+Notes:
+- Built native with cmake -S runtime -B runtime/build/mac -DVulkan_INCLUDE_DIR=/opt/homebrew/include; the
+  portable subset only (gta6rt and the shims are Windows-only), 72 ctest cases, all pass.
+- run_gpu_tests.py's single untranslated shader is ps_ij_computed under --f16-interp-fallback
+  (wave64 tiers there: A: 1, C: 1); build.py's own 280/280 covers everything else.
+- ps_imgatomic passes every run here; no #543 flake seen on this machine (M4, MoltenVK 1.4.2).
+- The four failures match the M5 Pro record (#552) word for word on the same MoltenVK 1.4.2, and the pass/skip
+  counts (183/61 native, 214/30 emulated) are identical on 1c93c869 and d42773d07, so nothing Apple-specific
+  beyond ps_ssharp's determinism and the absence of the #543 flake.
+- AI-assisted (omp).

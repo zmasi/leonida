@@ -359,16 +359,83 @@ constexpr uint64_t kAudioFramesPerSecond = 375;
 //   Word 9: output read block index (0..4).
 //
 // Packets are decoded by the Rust decoder in runtime/xma_decoder when CMake found cargo (LEONIDA_HAVE_XMA2_DECODER);
-// otherwise each packet becomes silence for its frame count. The read offset (word 2) and the loop points (words 3
-// and 4) are used per 2048-byte packet, so the loop-end subframe (word 1 bits 12..13) is not applied.
+// otherwise each packet becomes silence for its frame count. The loop points name frame bit positions within
+// the input buffers. On a pass that rewinds, the loop-end frame plays through the selected 128-sample subframe.
 
 constexpr std::size_t kXmaBlockBytes = 256;
 constexpr std::size_t kXmaSamplesPerBlock = kXmaBlockBytes / 2;
 constexpr std::size_t kXmaPacketBytes = 2048;
 constexpr std::size_t kXmaPacketBits = kXmaPacketBytes * 8;
+constexpr std::size_t kXmaHeaderBits = 32;
+constexpr std::size_t kXmaFrameLengthBits = 15;
 constexpr std::size_t kXmaSubframeSamples = 128;
 constexpr std::size_t kXmaFrameSamples = 512;
 constexpr uint32_t kXmaErrorInputInvalid = 4;
+
+// XMA2's big-endian packet header has the count of frames that start in this packet, then the bit count of
+// the preceding frame's continuation. Each newly started frame has a 15-bit length, including the prefix.
+struct XmaPacketFrames {
+    std::array<std::size_t, 63> starts{};
+    std::size_t count = 0;
+    std::size_t complete = 0;
+    std::size_t leading = 0;
+
+    std::optional<std::size_t> index(std::size_t bit) const {
+        const auto end = starts.begin() + static_cast<std::ptrdiff_t>(count);
+        const auto found = std::find(starts.begin(), end, bit);
+        if (found == end) return std::nullopt;
+        return static_cast<std::size_t>(found - starts.begin());
+    }
+};
+
+std::size_t xma_bits(const uint8_t* packet, std::size_t bit, std::size_t count) {
+    std::size_t value = 0;
+    for (std::size_t i = 0; i < count; ++i, ++bit) {
+        value = (value << 1) | ((packet[bit / 8] >> (7 - bit % 8)) & 1u);
+    }
+    return value;
+}
+
+std::size_t xma_leading_bits(const uint8_t* packet) {
+    return ((packet[0] & 3u) << 13) | (packet[1] << 5) | (packet[2] >> 3);
+}
+
+std::optional<XmaPacketFrames> xma_packet_frames(const uint8_t* packet) {
+    XmaPacketFrames frames;
+    frames.count = packet[0] >> 2;
+    frames.leading = xma_leading_bits(packet);
+    std::size_t bit = kXmaHeaderBits + frames.leading;
+    for (std::size_t i = 0; i < frames.count; ++i) {
+        if (bit >= kXmaPacketBits) return std::nullopt;
+        frames.starts[i] = bit;
+        const std::size_t remaining = kXmaPacketBits - bit;
+        if (remaining < kXmaFrameLengthBits) break;
+        const std::size_t length = xma_bits(packet, bit, kXmaFrameLengthBits);
+        if (length <= kXmaFrameLengthBits) return std::nullopt;
+        if (length > remaining) break;
+        ++frames.complete;
+        bit += length;
+    }
+    if (frames.count - frames.complete > 1) return std::nullopt;
+    return frames;
+}
+
+bool xma_finishes_split_frame(const uint8_t* packet, std::size_t start, const uint8_t* next) {
+    const std::size_t head = kXmaPacketBits - start;
+    const std::size_t tail = xma_leading_bits(next);
+    if (tail == 0 || tail > kXmaPacketBits - kXmaHeaderBits) return false;
+    const std::size_t prefix = std::min(head, kXmaFrameLengthBits);
+    const std::size_t missing = kXmaFrameLengthBits - prefix;
+    if (tail < missing) return false;
+    const std::size_t length = (xma_bits(packet, start, prefix) << missing) | xma_bits(next, kXmaHeaderBits, missing);
+    return length == head + tail;
+}
+
+void xma_start_at_frame(uint8_t* packet, std::size_t bit, std::size_t remaining_frames) {
+    const auto header = static_cast<uint32_t>((remaining_frames << 26) | ((bit - kXmaHeaderBits) << 11) |
+                                               ((packet[2] & 7u) << 8) | packet[3]);
+    for (std::size_t i = 0; i < 4; ++i) packet[i] = static_cast<uint8_t>(header >> (24 - 8 * i));
+}
 
 #if defined(LEONIDA_HAVE_XMA2_DECODER)
 constexpr uint32_t kXmaRates[4] = {24000, 32000, 44100, 48000};
@@ -414,6 +481,7 @@ struct XmaVoice {
     std::size_t pcm_read = 0;
     std::size_t loop_skip = 0;  // samples per channel to drop after a rewind
     uint32_t format;  // SHAPE word 1 bits 27..29, rate and channel layout
+    bool loop_restart = false;
     bool ended = false;
 };
 
@@ -508,6 +576,7 @@ public:
                 voice->pcm.clear();
                 voice->pcm_read = 0;
                 voice->loop_skip = 0;
+                voice->loop_restart = false;
                 voice->format = format;
 #if defined(LEONIDA_HAVE_XMA2_DECODER)
                 voice->decoder.reset();
@@ -556,7 +625,7 @@ private:
 
     // Appends interleaved s16 for one 2048-byte packet. Without the Rust decoder, or when it
     // fails, the packet becomes silence for its frame count (header bits 26..31) so timing holds.
-    static void decode_packet(XmaVoice& voice, const uint8_t* bytes) {
+    static bool decode_packet(XmaVoice& voice, const uint8_t* bytes) {
         const std::size_t channels = voice.channels();
 #if defined(LEONIDA_HAVE_XMA2_DECODER)
         if (!voice.decoder) {
@@ -573,17 +642,46 @@ private:
                 const int16_t* samples = leonida_xma2_pcm_data(block.get());
                 const std::size_t count = leonida_xma2_pcm_sample_count(block.get());
                 if (count != 0) voice.pcm.insert(voice.pcm.end(), samples, samples + count);
-                return;
+                return true;
             }
             voice.decoder.reset();  // Resume with a clean state after replacing a packet with silence.
         }
 #endif
         voice.pcm.resize(voice.pcm.size() + static_cast<std::size_t>(bytes[0] >> 2) * kXmaFrameSamples * channels);
+        return false;
+    }
+
+    // Keep only PCM through the selected loop-end subframe. The Rust decoder can prepend one frame finished from
+    // the previous packet. Compare its returned count with the packet's completed new frames to locate this one.
+    static bool trim_loop_end(XmaVoice& voice, std::size_t packet_start, bool decoded, const XmaPacketFrames& frames,
+                              std::size_t end, std::size_t subframe, const uint8_t* continuation) {
+        const std::size_t frame_samples = kXmaFrameSamples * voice.channels();
+        const std::size_t keep_tail = (subframe + 1) * kXmaSubframeSamples * voice.channels();
+        if (!decoded) {
+            voice.pcm.resize(packet_start + end * frame_samples + keep_tail);
+            return true;
+        }
+
+        const std::size_t before_continuation = voice.pcm.size();
+        const std::size_t current_samples = before_continuation - packet_start;
+        const std::size_t complete_samples = frames.complete * frame_samples;
+        const bool has_previous = frames.leading != 0 && current_samples == complete_samples + frame_samples;
+        if (!has_previous && current_samples != complete_samples) return false;
+        if (end == frames.complete) {
+            if (!continuation) return false;
+            const auto next = xma_packet_frames(continuation);
+            if (!next || !decode_packet(voice, continuation) ||
+                voice.pcm.size() - before_continuation != (next->complete + 1) * frame_samples) {
+                voice.pcm.resize(before_continuation);
+                return false;
+            }
+        }
+        const std::size_t prefix = has_previous ? frame_samples : 0;
+        voice.pcm.resize(packet_start + prefix + end * frame_samples + keep_tail);
+        return true;
     }
 
     // Decodes the packet at the read offset of the current input buffer and queues its PCM.
-    // Offsets and loop points are used per packet: a loop plays its end packet in full and
-    // restarts at the start of the packet holding the loop start.
     static bool decode_one_packet(XmaContextView ctx, XmaVoice& voice) {
         if (voice.ended) return false;
 
@@ -603,7 +701,8 @@ private:
 
         const uint32_t address = (current == 0) ? ctx.get(5) : ctx.get(6);
         const std::size_t packets = (current == 0) ? ctx.field(0, 0, 12) : ctx.field(1, 0, 12);
-        const std::size_t packet = ctx.field(2, 0, 26) / kXmaPacketBits;
+        const std::size_t offset = ctx.field(2, 0, 26);
+        const std::size_t packet = offset / kXmaPacketBits;
         const uint8_t* data = apu_span(address & ~0x7FFu, packets * kXmaPacketBytes);
         if (!data || packet >= packets) {
             finish_input(ctx, current, packet >= packets ? packet - packets : 0);
@@ -612,12 +711,60 @@ private:
 
         const uint8_t* packet_data = data + packet * kXmaPacketBytes;
         const uint8_t packet_skip = packet_data[3];
+        // XMA2 packet headers link packets from the same stream; 0xff ends the chain.
+        std::size_t next = packet_skip == 0xFFu ? packets : packet + 1 + packet_skip;
+        const uint32_t loops = ctx.field(0, 12, 8);
+        const std::size_t loop_start = ctx.field(3, 0, 26);
+        const std::size_t loop_end = ctx.field(4, 0, 26);
+        const bool loop_packet = loops > 0 && loop_end != 0 && packet == loop_end / kXmaPacketBits;
+        const std::size_t start_bit = offset % kXmaPacketBits;
+        auto frames = (loop_packet || voice.loop_restart) ? xma_packet_frames(packet_data) : std::nullopt;
+        // When resuming at a later frame, present its prefix as continuation data to the freshly reset codec.
+        // It skips the prefix on its first packet without decoding earlier PCM into the overlap state.
+        std::array<uint8_t, kXmaPacketBytes> start_packet;
+        if (frames && voice.loop_restart) {
+            if (const auto start = frames->index(start_bit); start && *start > 0) {
+                std::memcpy(start_packet.data(), packet_data, start_packet.size());
+                xma_start_at_frame(start_packet.data(), start_bit, frames->count - *start);
+                packet_data = start_packet.data();
+                frames = xma_packet_frames(packet_data);
+            }
+        }
+        const auto end = loop_packet && frames ? frames->index(loop_end % kXmaPacketBits) : std::nullopt;
+        const uint8_t* continuation = nullptr;
+        if (end && *end == frames->complete) {
+            if (next < packets) {
+                continuation = data + next * kXmaPacketBytes;
+            } else if (packet_skip != 0xFFu) {
+                const uint32_t other = 1u - current;
+                const std::size_t other_packets = ctx.field(other, 0, 12);
+                const std::size_t follow = next - packets;
+                if (follow < other_packets) {
+                    // A declared continuation may arrive after the current input. Keep that input for the rewind.
+                    if ((valid & (1u << other)) == 0) return false;
+                    const auto* other_data = apu_span(ctx.get(5 + other) & ~0x7FFu, other_packets * kXmaPacketBytes);
+                    if (other_data) continuation = other_data + follow * kXmaPacketBytes;
+                }
+            }
+            if (continuation && !xma_finishes_split_frame(packet_data, frames->starts[*end], continuation)) {
+                continuation = nullptr;
+            }
+        }
         // Decoding is only requested when less than a ring block remains. Keep that
         // tail and reuse the packet storage as the voice consumes subsequent packets.
         voice.pcm.erase(voice.pcm.begin(), voice.pcm.begin() + static_cast<std::ptrdiff_t>(voice.pcm_read));
         voice.pcm_read = 0;
+        voice.loop_restart = false;
         const std::size_t packet_start = voice.pcm.size();
-        decode_packet(voice, packet_data);
+        const bool decoded = decode_packet(voice, packet_data);
+        const std::size_t loop_start_packet = loop_start / kXmaPacketBits;
+        if (end && (*end < frames->complete || continuation) && loop_start_packet < packets) {
+            const auto rewind = xma_packet_frames(data + loop_start_packet * kXmaPacketBytes);
+            if (rewind && rewind->index(loop_start % kXmaPacketBits)) {
+                voice.loop_restart = trim_loop_end(voice, packet_start, decoded, *frames, *end,
+                                                   ctx.field(1, 12, 2), continuation);
+            }
+        }
         const std::size_t packet_samples = voice.pcm.size() - packet_start;
         const std::size_t subframe_samples = kXmaSubframeSamples * channels;
         const std::size_t initial_skip = ctx.field(1, 24, 3);
@@ -635,16 +782,14 @@ private:
         }
         voice.loop_skip -= loop_samples / channels;
 
-        // XMA2 packet headers link packets from the same stream; 0xff ends the chain.
-        std::size_t next = packet_skip == 0xFFu ? packets : packet + 1 + packet_skip;
-        const uint32_t loops = ctx.field(0, 12, 8);
-        const std::size_t loop_end = ctx.field(4, 0, 26);
-        if (loops > 0 && loop_end != 0 && packet == loop_end / kXmaPacketBits) {
-            next = ctx.field(3, 0, 26) / kXmaPacketBits;
+        std::size_t next_offset = 0;
+        if (loop_packet) {
+            next = loop_start_packet;
+            if (voice.loop_restart) next_offset = loop_start % kXmaPacketBits;
             voice.loop_skip = static_cast<std::size_t>(ctx.field(1, 17, 3)) * kXmaSubframeSamples;
 #if defined(LEONIDA_HAVE_XMA2_DECODER)
-            // A frame spilling out of the loop-end packet does not continue in the loop-start packet:
-            // start a fresh decoder there rather than decode the spliced bits.
+            // A rewind starts a different packet sequence. Discard the old overlap and any state advanced by
+            // inspecting a continuation, including when its PCM count required a packet-level fallback.
             voice.decoder.reset();
 #endif
             if (loops != 255u) ctx.set_field(0, 12, 8, loops - 1u);
@@ -652,7 +797,7 @@ private:
         if (next >= packets) {
             finish_input(ctx, current, next - packets);
         } else {
-            ctx.set_field(2, 0, 26, static_cast<uint32_t>(next * kXmaPacketBits));
+            ctx.set_field(2, 0, 26, static_cast<uint32_t>(next * kXmaPacketBits + next_offset));
         }
         return true;
     }

@@ -126,6 +126,24 @@ def tarred(members):
     return buf.getvalue()
 
 
+def v7_tarred(members):
+    """Hand-built legacy tar headers, without the later ustar marker or extension fields."""
+    buf = io.BytesIO()
+    for name, data in members.items():
+        info = tarfile.TarInfo(name)
+        info.size = len(data)
+        info.type = tarfile.AREGTYPE
+        header = bytearray(info.tobuf(format=tarfile.USTAR_FORMAT))
+        header[257:] = bytes(tarfile.BLOCKSIZE - 257)
+        header[148:156] = b"        "
+        header[148:156] = ("%06o\0 " % sum(header)).encode("ascii")
+        buf.write(header)
+        buf.write(data)
+        buf.write(bytes(-len(data) % tarfile.BLOCKSIZE))
+    buf.write(bytes(2 * tarfile.BLOCKSIZE))
+    return buf.getvalue()
+
+
 def corrupt_deflate(archive):
     """`archive` (one deflated zip member) with the first byte of its deflate data made an invalid block type."""
     data = bytearray(archive)
@@ -210,6 +228,52 @@ class CheckNoGameData(unittest.TestCase):
                 result = run([self.write(name, data)])
                 self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
                 self.assertIn(f"{name}: {line}", result.stdout)
+
+    def test_v7_tar_members_are_checked_without_a_ustar_marker(self):
+        data = v7_tarred({"readme.txt": b"plain text\n", "synthetic.bin": DDS})
+        self.assertEqual(data[257:263], bytes(6))
+        # Confirm this is a readable archive, rather than depending on our scanner's interpretation.
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            self.assertEqual(archive.getnames(), ["readme.txt", "synthetic.bin"])
+            with archive.extractfile("synthetic.bin") as member:
+                self.assertEqual(member.read(), DDS)
+        expected = "DDS texture in tar archive (synthetic.bin)"
+        cases = [
+            ("legacy.bin", data, expected),
+            ("legacy_gzip.bin", gzip.compress(data), expected + " in gzip stream"),
+            ("legacy_bzip2.bin", bz2.compress(data), expected + " in bzip2 stream"),
+            ("legacy_xz.bin", lzma.compress(data), expected + " in xz stream"),
+            ("nested.bin", zipped({"inner.bin": data}), expected + " in zip archive (inner.bin)"),
+        ]
+        for name, payload, line in cases:
+            with self.subTest(name=name):
+                result = run([self.write(name, payload)])
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn(f"{name}: {line}", result.stdout)
+
+    def test_v7_tar_containing_only_text_passes(self):
+        data = v7_tarred({"readme.txt": b"plain text\n", "empty.txt": b""})
+        paths = [self.write("legacy.bin", data), self.write("legacy_gzip.bin", gzip.compress(data)),
+                 self.write("nested.bin", zipped({"inner.bin": data}))]
+        result = run(paths)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_v7_header_probe_does_not_reject_non_archives(self):
+        bad_checksum = bytearray(v7_tarred({"readme.txt": b"plain text\n"}))
+        bad_checksum[0] ^= 1
+        cases = [("bad_checksum.bin", bad_checksum), ("short.bin", bad_checksum[:511]),
+                 ("zeros.bin", bytes(1024)), ("text.txt", b"# ordinary text\n" * 40)]
+        result = run([self.write(name, data) for name, data in cases])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_broken_ustar_is_still_reported_as_unchecked(self):
+        data = bytearray(tarred({"readme.txt": b"plain text\n"}))
+        data[0] ^= 1
+        result = run([self.write("broken.bin", data)])
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("tar archive that can't be opened (contents can't be checked)", result.stdout)
 
     def test_decompression_is_bounded(self):
         # A gzip of 65 MiB of zeros (about 64 KiB on disk) holding a zip: past the 64 MiB budget, reported, not read

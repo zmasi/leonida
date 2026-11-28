@@ -234,7 +234,12 @@ def _temp_stream(path, offset, size):
     """Write one stream to a temporary file; return (name, cleanup)."""
     fd, name = tempfile.mkstemp(prefix="bink_index_", suffix=".bk2")
     try:
-        with os.fdopen(fd, "wb") as out, open(path, "rb") as fh:
+        try:
+            out = os.fdopen(fd, "wb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with out, open(path, "rb") as fh:
             fh.seek(offset)
             left = size
             while left:
@@ -244,9 +249,27 @@ def _temp_stream(path, offset, size):
                 out.write(chunk)
                 left -= len(chunk)
     except BaseException:
-        os.unlink(name)
+        try:
+            os.chmod(name, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
         raise
-    return name, lambda: os.unlink(name)
+
+    def cleanup():
+        try:
+            os.chmod(name, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+
+    return name, cleanup
 
 
 def probe_row(row, ffprobe):
@@ -324,13 +347,16 @@ def _publish_text(path, write_body, *, newline, prefix):
     try:
         with staged:
             write_body(staged)
-        if os.name != "nt":
-            os.chmod(staged.name, published_mode(destination))
+        os.chmod(staged.name, published_mode(destination))
         replace_retry(staged.name, destination)
     finally:
         try:
+            os.chmod(staged.name, 0o600)
+        except OSError:
+            pass
+        try:
             os.unlink(staged.name)
-        except FileNotFoundError:
+        except OSError:
             pass
 
 

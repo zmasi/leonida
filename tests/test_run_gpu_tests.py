@@ -431,11 +431,17 @@ class ComputeFeatureUnsupported(unittest.TestCase):
 
 
 class FilterWithoutRunnableCases(unittest.TestCase):
-    """A filter selecting only an input shader (cs_bench_mix) must not report 0/0 passed with exit 0."""
+    """Selecting only an input shader (cs_bench_mix) must not report 0/0 passed with exit 0."""
 
-    def run_filter(self, name, translate_rc=0, spv=True):
+    def run_filter(self, name, translate_rc=0, spv=True, *, replay=False):
         with tempfile.TemporaryDirectory() as tmp:
             args = SimpleNamespace(filter=name, build=tmp, llvm_mc="unused")
+            if replay:
+                listings = Path(tmp) / "listings"
+                listings.mkdir()
+                (listings / f"{name}.s").write_text("; synthetic\n", encoding="utf-8", newline="\n")
+                args.filter = ""
+                args.disasm_dir = str(listings)
 
             def translate(_cmd, env=None, gpu=True):
                 if spv:
@@ -459,6 +465,15 @@ class FilterWithoutRunnableCases(unittest.TestCase):
         self.assertIn("benchmark tool", err)
         self.assertIn("=== rdna2spirv.py ===", out)
         self.assertNotIn("0/0 passed", out)
+
+    def test_disassembly_replay_of_benchmark_input_reports_no_runnable_cases(self):
+        rc, out, err, assemble, run = self.run_filter("cs_bench_mix", replay=True)
+        self.assertEqual(rc, 2, out + err)
+        self.assertIn("--disasm-dir", err)
+        self.assertIn("selected cs_bench_mix but no runnable GPU test cases", err)
+        self.assertNotIn("0/0 passed", out)
+        assemble.assert_not_called()
+        run.assert_called_once()
 
     def test_translation_failure_stays_a_failure(self):
         rc, out, err, _, _ = self.run_filter("cs_bench_mix", translate_rc=1)

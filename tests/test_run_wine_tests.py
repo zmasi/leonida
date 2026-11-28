@@ -729,6 +729,17 @@ class MainTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("required tests that did not pass: bad", out)
 
+    def test_required_name_checks_every_result_with_that_name(self):
+        entries = [ctest_entry("shared", self.command("bad.py")),
+                   ctest_entry("shared", self.command("ok.py"))]
+        summary = self.root / "summary.md"
+        code, out, _ = self.run_main(entries, "--require", "shared", "--summary", str(summary))
+        self.assertEqual(code, 1, out)
+        self.assertIn("1 passed, 1 failed, 0 skipped under Wine (2 tests)", out)
+        self.assertIn("required tests that did not pass: shared", out)
+        table = summary.read_text(encoding="utf-8")
+        self.assertIn("| `shared` | fail | yes |\n| `shared` | pass | yes |", table)
+
     def test_a_required_test_that_is_not_listed_exits_one(self):
         code, out, _ = self.run_main([ctest_entry("ok", self.command("ok.py"))], "--require", "absent")
         self.assertEqual(code, 1)

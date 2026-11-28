@@ -1,0 +1,252 @@
+number	tip	author_date	author	subject
+2906	9410b624281ca854a732750ce9145b6856b12747	2026-11-22T19:57:44-03:00	Rafael	first_light textured: the PS's pointer SGPR and T# slot come from the PS (13 game copy shaders pass)
+3014	da184d231451d34f0c049741f8aa80564e6998db	2026-11-23T07:07:47-06:00	Rayhan Robin	CI: restore macOS step ownership after the rebase and guard it
+4251	39c63602e17d44e50cad7bd3728a8131a6c2a140	2026-11-23T14:20:45-03:00	Rafael	first_light: section 9 says to pick a model covering a few thousand pixels
+4669	9339b41169cb449a154362f76e8a835bf56920eb	2026-11-23T20:09:43-03:00	Rafael	Merge main into test/mqsad-gpu
+4682	310fa8076e5103485c01f95a8417fcc6574b2951	2026-11-23T05:35:35-06:00	Rayhan Robin	d3d12: drop the stale tier-1 doc row and keep fallback logs honest
+4765	5969148ea4499e8de8ce8b6cc46307a0a6683fae	2026-11-23T02:30:47-03:00	Rafael	d3d12: the console static-sampler key drops the layer's NEVER mark; a clash is logged
+5076	12734e9bc718f0044ff2cd4cc059a5caa8feecbd	2026-11-23T09:08:17-06:00	Rayhan Robin	gameinput: pin both history-walk directions and the device filter
+5237	ecaaf14b9de986464f2e2aa9b85adf2680e0207b	2026-11-23T20:20:49-03:00	Rafael	Merge main into fix/front-face-mask
+7189	d077c5a4c766080976d4fc10e8326d84fa6610d6	2026-11-23T19:52:41-03:00	Rafael	startup trace: a null transfer is attributed to a call only when the call is proven
+7417	0ba54d34db1411b4c8f776482a2a98b6b6b8e735	2026-11-23T20:07:07-03:00	Rafael	Merge main into feat/stub-pipelines
+9768	369f79efd85d11d395b9b405a0d16dacb55f4ac4	2026-11-23T21:00:29+03:00	d7ommy	pe_inspect: validate Export Address Table entries and forwarder targets against pe_loader contract
+9769	84dde3f1c4cee4d06cfbe8e6d32c0d472c70fb20	2026-11-23T19:22:42-03:00	Luc	gameinput: StopCallback and UnregisterCallback take the current-callback token
+9770	24241976987b13d7c21a8f926804444da0dfec1a	2026-11-23T19:23:05-03:00	Luc	w64_graphics: a vk_harness timeout fails that fixture; the rest still run (#9764)
+9771	72751d02a8d282dab2bbb4c84343ebeaa6b37cfa	2026-11-23T22:18:26+01:00	ThomasSAMP	d3d12_vulkan_device: answer features 56 and 57 before the CheckFeatureSupport switch (MSVC C4063)
+9772	6e067f94afac7fcc9d1f541228a52caa1e6fe2b3	2026-11-23T16:15:36-06:00	Travis Curtsinger	Keep oversized sheets out of sandbox ground bounds
+9773	29ffd11a5881bb8420061f03f81a75f466ebbeca	2026-11-23T19:59:27-03:00	Luc	d3d12: refuse a pipeline whose shader needs VK_KHR_maintenance8 on a device without it
+9774	f691964de49f4f9005e91f21865e933d0e1942d1	2026-11-23T17:48:09-05:00	NinjaArmy36	docs(i18n): shaders, assets and runtime run together since #1797 in the de, es and ja quickstarts (PROC-544)
+9775	b84496342b55d7ab04c4b5dd69d8e9b8e1502717	2026-11-23T21:57:44+03:00	d7ommy	pe_shader_containers: sequence container stems sequentially across multi-image extract
+9776	99fe4802a5105e2dd0a0beade9bfb5a162045b29	2026-11-24T01:56:31+04:00	pes7	bench_translate: refuse flag combinations that were silently ignored, and require a baseline that exists
+9777	ec340d9c1e1308700dd6b2a754279e2fac4df71f	2026-11-23T21:03:09+04:00	pes7	tests: compare work_root with the resolved temporary folder, as the function returns it
+9779	ff80152d2374b9680a082dd7350d5c79fa796969	2026-11-23T22:16:29+04:00	pes7	rdna2spirv: a shard stops when it cannot size a file, instead of guessing 0
+9780	0e2e94d85d171fb9d411c5f39a57a6f15bf7294f	2026-11-23T22:10:31+04:00	pes7	replay_cpu_bench: a steady-state draw does not rebuild its views, so measure that apart
+9781	d24ef75598fcc3e7b72ca65f0feb22fa3d2a828e	2026-11-23T18:49:45-03:00	Joaco9020	GPU fixture for the packed integer dot products (cs_w32_dot_int)
+9783	6d0afc8cc8a6862b32c286530709662006879471	2026-11-23T17:38:36-05:00	Michael-M51	dxgi: support sampling swap-chain back buffers
+9784	f24768124175984c59498047d6553d1d3bde9f3e	2026-11-23T23:04:51+01:00	Simone Beduzzi	make_game: --gpu-info FILE decides the shaders stage for the PC that will run the port
+9785	de2370ebe709d303d7d56ab758fb51d5ab0899ae	2026-11-23T23:59:00+01:00	Clement Primot	test(xdxr): print the sizes when the compacted-size check fails
+9787	fae4bbc90aa4dcd349d45fc4445409ecc1ed0d4e	2026-11-24T01:11:21+03:00	Oleg Makarov	ps_sweep: preserve proven color mismatches in exact reports
+9789	5cfceaa5b5eddad5c874a407126b8f36c9571066	2026-11-23T23:03:36Z	incub0t-hash	v35: reach sustained retail rendering loop with live fences and A8 compatibility
+9790	fbe718a46077501038b4a0c3b11c45f57b4dec3b	2026-11-23T17:33:16-03:00	tiagonogueiraa-bit	ab_control_flow: leave flat_atomic out of the A/B sweep too
+9791	3ecb70285512ee9cba55d89aac45d3a8d7f27731	2026-11-24T02:06:09+03:00	Nikita Romanovich	docs/gpu_test_results.md: record NVIDIA GeForce RTX 5060 Ti (Windows 11, 610.88) results
+9792	b01f4c33797cc69212e10504bea7c2343aa12eaf	2026-11-23T22:29:26+03:00	d7ommy	find_hash_lookup: clamp raw section sizes and validate window and top parameters
+9794	028df8b53feb0294ccfb3a8e15c428d22e1fe4e0	2026-11-23T20:07:35-03:00	totonii	fix(vulkan): use memory_type_order with OOM fallback in PredicateReducer::batch
+9796	774e6f8ec81ebcf8925d3be4c008f18c76033c00	2026-11-24T00:07:50+01:00	Osis78	docs(i18n): describe parallel build stages in ar, it and zh-CN
+9799	5468daa1bb81bacf544793613f0c5384df8b36e1	2026-11-24T01:08:33+02:00	Kiril-Donec	docs/i18n: quickstarts say shaders, assets and runtime run together (PROC-544)
+9801	d82d9109a86a408a5aefde44e19cfeb41e783ac4	2026-11-23T19:48:40-03:00	Ramon Victor Cardoso	docs: D3D-56 descriptor lookup numbers on RTX 3070 (Ampere, ReBAR off)
+9803	b34987e1bb614f48fc99ea9cd9c19957856a2bb6	2026-11-23T23:55:31+01:00	EspadaHD	bvh_slot_check: unpack 6-tuple from model_geometries()
+9805	3c51dcee6459a007a17df3a64839d30114f0ae8a	2026-11-23T22:04:46+01:00	a-lebailly	Cancel suspended Vulkan presents before enqueueing
+9806	d1a1e249f4fafbb9d9d7d8129c1f2438c9ad2608	2026-11-23T17:14:31-05:00	WebIdentity1	Keep query recording state consistent after allocation failure
+9807	5b0cf3654fbaffe8085c7b000d5ead13f57e493f	2026-11-24T00:50:37+02:00	nino-exe	buffer_bounds_probe: a non-numeric --waves is a bad argument (exit 2), not a traceback
+9809	a5165cb263bf97a56751a683bae34fb7dfdc8ab6	2026-11-23T17:06:15-06:00	dhillonjagga	d3d12: slot 14's console descriptor heap compiles, through a handler the layer registers on request
+9810	f5b1b8ab8e9c6b420656cf768457eee24a8bffa2	2026-11-23T23:09:29Z	WeiZheng Huang	docs/testing.md: known-problems row for the four newer compute fixtures on an Intel Arc 140T (ANV 25.2.8)
+9813	2057c0ef153add24134d44c7e174b2731aa623fa	2026-11-23T15:07:44-08:00	KoLolX3	Tests: GPU coverage for v_swaprel_b32 and s_movrels_b32/b64
+9815	0285d161d1008598cdc15caa0b41d235f5abd8ea	2026-11-24T06:45:49+07:00	piyonchu	runtime: fix Vulkan ConsoleDescriptorHeap compile errors on MSVC
+9816	793724fbf4b17d066a174c8ea1d9d374d8883575	2026-11-24T05:37:00+07:00	piyonchu	runtime/shims: shim GetLogicalProcessorInformation and GlobalMemoryStatusEx
+9819	cb6d91086ae1121660592f146540dec5a499a2f8	2026-11-24T05:37:17+07:00	piyonchu	runtime/shims: shim GetDateFormatEx and GetTimeFormatEx
+9820	c20a1136d1ae7f49ac1c753960843615dc7f1294	2026-11-23T14:19:57-08:00	KoLolX3	shader_ir: the docstring gives "invalid" as a count, which is what parse_file returns
+9822	94ef56fb4c96f69d94006204e8b941fb75ae8324	2026-11-23T17:41:47-05:00	SkippySteve	docs(i18n): shaders, assets and runtime run together since #1797 (PROC-544)
+9823	3b7971d1cf1a6f4f5b52b71b64e53c830710b767	2026-11-24T01:51:59+03:00	lordon1a	tests: provide AbortController and timers in viewer camera speed test sandbox
+9826	a63d2960a9658b9014474cbe6a2667a8a378932e	2026-11-24T01:55:27+03:00	lordon1a	rdna2spirv: use OpAtomicStore for MSG_GS_ALLOC_REQ %ms_counts (SHADER-766)
+9827	1820512d3eae1486268d66fdebdb731d38a59430	2026-11-23T20:19:36Z	Lewandox	rdna2spirv: guard image_bvh PhysicalStorageBuffer loads on active EXEC lanes
+9829	1d9f45188fd2d2745628a725d978e12c946cc6f7	2026-11-23T20:36:49Z	Lewandox	rdna2spirv: redirect absent subgroup lanes before OpGroupNonUniformShuffle in ds_permute
+9830	f9386399817e4ccca91ce3775fbc74a5688b65c5	2026-11-23T16:46:47-06:00	Alexis Alberto Reyna Sánchez	docs(i18n): update stage-order sentence in 9 quickstarts (PROC-544)
+9831	5a78df0dba674d983e86aeff725d4aa998fbe6c0	2026-11-24T09:38:10+10:30	dhale2	docs, tools: point repository links at ProjectLeonida/Leonida
+9833	833af334973242a2650f7afc28118f07bf0d6341	2026-11-23T22:34:57Z	Lewandox	rdna2spirv: use subgroup ballot in quad_any for non-PS stages to avoid partial-quad UB
+9834	42f55beebf13c196144559ca188093892612a2d3	2026-11-23T22:08:53Z	Killurassoul	vk_pipeline_check: skip a module's missing features before vkCreateShaderModule
+9835	ed47f8741694da21876b3d9eb58b97f42fa61536	2026-11-24T01:12:14+02:00	Kiril-Donec	docs: the four doc-test failures on main (repeated lines, CLI flags, a missing path)
+9836	4baf1c8c81c5b4b4dd748e2e5d346f4a913093aa	2026-11-23T23:43:20+01:00	noosko21-a11y	tests/docs: read an indented code block as code, not prose
+9837	0d5198e2945426d7fd7ad609252005e4ecefae95	2026-11-24T00:11:26+01:00	noosko21-a11y	tests/rdna2spirv: drop the test of a method the branchless decode removed
+9838	29cb2886987256f1dcb99d3fa0783eac3c41184f	2026-11-24T00:12:22+01:00	tedin7	wave64_emulate_opt: ds_append and ds_consume always barrier
+9839	f8252efddeb3fb4c8081208e6027b877a44dff1d	2026-11-24T01:55:25+03:00	Hassan Kamal Al-basheer	rdna2spirv: an implicit image_sample reads the UINT/SINT view in every dimension and stage (SHADER-1404)
+9840	a9d1da6a57ee55995cc9526548fbfeae3fdafba8	2026-11-23T17:10:38-06:00	turg	tested with real executable
+9843	1c08f3856de0d503086e570ed8299a78807ca77c	2026-11-23T20:13:35-03:00	tiagonogueiraa-bit	rdna2spirv: a plain image_sample reads a UINT/SINT image in every dimension and stage (SHADER-1404)
+9844	d64326ee05203b68aa152d9a7a03db31afd2c486	2026-11-23T22:31:47-05:00	Imran AKKI	Tests: method_variants castable-list cases on a host without relaxed format casting
+9845	71fdcc005266812c90a45afade9d8cde90bc1d5e	2026-11-23T21:42:24+01:00	ThomasSAMP	rdna2spirv: refuse 3D Dref c_lz samples
+9846	f00b5056b45e7861543d8ebfd819154155f6f99a	2026-11-23T19:11:00+01:00	TG0000	vulkan_bindless: pending writes in flat per-binding arrays, free index by memchr
+9848	9aece26a3eb14f08d1ae2b863c3f232cf8d8f2f8	2026-11-24T00:09:35+01:00	David	conformance/compare.py: import traceback, so an unexpected crash exits 2 and not the mismatch code 1
+9849	f41a8ff28347081c23f6bff91922e76bf285a6e2	2026-11-23T19:43:15+01:00	TG0000	registry: an unimplemented import's repeat call takes no lock and does no lookup
+9850	43769a0702a7f9c20d9525364f350d874a3e5b02	2026-11-24T00:09:35+01:00	David	test_ttpf_assets: read the original DDS before the rebuild removes it
+9851	db5bca44ba282ea2ce0f8f2f565631a53f5bd260	2026-11-24T01:49:06+03:00	lordon1a	tests/semantic: narrow EXEC in test_image_atomics_guard so dynamic %active guard is exercised
+9852	170f70ecdae63c62150f3beb78c7f321787d1793	2026-11-23T16:09:47-06:00	haayden	d3d12: CheckFeatureSupport refuses shader models past 6.9 and sets CAST_WITHIN_BIT_LAYOUT as the host does
+9853	3f90678cf0626e73fb01947ab19cad56610e6234	2026-11-24T02:08:27+03:00	lordon1a	tests: create gta6rt.exe on Windows in test_leonida_mods run --print test
+9855	6cfe5ef1bacd9fc0ada04555eb96f2e8fa750cad	2026-11-22T22:36:09-08:00	Jess-Doit	docs/testing.md: ps_ij_computed is skipped on a Mac (no geometry stage) under either fallback
+9856	434251342fe834643d5d532cc81b217442220328	2026-11-24T02:22:04+03:00	lordon1a	tests/mc_command: add cross-platform PATHEXT fallback test and clarify comment
+9857	58a4b58dd7a4be4ad5ed5347ebefd16e27b429ad	2026-11-23T15:15:12-08:00	liamhob	runtime: fix MSVC build failures in acphal and console descriptor heap shims
+9858	9d4cb9171e79466bfc702621cc9317126bbc02c2	2026-11-24T02:11:02+03:00	Nevrche	cmake: pass LEONIDA_SPIRV_TOOLS to the subgroup shader build
+9859	44481fdb9f2bf0e4f4daca77174f156d46703639	2026-11-23T18:14:06-05:00	WebIdentity1	Do not skip failed compute dumps after subgroup warning
+9860	b18da3d13c01f2db49ec69ba1f55844e2024ea67	2026-11-24T00:28:40+01:00	Salim Hammami	xgameruntime: XUserFindForDevice answers E_GAMEUSER_USER_NOT_FOUND until XUserAddAsync (RT-382)
+9861	82bdc54ffea152d60f3290ba6a3119bd54661ec2	2026-11-24T00:29:03+01:00	Salim Hammami	tools: print the plain path, not a repr'd one, in OSError messages
+9862	d8be7a110f7f27584e4ee13110815558c19770f0	2026-11-23T12:37:20+01:00	Salim Hammami	tests: compare the fence's info string too, so two languages are not one duplicate
+9863	0352291674721e98ddc5e6a1646fb2ea33c31fd5	2026-11-24T00:39:19+01:00	raulmesa96	vk_texture_test: integer 2D-array implicit image_sample fixtures (SHADER-1404)
+9864	6a592eb96edb35468c6939989e1984d34707dfd9	2026-11-23T13:31:09-08:00	KoLolX3	Tests: GPU coverage for v_add/sub_nc_i16, 16-bit min3/max3/med3 and v_pk_add_u16/v_pk_mad_i16
+9865	78afb4eaa1ee5e459b489423387ba6ee97a0663d	2026-11-23T13:35:51-08:00	KoLolX3	Tests: GPU coverage for v_cmp_class_f16/f64, v_fmamk/fmaak_f16, v_cvt_pknorm_*_f16 and v_mac_legacy_f32
+9866	abd6173fb988ce85c4b615d54f697b7c5fce0f2d	2026-11-24T00:15:47+01:00	TQuentinD	tests/semantic: green without the game or SPIRV-Tools
+9868	cc05917ae0df21c4791dead7d977b6506e2b5934	2026-11-23T21:59:25Z	Claude	test_image_bvh_tri: no select pairs the NaN or miss constant with a computed word
+9869	360abb21f3451e6ccc134ae198a8fc78f40c52a1	2026-11-24T00:10:14+01:00	Amitox	d3d12: a failed present is named and a run of the same failure is logged at its 1st, 10th, 100th, ...
+9871	ddf8fa1242553b280e8bdcf8a2a9907ef9d36bfc	2026-11-23T23:06:24+01:00	maxence468	CI: suppress pass notices when the runner reports no failure names
+9872	20e7ccd0f59e0b477b84a7001fee09eb921c9deb	2026-11-24T00:15:54+01:00	TG0000	tools/native: one Cargo workspace for eight Rust accelerators
+9873	2e3b55965f3216542ef9fe0a220efcd802a94ce3	2026-11-24T00:14:31+01:00	MiguelMatMar	runtime: build again on MSVC after #9576 (console descriptor heap on slot 14)
+9874	4c780823a9c93614e6af581070ebbbe746a0955c	2026-11-24T00:41:18+01:00	YuhiAida	d3d12_xs: cover the console list IID in xs_proxy_mock_test
+9875	8c9a4745b2c380a47ce4603276c0919b65a2438c	2026-11-23T23:11:33+01:00	tedin7	fix: translate image_load_mip glc on 2D through the coherent storage view
+9876	8656629f859dbfbee97771c7a36572f3c3d78ff7	2026-11-23T20:17:20-03:00	Ramon Victor Cardoso	tests: GPU fixture cs_w32_min3_med3_16 for 16-bit min3/max3/med3
+9877	6f014cfc1c11ee232664c8075eae58b9305b30c5	2026-11-23T20:35:04+03:00	AwkGrep256	Merge remote-tracking branch 'origin/main' into rt-344-ffx-vk
+9879	8df205109c2c770b3c187ad99890d547aa4c4ea2	2026-11-24T02:26:21+05:30	ChAlanA	resource_detile: strip-mined cache-line micro-tile copies (1.2x-14.6x faster, bit-identical)
+9880	9dca4f37318f690c3bee6f2c3683b4d5526739ed	2026-11-24T01:02:04+05:30	ChAlanA	xgameruntime_gamesave: prevent uint64_t quota underflow in commit() on case-colliding blobs
+9881	136e1d101e1802c9298293e36c504ef133b842cd	2026-11-24T02:02:55+05:30	ChAlanA	subgroup_size: reject half-zero and invalid subgroup size ranges in decide_subgroup_size
+9882	c75c03a98e4b3861177d9fbf69e6301289a00cbf	2026-11-23T20:35:21+03:00	AwkGrep256	Merge branch 'rt-344-ffx-vk' into ffx-upscale-shim
+9883	bb7af6afe3c2f8ce1c325a05d636e1f4d2398a64	2026-11-24T02:12:34+03:00	AwkGrep256	FFX shim: say once why ffxCreateContext refuses a chain without a device
+9884	dab41122066cad1141f6b5b6dc3046354a752914	2026-11-23T18:32:53+03:00	AwkGrep256	runtime: answer the console-type registry key (ConsoleMode) from LEONIDA_DEVICE_TYPE
+9885	0b55cf08b1c7711ccf84de33864d0ba95c780f73	2026-11-23T20:36:05+03:00	AwkGrep256	Merge remote-tracking branch 'origin/main' into fsr-series-x
+9886	fde408da00b6fafbb15d90fa8d53976f5cc9ab41	2026-11-24T00:30:24+01:00	ruipedro-pinheiro	gpu: a 2D-array UINT fixture for implicit typed samples (SHADER-1404)
+9887	52a88078219ba07a8dac12f49794c6e6df724942	2026-11-23T20:18:19-03:00	totonii	fix(xgameruntime): release g_error_mutex before invoking XErrorCallback in XErrorReport
+9889	330c6bbd8e8935bc5918110edc877f8c5b86ff53	2026-11-24T05:02:21+05:30	Abhishek Mahapatra	docs(i18n): shaders, assets and runtime run together since #1797 in 9 quickstarts (PROC-544)
+9890	128ed59cdc3934fd2dadb2491c463eb8b06468d7	2026-11-23T23:33:49+01:00	SweatierKey	Merge remote-tracking branch 'origin/main' into d3d12-xs-slot55-81
+9891	5ed4500aa5e7487a6cb102a6ab60b9d65a5537bb	2026-11-23T17:32:22-06:00	Alexis Alberto Reyna Sánchez	docs: clarify the default salu_diff opcode pool
+9892	8c359bb665b6f3a1b22e172ef6c6cdebd5dcbd5d	2026-11-23T17:16:58-06:00	Tiller431	docs: verify movie archive padding and trailer totals
+9893	d3a4d1733bf1bd03db387b0a2bded31e70945264	2026-11-23T23:12:05+01:00	tedin7	fix: mesh shader pos1 misc export writes Layer and ViewportIndex per primitive (rdna2spirv)
+9895	164fa370f37a1eedda9dc8e5e87c0da61a5ee1b3	2026-11-24T04:42:02+05:30	neoisg8	docs: document LEONIDA_RNG_SEED in runtime/README.md
+9897	065d86a313b7cc6b512c21b8ebc0fa56041e8bdf	2026-11-24T04:44:59+05:30	neoisg8	docs: escape pipe in design.md table and deduplicate README.md rows
+9899	4d4e9486f5e5b540bfc92aace69085f706ef563e	2026-11-24T04:46:49+05:30	neoisg8	docs: fence command block in semantic README and unbacktick unmerged note path
+9900	f14804d04d2a454bd699d741d5a14ed96aed4281	2026-11-23T23:23:42+01:00	tedin7	xgameruntime: XPackage enumeration, installation monitors and package-installed registration offline
+9901	efa3f317634f9e60c8b39f7d3caed94f04cc19a1	2026-11-24T04:48:59+05:30	neoisg8	docs: update pt-PT quickstart pc checker and whitelist foreign CLI flags
+9902	3b420268130b40f15c583802c8def1619d4ae062	2026-11-24T00:19:55+01:00	EspadaHD	leonida_mods: hash lower-cased Latin-1 bytes in joaat()
+9904	54733afaba17525d1f75a0649ef96cd8e2abf55c	2026-11-23T20:18:38-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9905	164788f13e8a81158c37549e6b2c943ed9dcac50	2026-11-24T00:19:36+01:00	cdomergue	Measure the 4 KiB boundary cases in navmesh directories
+9906	4c479bdb5f1a8d9db36dba7e248f375c644bdd17	2026-11-23T20:18:35-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9907	5bedfa66791199f42352e787882de9af244909eb	2026-11-23T15:19:07-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9908	4fc0d9768ddf19b6f8fdd22ab53c84e12b677c00	2026-11-23T20:18:32-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9909	09b42180ba2df7e49e2a532d45fe7dd827304a4a	2026-11-23T20:18:30-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9910	0704e43a0b11f1baedd6108dd180d97c2efd9e56	2026-11-23T15:18:59-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9911	8f7118cbb3c086c71ca2ac81876274f44f2b02e6	2026-11-23T20:18:27-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9912	ce27f4dfe843cca8d72a417816155bd077562e93	2026-11-23T20:18:25-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9913	ad3ce0722fb4e35df7313460927e7e5b67b16254	2026-11-23T20:18:22-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9914	73c4d4bdd6c3883f3f2a92602fd0052111761cb0	2026-11-23T18:16:11-05:00	Sunkiller-qc	xgameruntime: test the XErrorReport export and count it among the looked-up names
+9915	93812b543c58b6f6e5b7f3d5edaff74e28e2823a	2026-11-23T18:16:40-05:00	Sunkiller-qc	host_cpu: move gta6rt's AVX preflight decision into a testable preflight()
+9916	98cefe9b08e4d868f610415ab798932ab3b59ff8	2026-11-23T20:18:19-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9917	c06fcf43303fa603775f57f1b346037cdb209419	2026-11-23T12:13:09-07:00	enx	Upstream PR #8588: xgameruntime: XAsyncBeginAlloc and XTaskQueueIsEmpty are forwarded to the real task queue
+9918	68a826062501abe427b26625c2b682291850c21c	2026-11-23T18:17:56-05:00	Sunkiller-qc	cs_lds_xchg64_ext: judge ds_or_rtn_b64's returned pair and ds_max_rtn_f32's two results apart
+9919	54d8cd32ee56bd3ba4b0fe524c73bf45cc22fb47	2026-11-23T20:18:16-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9920	cc2e28195926db2cfdc2ea9a3f3824f8282e7f54	2026-11-23T18:28:19-05:00	Sunkiller-qc	check_d3d12_trace: capture the fixture's output in files so a timeout cannot wait for its children
+9921	d165a3d6fbe0b4ca943da0d85a3f00c956160174	2026-11-23T23:23:55+01:00	tedin7	fix: mesh shader compressed exports (exp pos1/param ... compr) unpack their f16 pairs instead of raising Unsupported (rdna2spirv)
+9922	1b8cc6ad1df428cfc0fff34a563de2106573b740	2026-11-23T19:54:08-03:00	kelsenvictor10	Create triage-block-9625-9660.md
+9923	3b41e2206afabf64b5a2a7fb8b9223222635d164	2026-11-23T18:24:40-03:00	Luiz Neves	docs/design.md: fcmpswap is not in Global atomics' Still Unsupported list; it has its own row (@WALID1618Y on #4879)
+9924	d01ed69b068a58d81ae645ca6c05606250573650	2026-11-24T00:21:31+01:00	tedin7	make_game: run asset exports and pool follow-ups on --jobs workers, results in order
+9925	efbfe5f0995d1d9ae1b72c11052bf1e475e561f2	2026-11-23T20:18:14-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9926	0514c158b521dceffb57ecd782aae81f4b460bcc	2026-11-23T23:20:54Z	JRamos1993	runtime: LEONIDA_THREAD_SNAPSHOT names what every thread waits on at given times (A50)
+9927	2496beffe5b1ee52e9d470c8b9f73d59d8d9e0b8	2026-11-24T04:04:22+05:30	neoisg8	awc_shorts: refuse a catalog destination that aliases an input bank
+9928	32a9427ba442e2160be96e110ffc8362bb14e4e3	2026-11-23T16:42:25-05:00	Størm	wint_diff: GFX12 has no always-true/false VALU compare; skip those programs by name
+9929	ea3ea94987179fb4f0758de21303624f482978b8	2026-11-23T16:14:08-03:00	Luiz Neves	docs/design.md: the pknorm NaN measurement once, in the Measured on RDNA2 sentence (@skorex on #4899)
+9931	136b877c8130f20c47b5fc2ecbbd1d20b10a5559	2026-11-23T23:20:08Z	lnaq	docs: correct translated quickstart build order (PROC-544)
+9933	4c9243705a7f424af7d9a36549522eefbfc84635	2026-11-23T20:18:11-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9934	9fa3ed00f227a54c9524fbdfb7538b5681ee5621	2026-11-23T15:19:17-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9935	db8e449a91c307337f445f3bee48e80b34197709	2026-11-23T20:18:06-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9936	4e990a3175c3cee23dcd3268008dff08449ee933	2026-11-23T23:19:18Z	Claude	docs/i18n/ru: the quickstart says shaders, assets and runtime run together
+9937	560c3fa9246a2f07d1c75c449f1c2fe7376e1aa8	2026-11-23T11:11:40-03:00	Luiz Neves	Merge origin/main: stage main's wine_launcher() text with the rest
+9938	3240a16b3fef59e3a83f6f26651d4d603ffce259	2026-11-23T20:03:13+01:00	AGInformatique81	Report skipped Wave64 benchmark fixtures
+9939	f99e0b96314185608c37f1a124d7b6a2391bf02a	2026-11-23T09:08:50-03:00	Luiz Neves	Merge remote-tracking branch 'origin/main' into HEAD
+9940	21dc3889280dba49916f63342dab72750d3ee4b9	2026-11-23T21:53:37+01:00	tedin7	d3d12: rect list test: every pixel well inside a non-right triangle is drawn; geometry notes edges are measured in NDC
+9941	967f20036dbdd8bfb50f213ca26e034f3e728e41	2026-11-23T20:31:30-03:00	carlos-seiffert	d3d12_xs_rootsig: one checksum check, the one that keeps an all-zero checksum
+9942	633f5208ba0754d8be685e9288cc9e04c8e51588	2026-11-23T20:25:06-03:00	Luiz Neves	tests/test_first_look_rebuild.py: the stub writes its call log and outputs with newline="\n" (tikD1337 on #9942)
+9943	314bf8e4a9ac94e0cf4115b81bac3d36cfc2bfa0	2026-11-23T09:32:04-03:00	Luiz Neves	vk_compute_test: check VKC_HEAP_FILE's size on the open file before reading it (#5878)
+9946	b3dec3ab2ad364bf2454ce1e14d9831106d9dabe	2026-11-23T18:22:53-05:00	icecreammule277-dot	test_bvh_shaders_stage: give the fake FSPX translation its fspx_code_sha256
+9947	eb9199fdb65a4ee06d10a63e3f22c0551d8ff413	2026-11-23T23:21:36Z	Claude	rdna2spirv: s_bfe_u64 / s_bfe_i64 on the dword pair, with no Int64 (SHADER-930)
+9948	33f4a5aedeb48e27b004efe5d6ae306130d55cdd	2026-11-23T23:53:36+01:00	Almogaver295	Merge upstream main and preserve 1D UAV clear compatibility
+9949	3fbb6314df099b2a86922ada5cd83dec7e818607	2026-11-23T22:26:32+01:00	Almogaver295	Merge upstream main into ASSET-430, preserving verified model pin
+9950	30b664d0d76ceb5d3b4ca23497b36f12d46d044d	2026-11-23T18:04:04+01:00	Almogaver295	test(runtime): distinguish wrong V# addresses from a broken draw
+9951	85d1e807a351055413dc7d3e28f7af85bf3a6f6b	2026-11-23T17:20:17-06:00	Travis Curtsinger	Select the console descriptor heap layout per device proxy
+9952	a8b661cf4050c44e96708c23c387ccbf1bab857b	2026-11-23T18:23:17-05:00	SkippySteve	run_wine_session: initialize and stop the prefix with $WINE
+9953	99cefc90d6545c0c204d12f1d3161f423939ed3f	2026-11-24T00:23:41+01:00	tedin7	d3d12: persist the runtime Vulkan pipeline cache across launches (framed and checksummed file, saved after a cache miss and under 1 GiB, merged across sessions, never the build seed)
+9954	1b07215c84443b87ad152ffdc8d23b0356125456	2026-11-23T23:22:45Z	justr4mzi	d3d12_xs: route device slots 86, 101, and 108 to PC Device2/Device5/Device8
+9955	7342eadaa549907554f18a46ca7c30578375d5df	2026-11-23T23:23:01Z	justr4mzi	d3d12: validate CreateShaderResourceView descriptors
+9956	321cd0d30ecb54971e92a3ce163e727c938811d4	2026-11-23T15:55:26-05:00	SkippySteve	README: run gta6rt.sh with UMU-Proton's wine in a prefix of its own
+9957	3e7a8829568e02f4ed9e69f518dea89ccc3e1bb5	2026-11-23T15:52:07-07:00	slipperysquid	docs/i18n: the quickstarts say shaders, assets and runtime run together (PROC-544)
+9958	135d44bee33909164cc693cc6689c7ab356b98f5	2026-11-23T16:06:17-07:00	slipperysquid	rdna2spirv: 64-bit scalar data ops lower to 2x32-bit, no Int64 (SHADER-930)
+9959	0b416ec925ced03ba16dc9cc97b30c3991c9bb47	2026-11-23T16:12:05-07:00	slipperysquid	rdna2spirv: image_sample* outside 2D selects the UINT/SINT sampled view (SHADER-1404)
+9960	2ae27e438cc399732c1233944a6d966fa50176a2	2026-11-23T20:23:47-03:00	Ramon Victor Cardoso	tests: GPU fixture cs_w32_cvt_flr_rpi for v_cvt_flr_i32_f32 and v_cvt_rpi_i32_f32
+9961	a75e3253e855d07fdaa50f9bb618c32e8e70dc73	2026-11-23T16:07:53-07:00	slipperysquid	runtime: LEONIDA_SKIP_ASSERTS and caller logging for forwarded device slots (RT-526)
+9962	8368be1dd059fa50823aefcd4251609ab85e203e	2026-11-23T23:30:41Z	Leeahmy	test_conformance_build_script: pass with a non-ASCII temporary folder
+9963	6c3603e883885197fc0c4ea801e0561562b90b8b	2026-11-23T18:30:04+01:00	Alex Arenas	psocache_usersig: refuse --limit combined with --entry
+9964	5b022527100f2f4c8c246f652fe819b396b921b2	2026-11-24T06:24:45+07:00	piyonchu	runtime/shims: implement console DirectStorage shims (XCRDAPI / dstorage_xs)
+9965	f44150a28bbfd20edb4bcb7eac957272aed91786	2026-11-23T18:22:37-05:00	BatSmacker84	Tests: d3d12_depth_resolve no longer expects a refused list to replay
+9966	db3851a22c49fb6e45e33305643ce524806a4bdd	2026-11-23T23:14:07+01:00	tedin7	gameinput: preserve controller transitions between polls
+9968	5bbd0f35eebee3a3a1e3ba44ac7cab53852cb010	2026-11-23T15:25:44-08:00	liamhob	d3d12_xs_rootsig: remove duplicate checksum check that rejected all-zero-checksum Xbox blobs
+9969	cd1d0836b174911af6ec1fe55b3d50793ca3854a	2026-11-23T15:25:44-08:00	liamhob	d3d12_com_test: test invalid ClearDepthStencilView flags instead of depth 2.0f
+9970	c3617cf9cd8e0bb1f0b78c16ef7abc5f47e8cc40	2026-11-23T15:25:44-08:00	liamhob	d3d12_vulkan_device_test: query ID3D12Device10 on inner device to avoid slot 78 SetFrameIntervalX shadow
+9971	95c52eed87e3918295d29a04ed7811c6ed1f6508	2026-11-23T20:51:56+01:00	tedin7	test: d3d12_vulkan_device expects a colour MAX resolve to be accepted and keeps a non-resolve mode refused
+9972	f57fd7049d7cdb6afac50ebae7d7bedf1db41ff1	2026-11-23T18:32:20+01:00	Alex Arenas	ps_interp_modes: refuse a single named file without a readable PSV0 chunk
+9973	63170fe80c8ec5602b79672d4d697b49f62b6141	2026-11-23T15:24:31-08:00	Nandan Pericherla	merge_check: separate Git revisions from checkout paths
+9978	7b31674e1ead28893b313d3b05f8b9ddac861c93	2026-11-23T18:52:54-05:00	icecreammule277-dot	runtime: give the remaining standalone d3d12_xs_device.cpp consumers the stub too
+9979	ae40c8eea00a10e75b459876eadb32b92119e3bf	2026-11-23T16:14:54-06:00	Elijah-J	Document radio track label keys and count matches
+9981	6102b26ffd11b01d969da3ccabea976408e95e60	2026-11-23T18:34:03+01:00	Alex Arenas	d3d12_boot_movie_test: drop unused label parameter on present lambda (C4100)
+9982	5f3dea643a588319c670f570f86cccf40f13675e	2026-11-23T23:26:08Z	Lewandox	rdna2spirv: support directed MODE.FP_ROUND[3:2] (+inf/-inf) and dynamic s_setreg_b32
+9983	6c8151d6e1a8e6e45bcd93f369e3aa05312496ec	2026-11-23T18:25:56-05:00	WebIdentity1	test: exercise AWC manifest staged cleanup on all hosts
+9984	12e612449ed1616ab2249eae3a8d0404a58d9edb	2026-11-24T05:02:54+05:30	Abhishek Mahapatra	docs(models): remove duplicate material effect section
+9985	9bf36d597eeb92c5dc1097450caa2fb39ea89c52	2026-11-23T23:24:41Z	Richy	Update Discord link in README.md
+9986	e990c82092612cb10d28284a52bfb7ecbb127c3e	2026-11-22T18:51:18-03:00	Tayar	Validate RPF9 archive headers before scanning meshlet pages
+9987	a631bc68c4ce2ad4f7fb1993e6611aedfcf486da	2026-11-23T14:05:22-03:00	Tayar	Clarify expect exit codes and image-error precedence
+9988	989273d051457fe2debd5887b92259437352e2b6	2026-11-23T23:18:33Z	Jake Reddy	Merge branch 'ProjectLeonida:main' into main
+9989	48a5f2bd9bf1183f334e797e21bbef19039902f3	2026-11-23T14:04:34-03:00	Tayar	Reject non-letter PNG chunk types after review
+9990	0ff37d43f4390e211ee3ea406370a19abbab1194	2026-11-23T23:30:51Z	Lucy	d3d12_xs: slot caller via a formatter hook, cleared on reset (review of #9990)
+9991	632cb75ad5c78409ebd151d8396519a985108fea	2026-11-24T07:13:27+08:00	channa317	Merge upstream documentation updates into D3D-991
+9994	cc9f3736f0e345cef66a9e4b735a5d9657329efe	2026-11-24T00:19:53+01:00	owsyks	wip: local boot fixes up to 1636 D3D12 calls
+9995	1c67b24a1e150cfd0785cb4af88d9bff842ad827	2026-11-24T02:27:51+03:00	lordon1a	docs/gpu_test_results: record Intel Iris Xe (8086:46a6) and RTX 3070 Ti Laptop (Windows 11) results
+9996	167df2770781bf9faa171cd1e4c1172b70833bdc	2026-11-23T23:09:05+01:00	tedin7	fix: lower wide and strided geometry shader LDS accesses
+9998	a2828eeec0f776fccec4d8de7d82deea5886a9ec	2026-11-23T17:26:31Z	Courtyard Games	runtime: stop the configure when Vulkan headers are too old for the Windows runtime
+10000	0fe16691d12136d179b9858bfbe49a485b04ade3	2026-11-23T18:27:47-05:00	WebIdentity1	test: follow full-EXEC f64 output word stores
+10004	7e7a0d952aabff4fce5c9be58acd5a5067c641f4	2026-11-24T00:27:37+01:00	Maxime Mansiet	file_system: a GAME: name inside a missing folder fails with ERROR_PATH_NOT_FOUND, as on the host
+10005	82c5a2ed22db314ab62d84af168afc4ebb693ddb	2026-11-23T23:07:13+03:00	YaBulochka	docs/boot.md: what a Wine prefix has to supply, and the quiet failure without it
+10006	0dc1645400e1e39b7768d02411b0b200c583a606	2026-11-24T00:28:26+01:00	EspadaHD	bvh_groups: use shared same_report_path and catch --json write OSError
+10007	c2e0b361a77d3be752139bff1ec8fc2cc2041671	2026-11-24T00:36:34+01:00	Louka Ayari-Pignel	docs/i18n: drop the claim that the runtime doesn't load pipeline_cache.bin
+10008	067c048e7bf90ededa4d4c1111dad4bc87c7eea1	2026-11-24T06:28:45+07:00	piyonchu	runtime/shims: implement xapu.dll and chad.dll audio processor shims
+10009	474b799915df1f26b2455daaa33073974539398f	2026-11-24T01:14:21+02:00	Zilumz1	d3d12: min/max samplers honour filterMinmaxImageComponentMapping (D3D-994)
+10010	4e4970956afa8f19d11f1c3c92a8f203baf04a87	2026-11-23T23:35:37+01:00	tedin7	fix: shader_disasm prints the v_dot4_i32_i8 op_sel 2 / op_sel_hi 5 words llvm-mc rejects, so the FSR4 FSPX programs translate
+10011	1826e88839fe079d37d107f8efbadb6ddf8d4a38	2026-11-23T20:29:32-03:00	totonii	fix(rdna2spirv): order image_sample, image_gather4, image_bvh and ignore ds_nop in --wave64-emulate
+10012	17ead7a27301d9ec96a100525f3c3f65ccc3682c	2026-11-23T21:52:58+01:00	tedin7	feat: d3d12_xs exports D3D12CreateVersionedRootSignatureDeserializer, clearing the Xbox RTS0 flags
+10014	04fb785d3cbbad8dddf683accb95fb46b501fdfd	2026-11-23T18:29:57-05:00	WebIdentity1	test: compare Wine launcher physical paths
+10015	b3a8c538b737826a5e34e2b96f44d889d4870479	2026-11-24T00:30:26+01:00	AGInformatique81	Keep checking pipelines when the previous crash report is locked
+10016	4ff5997d05a74a547de3930879cb7f1ee3148d77	2026-11-23T20:27:42-03:00	towiice	docs: add NVIDIA GeForce GTX 1650 SUPER GPU test results
+10017	16acface42bb14cc8222fbf465373f562821ccfc	2026-11-23T21:18:58+01:00	tedin7	Fix GetTempPathA exact capacity return
+10019	5894b0b97ce9fd3b7f0fee2a86b3f093e653b715	2026-11-23T23:30:20Z	tuga	Tests: a refused depth resolve is checked by its Close alone
+10020	f5502513a77eaeac5372eba5927f0d471f622691	2026-11-23T17:30:37-06:00	beamdotdev	shader_disasm: hand llvm-mc its input in lines of 64 bytes, not one long line
+10021	b9918c13d359992d8dec500a51bf72773f09e186	2026-11-23T21:00:04+01:00	tedin7	test: draw LINE_LIST per D3D12_LINE_RASTERIZATION_MODE and check the pixels; note that wide and narrow are one Vulkan mode
+10022	de87b1a9ea278d95724171613ca10384bc2b8e27	2026-11-24T02:30:40+03:00	Nikita Romanovich	rdna2spirv: zero the tfe/lwe status VGPR on image_load and image_load_mip
+10023	9b9679eb6446ec06d893814ab91e592eda02cb9f	2026-11-23T23:27:08+01:00	tedin7	d3d12: ResolveSubresource averages a typeless resource in the format it names (sRGB in linear light)
+10025	8e33f7866a01e78ca39580b5178f9e43f0181f80	2026-11-23T20:30:25-03:00	Igor Borges	spirv_asm: refuse an output that aliases the source
+10026	5f516e754553322aaf1a9d70dbe7aba76a3a58f0	2026-11-24T00:31:47+01:00	Ritolino	test: unit tests for tools/rdna2_isa_tables.py
+10027	41d8737aef348ca6b653bc6b898e60f9576111df	2026-11-24T00:31:48+01:00	Ritolino	test: unit tests for tools/probe_gfx1036_vcmp16.py
+10028	bc83450ac4140964259ad3b9a3bf2f6d2124a5c6	2026-11-23T18:32:25-05:00	SkippySteve	make_game: gta6rt.sh resolves a relative WINE before changing to the game folder
+10029	c61bca752d0963974ce4ef4f986899dfc210ae40	2026-11-24T00:31:48+01:00	Ritolino	test(hw_oracle): unit tests for tools/hw_oracle/drm.py
+10030	ec8d11010b21d654a9ad32c37115484f975149e6	2026-11-24T00:31:15+01:00	Ritolino	test(hw_oracle): unit tests for tools/hw_oracle/tsharp.py
+10031	545dc8fd6a15c30d37eec85a6e1e68e1b4562dbf	2026-11-24T00:31:48+01:00	Ritolino	test: SPIR-V translation tests for image_sample_d and image_sample_d_cl
+10032	ac5ca02a671814acd2ae8d6750aed3b389eb0b27	2026-11-24T00:20:58+01:00	maxence468	merge_check: preserve Unicode line separators in squash subjects
+10033	3ca5be83cdf87e414a3a7c1a60ad4da0edb5fcfc	2026-11-24T00:32:32+01:00	EspadaHD	wave32_pixel_scan: use shared same_report_path and catch --out write OSError
+10034	1f82097ce353d10f2d1e8378a32a1ff230c2fe98	2026-11-23T20:32:59-03:00	Ramon Victor Cardoso	tests: GPU fixture cs_w32_vcmp64_null for 64-bit integer v_cmp/v_cmpx null sources
+10036	98eb113e2610ce9f1990d8966bb601434b992a48	2026-11-24T00:33:07+01:00	tedin7	make_game: extract and translate the retail executable's 10 embedded shaders into shaders/exe
+10038	72c3806fdb92766911be8ab055c9bf47d7ae9776	2026-11-23T20:32:34-03:00	Igor Borges	docs: correct the retail XMem shim status
+10040	eb30560bf2eaca377a515681030500273561bb98	2026-11-23T17:30:51-06:00	Tiller431	bink_index: validate frame offsets within each stored stream
+10041	125a56889d871ff270a894baa35675c66affc4bc	2026-11-23T15:34:00-08:00	liamhob	d3d12_execute_indirect_validation_test: handle Windows 11 26300 relaxed max=0 and padded-stride bounds
+10042	26eedb7f7359fc3cf1fffb4cdb10ef5ce5548d7c	2026-11-23T15:34:00-08:00	liamhob	d3d12_clear_test: report Vulkan driver NaN depth-clear canonicalization to 1.0 on AMD
+10043	a3cccb632b4683b5534e866d0b5d59b683cfdf2c	2026-11-24T00:33:22+01:00	tedin7	anim_glb: bind weighted bones outside the skeleton as extra rest-pose joints
+10044	5254b20ee417ec0c1163343c2ecaab5bf70d1969	2026-11-23T17:48:39+01:00	SweatierKey	tests/semantic: follow forwarded %vgpr OpStore in test_image_sample_bias_nonps
+10045	baab2e8189f986e2ed9fd77b1754c3c803761549	2026-11-23T15:05:12-03:00	Matheus Fermiano	vk_subgroup_info: per_vertex_inputs needs VK_KHR_fragment_shader_barycentric listed
+10046	e29f8f0971e53c2fee57bd57d6809360e4971f2e	2026-11-23T18:33:39-05:00	icecreammule277-dot	tests: expect the unreadable path as OSError prints it (bink_names, opus_tags, world_names)
+10047	d350623242e92c3b26ea7084bd75d54fe5580868	2026-11-23T18:33:44-05:00	SkippySteve	run_guest_scene: take the Wine from $WINE when --wine is not given
+10048	bbc8999d509422782f39e106a77205b1d4f4dda4	2026-11-23T13:10:57-05:00	kykifox1337-source	d3d12: SYNC_COPY waits for the CLEAR stage too (D3D-838)
+10049	24ac12684617f30e9d5bfe97d90150add2feedfc	2026-11-24T00:33:56+01:00	tedin7	perf: read grass and prop instance lists in bulk in instance_lists
+10050	3bf949084455e79961153c63ee951aebf61c1c52	2026-11-23T23:32:25Z	Claude	mods: hash a mod.json name as hashdict.joaat does (lower-cased Latin-1, not UTF-8 bytes)
+10051	468b75ad1e3dbb7f17d344013b4b95a3c80e8d07	2026-11-23T20:47:13+01:00	tedin7	file_system: map G volume to package
+10052	a27bc7cdfda6e4c3fc730c4ca1780f8fcbe0325c	2026-11-23T15:15:46-05:00	WebIdentity1	Reject failed crosslane GPU dumps
+10053	ed65e8c977cba2c77d2b2b3f58b7bda9e31d9663	2026-11-23T18:05:11-05:00	QemmHD	runtime: link the fixtures with no base relocations with /INCREMENTAL:NO (BUILD-1550)
+10055	43b7df189c173c4f8a438c1dd29d0991e2e909c7	2026-11-24T01:35:11+02:00	wavehs	test_guest_scene_reference: compare the resolved loader path
+10056	809eca2a9baf80673f6a375de943f7a234142c19	2026-11-23T23:58:52+01:00	BlackNife	tests: the make_game --jobs tests no longer depend on the host's core count
+10057	005f6ec20f81552052cf7563912a6dff153fb4de	2026-11-24T00:41:49+01:00	Osis78	docs: clarify default pipeline cache placement
+10058	183d63f553a4c049f0073bb54a0b0adbac5d68d0	2026-11-24T00:01:20+01:00	Wail	rdna2spirv: write out a carry-out subtract of a register from itself (AMD Windows driver crash)
+10059	9b036354288b512b22a2b5aa09a15cb3a8a29e28	2026-11-24T01:35:39+02:00	wavehs	docs/i18n: the nine quickstarts say the stages run together, not in a chain
+10061	5f86fa5d449691032ecbe9a15785a23fe22058c6	2026-11-24T00:35:54+01:00	tedin7	test: replay_index_view_test covers the index view bounds in prepare_draw without a GPU
+10062	063f14dcd944170efb6cf907cdb9cd5ca57d8da9	2026-11-24T00:35:11+01:00	tedin7	fix: rdna2spirv decodes scalar, image and buffer tuples that run into vcc from the blob when llvm-mc rejects them
+10063	c90d09b7092344b09c8e01541f01e2e1bde851f3	2026-11-24T05:05:36+05:30	ShotTechOp	xdxr_bvh: handle D3D12 inactive primitives and NaN bounds
+10065	10f8f1b3f72d66f7a16944b53aa3ef501b4c31da	2026-11-23T17:35:34-06:00	Mumogg	runtime: main builds again (console descriptor heap, acphal context sizes)
+10066	bcc36841ee10720cf9e25dd7aa35b677b6b663e5	2026-11-24T05:06:51+05:30	ShotTechOp	meshlet_page: fix u16 running-sum wraparound, non-finite crashes, and 0-meshlet groups
+10067	645a1ea904b8a6e44e90123fb22ef652c101481a	2026-11-24T00:36:49+01:00	AGInformatique81	Ignore partial vulkaninfo output after a failed probe
+10068	c6b8d70f7ccea1fd4e6bbdff2c80d92e5eca6deb	2026-11-24T00:32:28+01:00	Louka Ayari-Pignel	dxgi: an _SRGB shader-resource view samples an 8-bit UNORM back buffer

@@ -1,0 +1,41 @@
+GPU:        NVIDIA GeForce RTX 5060 Ti (GB206, Blackwell, 16 GB GDDR7), subgroups 32..32
+Driver:     NVIDIA proprietary 620.73.04, Vulkan 1.4.357
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
+OS:         CachyOS (Arch Linux), kernel 7.3.1-1-cachyos
+Commit:     b4b7756e8 (main, 2026-11-25)
+Tools:      llvm-mc 23.1.4 (Arch llvm, AMDGPU target), SPIRV-Tools v2026.4
+            (Arch spirv-tools v2026.4.rc2-0-gef96ed763), CMake 4.5.1 +
+            Unix Makefiles, Python 3.14.9, Vulkan headers from Arch
+            vulkan-headers
+run_gpu_tests.py: 265 shaders: 265 translated, 265 pass spirv-val
+            native:                 207/256 passed, 49 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  239/256 passed, 17 skipped, 0 failed
+ctest (Vulkan subset, RelWithDebInfo): 76 configured: 74 passed, 2 skipped
+            (shader_library_corpus, vk_sync_validation), 0 failed
+Failed:     none. cs_imgload_tfe and cs_imgload_d16_tfe now PASS in both modes
+            ("r32 sint (sint view): 0 bad, texel(5,3) = 71") — the #31 pair that
+            failed on this GPU at ece4ba5b3 and 8f481cf16 ("64 bad, texel(5,3) =
+            2071"); the tfe fixture correction landed as #892.
+Skipped:    native: 31 skips "no 64-wide compute subgroup on this device", 1 skip
+            "no 64-wide subgroup on this device", 1 skip "this device cannot
+            require a 64-wide fragment subgroup: subgroup 32..32" (32-wide
+            subgroups; the wave64 suite needs a 64-wide device or the emulate
+            path), plus the 16 documented "run by d3d12_*_test / w64_graphics.py"
+            cases (cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect,
+            ps_live_width, ps_m15, ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff,
+            ps_m3, ps_m3_post, ps_m3_query, vs_m15, vs_m2, vs_m3).
+            emulated: ps_w64x_readlane plus the same 16.
+Notes:
+- Post-#892 re-run of the RTX5060Ti.txt baseline (native 197/248 passed, 49
+  skipped, 2 failed = the tfe pair; emulated 229/248 passed, 17 skipped,
+  2 failed). Native passes 197 -> 207: the two tfe fixtures plus 8 further
+  passes from suite growth (257 -> 265 shaders, 248 -> 256 judged cases;
+  ctest 72 -> 76 configured).
+- First Blackwell record in gpu-test-results/ with zero failures.
+- Every skip is a documented device-capability or cross-suite case; no
+  judgement was withheld on a 32-wide-capable test.
+- Built the portable (Vulkan) subset only: cmake -S runtime -B runtime/build
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo; cmake --build runtime/build --parallel 8
+  (gta6rt requires Windows; on Linux the Vulkan tools are what get built).
+- Machine is a headless-ish Steam PC (Hyprland session); tests ran with the
+  proprietary NVIDIA driver and the stock Vulkan loader, no gamescope.

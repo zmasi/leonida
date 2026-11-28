@@ -259,7 +259,9 @@ showed why that matters: several compiles that each needed gigabytes of host RAM
 modules now share a memory budget (`runtime/src/large_module_gate.h`): each one reserves 512 bytes of RAM per
 SPIR-V byte, and they enter the driver while their reservations fit three quarters of the memory available when
 the run starts, up to `--jobs` of them. One large module always gets in when none is compiling, so a module
-bigger than the whole budget still compiles, alone among the large ones. Small modules are never held back. On
+bigger than the whole budget still compiles, alone among the large ones. Small modules are never held back, and a
+large module that doesn't fit yet doesn't hold its thread: it goes back in the queue and the thread takes the next
+module. The oldest one put back gets in first once it fits, and no later large module passes it. On
 Linux the budget is the smaller of `MemAvailable` and the room under the cgroup v2 `memory.max` of the process and
 every cgroup above it (a container, or `systemd-run -p MemoryMax=...`); on Windows it is `ullAvailPhys`. Where
 neither can be read, every large module compiles alone, as before. After each large module, glibc builds call

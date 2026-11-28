@@ -163,7 +163,9 @@ sensor, about a pixel at Windows' default pointer speed without acceleration, so
 
 With raw input on and a window of this process in the foreground, the cursor is kept inside that window's client
 area (`ClipCursor`, re-applied every 100 ms) so that a click cannot land on another window; it is released when focus
-moves away or the keyboard pad is turned off. The cursor stays visible: hiding it has to happen on the thread that
+moves away or the keyboard pad is turned off. It is also released while the window is moved or sized, while a
+menu loop runs, and while a mouse press that began outside the client area (on the title bar or a border) is held, so
+the window can still be dragged; it comes back once the button is released. The cursor stays visible: hiding it has to happen on the thread that
 owns the game's window, which is the title's, not the shim's.
 
 Keys are read with `GetAsyncKeyState`, which needs no window or message loop (SDL's keyboard is part of its video

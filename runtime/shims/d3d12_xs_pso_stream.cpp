@@ -29,7 +29,7 @@ struct Layout {
 };
 
 // Size and alignment of each subobject payload this module walks (the SDK's D3D12_PIPELINE_STATE_SUBOBJECT_TYPE).
-// VIEW_INSTANCING and unknown types are not modelled: a stream with one is not captured.
+// Unknown types are not modelled: a stream with one is not captured.
 bool layout_of(unsigned type, Layout& out) {
     switch (type) {
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE: out = {8, 8}; return true;
@@ -60,6 +60,12 @@ bool layout_of(unsigned type, Layout& out) {
             out = {sizeof(D3D12_RT_FORMAT_ARRAY), 4};
             return true;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC: out = {sizeof(DXGI_SAMPLE_DESC), 4}; return true;
+        // Modelled so that a stream the creation parser accepts is also captured. That parser refuses a non-zero
+        // `ViewInstanceCount`, so the payload's `pViewInstanceLocations` is never read; only the entry's own size and
+        // alignment are needed to walk past it.
+        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING:
+            out = {sizeof(D3D12_VIEW_INSTANCING_DESC), 8};
+            return true;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CACHED_PSO: out = {sizeof(D3D12_CACHED_PIPELINE_STATE), 8}; return true;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1: out = {sizeof(D3D12_DEPTH_STENCIL_DESC1), 4}; return true;
         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2: out = {sizeof(D3D12_DEPTH_STENCIL_DESC2), 4}; return true;

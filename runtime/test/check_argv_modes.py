@@ -11,15 +11,26 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
 import tempfile
+import time
 
 
 def run(executable, command, cwd, environment):
-    result = subprocess.run(
-        command, executable=executable, cwd=cwd, env=environment,
-        capture_output=True, timeout=15,
-    )
+    try:
+        result = subprocess.run(
+            command, executable=executable, cwd=cwd, env=environment,
+            capture_output=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return {
+            "command": command,
+            "exit_code": None,
+            "lines": [],
+            "stdout": "",
+            "stderr": str(exc),
+        }
     output = result.stdout.decode("utf-8", "replace")
     return {
         "command": command,
@@ -31,6 +42,85 @@ def run(executable, command, cwd, environment):
     }
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
+def _strip_env_keys(environment, names):
+    """Remove environment keys (case-insensitively on Windows)."""
+    if _is_windows():
+        targets = {name.upper() for name in names}
+        for key in list(environment):
+            if key.upper() in targets:
+                del environment[key]
+    else:
+        for name in names:
+            environment.pop(name, None)
+
+
+def _preflight_paths(args, parser):
+    raw_loader = str(args.loader)
+    if not raw_loader.strip() or not Path(raw_loader).is_file():
+        parser.error(f"--loader is not an existing file: {raw_loader}")
+    for flag, path in (("--fixtures", args.fixtures), ("--work-dir", args.work_dir)):
+        raw = str(path)
+        if not raw.strip() or not Path(raw).is_dir():
+            parser.error(f"{flag} is not an existing directory: {raw}")
+    if args.report is not None:
+        raw_rep = str(args.report)
+        if not raw_rep.strip():
+            parser.error("--report path must not be empty")
+        if raw_rep.endswith(("/", "\\")) or (os.sep and raw_rep.endswith(os.sep)):
+            parser.error(f"--report must name a file, not a directory: {raw_rep}")
+        for cand in (Path(os.path.abspath(raw_rep)), Path(os.path.realpath(raw_rep))):
+            if cand.is_dir():
+                parser.error(f"--report is a directory: {raw_rep}")
+            anc = cand.parent
+            while str(anc) and not (anc.exists() or anc.is_symlink()):
+                if anc.parent == anc:
+                    break
+                anc = anc.parent
+            if str(anc) and not anc.is_dir():
+                parser.error(f"--report parent is not a directory: {anc}")
+
+
+def _write_report_atomic(path: Path, payload: dict) -> None:
+    dest = Path(os.path.realpath(path))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=dest.parent, prefix=".report-", suffix=".tmp")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if os.name == "posix":
+            try:
+                shutil.copymode(dest, tmp)
+            except FileNotFoundError:
+                pass
+        for delay in (0.01, 0.02, 0.04) if _is_windows() else ():
+            try:
+                os.replace(tmp, dest)
+                return
+            except PermissionError as exc:
+                if getattr(exc, "winerror", None) not in (5, 32, 33):
+                    raise
+                time.sleep(delay)
+        os.replace(tmp, dest)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def entry_count(lines):
     if not lines:
         return None
@@ -38,15 +128,16 @@ def entry_count(lines):
     return int(match[1]) if match else None
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--loader", type=Path, required=True)
     parser.add_argument("--fixtures", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--report", type=Path, help="optional retained JSON evidence")
-    args = parser.parse_args()
-    if os.name != "nt":
+    args = parser.parse_args(argv)
+    if not _is_windows():
         parser.error("this native MSVC startup comparison requires Windows")
+    _preflight_paths(args, parser)
     loader = args.loader.resolve(strict=True)
     fixtures = args.fixtures.resolve(strict=True)
     work_dir = args.work_dir.resolve(strict=True)
@@ -81,8 +172,7 @@ def main():
                 for case in cases:
                     label = f"{width}/{mode}/{case}"
                     environment = os.environ.copy()
-                    environment.pop("LEONIDA_GAME_DIR", None)
-                    environment.pop("LEONIDA_ARGV_SEQUENCE", None)
+                    _strip_env_keys(environment, ("LEONIDA_GAME_DIR", "LEONIDA_ARGV_SEQUENCE"))
                     if case == "sequence":
                         environment["LEONIDA_ARGV_SEQUENCE"] = "1"
                     native_command = subprocess.list2cmdline([guest.name]) + " " + tails[case]
@@ -129,7 +219,7 @@ def main():
             failures.append("the synthetic package was modified")
     report = {"acp": ctypes.windll.kernel32.GetACP(), "pairs": len(rows), "failures": failures, "rows": rows}
     if args.report:
-        args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8", newline="\n")
+        _write_report_atomic(args.report, report)
     print(f"argv modes: {len(rows)} native/mapped pairs, {len(failures)} failures, ACP {report['acp']}")
     return int(bool(failures))
 

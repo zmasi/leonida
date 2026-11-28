@@ -222,6 +222,37 @@ void test_stencil_mask_record() {
     check(out[dp + 0x10] == 0x01 && out[dp + 0x11] == 0x02, "tag 0 after tag 5 wins (record order)");
 }
 
+void test_view_instancing_is_captured() {
+    // The creation parser accepts a VIEW_INSTANCING subobject whose count is 0 (it refuses only a non-zero count).
+    // Such a stream must also be captured: otherwise the PSO carries no kept stream and every derived PSO on it is
+    // refused with "base PSO has no kept stream".
+    D3D12_INPUT_ELEMENT_DESC elements[1] = {make_element(kSemantic)};
+    std::vector<unsigned char> base = base_stream(elements, 1);
+    const std::size_t off = base.size();
+    const unsigned type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING;
+    const std::size_t payload = align_up(off + 4, 8);
+    base.resize(payload + sizeof(D3D12_VIEW_INSTANCING_DESC));
+    std::memcpy(base.data() + off, &type, sizeof(type));
+    D3D12_VIEW_INSTANCING_DESC vi{};
+    vi.ViewInstanceCount = 0;
+    vi.Flags = D3D12_VIEW_INSTANCING_FLAG_NONE;
+    std::memcpy(base.data() + payload, &vi, sizeof(vi));
+
+    auto rec = rt::d3d12_xs::PsoStreamRecord::capture({base.size(), base.data()});
+    check(rec != nullptr, "a stream with a zero-count VIEW_INSTANCING subobject is captured");
+    if (!rec) return;
+    check(rec->bytes().size() == base.size(), "the copy has the stream's size");
+    check(payload_of_type(rec->bytes(), type) == payload, "the VIEW_INSTANCING payload keeps its offset");
+
+    // And a derived record still resolves against it, which is what the PSO needs.
+    D3D12_RASTERIZER_DESC raster{};
+    raster.FillMode = D3D12_FILL_MODE_WIREFRAME;
+    auto r1 = record(1, &raster, sizeof(raster));
+    std::vector<unsigned char> out;
+    check(rt::d3d12_xs::derive_stream(*rec, r1.data(), 1, out) == rt::d3d12_xs::DeriveStatus::ok,
+          "a derived stream still derives on a base with VIEW_INSTANCING");
+}
+
 void test_refusals() {
     D3D12_INPUT_ELEMENT_DESC elements[1] = {make_element(kSemantic)};
     std::vector<unsigned char> base = base_stream(elements, 1);
@@ -262,6 +293,7 @@ int main() {
     test_capture_and_deep_copy();
     test_derive_single_and_all_tags();
     test_stencil_mask_record();
+    test_view_instancing_is_captured();
     test_refusals();
     std::printf("%s: %d failure(s)\n", g_failures ? "FAILED" : "OK", g_failures);
     return g_failures ? 1 : 0;

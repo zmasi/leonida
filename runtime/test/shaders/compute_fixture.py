@@ -8,15 +8,17 @@ from pathlib import Path
 def compute_header(asm_path, shift=0):
     # Default: four user SGPRs (V#), TGID_X, 512 bytes LDS, 64 threads. `shift`: see shift_user_data.
     rsrc2, group = 0x8088, (64, 1, 1)
-    for line in Path(asm_path).read_text(encoding="utf-8").splitlines():
+    for line in Path(asm_path).read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if not line:
             continue
         if not line.startswith(";"):
             break
-        size = re.match(r";\s*group:\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)", line)
+        size = re.match(r";\s*group:\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)", line)
         if size:
             group = tuple(map(int, size.groups()))
+            if any(not 1 <= d <= 0xFFFFFFFF for d in group):
+                raise ValueError(f"group dimensions must be in 1..0xFFFFFFFF, got {group}")
         elif line[1:].lstrip().startswith("rsrc2:"):
             rsrc2 = int(line.split(":", 1)[1].strip(), 0)
     header = bytearray(0x148)
@@ -37,7 +39,14 @@ def shift_user_data(text, shift):
     reuses such a fixture builds it with LEONIDA_USER_DATA_SHIFT=4: the same program, its user data 4 SGPRs up, and
     shifted_rsrc2 moves the user count and the thread-group ids that follow it. Named registers (vcc, exec, m0,
     ttmp) don't move. Raises ValueError when a register would pass s105."""
+    if type(shift) is not int or shift < 0:
+        raise ValueError(f"shift must be a non-negative integer, got {shift!r}")
     if shift == 0:
+        for line in text.splitlines():
+            code = line.partition(";")[0]
+            for m in _SGPR_RANGE.finditer(code):
+                if int(m.group(1)) > int(m.group(2)):
+                    raise ValueError(f"inverted SGPR range s[{m.group(1)}:{m.group(2)}]")
         return text
 
     def one(m):
@@ -47,7 +56,10 @@ def shift_user_data(text, shift):
         return f"s{n}"
 
     def pair(m):
-        lo, hi = int(m.group(1)) + shift, int(m.group(2)) + shift
+        src_lo, src_hi = int(m.group(1)), int(m.group(2))
+        if src_lo > src_hi:
+            raise ValueError(f"inverted SGPR range s[{m.group(1)}:{m.group(2)}]")
+        lo, hi = src_lo + shift, src_hi + shift
         if hi >= SGPR_LIMIT:
             raise ValueError(f"s[{m.group(1)}:{m.group(2)}] + {shift} is past s{SGPR_LIMIT - 1}")
         return f"s[{lo}:{hi}]"
@@ -62,6 +74,8 @@ def shift_user_data(text, shift):
 
 def shifted_rsrc2(rsrc2, shift):
     """COMPUTE_PGM_RSRC2 with USER_SGPR [5:1] raised by `shift` (the enabled thread-group ids follow it)."""
+    if type(shift) is not int or shift < 0:
+        raise ValueError(f"shift must be a non-negative integer, got {shift!r}")
     user = ((rsrc2 >> 1) & 31) + shift
     if not 0 <= user <= 31:
         raise ValueError(f"USER_SGPR {user} does not fit RSRC2's 5-bit field")

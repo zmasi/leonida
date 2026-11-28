@@ -1,0 +1,82 @@
+UPDATE 2026-11-25, re-run on current main. The sections below are the earlier measurement at 21625bca8
+(2026-11-24) and are kept for reference; where they differ, THIS block is current.
+
+Commit:     5fab93967 (main, 2026-11-25, merge of #1630); same container, driver, llvm-mc 19.1.1, system
+            Vulkan headers (VK_HEADER_VERSION 275), CMake + Ninja Release build as below
+run_gpu_tests.py: 277 shaders: 277 translated, 277 pass spirv-val (both modes)
+            native:                 208/268 passed, 59 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:  243/268 passed, 24 skipped, 1 failed
+Failed:     cs_imgatomic_ext: "6 of 64 sint words differ; first word 32: got 0x0badf00d, expected 0x00000101"
+            (both modes; open fix #1518). The cs_imgload_tfe pair, which failed at 21625bca8, passes now.
+Device:     NVIDIA GeForce RTX 5060 Laptop GPU (subgroup 32..32).
+AI-assisted (Claude Code): rebuilt main at 5fab93967 on this GPU and ran run_gpu_tests.py native and
+under LEONIDA_W64_EMULATE=1; counts and FAIL lines are copied from those runs. The skip lists and per-fixture
+notes further down were NOT re-derived for this commit.
+------------------------------------------------------------------------------
+
+GPU:        NVIDIA GeForce RTX 5060 Laptop GPU (Blackwell, PCI 10de:2d19), host CPU Intel Core Ultra 7 255H
+Driver:     NVIDIA 620.70.06 (proprietary, driverVersion 620.70.6.0), Vulkan 1.4.357
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32; subgroupSizeControl,
+            requiredSubgroupSizeStages count 14; default 32)
+OS:         Ubuntu 24.04.4 LTS container, kernel 7.3.3-300.fc45.x86_64
+Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31 (main, 2026-11-24)
+Tools:      llvm-mc 19.1.1 (Ubuntu LLVM, /usr/lib/llvm-19/bin), SPIRV-Tools v2025.1 (Ubuntu
+            spirv-tools, "unknown hash"), Python 3.12.3, system Ubuntu Vulkan headers
+            (VK_HEADER_VERSION 275), not the pinned 1.4.363 SDK; docs/testing.md says older
+            headers still build but skip what needs VK_KHR_maintenance8
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val (both modes)
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 1, tier C: 1
+            native:                 194/248 passed, 52 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  226/248 passed, 20 skipped, 2 failed
+            Arithmetic: native 194 + 52 + 2 = 248; emulated 226 + 20 + 2 = 248.
+Failed:     cs_imgload_d16_tfe and cs_imgload_tfe, with byte-identical output in both modes:
+            "exit 1: r32 sint (sint view): 64 bad, texel(5,3) = 2071". That is the known #31
+            pair and the same words as RTX5070.txt and IntelMTL.txt; IntelMTL.txt reports the pair passing with #98 (not measured here);
+            RTX5070.txt does not mention #98.
+Skipped:    native 52 = 16 documented "run by d3d12_*_test / w64_graphics.py" cases
+            (cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width, ps_m15,
+            ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post, ps_m3_query,
+            vs_m15, vs_m2, vs_m3)
+            + 31 "no 64-wide compute subgroup on this device"
+            + 1 "no 64-wide subgroup on this device" (the mesh case, ms_w64x_ballot)
+            + 3 "unsupported: VK_KHR_maintenance8 (non-constant texel Offset)"
+            (ps_texoff, ps_texoff_forms, ps_texoff_implicit)
+            + 1 "this device cannot require a 64-wide fragment subgroup: subgroup 32..32"
+            (ps_w64x_readlane)
+            Emulated 20 = the same 16 documented cases + the 3 maintenance8 cases + the one
+            fragment-subgroup case; all 32 wave64 skips run and pass.
+Notes:
+- Every skip and every pass is a printed fixture name plus its words; no shader source, SPIR-V
+  bytes or game data are kept here.
+- The device has no 64-wide subgroup at all, so natively only wave32 runs: the 31 compute wave64
+  fixtures and ms_w64x_ballot skip, and under LEONIDA_W64_EMULATE=1 all 32 run and pass
+  (cs_wave64_ballot prints "32 16 24 40 8 48", ms_w64x_ballot 4096/4096 pixels exact).
+- vulkaninfo advertises VK_KHR_maintenance8 (revision 1), VK_KHR_fragment_shader_barycentric
+  (revision 1, fragmentShaderBarycentric = true), VK_NV_fragment_shader_barycentric and
+  VK_EXT_mesh_shader (revision 1). The three maintenance8 skips are therefore a header limit,
+  not a driver one: runtime/test/vk_texture_test.cpp guards the whole maintenance8 block with
+  "#ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME", and the system headers (VK_HEADER_VERSION 275)
+  do not declare it, so the extension is never enabled and the test exits 77. With headers that
+  declare it the three would at least be attempted; not measured here.
+- The barycentric extension is present, so ps_bary, ps_persp_bary, ps_uniform_branch,
+  ps_scc_mask32, ps_ij_computed, ps_interp_f16_high and ms_f16_pack all run natively and pass,
+  and neither log mentions a barycentric or f16-interp fallback. The only fragment-subgroup
+  skip is ps_w64x_readlane, which cannot require a 64-wide fragment subgroup on a 32..32 device.
+- Mesh support is exposed: five of the six ms_* fixtures run natively and pass (ms_clip 2048/4096
+  pixels covered as expected, ms_tri 4096/4096 exact, ms_v5_workgroup 24/24 workgroup coordinates,
+  ms_wave_info_s3 4096/4096 exact, ms_f16_pack within 2e-3); ms_w64x_ballot is the wave64 one.
+- Nothing was inexact in the run itself: 78 native and 79 emulated cases print 4096/4096, and the
+  compute and draw cases print their exact words or pixel masks.
+- There is no RTX5080.txt in gpu-test-results/ at this commit; the sibling RTX 50 entry is
+  RTX5070.txt (197/248 native, 49 skipped, 2 failed; 229/248 emulated, 17 skipped), which reports
+  the same two failures in both modes. Its skip categories are the three seen here too -
+  16 documented, 31 plus 1 wave64, and one fragment-subgroup case - and this record skips
+  exactly 3 more in each mode (52 vs 49, 20 vs 17), which is the three ps_texoff* fixtures. That
+  difference follows from the graphics stack (Ubuntu's Vulkan headers 1.3.275 (VK_HEADER_VERSION 275) vs the SDK's
+  1.4.363), not from the GPU, and it is the only skip difference. This GPU also passes 3 fewer
+  cases than the RTX 5070 natively (194 vs 197) and 3 fewer emulated (226 vs 229), the same three
+  fixtures.
+- The logs contain synthetic fixture output only; no game files were used.
+- AI-assisted (pi coding agent operated by the repo contributor): built main at 21625bca
+  (CMake+Ninja on this GPU), ran run_gpu_tests.py native and under LEONIDA_W64_EMULATE=1, and
+  extracted the numbers above from the run logs.

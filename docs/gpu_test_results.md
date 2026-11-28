@@ -20,8 +20,27 @@ post counts and pass/fail lines there, never game shaders, logs or private paths
 | NVIDIA GeForce RTX 5070 Ti (Blackwell), subgroup 32..32 | NVIDIA 617.42, Vulkan 1.4.351, Windows 11 Pro 26300 | `21625bc` | 257/257 translated and valid (run_gpu_tests.py) | run via run_gpu_tests.py | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31) | [local note](../gpu-test-results/RTX5070Ti.txt) |
 | Apple M5 Pro (16-core GPU, Metal 4), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 26.7.3 (25G342) | `d42773d07` | 280/280 translated and valid | 175/219 pass, 39 skipped, 5 failed | 183/248 passed, 61 skipped, 4 failed (native); 214/248 passed, 30 skipped, 4 failed (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (known row), `cs_imgload_tfe`, `cs_imgload_d16_tfe` (pass with #291), `ps_imgatomic` flake (#543) | [local note](../gpu-test-results/AppleM5Pro.txt) |
 | Apple M3 (10-core GPU), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 26.5.1 (25F80) | `a73a57e13` | stops at `cs_dpp_cmp` on `main`; 301/301 translated and valid with #1444 | 185/234 pass, 44 skipped, 5 failed (with #1444) | 195/268 passed, 70 skipped, 3 failed (native); 229/268 passed, 36 skipped, 3 failed (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (#1724), `ps_ssharp` (#1774), `cs_imgatomic_ext` (#1518); check.py also `ps_ij_computed`, `ps_interp_f16_high` (#2176); validation clean but for the three documented messages; KosmicKrisp 190/268 (`cs_bvh`, `cs_bvh32`, `ps_cndmask_sign_mods`, `ps_valu16_mad_sel`: its `(NAN)` constants, #2229; `cs_imgatomic_ext`); llvmpipe 177/268 (`cs_imgatomic_ext`) | [local note](../gpu-test-results/AppleM3.txt) |
+| AMD Radeon RX 7900 XTX (RDNA3, gfx1100), subgroup 32..64 | RADV, Mesa 25.2.8 (Ubuntu 24.04), Vulkan 1.4.318 | `5fab93967` | not run | not run | 242/268 passed, 24 skipped, 2 failed (native and `LEONIDA_W64_EMULATE=1`) | `cs_imgatomic_ext` (#1518), `cs_w32_salu64` (documented RADV Mesa 25.2); the `cs_imgload_*_tfe` pair now passes | [local note](../gpu-test-results/RX7900XTX.txt) |
+| NVIDIA GeForce RTX 5060 Laptop (Blackwell, GB207), subgroup 32..32 | NVIDIA 620.70.06, Ubuntu 24.04, Vulkan 1.4.357 | `5fab93967` | not run | not run | 208/268 passed, 59 skipped, 1 failed (native); 243/268 passed, 24 skipped, 1 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgatomic_ext` (#1518); the `cs_imgload_*_tfe` pair now passes | [local note](../gpu-test-results/RTX5060Laptop.txt) |
+| Intel Graphics (Arrow Lake-H), subgroup 8..32 | ANV, Mesa 25.2.8 (Ubuntu 24.04), Vulkan 1.4.318 | `5fab93967` | not run | not run | 203/268 passed, 62 skipped, 3 failed (native); 238/268 passed, 27 skipped, 3 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgatomic_ext` (#1518), `cs_signed_zero_nan` (documented ANV Mesa 25.2), `cs_fmt_int_narrow` (unknown; see note); the `cs_imgload_*_tfe` pair now passes | [local note](../gpu-test-results/IntelARL.txt) |
 | NVIDIA GeForce RTX 3080 (Ampere, GA102, 10 GB GDDR6X), subgroup 32..32 | NVIDIA 580.178.04, Vulkan 1.4.312, Ubuntu 26.04 LTS | `d2cd6c0` | not run | not run | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31; see #280) | [local note](../gpu-test-results/RTX3080.txt) |
 | NVIDIA GeForce RTX 5060 Ti (Blackwell), subgroup 32..32 | NVIDIA 610.88, Windows 11 | `5d74c27` | 270/270 translated and valid | 176/211 pass, 35 skipped | 192/241 passed, 48 skipped (native); 25/26 (`LEONIDA_W64_EMULATE=1 --filter w64`) | `ms_wave_info_s3` (known #8608) | [#166](https://github.com/ItsNotRexed/Leonida/issues/166) |
+| Intel Iris Xe Graphics (Xe-LP / Gen12.2, Alder Lake-P, PCI `8086:46a6`), subgroup 8..32 | Intel proprietary 32.0.101.7088, Vulkan 1.4.323, Windows 11 26H2 (26200) | `5d74c27` / `a60e5ea` | 270/270 translated and valid | 160/211 native, 191/211 emulated (`5d74c27`) | 171/241 native, 201/241 emulated (`5d74c27`); 174/244 native, 204/244 emulated (`a60e5ea`); 213/241 all fallbacks (`5d74c27`) | none natively; `ms_wave_info_s3` under `MESH_COMPUTE=1` (fixed by #9826) | this page |
+| NVIDIA GeForce RTX 3070 Ti Laptop GPU (Ampere GA104, PCI `10de:24e0`), subgroup 32..32 | NVIDIA 616.64 (32.0.16.1664), Vulkan 1.4.351, Windows 11 26H2 (26200) | `5d74c27` / `a60e5ea` | 270/270 translated and valid | 176/211 native, 207/211 emulated (`5d74c27`) | 192/241 native, 223/241 emulated (`5d74c27`); 226/244 emulated (`a60e5ea`) | `ms_wave_info_s3` (known SHADER-766, fixed by #9826) | this page |
+| NVIDIA GeForce RTX 2080 Ti (Turing, TU102), subgroup 32..32 | NVIDIA 572.83 (proprietary), Vulkan 1.4.303, Windows 10 Pro 22H2 19045 | `5a5df8e0b` | not run; `run_gpu_tests.py` translated 265/265, all spirv-val clean | not run | 204/256 passed, 52 skipped (native); 236/256 passed, 20 skipped (`LEONIDA_W64_EMULATE=1`) | none in either mode | [local note](../gpu-test-results/RTX2080Ti.txt) |
+| NVIDIA GeForce RTX 5060 Ti (Blackwell, GB206), subgroup 32..32 | NVIDIA 620.73.04 (proprietary), Vulkan 1.4.357, CachyOS | `b4b7756` | 265/265 translated and valid (via run_gpu_tests.py) | not run separately (run_gpu_tests.py below) | 207/256 passed, 49 skipped, 0 failed (native); 239/256 passed, 17 skipped, 0 failed (`LEONIDA_W64_EMULATE=1`); ctest (Vulkan subset, RelWithDebInfo): 76 configured, 74 passed, 2 skipped, 0 failed | none (the #31 tfe pair passes post-#892) | [local note](../gpu-test-results/RTX5060Ti-post892.txt) |
+| NVIDIA GeForce GTX 1050 Ti Max-Q (Pascal GP107M), subgroup 32..32 | NVIDIA 555.58.02, Vulkan 1.3.278, Linux | `3aa9754` | 283/283 translated and valid | 184/222 pass, 38 skipped | 190/252 passed, 62 skipped (native); 221/252 passed, 31 skipped (`LEONIDA_W64_EMULATE=1`); 234/252 passed, 18 skipped (plus `LEONIDA_MESH_COMPUTE=1 LEONIDA_BARY_FALLBACK=1 LEONIDA_TEXOFF_FALLBACK=1`) | none in the shader suites; ctest: `xdxr_build_check` timeout (see note) | [local note](../gpu-test-results/GTX1050Ti-Linux.txt) |
+| Intel UHD Graphics 630 (Coffee Lake GT2, Gen9.5), subgroup 8..32 | ANV, Mesa 26.1.6, Vulkan 1.4.354, Linux | `3aa9754` | 283/283 translated and valid | 182/222 pass, 40 skipped | 195/252 passed, 57 skipped (native); 226/252 passed, 26 skipped (`LEONIDA_W64_EMULATE=1`) | none in the shader suites; ctest: `vk_predicated_copy`, `xdxr_build_check` timeout (see note) | [local note](../gpu-test-results/UHD630-Linux.txt) |
+| Apple M5 (8-core GPU, Metal 4), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 27.2.1 (26B131) | `47c651174` | 281/281 translated and valid | 175/220 pass, 39 skipped, 6 failed | 185/249 passed, 61 skipped, 3 failed (native); 215/249 passed, 30 skipped, 4 failed (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (known row), `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31), `ps_imgatomic` flake (#543) | [local note](../gpu-test-results/AppleM5.txt) |
+| AMD Radeon 780M (RDNA3 iGPU, gfx1103), subgroup 32..64 | AMD proprietary 26.10.2 (LLPC), Vulkan 1.4.359, Windows 11 10.0.29712 | `bcaa13d` | not run; 273/273 translated and valid via run_gpu_tests.py | not run separately (run_gpu_tests.py below) | 243/263 passed, 18 skipped, 2 failed (native and emulated) | `cs_imgatomic_ext` (#1518), `cs_texture_uav` (no D3D12 build on this machine) | [local note](../gpu-test-results/780M.txt) |
+| NVIDIA GeForce RTX 4060 Ti (Ada, AD106), subgroup 32..32 | NVIDIA 610.88, Vulkan 1.4.341, Windows 11 26300.9974 | `8f481cf` | run via run_gpu_tests.py | run via run_gpu_tests.py | 197/248 passed, 49 skipped (native); 229/248 passed, 17 skipped (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31) | [local note](../gpu-test-results/RTX4060Ti.txt) |
+| NVIDIA GeForce RTX 3050 6GB Laptop GPU (Ampere, GA107), subgroup 32..32 | NVIDIA 621.24, Vulkan 1.4.357, Windows 11 26300.9974 | `8f481cf` | not run (257/257 translated and valid inside run_gpu_tests.py) | not run | 197/248 passed, 49 skipped (native); 229/248 passed, 17 skipped (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (pass with #291) | [local note](../gpu-test-results/RTX3050-Laptop.txt) |
+| Apple M4 (8-core GPU), subgroup 4..32 | MoltenVK 1.4.2 (Homebrew), Vulkan 1.4.357, macOS 27.3 | `1c93c86` | 280/280 translated and valid | 174/219 pass, 39 skipped, 6 failed | 183/248 passed, 61 skipped (native); 214/248 passed, 30 skipped (`LEONIDA_W64_EMULATE=1`) | `cs_fma_fused` (known row), `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31; pass with #291), `ps_ssharp` (deterministic, near old #7587) | [local note](../gpu-test-results/AppleM4.txt) |
+| AMD Radeon RX 6900 XT (RDNA2, GFX1030), subgroup 32..64 | RADV, Mesa 26.2.4, Vulkan 1.4.354, Nobara Linux 44 (kernel 7.2.10) | `21625bc` | 280/280 translated and valid | 214/219 pass, 3 skipped, 2 failed | 230/248 passed, 16 skipped, 2 failed (native and emulated alike) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (SHADER-1266 / #31; see below) | [local note](../gpu-test-results/RX6900XT.txt) |
+| NVIDIA GeForce RTX 2070 SUPER (Turing, TU104), subgroup 32..32 | NVIDIA 620.70.06, Vulkan 1.4.357, Fedora Linux 44 | `21625bc` | not run | not run | 257/257 translated, spirv-val clean; 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31) | [local note](../gpu-test-results/RTX2070Super.txt) |
+| AMD Radeon RX 6600 (RDNA2, Navi 23), subgroup 32..64 | AMD 26.11.2, Vulkan 1.4.315, Windows 11 26300.10075 | `6293c1c4f` | not run | not run | 235/252 passed, 17 skipped (native, 3 runs, and `LEONIDA_W64_EMULATE=1`) | none in `run_gpu_tests.py`; `ctest` 292 passed, 12 skipped, 4 failed: `d3d12_texture_tiles`, `d3d12_execute_indirect_validation`, `d3d12_clear` (#787), `d3d12_mesh` | [local note](../gpu-test-results/RX6600.txt) |
+| NVIDIA GeForce RTX 5070 (Blackwell), subgroup 32 | NVIDIA 617.42, Vulkan 1.4.363, Windows 11 26200.9974 | `21625bc` | not run | not run | 197/248 passed, 49 skipped, 2 failed (native); 229/248 passed, 17 skipped, 2 failed (`LEONIDA_W64_EMULATE=1`) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31, known; pass with #98) | [local note](../gpu-test-results/RTX5070-617.42.txt) |
+| AMD Radeon 660M (RDNA2 iGPU, gfx1035, Ryzen 5 7535HS), subgroup 32..64 | AMD Adrenalin 32.0.21045.1000 (Vulkan driver 2.0.353), Vulkan 1.4.315, Windows 11 26200 | `21625bc` | 280/280 translated and valid | 213/219 pass, 4 skipped, 2 failed | 223/248 passed, 23 skipped, 2 failed (native and emulated alike) | `cs_imgload_tfe`, `cs_imgload_d16_tfe` (#31) | [below](#amd-radeon-660m--2026-11-24) |
 
 ## AMD Radeon RX 9070 GRE — 2026-11-23
 
@@ -191,3 +210,187 @@ Setup: `cmake -S runtime -B runtime/build -DLLVM_MC=<path-to-llvm-mc.exe>`; `cma
 All 8 D3D12 shader tests (`d3d12_translated_draw`, `d3d12_m2_textured`, `d3d12_m2_formats`, `d3d12_m3_frame`, `d3d12_m3_first_pass`, `d3d12_m4_compute`, `d3d12_buffer_uav`, `d3d12_subgroup`) passed 8/8.
 
 AI-assisted: built `main` at `5d74c2723`, ran `ctest`, `build.py`, `check.py`, and `run_gpu_tests.py` on this GPU with synthetic inputs only (no game files).
+
+## Intel Iris Xe Graphics (Alder Lake-P) — 2026-11-24
+
+```
+GPU:        Intel(R) Iris(R) Xe Graphics (Xe-LP / Gen12.2, Core i7-12700H, PCI 8086:46a6)
+Driver:     Intel proprietary Windows 32.0.101.7088, Vulkan 1.4.323
+Subgroup:   8..32 (default 32, maxPushConstantsSize 256, per_vertex_inputs: false)
+OS:         Windows 11 Home 26H2 (build 26200)
+Commits:    5d74c2723, a60e5eab5, 2d53a8055 (main, 2026-11-24)
+Tools:      MSYS2 clang64 LLVM 23.1.5 (llvm-mc with AMDGPU target), SPIRV-Tools v2026.4,
+            Clang 23.1.5, CMake 4.5.1, Ninja 1.13.2, CPython 3.11.9
+build.py:   270 shaders: 270 translated, 270 pass spirv-val (native and LEONIDA_W64_EMULATE=1, 5d74c2723)
+check.py:   160 of 211 pass, 51 skipped natively; 191 of 211 pass, 20 skipped with LEONIDA_W64_EMULATE=1 (5d74c2723)
+run_gpu_tests.py:
+            5d74c2723 native:        171/241 passed, 70 skipped, 0 failed
+            5d74c2723 W64_EMULATE=1: 201/241 passed, 40 skipped, 0 failed
+            5d74c2723 all fallbacks (W64_EMULATE + BARY_FALLBACK + TEXOFF_FALLBACK + MESH_COMPUTE):
+                                     213/241 passed, 27 skipped, 1 failed (ms_wave_info_s3)
+            a60e5eab5 native:        174/244 passed, 70 skipped, 0 failed
+            a60e5eab5 W64_EMULATE=1: 204/244 passed, 40 skipped, 0 failed
+FMA:        cs_fma_fused — glsl: 3/7 f32 fused / 4/7 split (f16 exact); khr: SKIP (no VK_KHR_shader_fma);
+            exact: 8/8 fused exact
+PC_TAIL_UBO: LEONIDA_PC_TAIL_UBO=1 passed on cs_user_sgprs, cs_heap_init, ps_tex (6/12, 6 feature skips),
+            ps_ops* (8/8), vs_clip* (3/3)
+ctest:      72/72 portable C++ tests passed on 2d53a8055 (70 passed, 2 skipped, 0 failed, excluding CPU-only xdxr_build_check)
+Failed:     none natively or under W64_EMULATE=1. Under LEONIDA_MESH_COMPUTE=1, ms_wave_info_s3 failed with
+            (-1,-1,-1,-1) (known SHADER-766 %ms_counts single-writer guard; passes 6/6 mesh fixtures with #9826).
+Skipped:    native skips on 5d74c2723 (run_gpu_tests.py): 30 wave64 compute, 6 mesh (no VK_EXT_mesh_shader),
+            4 shaderFloat64, 4 BaryCoordKHR, 3 VK_KHR_maintenance8 texoff, 3 shaderResourceMinLod,
+            3 narrow/non-64 fragment subgroup, 1 computed I/J without PerVertexKHR (passes with #9855),
+            and 16 harness-external d3d12_* / w64_graphics cases.
+```
+
+Setup: built portable Vulkan test binaries with `-DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF` using MSYS2 `clang64`
+(`clang++ 23.1.5`, `cmake 4.5.1`, `ninja 1.13.2`, `llvm-mc 23.1.5`, `spirv-tools v2026.4`, `vulkan-headers`) and
+selected the iGPU with `LEONIDA_VK_DEVICE=Intel`.
+
+## NVIDIA GeForce RTX 3070 Ti Laptop GPU — 2026-11-24
+
+```
+GPU:        NVIDIA GeForce RTX 3070 Ti Laptop GPU (Ampere GA104, PCI 10de:24e0)
+Driver:     NVIDIA proprietary Windows 616.64 (32.0.16.1664), Vulkan 1.4.351
+Subgroup:   32..32 (maxPushConstantsSize 256, per_vertex_inputs: true, VK_EXT_mesh_shader, VK_KHR_shader_fma)
+OS:         Windows 11 Home 26H2 (build 26200)
+Commits:    5d74c2723, a60e5eab5, 2d53a8055 (main, 2026-11-24)
+Tools:      MSYS2 clang64 LLVM 23.1.5, SPIRV-Tools v2026.4, Clang 23.1.5, CMake 4.5.1, Ninja 1.13.2, CPython 3.11.9
+build.py:   270 shaders: 270 translated, 270 pass spirv-val (native and LEONIDA_W64_EMULATE=1, 5d74c2723)
+check.py:   176 of 211 pass, 35 skipped natively; 207 of 211 pass, 4 skipped with LEONIDA_W64_EMULATE=1 (5d74c2723)
+run_gpu_tests.py:
+            5d74c2723 native:        192/241 passed, 48 skipped, 1 failed (ms_wave_info_s3)
+            5d74c2723 W64_EMULATE=1: 223/241 passed, 17 skipped, 1 failed (ms_wave_info_s3)
+            a60e5eab5 W64_EMULATE=1: 226/244 passed, 17 skipped, 1 failed (ms_wave_info_s3)
+FMA:        cs_fma_fused — glsl: 8/8 fused exact; khr: 8/8 fused exact; exact: 8/8 fused exact
+ctest:      73/73 portable C++ tests passed on 2d53a8055 (71 passed, 2 skipped, 0 failed, including xdxr_build_check)
+Failed:     ms_wave_info_s3: at (0,0) got (-1.0000,-1.0000,-1.0000,-1.0000), want (0.0078,0.0078,0.5,1.0)
+            (known SHADER-766 %ms_counts single-writer guard; passes 6/6 mesh fixtures with #9826).
+Skipped:    W64_EMULATE=1 skips are the 16 harness-external d3d12_* / w64_graphics cases plus ps_w64x_readlane
+            (subgroup 32..32 cannot require 64-wide fragment subgroup).
+```
+
+AI-assisted: built the portable Vulkan test tools locally on Windows 11 with MSYS2 `clang64` and ran all synthetic shader and C++ `ctest` suites on both GPUs (no game files).
+
+## AMD Radeon 780M — 2026-11-25
+
+```
+GPU:        AMD Radeon 780M Graphics (RDNA3 iGPU, gfx1103, WDDM 3.2, 16 GB shared), subgroup 32..64
+Driver:     AMD proprietary 26.10.2 (32.0.32015.12012, LLPC), Vulkan 1.4.359
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64)
+OS:         Windows 11, 10.0.29712
+Commit:     bcaa13dad35f560748bd9b6293cd46504fe288c6 (main, 2026-11-25)
+run_gpu_tests.py: 273 shaders: 273 translated, 273 pass spirv-val
+            Native: 243/263 passed, 18 skipped, 2 failed.
+            LEONIDA_W64_EMULATE=1: 243/263 passed, 18 skipped, 2 failed.
+Failed:     cs_imgatomic_ext (#1518), cs_texture_uav (no D3D12 build on this machine)
+Skipped:    18 skips are the documented "run by d3d12_*_test / w64_graphics.py" cases.
+```
+
+Setup: `cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=<llvm-mingw clang++> -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF -DLEONIDA_VULKAN_HEADERS_FETCH=ON`;
+the pinned Khronos Vulkan-Headers release (6802bb47, vulkan-sdk-1.4.363.0) is declared with a SHA256 URL_HASH in
+`runtime/CMakeLists.txt` and was supplied directly to CMake, because this machine already has Vulkan 1.3 headers in the include search path and the fetch is only taken when no
+Vulkan headers are found. This machine also has no MSVC and no Windows SDK, so the D3D12-side runtime and its tests are not built:
+the 18 cases above skip, and `cs_texture_uav` fails because its D3D12 test program is not built (`docs/testing.md`: a missing test
+executable on Windows fails the runner). The full record, with every skip by name, is in
+[`gpu-test-results/780M.txt`](../gpu-test-results/780M.txt).
+
+Both failing cases are new since the previous record, not regressions. `cs_imgatomic_ext` is the fixture whose 3D volume T# does
+not carry the tag `vk_store_test` now expects (#1518), and pull request 1518 fixes it: with 1518 applied to this commit, `--filter cs_imgatomic` passes 3 of 3 on this GPU.
+`cs_texture_uav` is the D3D12 case above. The four failures of the previous record (`cs_w32_exec_computed`,
+`cs_w64_exec_computed`, `cs_imgload_tfe`, `cs_imgload_d16_tfe`) now pass at this commit.
+
+AI-assisted (MiniMax Code): built `main` at `bcaa13dad`, ran `run_gpu_tests.py` on this GPU natively and with
+`LEONIDA_W64_EMULATE=1`, and reran the `cs_imgatomic` family with 1518 applied.
+
+## NVIDIA GeForce RTX 4060 Ti — 2026-11-24
+
+```
+GPU:        NVIDIA GeForce RTX 4060 Ti (Ada / AD106, PCI 10de:2805), subgroup 32..32
+Driver:     NVIDIA 610.88 (Windows driver 32.0.16.1088), Vulkan 1.4.341
+OS:         Windows 11, 10.0.26300.9974
+Commit:     8f481cf16 (main, 2026-11-24)
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
+            native: 197/248 passed, 49 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1: 229/248 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (#31)
+```
+
+The device has no 64-wide subgroup. Natively, the 33 wave64 tests skip; under `LEONIDA_W64_EMULATE=1` all but the
+64-wide fragment one run and pass. The other 16 skips are the documented "run by d3d12_*_test / w64_graphics.py"
+cases. On the same checkout `ctest` passed 302/303: `d3d12_execute_indirect_validation` fails 5 parity cases on this
+host's D3D12 runtime (10.0.26100.9818), and #337 makes it 303/303. The full record is in
+[`gpu-test-results/RTX4060Ti.txt`](../gpu-test-results/RTX4060Ti.txt).
+
+AI-assisted (Claude Code): built `main` at `8f481cf`, ran `run_gpu_tests.py` native and emulated, `ctest` and the
+translator suite on this GPU.
+That last note is now out of date: #98 was closed unmerged and the tfe pair is the open SHADER-1266 (#31) question in
+the coordination issue, where the current position is that `main`'s translator is exact and the two fixtures expect
+the wrong value. The RX 6900 XT record below describes the failure without claiming a translator bug, and says why;
+the Radeon 610M record in the table above still carries the older "#98 fixes it" reading.
+
+## AMD Radeon RX 6900 XT — 2026-11-24
+
+```
+GPU:        AMD Radeon RX 6900 XT (RDNA2 / GFX1030, Navi 21, PCI 1002:73bf), subgroup 32..64
+Driver:     RADV, Mesa 26.2.4, Vulkan 1.4.354 (conformance 1.4.5.3)
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; subgroupSizeControl true)
+OS:         Nobara Linux 44 (Fedora 44), kernel 7.2.10-200.nobara.fc44.x86_64
+Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31 (main, 2026-11-24)
+Tools:      llvm-mc 22.1.8 (Fedora llvm package, AMDGPU target; unpacked into a local prefix), SPIRV-Tools v2026.1,
+            CMake 3.31.10, GCC 16.2.1, Python 3.14.9
+build.py:   280 shaders: 280 translated, 280 pass spirv-val
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 11, tier B: 8, tier C: 13
+check.py:   214 of 219 pass, 3 skipped, 2 failed
+run_gpu_tests.py: native 230/248 passed, 16 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1: 230/248 passed, 16 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe: "r32 sint (sint view): 64 bad, texel(5,3) = 2071"
+```
+
+This is the first RDNA2 discrete desktop card in this folder, and it agrees with the 610M record (`gfx1036`, RADV) on
+every count: 230/248 passed, 16 skipped, the same two fixtures. Every wave64 fixture ran natively — the device is
+32..64, so nothing needs `LEONIDA_W64_EMULATE=1`, and setting it changed no result.
+
+The one failure is the open `tfe` question, not a driver difference. The fixture stores `100 + 8y + x` in the r32 uint
+image (129 at (5,3)) and `-2 (8y + x)` in the r32 sint image (-58 there) and expects their sum, 71. It seeds each of
+its two fetch-status VGPRs with 1000 (`0x3e8`), and `2071 - 71 = 2000` is exactly both seeds, so the status dwords are
+read but never written. The uint view is exact in the same run (0 bad, texel 129), so only those two dwords differ,
+and `check.py` and `run_gpu_tests.py` report identically.
+
+Setup: `cmake -S runtime -B runtime/build/linux` and `cmake --build runtime/build/linux --parallel` with GCC 16.2.1;
+this host has no Windows surface, so `gta6rt` and the shims are not built. `llvm-mc` is Fedora's LLVM 22 package
+unpacked into a local prefix (no `llvm-mc` or `spirv-val` on `PATH` and no root, per [testing.md](testing.md)'s
+distro-package route).
+
+The overlay layers that would need suppressing on other hosts are not installed here: `VK_LOADER_DEBUG=layer` shows
+MangoHud, vkBasalt, gamescope WSI and Mesa's `device_select` (which the loader does insert), so
+`DISABLE_RTSS_LAYER=1`/`DISABLE_VULKAN_OBS_CAPTURE=1` are no-ops. As a control, the whole native suite was rerun under
+`VK_LOADER_LAYERS_DISABLE='~implicit~'` and gave the same 230/248 with the same two failures.
+
+AI-assisted (Hermes Agent): built `main` at `21625bc`, ran `build.py`, `check.py` and `run_gpu_tests.py` native and
+emulated, reproduced the two failures alone with `--filter tfe`, and reran the native suite with implicit layers
+disabled. The entry was first measured at `1c93c86`; `main` moved 42 commits while it was written, so every count
+above is from `21625bc`.
+
+## AMD Radeon 660M — 2026-11-24
+
+```
+GPU:        AMD Radeon 660M (RDNA2 iGPU, gfx1035, Ryzen 5 7535HS), subgroup 32..64
+Driver:     AMD Adrenalin 32.0.21045.1000 (Vulkan driver 2.0.353), Vulkan 1.4.315
+Subgroup:   32..64 (native wave64 compute; no 64-wide fragment subgroup can be required)
+OS:         Windows 11 build 26200
+Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31 (main, 2026-11-24)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools), Vulkan SDK 1.4.363 (SPIRV-Tools), Visual Studio 2026 (MSVC, RelWithDebInfo), Python 3.14.2
+build.py:   280 shaders: 280 translated, 280 pass spirv-val (6 mesh fixtures not built: ms_clip, ms_f16_pack, ms_tri, ms_v5_workgroup, ms_w64x_ballot, ms_wave_info_s3)
+check.py:   213 of 219 pass, 4 skipped, 2 failed
+run_gpu_tests.py: 223/248 passed, 23 skipped, 2 failed (native and LEONIDA_W64_EMULATE=1 alike; 257/257 shaders translated and passed spirv-val in both runs)
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe: r32 sint (sint view) 64 bad, texel(5,3) = 2071 (the uint view is exact). Same signature as #31 (Radeon 780M); both pass 2/2 with #291 (de87b1a9e) applied.
+Skipped:    6 mesh fixtures (no VK_EXT_mesh_shader on this driver), ps_w64x_readlane (cannot require a 64-wide fragment subgroup), and the 16 documented "run by d3d12_*_test / w64_graphics.py" cases.
+```
+
+Setup: `cmake -S runtime -B runtime/build` (Visual Studio 18 2026 generator, `VULKAN_SDK=C:\VulkanSDK\1.4.363.0`),
+`cmake --build runtime/build --config RelWithDebInfo`; implicit Vulkan layers disabled (`VK_LOADER_LAYERS_DISABLE='~implicit~'`).
+No mesh shaders on this driver, so every mesh fixture is skipped; apart from the two tfe cases above, every other pixel and compute test was exact.
+
+AI-assisted (Claude and OpenCode): built `main` at `21625bc`, ran `build.py`, `check.py` and `run_gpu_tests.py`
+(native and emulated) on this GPU, and checked the two failures against #31 and #291.

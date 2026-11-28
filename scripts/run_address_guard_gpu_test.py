@@ -68,15 +68,19 @@ def find_tool(build, name):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--build", default=os.path.join(ROOT, "runtime", "build"), help="folder with vk_compute_test")
-    ap.add_argument("--llvm-mc", default=os.environ.get("LLVM_MC", "llvm-mc"))
+    # No literal default: unset, mc_command() reads LLVM_MC and then finds llvm-mc on PATH or a versioned
+    # Debian/Ubuntu install (llvm-mc-21, /usr/lib/llvm-21/bin/llvm-mc), as run_gpu_tests.py does.
+    ap.add_argument("--llvm-mc", default=None)
     ap.add_argument("--work", default=None, help="keep the intermediate files here")
     a = ap.parse_args(argv)
     vk_compute = find_tool(a.build, "vk_compute_test")
     if not vk_compute:
         print(f"SKIP: no vk_compute_test under {a.build}")
         return 77
-    if not shutil.which(a.llvm_mc.split()[0]):
-        print(f"SKIP: {a.llvm_mc} not found")
+    import mc_command
+    mc = mc_command.mc_command(a.llvm_mc)
+    if not shutil.which(mc[0]):
+        print(f"SKIP: {' '.join(mc)} not found")
         return 77
     sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
     sys.path.insert(0, os.path.join(ROOT, "scripts"))

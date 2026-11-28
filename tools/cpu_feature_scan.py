@@ -165,20 +165,24 @@ PREFIXES = {"lock", "rep", "repe", "repz", "repne", "repnz", "xacquire", "xrelea
 ALLOWED_INT = {3, 0x29, 0x2C, 0x2D}  # breakpoint, __fastfail, __assert, debug service: Windows serves them
 FMA3 = re.compile(r"^vf(?:n?m(?:add|sub)|maddsub|msubadd)(?:132|213|231)(?:ps|pd|ss|sd)$")
 AES = {"aesenc", "aesenclast", "aesdec", "aesdeclast", "aesimc", "aeskeygenassist"}
-CONTROL_REG = re.compile(r"\b[cd]r\d+\b")
-IMMEDIATE = re.compile(r"^([0-9A-F]+)h?$")
-ZMM = re.compile(r"\bzmm\d+\b|\{k\d\}")
-YMM = re.compile(r"\bymm\d+\b")
+CONTROL_REG = re.compile(r"\b[cd]r\d+\b", re.IGNORECASE)
+IMMEDIATE = re.compile(r"^(?:0[xX]([0-9A-Fa-f]+)|([0-9A-Fa-f]+)[hH]?)$")
+ZMM = re.compile(r"\b(?:zmm\d+|[xy]mm(?:1[6-9]|2\d|3[01]))\b|\{k\d\}", re.IGNORECASE)
+YMM = re.compile(r"\bymm\d+\b", re.IGNORECASE)
 
 
 def classify(mnem: str, ops: str) -> str | None:
     """The feature (a FEATURES key) one dumpbin instruction needs, or None for the plain x86-64 baseline."""
+    mnem = mnem.strip().lower()
+    ops = ops.strip()
     while mnem in PREFIXES and ops:
-        mnem, _, ops = ops.partition(" ")
-        ops = ops.strip()
+        parts = ops.split(None, 1)
+        mnem = parts[0].lower()
+        ops = parts[1].strip() if len(parts) > 1 else ""
     if mnem == "int":
-        m = IMMEDIATE.match(ops.strip())
-        return None if m and int(m.group(1), 16) in ALLOWED_INT else "INT"
+        m = IMMEDIATE.match(ops)
+        val = int(m.group(1) or m.group(2), 16) if m else None
+        return None if val in ALLOWED_INT else "INT"
     if mnem == "int1" or mnem == "into":
         return "INT"
     if mnem == "mov" and CONTROL_REG.search(ops):
@@ -196,7 +200,7 @@ def classify(mnem: str, ops: str) -> str | None:
         return "FMA"
     if mnem.startswith("vp") and YMM.search(ops):
         return "AVX2"  # a 256-bit integer operation
-    if mnem.startswith("v") and (YMM.search(ops) or "xmm" in ops):
+    if mnem.startswith("v") and (YMM.search(ops) or "xmm" in ops.lower()):
         return "AVX"
     return None
 
@@ -290,11 +294,21 @@ def to_text(report: dict, show_sites: bool) -> str:
     return "\n".join(out)
 
 
+def _parse_hex_base(value: str) -> int:
+    try:
+        base = int(value, 16)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid hex base: {value!r}") from None
+    if base < 0:
+        raise argparse.ArgumentTypeError(f"base must be non-negative: {value!r}")
+    return base
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("source", type=Path, help="an x64 PE (disassembled with dumpbin) or a saved dumpbin listing")
     p.add_argument("--image", type=Path, help="for a listing: the PE it came from, to read .pdata and the base")
-    p.add_argument("--base", type=lambda s: int(s, 16), help="image base (default: the PE's, else inferred)")
+    p.add_argument("--base", type=_parse_hex_base, help="image base (default: the PE's, else inferred)")
     p.add_argument("--sites", action="store_true", help="print the RVA of every flagged instruction")
     p.add_argument("--json", action="store_true", help="print the report as JSON")
     args = p.parse_args(argv)
@@ -314,7 +328,11 @@ def main(argv=None) -> int:
         if base is None:
             base = img.image_base
     stats = {}
-    report = summarize(scan(inline_scan.read_lines(args.source), functions, base, stats), stats, functions)
+    try:
+        report = summarize(scan(inline_scan.read_lines(args.source), functions, base, stats), stats, functions)
+    except OSError as e:
+        print(f"{args.source}: {e}", file=sys.stderr)
+        return 2
     if not stats["instructions"]:
         print(f"{args.source}: no instructions found (not a dumpbin listing, or an image without code)",
               file=sys.stderr)

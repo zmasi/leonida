@@ -192,6 +192,71 @@ class MaskChannelTests(unittest.TestCase):
             with open(path, "rb") as fh:
                 self.assertEqual(fh.read(), original)
 
+    def test_blobs_and_channel_counts_reject_invalid_dimensions_and_lengths(self):
+        for args in [(bytearray(), 0, 0), (bytearray(4), 2, 3), (bytearray(1), True, 1)]:
+            with self.subTest(blobs_args=args), self.assertRaises(ValueError):
+                mc.blobs(*args)
+        for args in [(0, 1, b""), (2, 2, bytes(8)), (True, 1, bytes(4))]:
+            with self.subTest(counts_args=args), self.assertRaises(ValueError):
+                mc.channel_counts(*args)
+
+    def test_empty_whitespace_and_trailing_sep_json_rejected_before_decode(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as cwd:
+            path = os.path.join(tmp, "m.dds")
+            with open(path, "wb") as fh:
+                fh.write(rgba8_dds(W, H, image()))
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(cwd)
+                with mock.patch.object(mc.dds_png, "decode_dds", side_effect=AssertionError("should not decode")):
+                    for bad in ("", "   "):
+                        with self.subTest(bad=bad), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                            with self.assertRaises(SystemExit) as cm:
+                                mc.main([path, "--json", bad])
+                            self.assertEqual(cm.exception.code, 2)
+                    trailing = os.path.join(tmp, "new_dir") + os.sep
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    with redirect_stdout(stdout), redirect_stderr(stderr):
+                        self.assertEqual(mc.main([path, "--json", trailing]), 2)
+                    self.assertEqual(stdout.getvalue(), "")
+                    self.assertIn("is a directory", stderr.getvalue())
+                self.assertEqual(os.listdir(cwd), [])
+                self.assertFalse(os.path.exists(os.path.join(tmp, "new_dir")))
+            finally:
+                os.chdir(old_cwd)
+
+    def test_symlinked_json_updates_target_in_place_and_ends_with_newline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.dds")
+            with open(path, "wb") as fh:
+                fh.write(rgba8_dds(W, H, image()))
+            target = os.path.join(tmp, "real.json")
+            with open(target, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("{}\n")
+            link = os.path.join(tmp, "link.json")
+            try:
+                os.symlink(target, link)
+            except (OSError, NotImplementedError) as e:
+                self.skipTest(f"symlinks unavailable: {e}")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(mc.main([path, "--json", link]), 0)
+            self.assertTrue(os.path.islink(link))
+            with open(target, encoding="utf-8") as fh:
+                raw = fh.read()
+            self.assertTrue(raw.endswith("\n"))
+            self.assertEqual(json.loads(raw)["width"], W)
+
+    def test_devnull_json_writes_directly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "m.dds")
+            with open(path, "wb") as fh:
+                fh.write(rgba8_dds(W, H, image()))
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = mc.main([path, "--json", os.devnull])
+            self.assertEqual(code, 0, stderr.getvalue())
+            self.assertIn("16x16", stdout.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

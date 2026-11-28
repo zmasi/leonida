@@ -252,6 +252,43 @@ class SummaryLineTests(unittest.TestCase):
         self.assertIn("6/7 f16 transcendentals 0/65536 RNE/RTZ diffs", out)
         self.assertIn("v_sin_f16_e32: 3/65536 RNE/RTZ diffs", out)
 
+    def test_publish_cleans_up_staged_file_when_replace_fails_even_if_readonly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = os.path.join(tmp, "report.json")
+            with open(report, "w", encoding="utf-8") as f:
+                f.write('{"initial": 1}\n')
+            os.chmod(report, 0o444)
+
+            real_unlink = os.unlink
+
+            def windows_strict_unlink(p):
+                mode = os.stat(p).st_mode
+                if not (mode & 0o200):
+                    raise PermissionError(13, f"Access is denied: {p}")
+                return real_unlink(p)
+
+            with mock.patch.object(probe, "replace_retry", side_effect=OSError(13, "Permission denied")), \
+                 mock.patch("os.unlink", side_effect=windows_strict_unlink):
+                err = probe.write_json_report(report, {"new": True})
+                self.assertIsNotNone(err)
+
+            leftover = [f for f in os.listdir(tmp) if f.startswith(".mode_round_probe-")]
+            self.assertEqual(leftover, [])
+
+    def test_publish_applies_published_mode_on_windows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report = os.path.join(tmp, "report_win.json")
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode):
+                chmod_calls.append((p, mode))
+                real_chmod(p, mode)
+
+            with mock.patch("os.name", "nt"), mock.patch("os.chmod", side_effect=track_chmod):
+                probe.write_json_report(report, {"win": True})
+            self.assertTrue(len(chmod_calls) > 0)
+
 
 if __name__ == "__main__":
     unittest.main()

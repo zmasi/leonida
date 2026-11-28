@@ -2,37 +2,60 @@ GPU:        AMD Radeon 780M Graphics (RDNA3 iGPU, gfx1103, WDDM 3.2, 16 GB share
 Driver:     AMD proprietary 26.10.2 (32.0.32015.12012, LLPC), Vulkan 1.4.359
 Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64)
 OS:         Windows 11, 10.0.29712
-Commit:     9ec34cdff41b19d7671bc260e5f40dc69790d905 (main, 2026-11-24)
+Commit:     bcaa13dad35f560748bd9b6293cd46504fe288c6 (main, 2026-11-25)
+            Replaces the record of 9ec34cdf (2026-11-24).
 Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools, AMDGPU target), SPIRV-Tools v2026.4,
             Clang 23.1.6 (llvm-mingw 20261117), CMake 4.5.1 + Ninja 1.13.2, Python 3.13.17,
             Vulkan headers: the repository's pinned 6802bb4733b63ed5efd3adb308a6c885ef180ea1
             (vulkan-sdk-1.4.363.0)
-run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
-            228/248 passed, 16 skipped, 4 failed
-Failed:     cs_w32_exec_computed: got 8192 8192 8192 7682 512 4100 0 3
-            cs_w64_exec_computed: got 8224 8192 16384 16384 8192 4132 0 3
-            The SHADER-1264 fixtures: the translator half of that fix is not on main yet,
-            so the words that come back are the old ones. The CPU interpreter returns the
-            same two words (see #15), so this is not a GPU-only effect.
-            cs_imgload_tfe: exit 1. vk_store_test reports
-            "r32 sint (sint view): 64 bad, texel(5,3) = 2071", where the expected value
-            is 100 - (8y + x) = 71: every texel is off by exactly 2000, the value the
-            fixture seeds the tfe status VGPR with, so the fetch status VGPR is read but
-            never written.
-            cs_imgload_d16_tfe: the same, 64 bad, texel(5,3) = 2071.
-Skipped:    16 skips are the documented "run by d3d12_*_test / w64_graphics.py" cases:
+run_gpu_tests.py: 273 shaders: 273 translated, 273 pass spirv-val
+            Native: 243/263 passed, 18 skipped, 2 failed.
+            LEONIDA_W64_EMULATE=1: 243/263 passed, 18 skipped, 2 failed.
+Failed:     cs_imgatomic_ext: 6 of 64 sint words differ; first word 32: got 0x0badf00d,
+            expected 0x00000101. Per pull request 1518, the fixture's 3D volume T# does
+            not carry the tag vk_store_test now expects. Pull request 1518 fixes it:
+            with its two lines applied to this commit,
+            --filter cs_imgatomic passes 3 of 3 here (cs_imgatomic, cs_imgatomic3d,
+            cs_imgatomic_ext, "all 64 words of the uint image, the sint image and the
+            volume exact"). The case is new since the previous record.
+            cs_texture_uav: the runner reports "missing .../d3d12_texture_uav_test.exe".
+            This machine has no MSVC and no Windows SDK, so the D3D12-side test programs
+            are not built. docs/testing.md says a missing test executable on Windows fails
+            the runner (it is not a skip). The case is new since the previous record.
+Skipped:    18 skips are the documented "run by d3d12_*_test / w64_graphics.py" cases:
             cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width,
             ps_m15, ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post,
-            ps_m3_query, vs_m15, vs_m2, vs_m3.
+            ps_m3_query, ps_quad_flat, vs_m15, vs_m2, vs_m3, vs_quad_inst.
+Runtime:    Not run: the D3D12-side runtime does not build on this machine (no MSVC, no
+            Windows SDK), so ctest has no runtime test to run here.
+Validation: No VK_LAYER_KHRONOS_validation is installed on this machine, so both runs
+            are without GPU-assisted validation.
 Notes:
-- Built with cmake -S runtime -B runtime/build/vulkan4 -G Ninja
-  -DCMAKE_CXX_COMPILER=<llvm-mingw clang++> -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF.
-  This machine has no MSVC and no Windows SDK, so the D3D12-side runtime and its tests
-  are not built; that is why the 16 cases above skip instead of running.
-- Every other case was exact: the pixel cases 4096/4096 and the compute values exact.
-- The same suite on the previous main (dde82f27, upstream before the repository went
-  private) gives the identical result on every one of the 240 cases the two share, so
-  nothing that used to pass on this GPU regressed. All four failures are in cases that
-  were added after dde82f27.
-- The tfe failures are #31; the exec_computed pair is #15.
+- Neither failure is a regression: cs_imgatomic_ext and cs_texture_uav are both new
+  cases. runtime/test/shaders/check.py and scripts/run_gpu_tests.py at 9ec34cdf have
+  neither.
+- The four cases the previous record listed as failed now pass here:
+  cs_w32_exec_computed (259 1028 3088 7682 512 4100 0 3),
+  cs_w64_exec_computed (291 1028 11264 771 8192 4132 0 3),
+  cs_imgload_tfe and cs_imgload_d16_tfe (0 bad, texel(5,3) = 71).
+- The 16 skipped cases of the previous record still skip; ps_quad_flat and vs_quad_inst
+  (d3d12_quad_index_test) are new since then.
+- Every other case was exact: the pixel cases report 4096/4096 pixels exact and the
+  compute values are exact.
+- Built with cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_CXX_COMPILER=<llvm-mingw clang++> -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF
+  -DLEONIDA_VULKAN_HEADERS_FETCH=ON
+  -DFETCHCONTENT_SOURCE_DIR_VULKANHEADERS=<the pinned release>
+  -DVulkan_INCLUDE_DIR=<the pinned release>/include
+  -DCMAKE_CXX_FLAGS="-fms-extensions -D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00".
+  The two defines are what this MinGW build needs: the runtime uses SEH (__try in
+  runtime/src/title_page_watch.h) and VirtualAlloc2
+  (runtime/test/vk_host_region_import_test.cpp).
+  The pinned headers were handed to CMake directly because the fetch is only taken when
+  no Vulkan headers are found and this machine has conda-forge's Vulkan 1.3 headers in
+  the include search path; tarball SHA256
+  9044fbb356160e43201dc2094acb44c8a906722a63a35f48fc0f051579db9bb6, the URL_HASH in
+  runtime/CMakeLists.txt.
+- This machine has no MSVC and no Windows SDK, so the D3D12-side runtime and its tests
+  are not built; that is why the 18 cases above skip instead of running.
 - AI-assisted (MiniMax Code).

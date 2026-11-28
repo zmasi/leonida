@@ -1,0 +1,33 @@
+GPU:        NVIDIA GeForce RTX 4060 Ti (Ada / AD106, PCI 10de:2805), subgroup 32..32
+Driver:     NVIDIA 610.88 (Windows driver 32.0.16.1088), Vulkan 1.4.341
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
+OS:         Windows 11, 10.0.26300.9974
+Commit:     8f481cf16f261c7f37458aeb45e8f4e19994146d (main, 2026-11-24)
+Tools:      llvm-mc 21.1.8 (built by scripts/build_llvm_mc.ps1), SPIRV-Tools v2026.4 (Vulkan SDK 1.4.363),
+            CMake 3.29.5-msvc4, Visual Studio 17 2022 generator, MSVC 14.42.34433, Windows SDK 10.0.26100,
+            Python 3.13.1
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
+            native:                 197/248 passed, 49 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  229/248 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe (native and emulated alike), as on the other 32-wide
+            records: #31. The review on the closed #98 measured on native RDNA2 that a resident tfe load
+            keeps the seeded status VGPR, so the fixtures' expected value is what is off, not the
+            translator.
+Skipped:    native: 31 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this
+            device" and 1 "this device cannot require a 64-wide fragment subgroup" (the wave64 fixtures,
+            which the emulated run covers), plus the 16 documented "run by d3d12_*_test /
+            w64_graphics.py" cases. Emulated: the same 16, plus the 64-wide fragment one.
+Notes:
+- Built with cmake -S runtime -B runtime/build (Visual Studio 17 2022, x64) and
+  cmake --build runtime/build --config RelWithDebInfo. SDL3 not installed, so the GameInput shim and
+  its test are not built.
+- Device picked with VK_LOADER_DRIVERS_SELECT='*nv*' (the machine also has an Intel UHD Graphics 770).
+- Same checkout: ctest 302/303 passed. The one failure is d3d12_execute_indirect_validation, 5 of 49
+  parity cases (this host's D3D12 runtime, D3D12Core and WARP 10.0.26100.9818, accepts the ranges the
+  test expects refused); #337 (D3D-EXECIND-RANGE) merged onto this commit makes it 303/303.
+- Translator suite: 465 files / 6,104 tests, 1 file failed: test_image_cube_store_glc, because
+  LLVM_MC held a Windows path (as scripts/build_llvm_mc.ps1 sets it) and the test splits it with
+  POSIX shlex; #419 (TEST-CUBE-WINPATH) fixes that. With that helper fixed locally, the suite at
+  d2cd6c0d9 had 0 failures (465 files / 6,103 tests).
+- AI-assisted (Claude Code): built main, ran run_gpu_tests.py native and emulated, ctest and the
+  translator suite. No game files, nothing online.

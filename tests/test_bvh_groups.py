@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import bvh_groups  # noqa: E402
 import bvh_index  # noqa: E402
+import report_paths  # noqa: E402
 
 
 def a16(n):
@@ -255,6 +256,35 @@ class ScanTest(unittest.TestCase):
                 bvh_groups.write_json_report(path, {"source": "x", "summary": {}, "rows": []})
         with open(path, encoding="utf-8") as f:
             self.assertEqual(f.read(), previous)
+
+    def test_main_uses_shared_same_report_path(self):
+        self.assertIs(bvh_groups.same_report_path, report_paths.same_report_path)
+        with open(self.rpf, "rb") as f:
+            original = f.read()
+        alias = os.path.join(self.tmp.name, ".", "t.rpf")
+        with contextlib.redirect_stderr(io.StringIO()) as se:
+            self.assertEqual(bvh_groups.main([self.rpf, "--json", alias]), 2)
+        self.assertIn("--json would replace the archive", se.getvalue())
+        with open(self.rpf, "rb") as f:
+            self.assertEqual(f.read(), original)
+
+        other = os.path.join(self.tmp.name, "T.RPF")
+        with mock.patch.object(bvh_groups, "same_report_path", return_value=True) as mocked:
+            with contextlib.redirect_stderr(io.StringIO()) as se:
+                self.assertEqual(bvh_groups.main([self.rpf, "--json", other]), 2)
+        mocked.assert_called_once_with(other, self.rpf)
+        self.assertIn("--json would replace the archive", se.getvalue())
+
+    def test_main_json_oserror_returns_exit_2(self):
+        missing = os.path.join(self.tmp.name, "missing_dir", "r.json")
+        for target in (self.tmp.name, missing):
+            with self.subTest(target=target):
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()) as se:
+                    self.assertEqual(bvh_groups.main([self.rpf, "--json", target]), 2)
+                lines = se.getvalue().strip().splitlines()
+                self.assertEqual(len(lines), 1, se.getvalue())
+                self.assertTrue(lines[0].startswith("bvh_groups:"), lines[0])
+                self.assertNotIn("Traceback", se.getvalue())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,64 @@
+GPU:        Intel UHD Graphics 630 (Coffee Lake GT2, Gen9.5, PCI 8086:3e9b), integrated
+Driver:     Mesa 26.1.6 ANV, Vulkan 1.4.354 (loader 1.4.309)
+Subgroup:   8..32 (minSubgroupSize 8, maxSubgroupSize 32; default 32)
+OS:         Linux (x86-64); one machine with both GPUs, this one selected with
+            VK_LOADER_DRIVERS_SELECT='*intel_icd*'
+Commit:     3aa975421d470b76da1aa986a91282c59e20d642 (main, 2026-11-24)
+Tools:      GCC 14.2.0, CMake 3.31.6 with Ninja, llvm-mc 21.1.8 (apt.llvm.org), SPIRV-Tools v2025.1,
+            Vulkan headers 1.4.309 (system), Python 3.13.5
+Build:      cmake -S runtime -B runtime/build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release, then
+            python3 -I scripts/run_gpu_tests.py --build runtime/build/linux
+
+run_gpu_tests.py, 252 fixtures, 0 failed in every run:
+            native:                 195/252 passed, 57 skipped
+            LEONIDA_W64_EMULATE=1:  226/252 passed, 26 skipped
+
+Skipped, all documented reasons (docs/testing.md):
+  native:   31 no 64-wide compute subgroup (run under LEONIDA_W64_EMULATE=1 below),
+            6  no VK_EXT_mesh_shader / mesh shading unavailable (ANV doesn't expose it on Gen9),
+            2  fragment subgroup can run narrower than 32 on an 8..32 device (one ran at 16),
+            1  needs a required 64-wide fragment subgroup (8..32),
+            1  computed I/J pairs (ps_ij_computed: needs PerVertexKHR),
+            15 run by d3d12_*_test, 1 run by w64_graphics.py.
+  W64 emulation: the 31 wave64 compute fixtures all pass; the other 26 skips are unchanged.
+
+Supplementary runs (same machine and tools, same test binaries built from 3aa9754; the GPU picked
+with the same loader filter; each failure rerun once and reproduced). The three shader entry
+points judge different fixture sets by design (check.py 222, run_gpu_tests.py 252, build.py 283
+modules), so their counts are not comparable with each other.
+  build.py (no fallback variables; the vk_subgroup_info.py probe on this device answers
+            barycentric_fallback: true, so the four BaryCoordKHR shaders are translated with
+            --bary-fallback): 283 shaders: 283 translated, 283 pass spirv-val (the 6 ms_*
+            fixtures and ps_ij_computed are not built by build.py, as documented)
+  check.py: 182 of 222 pass, 40 skipped, 0 failed. Skips: 31 no 64-wide compute subgroup,
+            1 cs_exec64, 3 mesh fixtures built only by run_gpu_tests.py, ps_bitmask_perm and
+            ps_vcmpx_forms (fragment subgroup can run narrower than 32 on 8..32), 1
+            ps_ij_computed, 1 ps_interp_f16_high, 1 ps_w64x_readlane (subgroup 8..32).
+  w64_graphics.py: 5 ok, 24 skipped, 0 failed of 29. GS and VS tiers A and B are ok
+            (gs_w64_a_ring, vs_w64_a_skip, 3 vs_w64_b_*); 12 pixel tier A/B fixtures skip
+            because the fragment stage may run fewer than 32 live lanes and 32 cannot be
+            required on this device; 12 tier C fixtures skip as on the GTX 1050 Ti.
+  vk_pipeline_check <build.py spirv dir> --jobs 1: 283/283 modules ok, 283/283 pipelines ok,
+            0 failed, 0 skipped (same split as the GTX 1050 Ti). cs_buf_typed (38.8 s) and
+            cs_fmt_all (33.2 s) compile above the 30 s SLOW line.
+  ctest --timeout 120 (74 tests): 70 passed, 2 failed, 2 skipped (the same two by-design
+            skips as on the GTX 1050 Ti).
+            Failed: vk_predicated_copy, 2 of 2 runs, "line 138: value==0": one of the 11 words
+            of the empty VK_QUERY_TYPE_PIPELINE_STATISTICS query read nonzero
+            (runtime/test/vk_predicated_copy_test.cpp:138). The same binary passes on the
+            GTX 1050 Ti.
+            Failed: xdxr_build_check, Timeout in 2 of 2 runs, same as on the GTX 1050 Ti.
+            Neither failure is listed under "Known problems" in docs/testing.md.
+
+Notes:
+- First record for an Intel Gen9 iGPU. vulkaninfo lists no VK_KHR_fragment_shader_barycentric
+  on this device; the four BaryCoordKHR fixtures (ps_bary, ps_persp_bary, ps_uniform_branch,
+  ps_scc_mask32) pass through the ANV barycentric fallback that run_gpu_tests.py and build.py
+  pick from the device probe (SHADER-925), so the native-barycentric bug cannot show here.
+  Translated without the fallback (build.py probing the other GPU), check.py skips exactly
+  those four: 178 of 222 pass, 44 skipped, 0 failed.
+- The TEST-399 ANV texture-sampling crashes (listed for Mesa 26.1.6) and the cs_signed_zero_nan
+  row did not reproduce here: every texture fixture and cs_signed_zero_nan are ok in check.py.
+- ps_texoff and ps_texoff_implicit pass natively, but their +16/-32 offsets are not judged on
+  this device (its texel offset limits are narrower), as the tests print.
+- AI-assisted (Claude Code). Synthetic tests only; no game files.

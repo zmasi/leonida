@@ -19,6 +19,7 @@
 #include <cstdio>
 #include <cstring>
 #include <deque>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -776,6 +777,27 @@ void test_keyboard_pad_sticks(IGameInput* input, IGameInputDevice* kb) {
     rt::gameinput::reload_config();
     check(rt::gameinput::config().mouse_sensitivity == 1.0f && rt::gameinput::config().ds_trigger_gain == 1.0f,
           "keyboard pad: mouse sensitivity defaults to 1 and leaves the trigger gain alone");
+
+    g_cursor_x += 3'000'000;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 1),
+          "keyboard pad: a positive jump beyond LONG_MAX axis units stays full right");
+    g_cursor_x -= 3'000'000;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, -1),
+          "keyboard pad: a negative jump beyond LONG_MIN axis units stays full left");
+
+    const int prior_x = g_cursor_x;
+    g_cursor_x = std::numeric_limits<int>::max() - 1;
+    rt::gameinput::poll();
+    settle();
+    g_cursor_x = std::numeric_limits<int>::min() + 2;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 4096 / 32767.0f),
+          "keyboard pad: the raw cursor counter wrap moves four counts right");
+    g_cursor_x = prior_x;
+    rt::gameinput::poll();
+    settle();
 
     g_keys[VK_RBUTTON] = true;
     rt::gameinput::poll();

@@ -55,6 +55,27 @@ class PipelinesJobsTest(unittest.TestCase):
         self.assertEqual(args[1:3], [os.path.join(self.work, "shaders", "spirv"),
                                      os.path.join(self.out, "pipeline_cache.bin")])
 
+    def test_invalid_index_shape_preserves_the_previous_crash_report(self):
+        index = os.path.join(self.work, "shaders", "spirv", "index.json")
+        os.makedirs(self.out)
+        report = os.path.join(self.out, "pipeline_crashes.json")
+        for invalid in (["shader"], "shader", 1):
+            with self.subTest(index=invalid):
+                with open(index, "w", encoding="utf-8", newline="\n") as f:
+                    json.dump(invalid, f)
+                with open(report, "w", encoding="utf-8", newline="\n") as f:
+                    f.write("previous crash report")
+                err = io.StringIO()
+                with mock.patch.object(make_game, "pipeline_check_exe", return_value="vk_pipeline_check.exe"), \
+                        mock.patch.object(make_game, "checker_supports", return_value=False), \
+                        mock.patch.object(make_game, "run", return_value=0) as run, \
+                        mock.patch.object(sys, "stderr", err), self.assertRaises(SystemExit):
+                    make_game.pipelines(self.work, self.out)
+                run.assert_not_called()
+                self.assertIn("must contain a JSON object", err.getvalue())
+                with open(report, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), "previous crash report")
+
     def test_jobs_on_the_command_line_reach_the_checker(self):
         # main() clamps --jobs to the machine's hardware threads; pin them so 5 is in range anywhere (the
         # GitHub Windows runners have 4).
@@ -315,7 +336,31 @@ class PipelinesCrashRetryTest(unittest.TestCase):
         self.assertIsNotNone(err)
         self.assertIn("vk_pipeline_check", err.getvalue())
         self.assertIn("b_mod", err.getvalue())
+        self.assertNotIn("hashes in pipeline_crashes.json", err.getvalue())
         self.assertTrue(any("cannot write pipeline_crashes.json" in line for line in logs))
+
+    def test_a_locked_old_crash_report_does_not_prevent_a_clean_check(self):
+        os.makedirs(self.out)
+        report = os.path.join(self.out, "pipeline_crashes.json")
+        old_report = '{"modules": [{"name": "old", "spv_sha256": null}]}'
+        with open(report, "w", encoding="utf-8", newline="\n") as f:
+            f.write(old_report)
+        remove = os.remove
+
+        def remove_unlocked(path):
+            if path == report:
+                raise PermissionError("report is locked")
+            remove(path)
+
+        with mock.patch.object(make_game.os, "remove", side_effect=remove_unlocked):
+            failed, logs = self.stage(lambda args, n: 0)
+
+        self.assertIsNone(failed)
+        self.assertEqual(len(self.calls), 1)
+        self.assertTrue(any("cannot remove old pipeline_crashes.json" in line for line in logs))
+        self.assertTrue(any("may be stale" in line for line in logs))
+        with open(report, encoding="utf-8") as f:
+            self.assertEqual(f.read(), old_report)
 
     def test_a_clean_run_drops_an_old_crash_report(self):
         os.makedirs(self.out)

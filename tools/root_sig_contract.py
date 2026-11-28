@@ -47,7 +47,7 @@ def pack_layout(sig, stage=None):
     error is set (and dwords empty) on spill, cost overflow or bad input:
     refuse, never truncate.
     """
-    if stage is not None and stage not in STAGE_BASE:
+    if stage is not None and (not isinstance(stage, str) or stage not in STAGE_BASE):
         return [], f"no console base for stage {stage!r}"
     if not isinstance(sig, dict):
         return [], "root signature must be a JSON object"
@@ -149,7 +149,7 @@ def reconcile(shader_reads, dwords):
                                   "(a spill pointer?)")
             continue
         for kind in kinds:
-            allowed = KIND_TO_TYPES.get(kind)
+            allowed = KIND_TO_TYPES.get(kind) if isinstance(kind, str) else None
             if allowed is None:
                 issues.append(f"s{sgpr}: unknown read kind {kind!r}")
             elif kind == "const32" and _whole_address_copy(sgpr, slot, by_sgpr, dwords):
@@ -158,8 +158,16 @@ def reconcile(shader_reads, dwords):
                 issues.append(
                     f"s{sgpr} ({kind}) incompatible with param "
                     f"{slot['param']} ({slot['ptype']})")
-            elif kind in ("ptr32_lo", "ptr64_lo") and slot["sub"] != 0:
-                issues.append(f"s{sgpr} ({kind}) reads the high half of the address")
+            elif kind == "ptr32_lo":
+                if slot["sub"] != 0:
+                    issues.append(f"s{sgpr} (ptr32_lo) reads the high half of the address")
+            elif kind == "ptr64_lo":
+                if slot["sub"] != 0:
+                    issues.append(f"s{sgpr} (ptr64_lo) reads the high half of the address")
+                else:
+                    hi = dwords[sgpr + 1] if sgpr + 1 < len(dwords) else None
+                    if hi is None or hi["param"] != slot["param"] or hi["sub"] != 1:
+                        issues.append(f"s{sgpr} (ptr64_lo) without paired hi dword")
             elif kind == "ptr64_hi":
                 lo = dwords[sgpr - 1] if sgpr > 0 else None
                 if slot["sub"] != 1 or lo is None or lo["param"] != slot["param"] \
@@ -174,8 +182,9 @@ def cluster(shaders):
     for name in sorted(shaders):
         reads = shaders[name].get("user_sgpr_reads", [])
         shape = tuple(sorted(
-            ((r["sgpr"], r["kind"]) if type(r["sgpr"]) is int
-             else (f"invalid:{r['sgpr']!r}", r["kind"]) for r in reads),
+            ((r["sgpr"] if type(r["sgpr"]) is int else f"invalid:{r['sgpr']!r}",
+              r["kind"] if isinstance(r["kind"], str) else f"invalid:{r['kind']!r}")
+             for r in reads),
             key=lambda item: (type(item[0]) is not int, item[0], item[1])))
         groups.setdefault(shape, []).append(name)
     ranked = sorted(groups.items(), key=lambda kv: -len(kv[1]))
@@ -184,7 +193,7 @@ def cluster(shaders):
 
 def _load_json(path):
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             return json.load(f)
     except (OSError, ValueError, RecursionError) as e:
         reason = getattr(e, "strerror", None) or e
@@ -209,7 +218,7 @@ def main(argv=None):
              "visibility": "pixel"}],
             "static_samplers": []}, indent=2))
         return 0
-    if not a.index or not a.rootsig:
+    if not a.index or not a.index.strip() or not a.rootsig or not a.rootsig.strip():
         ap.error("index.json and --rootsig are required (or --example)")
     try:
         index = _load_json(a.index)
@@ -249,7 +258,20 @@ def main(argv=None):
                 return 2
     if a.model == "console":
         layouts = {}
-        for stage in sorted({str(entry.get("stage")) for entry in index.values()}):
+        stages = set()
+        for name in sorted(index):
+            stage = index[name].get("stage")
+            if not isinstance(stage, str):
+                print(f"ERROR: {a.index}: {name}: 'stage' must be a string for --model console",
+                      file=sys.stderr)
+                return 2
+            stages.add(stage)
+        if not stages:
+            _, error = pack_layout(sig, min(STAGE_BASE, key=STAGE_BASE.get))
+            if error:
+                print(f"root signature refused: {error}")
+                return 1
+        for stage in sorted(stages):
             dwords, error = pack_layout(sig, stage)
             if error:
                 print(f"root signature refused for {stage}: {error}")
@@ -266,7 +288,7 @@ def main(argv=None):
     bad = 0
     for name in sorted(index):
         reads = index[name].get("user_sgpr_reads", [])
-        issues = reconcile(reads, layouts[str(index[name].get("stage"))] if a.model == "console" else dwords)
+        issues = reconcile(reads, layouts[index[name]["stage"]] if a.model == "console" else dwords)
         if issues:
             bad += 1
             print(f"CONTRADICTION {name}:")

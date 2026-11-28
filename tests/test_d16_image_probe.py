@@ -4,7 +4,7 @@ when the oracle tools are present and the GPU is GFX10, and is skipped otherwise
 import io
 import json
 import os
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 import re
 import struct
@@ -195,10 +195,99 @@ class Cli(unittest.TestCase):
         self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
 
     def test_bad_arguments_are_a_usage_error(self):
-        for args in (["--formats", "unorm12"], ["--frac", "1.5"]):
-            r = subprocess.run([sys.executable, "-I", str(TOOLS / "d16_image_probe.py"), *args],
-                               capture_output=True, text=True)
-            self.assertEqual(r.returncode, 2, args)
+        for args in (["--formats", "unorm12"], ["--frac", "1.5"], ["--formats", ""], ["--formats", "unorm8,"],
+                     ["--waves", ""], ["--waves", "32,"]):
+            with self.subTest(args=args):
+                r = subprocess.run([sys.executable, "-I", str(TOOLS / "d16_image_probe.py"), *args],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, args)
+                if args == ["--formats", ""]:
+                    self.assertIn("--formats", r.stderr)
+                    self.assertNotIn("--frac must be", r.stderr)
+
+    def test_invalid_json_paths_fail_before_opening_oracle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = os.path.join(tmp, "blocker")
+            with open(blocker, "w", encoding="utf-8", newline="\n") as f:
+                f.write("x")
+            cases = [
+                "",
+                "   ",
+                tmp,
+                os.path.join(tmp, "sub") + os.sep,
+                os.path.join(blocker, "report.json"),
+                os.path.join(tmp, "bad\x00.json"),
+            ]
+            for bad in cases:
+                with self.subTest(bad=bad):
+                    err = io.StringIO()
+                    with (
+                        mock.patch.object(runner, "open_oracle", side_effect=AssertionError("should not open oracle")),
+                        redirect_stderr(err),
+                    ):
+                        rc = ip.main(["--formats", "unorm8", "--waves", "32", "--json", bad])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("error:", err.getvalue())
+
+    def test_json_report_atomic_parents_symlink_devnull_and_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = os.path.join(tmp, "a", "b", "report.json")
+            rc, out = run_main(FakeOracle(), "--formats", "unorm8", "--waves", "32", "--json", nested)
+            self.assertEqual(rc, 0, out)
+            with open(nested, encoding="utf-8") as f:
+                text = f.read()
+            self.assertTrue(text.endswith("\n"))
+            before = json.loads(text)
+
+            # Failed replace preserves previous report, cleans temp file, and returns exit 2 without traceback.
+            err = io.StringIO()
+            with (
+                mock.patch.object(runner, "open_oracle", return_value=FakeOracle()),
+                mock.patch.object(ip.replace_retry, "replace", side_effect=OSError("disk full")),
+                redirect_stdout(io.StringIO()),
+                redirect_stderr(err),
+            ):
+                rc = ip.main(["--formats", "unorm8", "--waves", "32", "--json", nested])
+            self.assertEqual(rc, 2)
+            self.assertIn("disk full", err.getvalue())
+            self.assertEqual([n for n in os.listdir(os.path.dirname(nested)) if n.startswith(".d16-image-")], [])
+            with open(nested, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), before)
+
+            # Symlink target is updated in place and symlink preserved.
+            target = os.path.join(tmp, "real.json")
+            link = os.path.join(tmp, "link.json")
+            try:
+                os.symlink(target, link)
+            except OSError:
+                pass
+            else:
+                rc, out = run_main(FakeOracle(), "--formats", "unorm8", "--waves", "32", "--json", link)
+                self.assertEqual(rc, 0, out)
+                self.assertTrue(os.path.islink(link))
+                self.assertTrue(os.path.isfile(target))
+
+            # Non-regular destination (/dev/null) works without staging in /dev.
+            if os.path.exists(os.devnull) and os.name != "nt":
+                rc, out = run_main(FakeOracle(), "--formats", "unorm8", "--waves", "32", "--json", os.devnull)
+                self.assertEqual(rc, 0, out)
+
+            with self.assertRaises(ValueError):
+                ip.write_json_report(os.path.join(tmp, "nan.json"), {"v": float("nan")})
+
+    def test_duplicate_formats_and_waves_are_deduplicated(self):
+        for fmts_arg, waves_arg in (("unorm8,unorm8", "32,32"), ("unorm8, unorm8", "32, 32")):
+            with self.subTest(fmts=fmts_arg, waves=waves_arg):
+                oracle = FakeOracle()
+                with mock.patch.object(oracle, "run", wraps=oracle.run) as spy:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        out_json = os.path.join(tmp, "r.json")
+                        rc, out = run_main(oracle, "--formats", fmts_arg, "--waves", waves_arg, "--json", out_json)
+                        self.assertEqual(rc, 0, out)
+                        with open(out_json, encoding="utf-8") as f:
+                            rep = json.load(f)
+                self.assertEqual(spy.call_count, 1)
+                self.assertEqual(rep["formats"]["unorm8"]["waves_differ"], {})
 
 
 class OnHardware(unittest.TestCase):

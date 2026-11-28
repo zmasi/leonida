@@ -1,0 +1,27 @@
+GPU:        AMD Radeon RX 9070 (RDNA4 / GFX1201, Navi 48, PCI 1002:7550), subgroup 32..64
+Driver:     radv (Mesa 26.3.1-arch3.5), Vulkan 1.4.363
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default 64, subgroupSizeControl)
+OS:         CachyOS (Arch Linux), kernel 7.3.5-2-cachyos-deckify
+Commit:     3aa975421d470b76da1aa986a91282c59e20d642 (main, 2026-11-24)
+Tools:      llvm-mc LLVM 23.1.5 (Arch Linux llvm), SPIRV-Tools v2026.4, CMake 4.5.1
+            (Ninja 1.13.2), GCC 16.2.1, Python 3.14.10
+run_gpu_tests.py: 261 shaders: 261 translated, 261 pass spirv-val
+            native:                 236/252 passed, 16 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  236/252 passed, 16 skipped, 0 failed
+Failed:     none.
+Skipped:    16 skips are the documented "run by d3d12_*_test / w64_graphics.py" cases:
+            cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width,
+            ps_m15, ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3, ps_m3_post,
+            ps_m3_query, vs_m15, vs_m2, vs_m3.
+Notes:
+- Built with cmake -S runtime -B runtime/build/linux -G Ninja and cmake --build
+  runtime/build/linux --parallel.
+- The suite ran on RADV (Mesa 26.3.1) with the project's own vk_harness /
+  vk_compute_test / vk_store_test binaries. No implicit layer.
+- Native and emulated runs are identical (236/252, 16 skipped, 0 failed). The GPU
+  runs wave64 natively (subgroup 64); LEONIDA_W64_EMULATE=1 validated the
+  emulation path against this native reference.
+- cs_fma_fused reports 3/7 f32 fused, 4/7 split under the default --fma glsl (the
+  documented RADV behavior); LEONIDA_FMA=khr / exact give strict fusion.
+- build.py and check.py (the two D3D12-side columns) were not run; the counts here
+  come from run_gpu_tests.py, which builds and translates the same fixtures.

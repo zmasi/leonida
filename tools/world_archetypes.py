@@ -26,11 +26,14 @@ import os
 import statistics
 import struct
 import sys
+import tempfile
 
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
 
+import file_mode  # noqa: E402
+import replace_retry  # noqa: E402
 import world_census as WC  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 import world_index as WI  # noqa: E402
@@ -64,16 +67,22 @@ TOLERANCE = 0.05
 def schema(b):
     """Return ({struct hash: (size, members)}, [(block struct hash, size, system offset or None)])."""
     n = len(b)
-    st, it = WI._ptr(WI._u64(b, 0x28), n), WI._ptr(WI._u64(b, 0x38), n)
     structs, blocks = {}, []
+    if n < 0x50:
+        return structs, blocks
+    st, it = WI._ptr(WI._u64(b, 0x28), n), WI._ptr(WI._u64(b, 0x38), n)
     if st is None or it is None:
         return structs, blocks
     for i in range(WI._u16(b, 0x48)):
         o = st + 32 * i
+        if o + 32 > n:
+            break
         members = WI._members(b, WI._ptr(WI._u64(b, o + 0x10), n), WI._u16(b, o + 0x1E), n) or {}
         structs.setdefault(WI._u32(b, o), (WI._u32(b, o + 0x18), members))
     for i in range(WI._u16(b, 0x4C)):
         o = it + 16 * i
+        if o + 16 > n:
+            break
         blocks.append((WI._u32(b, o), WI._u32(b, o + 4), WI._ptr(WI._u64(b, o + 8), n)))
     return structs, blocks
 
@@ -149,6 +158,17 @@ def _rotation(q, conjugate):
             (2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)))
 
 
+def _is_rotated(q):
+    """True when quaternion `q` represents a non-identity rotation (`q` and `-q` are the same rotation)."""
+    if not q:
+        return False
+    x, y, z, w = q
+    n = math.sqrt(x * x + y * y + z * z + w * w)
+    if not n:
+        return False
+    return max(abs(x / n), abs(y / n), abs(z / n)) > 1e-6
+
+
 def _scale(entity, key):
     """Missing scales use one; an explicit zero collapses the corresponding axes."""
     value = entity.get(key)
@@ -202,12 +222,12 @@ def check_extents(maps, defs):
         ref_lo, ref_hi = row.get("entities_min"), row.get("entities_max")
         if not ref_lo or not ref_hi or not ents:
             continue
-        if any(e.get("archetype") not in defs or not e.get("complete", True) for e in ents):
+        if any(e.get("archetype") is None or e["archetype"] not in defs or not e.get("complete", True) for e in ents):
             continue
         if any("bb_min" not in defs[e["archetype"]] or "bb_max" not in defs[e["archetype"]] for e in ents):
             continue
         out["maps_fully_defined"] += 1
-        rotated = any(e.get("rotation") and [round(c, 6) for c in e["rotation"]] != [0, 0, 0, 1] for e in ents)
+        rotated = any(_is_rotated(e.get("rotation")) for e in ents)
         scaled = any(abs(_scale(e, "scale_xy") - 1) > 1e-4 or abs(_scale(e, "scale_z") - 1) > 1e-4
                      for e in ents)
         if rotated:
@@ -265,17 +285,41 @@ def run(path, start=None, limit=None, extents=False):
             stats["kinds"][d["kind"]] = stats["kinds"].get(d["kind"], 0) + 1
             t = str(d.get("asset_type"))
             stats["asset_types"][t] = stats["asset_types"].get(t, 0) + 1
-            prev = defs.get(d.get("name"))
-            if prev is None:
-                defs[d.get("name")] = d
-            elif (prev.get("bb_min"), prev.get("bb_max")) != (d.get("bb_min"), d.get("bb_max")):
-                prev["_differs"] = True
+            name = d.get("name")
+            if name is not None:
+                prev = defs.get(name)
+                if prev is None:
+                    defs[name] = d
+                elif (prev.get("bb_min"), prev.get("bb_max")) != (d.get("bb_min"), d.get("bb_max")):
+                    prev["_differs"] = True
     stats["names"] = len(defs)
     stats["names_with_differing_boxes"] = sum(1 for d in defs.values() if d.pop("_differs", False))
     doc = {"summary": stats, "schemas": schemas, "archetypes": resources}
     if extents:
         doc["extents"] = check_extents(maps, defs)
     return doc
+
+
+def _write_json_atomic(path, doc):
+    out_dir = os.path.dirname(os.path.abspath(path))
+    mode = file_mode.published_mode(path)
+    payload = json.dumps(doc, indent=1, sort_keys=True) + "\n"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", newline="\n", dir=out_dir,
+                prefix=f".{os.path.basename(path)}.", suffix=".tmp", delete=False) as f:
+            tmp_path = f.name
+            f.write(payload)
+        os.chmod(tmp_path, mode)
+        replace_retry.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def main(argv=None):
@@ -287,24 +331,39 @@ def main(argv=None):
     ap.add_argument("--check-extents", action="store_true",
                     help="also compare each map's entitiesExtents with its transformed archetype boxes")
     a = ap.parse_args(argv)
+    if a.start is not None and a.start < 0:
+        ap.error("--start must be >= 0")
+    if a.limit is not None and a.limit < 1:
+        ap.error("--limit must be >= 1")
+    if not a.out.strip():
+        ap.error("--out path must not be empty")
     if not os.path.exists(a.path):
         ap.error("no such file or folder: %s" % a.path)
-    # Check the report path before the scan: --out equal to the archive used to truncate the input after the run, and
-    # an --out under a regular file or naming a folder raised a traceback once all the work was done.
+    # Check the report path before the scan: --out equal to the archive or any carved input used to truncate the input
+    # after the run, and an --out under a regular file or naming a folder raised a traceback once all the work was done.
     if same_report_path(a.out, a.path):
         ap.error("--out would overwrite the input %s" % a.path)
     if os.path.isdir(a.out):
         ap.error("--out %s is a folder, not a file" % a.out)
+    if os.path.isdir(a.path):
+        try:
+            for inp in WI._directory_files(a.path):
+                if same_report_path(a.out, inp):
+                    ap.error("--out would overwrite the input %s" % inp)
+        except OSError as e:
+            ap.error("%s: %s" % (a.path, e.strerror or e))
     out_dir = os.path.dirname(os.path.abspath(a.out))
     try:
         os.makedirs(out_dir, exist_ok=True)
     except OSError as e:
         ap.error("--out %s: cannot create %s: %s" % (a.out, out_dir, e.strerror or e))
-    doc = run(a.path, a.start, a.limit, a.check_extents)
+    try:
+        doc = run(a.path, a.start, a.limit, a.check_extents)
+    except (OSError, ValueError) as e:
+        ap.error("%s: %s" % (a.path, getattr(e, "strerror", None) or e))
     doc["summary"].update({"path": os.path.abspath(a.path), "start": a.start, "limit": a.limit})
     try:
-        with open(a.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(doc, f, indent=1, sort_keys=True)
+        _write_json_atomic(a.out, doc)
     except OSError as e:
         ap.error("--out %s: %s" % (a.out, e.strerror or e))
     print(json.dumps({k: doc[k] for k in ("summary", "extents") if k in doc}, indent=1, sort_keys=True))

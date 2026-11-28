@@ -16,10 +16,15 @@ struct CompileActivity {
     ~CompileActivity() { --count; }
 };
 
+inline bool is_direct_session_cache_enabled(const wchar_t* val, DWORD len) noexcept {
+    return !(len == 1 && val && val[0] == L'0');
+}
+
 inline bool direct_session_cache() {
     static const bool enabled = [] {
         wchar_t value[2]{};
-        return !(GetEnvironmentVariableW(L"LEONIDA_DIRECT_SESSION_CACHE", value, 2) == 1 && value[0] == L'0');
+        const DWORD len = GetEnvironmentVariableW(L"LEONIDA_DIRECT_SESSION_CACHE", value, 2);
+        return is_direct_session_cache_enabled(value, len);
     }();
     return enabled;
 }
@@ -56,6 +61,7 @@ public:
     void* data = nullptr;
 
     CacheStagingFile(const std::filesystem::path& destination, std::size_t bytes) {
+        if (destination.empty() || bytes == 0) return;
         static std::atomic<unsigned> sequence{0};
         temp_ = destination;
         temp_ += L".tmp." + std::to_wstring(std::chrono::steady_clock::now().time_since_epoch().count()) + L"." + std::to_wstring(sequence++);
@@ -78,7 +84,11 @@ public:
         }
     }
 
+    bool is_valid() const noexcept { return data != nullptr; }
+    const std::filesystem::path& temp_path() const noexcept { return temp_; }
+
     bool publish(const std::filesystem::path& destination, std::size_t written) {
+        if (!data || destination.empty()) return false;
         if (!UnmapViewOfFile(data)) return false;
         data = nullptr;
         LARGE_INTEGER length{};

@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,7 +14,7 @@ sys.path.insert(0, str(ROOT / "tests" / "semantic"))
 
 import rdna2spirv  # noqa: E402
 from support import translate_lines  # noqa: E402
-from wave64_pipeline_audit import Assessment, Device, STAGE_BITS, assess  # noqa: E402
+from wave64_pipeline_audit import Assessment, Device, STAGE_BITS, assess, build_report  # noqa: E402
 
 
 def shader(stage="ps", width=64, tier="C", **fields):
@@ -102,9 +103,31 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(Device.read(DEVICE_JSON), CAPS32)
         for bad in ({}, dict(DEVICE_JSON, subgroup_size=48),
                     dict(DEVICE_JSON, min_subgroup_size=64),
-                    dict(DEVICE_JSON, supported_subgroup_stages=True)):
+                    dict(DEVICE_JSON, supported_subgroup_stages=True),
+                    dict(DEVICE_JSON, min_subgroup_size=0, max_subgroup_size=64),
+                    dict(DEVICE_JSON, subgroup_size=64, min_subgroup_size=0, max_subgroup_size=32)):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 Device.read(bad)
+        # Devices without VK_EXT_subgroup_size_control report both bounds as 0.
+        no_range = Device.read(dict(DEVICE_JSON, min_subgroup_size=0, max_subgroup_size=0,
+                                    subgroup_size_control=False))
+        self.assertEqual((no_range.minimum, no_range.maximum), (0, 0))
+        # A programmatic Device with minimum=0 must not claim required-width support.
+        half_range = replace(HYBRID, minimum=0, maximum=64)
+        self.assertEqual(assess(shader("ps", width=64, tier="C"), half_range).outcome, "approximate")
+
+    def test_assess_missing_or_unknown_stage_returns_unknown(self):
+        for entry in (
+            {"wave64": True, "subgroup_size": 64},
+            {"stage": "hs", "wave64": True, "subgroup_size": 64},
+            {"stage": None, "wave64": True},
+        ):
+            with self.subTest(entry=entry):
+                self.assertEqual(assess(entry, CAPS32), Assessment("unknown", "unknown-stage"))
+
+    def test_build_report_rejects_empty_pipeline_chain(self):
+        with self.assertRaisesRegex(ValueError, "no shader stages"):
+            build_report({"v": shader("vs", tier="A")}, CAPS32, [SimpleNamespace(modules=())])
 
 
 class CommandLineTest(unittest.TestCase):
@@ -189,6 +212,24 @@ class CommandLineTest(unittest.TestCase):
         proc = self.run_audit("--strict")
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("no graphics shaders", proc.stderr)
+
+    def test_empty_whitespace_and_directory_report_paths_rejected(self):
+        with tempfile.TemporaryDirectory() as work_cwd:
+            for bad_report, expected in (
+                ("", "must not be empty"),
+                ("   ", "must not be empty"),
+                (str(self.dir), "is a directory"),
+            ):
+                with self.subTest(report=bad_report):
+                    proc = subprocess.run(
+                        [sys.executable, "-I", str(ROOT / "tools" / "wave64_pipeline_audit.py"),
+                         self.index, "--device-info", self.caps, "--report", bad_report],
+                        capture_output=True, text=True, timeout=20, cwd=work_cwd,
+                    )
+                    self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                    self.assertIn(expected, proc.stderr)
+                    self.assertNotIn("Traceback", proc.stderr)
+            self.assertEqual(list(Path(work_cwd).iterdir()), [])
 
 
 if __name__ == "__main__":

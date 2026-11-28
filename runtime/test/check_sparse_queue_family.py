@@ -87,7 +87,7 @@ def single_sparse_queue_family(path: Path) -> bool:
     chosen family lacks SPARSE_BINDING. On single-family GPUs (e.g. Intel Xe-LP iGPUs), VK_SHARING_MODE_CONCURRENT
     is illegal (VUID-00914).
     """
-    text = path.read_text(encoding="utf-8", errors="replace")
+    text = path.read_text(encoding="utf-8-sig", errors="replace")
     devices = CREATE_DEVICE.findall(text)
     if len(devices) != 1:
         return False
@@ -163,7 +163,7 @@ def single_sparse_queue_family(path: Path) -> bool:
 
 
 def check_trace(path: Path, expect_exclusive: bool, *, single_family: bool = False) -> tuple[int, int]:
-    rows = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    rows = path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
     records = 0
     for i, line in enumerate(rows):
         if SPARSE_FLAGS not in line:
@@ -194,12 +194,14 @@ def check_trace(path: Path, expect_exclusive: bool, *, single_family: bool = Fal
     return records // 2, records
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("executable", type=Path, help="Compiled Leonida d3d12_sparse_queue_family_test binary")
     parser.add_argument("--expect-baseline-exclusive", action="store_true",
                         help="negative-control mode: prove buggy EXCLUSIVE create infos instead of requiring fix")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    if not str(args.executable).strip():
+        parser.error("executable path must not be empty")
     exe = args.executable.resolve()
     if not exe.is_file():
         print(f"ERROR: missing executable {exe}", file=sys.stderr)
@@ -214,6 +216,7 @@ def main() -> int:
             "lunarg_api_dump.pre_dump = true\n"
             "lunarg_api_dump.detailed = true\n",
             encoding="utf-8",
+            newline="\n",
         )
         dump_env, validation_env = pass_envs(os.environ, path)
         # Two runs, one layer each. SDK 1.4.363's api_dump reads the VkDevice's dispatch key after the call down the
@@ -224,7 +227,7 @@ def main() -> int:
         if skip:
             return skip
         # Check the trace before the validation run: a skip there must not hide a contract the trace has broken.
-        candidates = list(path.glob("sparse_create_info.log*"))
+        candidates = sorted(path.glob("sparse_create_info.log*"))
         if not candidates:
             print("SKIP 77: Vulkan SDK VK_LAYER_LUNARG_api_dump unavailable or did not write trace")
             return 77
@@ -267,10 +270,10 @@ def died_in_vk_destroy_device(trace_dir: Path) -> bool:
     The trace can't tell api_dump's own read of the freed device from a driver crash in the same call. The validation
     run can: it destroys the device without api_dump and has to exit 0.
     """
-    traces = list(trace_dir.glob("sparse_create_info.log*"))
+    traces = sorted(trace_dir.glob("sparse_create_info.log*"))
     if len(traces) != 1:
         return False
-    calls = CALL_HEAD.findall(traces[0].read_text(encoding="utf-8", errors="replace"))
+    calls = CALL_HEAD.findall(traces[0].read_text(encoding="utf-8-sig", errors="replace"))
     return bool(calls) and calls[-1] == "vkDestroyDevice"
 
 
@@ -279,8 +282,11 @@ def run_pass(exe: Path, env: Mapping[str, str], cwd: Path, trace_dir: Path | Non
 
     trace_dir (the api_dump run only) allows an access violation in vkDestroyDevice, once every result is printed.
     """
-    run = subprocess.run([str(exe)], cwd=cwd, env=dict(env), capture_output=True,
-                         text=True, encoding="utf-8", errors="replace", timeout=RUN_TIMEOUT)
+    try:
+        run = subprocess.run([str(exe)], cwd=cwd, env=dict(env), capture_output=True,
+                             text=True, encoding="utf-8", errors="replace", timeout=RUN_TIMEOUT)
+    except OSError as exc:
+        raise AssertionError(f"failed to start {exe}: {exc}") from exc
     out = run.stdout + "\n" + run.stderr
     if run.returncode == 77:
         print("SKIP 77: Leonida Vulkan device / sparse features unavailable")

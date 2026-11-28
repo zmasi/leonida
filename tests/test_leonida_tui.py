@@ -5,6 +5,7 @@
 import ctypes
 import os
 import io
+import signal
 import sys
 import tempfile
 import unittest
@@ -18,6 +19,23 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import leonida_tui  # noqa: E402
 import make_game  # noqa: E402
+
+# run_setup() and LeonidaBoard.__enter__ call install_interrupt_handlers(), which replaces the process-wide SIGINT
+# (and on Windows SIGBREAK and the console control) handler with one that calls os._exit(130) and never puts the old
+# one back. Under a shared runner (`pytest tests`) a later test that raises KeyboardInterrupt on purpose, such as the
+# semantic runner's interrupt tests (_thread.interrupt_main), then ends the whole test process with exit code 130 and
+# no summary. The handlers are the TUI's, not what these tests check, so keep them out of the test process.
+_ORIGINAL_SIGINT = signal.getsignal(signal.SIGINT)
+_no_interrupt_handlers = mock.patch.object(leonida_tui, "install_interrupt_handlers", lambda: None)
+
+
+def setUpModule():
+    _no_interrupt_handlers.start()
+
+
+def tearDownModule():
+    _no_interrupt_handlers.stop()
+
 
 
 class EligibleTest(unittest.TestCase):
@@ -488,6 +506,13 @@ class UnexpectedStageExceptionTest(unittest.TestCase):
         self.assertIn("PermissionError", err)
         # wait() and the final drain must not report the same stage twice
         self.assertEqual(err.count("failed with an unexpected exception"), 1)
+
+
+class InterruptHandlersStayOutOfTestsTest(unittest.TestCase):
+    def test_setup_and_board_leave_the_process_sigint_handler_alone(self):
+        with mock.patch.object(leonida_tui.os, "cpu_count", return_value=8),                 mock.patch.object(leonida_tui, "_read_key", return_value="Enter"),                 mock.patch.object(leonida_tui, "enable_ansi", return_value=False),                 mock.patch.object(leonida_tui, "term_size", return_value=(80, 24)),                 mock.patch("sys.stdout"):
+            leonida_tui.run_setup(4, default_overlap=False)
+        self.assertIs(signal.getsignal(signal.SIGINT), _ORIGINAL_SIGINT)
 
 
 if __name__ == "__main__":

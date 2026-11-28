@@ -1968,6 +1968,10 @@ def _atomic_write_text(path, write_fn):
     except BaseException:
         if tmp and os.path.isfile(tmp):
             try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            try:
                 os.remove(tmp)
             except OSError:
                 pass

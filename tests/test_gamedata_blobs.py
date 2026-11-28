@@ -304,7 +304,8 @@ class BadCarveIndexTest(unittest.TestCase):
     """A folder that is not an rpf9_carve.py carve is one error line naming the index and the bad row."""
 
     def run_tool(self, target):
-        return subprocess.run([sys.executable, "-I", TOOL, target],
+        # UTF-8 mode: a piped stderr is the ANSI code page on Windows, and the errors below name a path.
+        return subprocess.run([sys.executable, "-I", "-X", "utf8", TOOL, target],
                               cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace")
 
     def assert_one_error(self, result, *needles, code=1, prefix="error:"):
@@ -325,7 +326,8 @@ class BadCarveIndexTest(unittest.TestCase):
         return folder
 
     def test_no_index_json_names_the_folder(self):
-        folder = self.make_folder()
+        folder = os.path.join(self.make_folder(), "carve-\u00f8")
+        os.mkdir(folder)
         self.assert_one_error(self.run_tool(folder), folder, "no index.json")
 
     def test_malformed_json_names_the_index(self):

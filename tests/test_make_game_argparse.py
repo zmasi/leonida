@@ -372,7 +372,7 @@ class JobsHandlingTest(unittest.TestCase):
                                     mock_preflight.assert_called_once_with(
                                         ["shaders"], os.path.abspath(work), False, None,
                                         emulate=True, keep_emulated=True,
-                                        fallbacks=("--descriptor-hash=fnv1a_fmix32",), jobs=6)
+                                        fallbacks=("--descriptor-hash=fnv1a_fmix32",), jobs=6, overlap=True)
                                     mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
                                                                          emulate=True, keep_emulated=True,
                                                                          fallbacks=("--descriptor-hash=fnv1a_fmix32",))

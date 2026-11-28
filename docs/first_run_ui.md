@@ -34,6 +34,10 @@ The profile selects Vulkan, a 2 GiB graphics address arena, on-demand pipelines,
 
 ## Through the first-run pages with the scripted pad
 
+Set `LEONIDA_TRACE_PIPELINE_COMPILE=1` and capture stderr with `--trace-d3d12` to time Vulkan pipeline creation.
+Pass that log to `tools/boot_trace.py --d3d12`. The summary reports the longest compilation and wait and counts
+builds without a recorded completion.
+
 Measured on 25 November 2026 on native Windows 11 with `scripts/windows-boot/boot.ps1`, an AMD Radeon RX 6800 (driver 32.0.21030.2001) and the shaders of an existing work folder, using no keyboard or controller, only `LEONIDA_INPUT_SCRIPT` (`-InputScript`). After the landing prompt takes A, the title shows these pages in order. None of them reaches the network: the WinHTTP shim refuses outbound requests.
 
 1. **Navigation experience** (first-run setup): A on the focused option moves on.

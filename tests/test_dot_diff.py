@@ -5,11 +5,14 @@ library only; no GPU, no game files.
 The family is v_dot2_i32_i16, v_dot2_u32_u16, v_dot4_i32_i8, v_dot4_u32_u8, v_dot8_i32_i4, v_dot8_u32_u4 (VOP3P) and
 the accumulating v_dot4c_i32_i8, v_dot2c_i32_i16, v_dot2c_u32_u16, v_dot4c_u32_u8, v_dot8c_i32_i4, v_dot8c_u32_u4.
 """
+import contextlib
+import io
 import os
 import random
 import re
 import sys
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -178,6 +181,73 @@ class Translated(unittest.TestCase):
             self.assertIn("expected 0x7fffffff, actual 0x80000000", d.check(lines))
         finally:
             d.translate_listing = real
+
+
+class CliGuards(unittest.TestCase):
+    def _run_main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["dot_diff.py", *argv]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = d.main()
+            except SystemExit as exc:
+                rc = exc.code
+        return rc, out.getvalue(), err.getvalue()
+
+    def test_skipped_programs_exit_nonzero(self):
+        with mock.patch.object(d, "run_one", return_value=("skip", "translator unsupported: synthetic")):
+            rc, out, _ = self._run_main(["--no-sweep", "--programs", "2", "--ops", "v_dot2_i32_i16"])
+        self.assertEqual(rc, 1)
+        self.assertIn("SKIPPED 2 program(s)", out)
+
+    def test_invalid_counts_and_empty_runs_are_rejected(self):
+        for argv, needle in (
+            (["--no-sweep", "--programs", "-1"], "--programs"),
+            (["--no-sweep", "--programs", "1", "--max-ops", "0"], "--max-ops"),
+            (["--no-sweep", "--programs", "1", "--max-ops", "-2"], "--max-ops"),
+            (["--no-sweep", "--programs", "0"], "nothing to run"),
+        ):
+            with self.subTest(argv=argv):
+                rc, _, err = self._run_main(argv)
+                self.assertEqual(rc, 2)
+                self.assertIn(needle, err)
+
+    def test_ops_validation_and_deduplication(self):
+        for bad_ops in ("", "   ", "v_dot2_i32_i16,", ",v_dot2_i32_i16"):
+            with self.subTest(ops=bad_ops):
+                rc, _, err = self._run_main(["--no-sweep", "--programs", "1", "--ops", bad_ops])
+                self.assertEqual(rc, 2)
+                self.assertIn("--ops", err)
+
+        seen_ops = []
+
+        def fake_suite(programs, seed, max_ops=6, ops=None):
+            seen_ops.append(ops)
+            return {"pass": 1, "mismatch": 0, "skip": d.Counter(), "ops": d.Counter({"v_dot2_i32_i16": 1}),
+                    "events": d.Counter()}, None
+
+        with mock.patch.object(d, "run_suite", side_effect=fake_suite):
+            rc, _, _ = self._run_main(["--no-sweep", "--programs", "1", "--ops", "v_dot2_i32_i16, v_dot2_i32_i16"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen_ops, [["v_dot2_i32_i16"]])
+
+        seen_ops.clear()
+        with mock.patch.object(d, "run_suite", side_effect=fake_suite):
+            rc, _, _ = self._run_main(["--no-sweep", "--programs", "1", "--ops", " gfx103x "])
+        self.assertEqual(rc, 0)
+        self.assertEqual(seen_ops, [list(d.GFX103X_OPS)])
+
+    def test_run_suite_validates_bounds_and_main_accepts_argv(self):
+        for bad_programs in (-1, True):
+            with self.subTest(programs=bad_programs), self.assertRaises(ValueError):
+                d.run_suite(bad_programs, 1)
+        for bad_max_ops in (0, -1, True):
+            with self.subTest(max_ops=bad_max_ops), self.assertRaises(ValueError):
+                d.run_suite(1, 1, max_ops=bad_max_ops)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(d.main(["--list-ops"]), 0)
+        self.assertIn("v_dot2_i32_i16", out.getvalue())
 
 
 if __name__ == "__main__":

@@ -2,6 +2,9 @@
 
     python -I tests/test_shader_stats.py
 """
+import contextlib
+import importlib.util
+import io
 import os
 import runpy
 import subprocess
@@ -267,6 +270,91 @@ class ShaderStats(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         self.assertNotIn("missing required", r.stderr)
         self.assertIn("no shader is in both", r.stderr)
+
+    def _load_module(self):
+        spec = importlib.util.spec_from_file_location("shader_stats_mod", SCRIPT)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_utf8_bom_csv_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.makedirs(disasm)
+            with open(os.path.join(disasm, "ps_flat.s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(PS_FLAT)
+            csv_path = os.path.join(tmp, "stats.csv")
+            with open(csv_path, "w", encoding="utf-8-sig", newline="\n") as f:
+                f.write("name,stage,statistic,value\n" + "\n".join(COMPLETE) + "\n")
+            r = self.run_args(csv_path, disasm)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout, COMPLETE_SUMMARY)
+
+    def test_shader_name_traversal_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.makedirs(disasm)
+            # Place a real listing outside disasm/ to prove traversal cannot read it.
+            outside = os.path.join(tmp, "outside.s")
+            with open(outside, "w", encoding="utf-8", newline="\n") as f:
+                f.write(PS_FLAT)
+            for bad_name in ("../outside", "..\\outside", outside[:-2], "", ".", ".."):
+                with self.subTest(bad_name=bad_name):
+                    csv_path = os.path.join(tmp, "stats.csv")
+                    with open(csv_path, "w", encoding="utf-8", newline="\n") as f:
+                        f.write(f"name,stage,statistic,value\n{bad_name},ps,Instructions,16\n")
+                    r = self.run_args(csv_path, disasm)
+                    self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                    self.assertIn("invalid shader name", r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+
+    def test_missing_or_file_disasm_dir_reports_not_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            csv_path = os.path.join(tmp, "stats.csv")
+            with open(csv_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("name,stage,statistic,value\n" + COMPLETE[0] + "\n")
+            missing = os.path.join(tmp, "no_such_dir")
+            for target in (missing, csv_path):
+                with self.subTest(target=os.path.basename(target)):
+                    r = self.run_args(csv_path, target)
+                    self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                    self.assertIn("not a directory", r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+
+    def test_short_unknown_option_and_whitespace_paths_are_rejected(self):
+        r = self.run_stats(COMPLETE, details=False, extra=["-d"])
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unknown option -d", r.stderr)
+        self.assertEqual(r.stdout, "")
+        for argv in (("   ", "disasm"), ("stats.csv", "   ")):
+            with self.subTest(argv=argv):
+                r = self.run_args(*argv)
+                self.assertEqual(r.returncode, 2)
+                self.assertIn("usage: shader_stats.py", r.stderr)
+
+    def test_number_rejects_bool_and_original_handles_empty_vlist(self):
+        mod = self._load_module()
+        self.assertIsNone(mod.number(True))
+        self.assertIsNone(mod.number(False))
+        fake = {"insns": [{"args": [{"k": "vlist", "r": []}]}]}
+        with mock.patch.object(mod.shader_ir, "parse_file", return_value=fake):
+            self.assertEqual(mod.original("synthetic.s"), (1, 0))
+
+    def test_main_accepts_argv_and_honors_details_from_argv(self):
+        mod = self._load_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            os.makedirs(disasm)
+            with open(os.path.join(disasm, "ps_flat.s"), "w", encoding="utf-8", newline="\n") as f:
+                f.write(PS_FLAT)
+            csv_path = os.path.join(tmp, "stats.csv")
+            with open(csv_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("name,stage,statistic,value\n" + "\n".join(COMPLETE) + "\n")
+            out = io.StringIO()
+            with mock.patch.object(sys, "argv", ["shader_stats.py"]), contextlib.redirect_stdout(out):
+                rc = mod.main([csv_path, disasm, "--details"])
+            self.assertEqual(rc, 0)
+            self.assertEqual(out.getvalue(), COMPLETE_DETAILS + COMPLETE_SUMMARY)
 
 
 if __name__ == "__main__":

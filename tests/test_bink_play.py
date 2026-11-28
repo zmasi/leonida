@@ -177,6 +177,60 @@ class CacheTest(unittest.TestCase):
             self.assertEqual(got, {"first": "Stinger/first.bk2", "second": "Stinger/second.bk2"})
             self.assertEqual(sorted(p.name for p in (d / "cache").iterdir()), ["bink_names.csv"])
 
+    def test_load_names_closes_mkstemp_fd_on_open_error(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            archive, mount = d / "movies.rpf", d / "common.rpf"
+            archive.write_bytes(b"x" * 16)
+            mount.write_bytes(b"y")
+            closed = []
+            real_close = bink_play.os.close
+
+            def track_close(fd):
+                closed.append(fd)
+                return real_close(fd)
+
+            def fake_names(argv):
+                out = Path(argv[argv.index("--out") + 1])
+                out.write_text("source,offset,size,path,confidence,width,height,frames\n"
+                               "movies.rpf,4096,10,Stinger/INTRO_A.bk2,anchored,3840,2160,450\n", encoding="utf-8")
+                return 0
+
+            with mock.patch.object(bink_play, "cache_path", return_value=d / "cache" / "bink_names.csv"), \
+                 mock.patch.object(bink_play.bink_names, "main", side_effect=fake_names), \
+                 mock.patch("bink_play.open", side_effect=OSError("open failure")), \
+                 mock.patch("bink_play.os.close", side_effect=track_close):
+                with self.assertRaises(OSError):
+                    bink_play.load_names(archive, mount)
+            self.assertTrue(len(closed) > 0)
+
+    def test_load_names_restores_write_mode_on_replace_failure(self):
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d)
+            archive, mount = d / "movies.rpf", d / "common.rpf"
+            archive.write_bytes(b"x" * 16)
+            mount.write_bytes(b"y")
+            chmod_calls = []
+            real_chmod = bink_play.os.chmod
+
+            def track_chmod(p, mode, **kwargs):
+                chmod_calls.append((p, mode))
+                return real_chmod(p, mode, **kwargs)
+
+            def fake_names(argv):
+                out = Path(argv[argv.index("--out") + 1])
+                out.write_text("source,offset,size,path,confidence,width,height,frames\n"
+                               "movies.rpf,4096,10,Stinger/INTRO_A.bk2,anchored,3840,2160,450\n", encoding="utf-8")
+                return 0
+
+            with mock.patch.object(bink_play, "cache_path", return_value=d / "cache" / "bink_names.csv"), \
+                 mock.patch.object(bink_play.bink_names, "main", side_effect=fake_names), \
+                 mock.patch("bink_play.os.replace", side_effect=OSError("replace failed")), \
+                 mock.patch("bink_play.os.chmod", side_effect=track_chmod):
+                with self.assertRaises(OSError):
+                    bink_play.load_names(archive, mount)
+            self.assertTrue(any(mode == 0o600 for p, mode in chmod_calls))
+
 
 class NoCacheTest(unittest.TestCase):
     def setUp(self):

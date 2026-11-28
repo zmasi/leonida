@@ -198,6 +198,47 @@ class ProgramText(unittest.TestCase):
                                "vk_compute_test: unsupported: no matching device", [0]])
 
 
+    def test_encoded_listings_skip_llvm_mc_and_follow_the_wave64_emulation_switch(self):
+        listing = "; cs_vkfuzz_0\n; encoding: [0x00,0x00,0x80,0xbf]\ns_endpgm\n"
+        if R.SHADERS not in sys.path:
+            sys.path.insert(0, R.SHADERS)
+        import compute_fixture
+        import mc_command
+
+        for wave, emulate in ((32, ""), (64, ""), (64, "1")):
+            with self.subTest(wave=wave, emulate=emulate), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / ("vk_compute_test.exe" if os.name == "nt" else "vk_compute_test")).touch()
+                seen = {"translator": None, "gpu": None, "env": None, "listing": None}
+
+                def child(cmd, *, env=None, **_kwargs):
+                    if "--out" in cmd:
+                        out = Path(cmd[cmd.index("--out") + 1])
+                        out.mkdir()
+                        seen["translator"] = list(cmd)
+                        seen["listing"] = (Path(cmd[cmd.index("--out") - 1]) / "cs_vkfuzz_0.s").read_text(
+                            encoding="utf-8")
+                        (out / "index.json").write_text(json.dumps({"cs_vkfuzz_0": {}}), encoding="utf-8",
+                                                        newline="\n")
+                        (out / "cs_vkfuzz_0.spv").write_bytes(b"synthetic")
+                        return subprocess.CompletedProcess(cmd, 0, "", "")
+                    seen["gpu"], seen["env"] = list(cmd), env
+                    Path(env["VKC_DUMP"]).write_bytes(bytes(4 * wave))
+                    return subprocess.CompletedProcess(cmd, 0, "", "")
+
+                with mock.patch.object(mc_command, "mc_command", side_effect=AssertionError("llvm-mc was asked")), \
+                     mock.patch.object(mc_command, "run", side_effect=AssertionError("llvm-mc was run")), \
+                     mock.patch.object(compute_fixture, "compute_header", return_value=b"synthetic"), \
+                     mock.patch.object(R.subprocess, "run", side_effect=child), \
+                     mock.patch.dict(os.environ, {"LEONIDA_W64_EMULATE": emulate}):
+                    got = R.run_programs([listing], words=1, wave=wave, build=tmp, work_parent=tmp, encoded=True)
+                self.assertEqual(got, [[0]])
+                self.assertEqual(seen["listing"], "; cs_vkfuzz_0\n" + listing)  # the text, as given
+                emulating = wave == 64 and emulate == "1"
+                self.assertEqual("--wave64-emulate" in seen["translator"], emulating)
+                self.assertEqual("--require-wave64" in seen["gpu"], wave == 64 and not emulating)
+                self.assertEqual(seen["env"].get("VKC_SUBGROUP_SIZE"), None if wave == 64 and not emulating else "32")
+
+
 class Guard(unittest.TestCase):
     FUZZERS = ("pk16_diff", "vint_diff", "sdwa_diff", "wint_diff", "fmisc_diff")
 

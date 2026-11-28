@@ -15,10 +15,13 @@ error in serial and parallel runs.
 It runs the files `python -m unittest discover -s tests/semantic` finds (`test*.py` by default, and packages below it), each in its own process from that folder, so a file sees the same import path as under discover.
 
 The files can run side by side because each one writes only into its own temporary folder; a new test must do the same. With -j 1,
-or on a single core, it runs that discover command itself. Prints the output of every failing file and one summary
-line, and exits 1 if a file fails, none is found, or no test ran. Standard library only.
+or on a single core, it runs that discover command itself. Prints the output of every failing file, headed by its
+exit code (a POSIX signal by name, a known Windows NTSTATUS with its meaning, e.g. 0xC0000005 access violation,
+since a file that crashes prints nothing), and one summary line, and exits 1 if a file fails, none is found, or no
+test ran. Standard library only.
 
-The count of tests comes from unittest's own result object, not from its output: a module that writes a line shaped like unittest's summary to stderr - a nested runner, or an atexit handler that runs after unittest's own summary - cannot change it.
+The test count and verdict come from unittest's result, not from printed summaries. A child exiting with status 0
+without a completed result, or after unittest reported failure, fails the run.
 
 `--timeout SECONDS` limits each module subprocess in parallel mode, or the entire discover subprocess with
 `-j 1`. The value must be positive and at most 86400 seconds (24 hours), keeping it within platform wait limits.
@@ -33,6 +36,7 @@ import locale
 import math
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -59,7 +63,7 @@ def _unregister_process(proc):
 def _kill_process_tree(proc):
     if proc is None:
         return
-    if os.name == "nt":
+    if os.name == "nt" and proc.poll() is None:
         try:
             subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -74,11 +78,13 @@ def _kill_process_tree(proc):
 def _terminate_active_processes():
     with _processes_lock:
         procs = list(_active_processes)
-    for p in procs:
-        try:
-            p.terminate()
-        except OSError:
-            pass
+    if os.name != "nt":
+        for p in procs:
+            try:
+                p.terminate()
+            except OSError:
+                pass
+    # On Windows taskkill /T needs the root process alive to find its descendants.
     for p in procs:
         _kill_process_tree(p)
         try:
@@ -94,13 +100,44 @@ CHILD_PROGRAM = (
     "import json, os, sys, unittest\n"
     "program = unittest.TestProgram(module=None, argv=['unittest'] + sys.argv[1:], exit=False)\n"
     "result = program.result\n"
-    "with open(os.environ['LEONIDA_TEST_COUNT'], 'w', encoding='utf-8') as handle:\n"
-    "    json.dump({'testsRun': result.testsRun}, handle)\n"
-    "if not result.wasSuccessful():\n"
-    "    sys.exit(1)\n"
-    "elif result.testsRun == 0 and len(result.skipped) == 0:\n"
-    "    sys.exit(5)\n"
-    "sys.exit(0)\n")
+    "code = 1 if not result.wasSuccessful() else 5 if not result.testsRun and not result.skipped else 0\n"
+    "with open(os.environ['LEONIDA_TEST_COUNT'], 'w', encoding='utf-8', newline='\\n') as handle:\n"
+    "    json.dump({'testsRun': result.testsRun, 'exitCode': code}, handle)\n"
+    "sys.exit(code)\n")
+
+# Windows NTSTATUS codes python.exe exits with when it crashes. A file that dies this way prints nothing, so the code
+# is the only clue there is (an access violation in a pure-Python test points at the machine, not at the test).
+NTSTATUS_CRASHES = {
+    0xC0000005: "access violation",
+    0xC000001D: "illegal instruction",
+    0xC0000017: "out of memory",
+    0xC00000FD: "stack overflow",
+    0xC0000374: "heap corruption",
+    0xC0000409: "fail fast / stack buffer overrun",
+}
+# Known statuses that end a process without it crashing.
+NTSTATUS_OTHER = {
+    0xC000013A: "interrupted with Ctrl+C",
+}
+
+
+def describe_exit(code):
+    """A failed module's exit code in words: `exit code 1`, `killed by SIGSEGV (-11)` for a POSIX signal, or for a
+    known Windows NTSTATUS its hexadecimal value and meaning (3221225477 -> 0xC0000005, access violation). Only the
+    statuses in NTSTATUS_CRASHES are called a crash: a process can also exit with any 32-bit value on purpose, so an
+    unknown one is reported as just its value."""
+    if code < 0:
+        try:
+            return f"killed by {signal.Signals(-code).name} ({code})"
+        except ValueError:
+            return f"killed by signal {-code} ({code})"
+    if code in NTSTATUS_CRASHES:
+        return f"exit code 0x{code:08X}, {NTSTATUS_CRASHES[code]} (the process crashed)"
+    if code in NTSTATUS_OTHER:
+        return f"exit code 0x{code:08X}, {NTSTATUS_OTHER[code]}"
+    if code > 0xFFFF:  # an NTSTATUS-sized value reads better in hexadecimal
+        return f"exit code 0x{code:08X}"
+    return f"exit code {code}"
 
 
 def module_path(directory, module):
@@ -139,14 +176,64 @@ def positive_seconds(value):
     return seconds
 
 
-def read_count(path):
-    """The number of tests the child ran, as unittest's own result object reported it."""
+def read_result(path, process_code):
+    """Return the effective exit code, completed test count, and any diagnostic."""
     try:
         with open(path, encoding="utf-8") as handle:
-            return int(json.load(handle)["testsRun"])
+            result = json.load(handle)
+        count, test_code = result["testsRun"], result["exitCode"]
+        if type(count) is not int or count < 0 or type(test_code) is not int or test_code not in (0, 1, 5):
+            raise ValueError("invalid unittest result")
     except (OSError, ValueError, KeyError, TypeError):
-        # The child wrote no result: it did not finish, so no test is known to have run.
-        return 0
+        if process_code == 0:
+            return 1, 0, "process exited without a unittest result"
+        return process_code, None, ""
+    if process_code in (0, 5) and process_code != test_code:
+        return 1, count, f"process exited with status {process_code} but unittest reported {test_code}"
+    return process_code, count, ""
+
+
+def result_environment(scratch):
+    result_path = os.path.join(scratch, "count.json")
+    return result_path, dict(os.environ, LEONIDA_TEST_COUNT=result_path)
+
+
+def run_discover(directory, pattern, verbose, timeout):
+    args = ["discover", "-s", directory, "-p", pattern, *(["-v"] if verbose else [])]
+    with tempfile.TemporaryDirectory() as scratch:
+        path, env = result_environment(scratch)
+        proc = subprocess.Popen([sys.executable, "-c", CHILD_PROGRAM, *args], env=env)
+        _register_process(proc)
+        start_time = time.monotonic()
+        try:
+            while True:
+                try:
+                    code = proc.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if timeout is not None and time.monotonic() - start_time >= timeout:
+                        raise
+        except subprocess.TimeoutExpired:
+            _kill_process_tree(proc)
+            print(f"TIMED OUT after {timeout:g} s: unittest discover in {directory}", file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            _kill_process_tree(proc)
+            try:
+                proc.wait(timeout=0.5)
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+            print("interrupted", file=sys.stderr)
+            return 130
+        except BaseException:
+            _kill_process_tree(proc)
+            raise
+        finally:
+            _unregister_process(proc)
+        code, _, diagnostic = read_result(path, code)
+    if diagnostic:
+        print(f"unittest discover in {directory}: {diagnostic}", file=sys.stderr)
+    return code
 
 
 def run_module(directory, module, verbose, timeout=None):
@@ -157,8 +244,7 @@ def run_module(directory, module, verbose, timeout=None):
     target = module[:-len(".__init__")] if module.endswith(".__init__") else module
     cmd = [sys.executable, "-c", CHILD_PROGRAM, *(["-v"] if verbose else []), target]
     with tempfile.TemporaryDirectory() as scratch:
-        count_path = os.path.join(scratch, "count.json")
-        env = dict(os.environ, LEONIDA_TEST_COUNT=count_path)
+        result_path, env = result_environment(scratch)
         proc = subprocess.Popen(cmd, cwd=directory, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, errors="replace")
         _register_process(proc)
@@ -181,13 +267,14 @@ def run_module(directory, module, verbose, timeout=None):
             raise
         finally:
             _unregister_process(proc)
-        count = read_count(count_path)
+        code, count, diagnostic = read_result(result_path, proc.returncode)
     out = stdout + stderr
-    # Discover imports every package initializer, but an empty one has no tests to run. It is included in the
-    # module list so parallel runs see TestCase classes when there are any; without them, it is not a failure.
-    if proc.returncode == 5 and count == 0 and module.endswith(".__init__") and "NO TESTS RAN" in stderr:
+    if diagnostic:
+        out += f"\n{diagnostic}\n"
+    # A package initializer that completed with no tests isn't a failed module.
+    if code == 5 and count == 0 and module.endswith(".__init__"):
         return 0, 0, out
-    return proc.returncode, count, out
+    return code, count or 0, out
 
 
 def main(argv=None):
@@ -206,35 +293,7 @@ def main(argv=None):
         print(f"no {a.pattern} files in {directory}")
         return 1
     if a.jobs <= 1:
-        cmd = [sys.executable, "-m", "unittest", "discover", "-s", directory,
-               "-p", a.pattern, *(["-v"] if a.verbose else [])]
-        proc = subprocess.Popen(cmd)
-        _register_process(proc)
-        start_time = time.monotonic()
-        try:
-            while True:
-                try:
-                    return proc.wait(timeout=0.2)
-                except subprocess.TimeoutExpired:
-                    if a.timeout is not None and time.monotonic() - start_time >= a.timeout:
-                        raise
-        except subprocess.TimeoutExpired:
-            _kill_process_tree(proc)
-            print(f"TIMED OUT after {a.timeout:g} s: unittest discover in {directory}", file=sys.stderr)
-            return 1
-        except KeyboardInterrupt:
-            _kill_process_tree(proc)
-            try:
-                proc.wait(timeout=0.5)
-            except (subprocess.TimeoutExpired, OSError):
-                pass
-            print("interrupted", file=sys.stderr)
-            return 130
-        except BaseException:
-            _kill_process_tree(proc)
-            raise
-        finally:
-            _unregister_process(proc)
+        return run_discover(directory, a.pattern, a.verbose, a.timeout)
     # Largest files first: they tend to run longest, and one started last would set the wall time alone.
     modules.sort(key=lambda m: -os.path.getsize(module_path(directory, m)))
     start, total, failed = time.monotonic(), 0, []
@@ -252,7 +311,8 @@ def main(argv=None):
                 total += ran
                 if code:
                     failed.append(jobs[job])
-                    print(f"==== FAILED: {jobs[job]}\n{out}", flush=True)
+                    silent = "" if out.strip() else "(no output: the process ended before printing anything)\n"
+                    print(f"==== FAILED: {jobs[job]} ({describe_exit(code)})\n{silent}{out}", flush=True)
                 elif a.verbose:
                     print(f"==== {jobs[job]}\n{out}", flush=True)
     except KeyboardInterrupt:

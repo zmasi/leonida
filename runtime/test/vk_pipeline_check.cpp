@@ -1479,6 +1479,7 @@ int main(int argc, char** argv) {
     leonida::LargeModuleGate large_gate(
         large_parallel == 0 ? available_memory / 4 * 3 : UINT64_MAX,
         large_parallel == 0 ? jobs : std::min<unsigned>(large_parallel, jobs));
+    leonida::LargeModuleQueue work_queue(large_gate, work.size());   // a large module that must wait frees its thread
     if (large_module_bytes) {
         if (large_exclusive)
             std::fprintf(stderr, "large modules (over %zu bytes): one at a time, the other threads waiting\n",
@@ -1494,7 +1495,7 @@ int main(int argc, char** argv) {
     std::map<std::string, uint32_t> modules_ok, modules_bad, big_skipped;
     std::map<std::string, StageStats> stats;
     std::map<std::string, VkShaderModule> stub_cache;
-    std::atomic<size_t> next{0}, done{0};
+    std::atomic<size_t> done{0};
     std::atomic<uint32_t> total_pipes_done{0};
     // What each worker is doing in the driver: creating the shader module, then creating its pipeline.
     struct InFlight {
@@ -1622,7 +1623,8 @@ int main(int argc, char** argv) {
     };
 
     auto worker = [&] {
-        for (size_t k; (k = next++) < work.size();) {
+        while (auto claim = work_queue.take()) {   // its ticket is left after the module and its pipeline are gone
+            const size_t k = claim->index;
             const std::string& name = *work[k].first;
             const ShaderMeta& meta = *work[k].second;
             const std::string& stage = meta.stage;
@@ -1673,13 +1675,11 @@ int main(int argc, char** argv) {
             const bool isolated = large_module_bytes && std::cmp_greater(file_size, large_module_bytes);
             std::unique_lock exclusive(compile_gate, std::defer_lock);
             std::shared_lock parallel(compile_gate, std::defer_lock);
-            leonida::LargeModuleGate::Ticket large_ticket;   // left after the module and its pipeline are gone
             if (large_exclusive) {
                 if (isolated) exclusive.lock();
                 else if (large_module_bytes) parallel.lock();
-            } else if (isolated) {
-                large_ticket = leonida::LargeModuleGate::Ticket(large_gate,
-                                                                leonida::large_module_estimate(file_size));
+            } else if (isolated && !work_queue.admit(*claim, leonida::large_module_estimate(file_size))) {
+                continue;   // not within the budget yet: put back, and this thread takes the next module
             }
             {   // in flight from here: vkCreateShaderModule can also take long or die in the driver
                 std::lock_guard<std::mutex> g(mu);

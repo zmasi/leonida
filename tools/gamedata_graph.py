@@ -132,7 +132,7 @@ def scan_document(doc: dict) -> dict:
         return report
     report["parsed"] = True
     report["root"] = root.tag
-    report["complete"] = bool(doc.get("complete", True))
+    report["complete"] = True
 
     own = _direct_id(root)
     if own:
@@ -426,7 +426,7 @@ def build_graph(documents: list) -> dict:
             stats["include_references"] += len(report["includes"])
             stats["target_references"] += len(report["refs"])
             stats["references"] += len(report["refs"]) + len(report["includes"])
-        if root in MANIFEST_ROOT_SET:
+        if report["parsed"] and root in MANIFEST_ROOT_SET:
             category_stats[category]["manifest_documents"] += 1
             root_stats[root]["manifest_documents"] += 1
 
@@ -538,7 +538,7 @@ def build_graph(documents: list) -> dict:
     # one category, so this also checks that the category totals line up with the 118 named roots.
     for category, stats in summary["categories"].items():
         stats["roots"] = sum(1 for root in summary["roots"]
-                             if (gx.category_for(root) if root else gx.UNCATALOGUED) == category)
+                             if root and gx.category_for(root) == category)
         stats.setdefault("manifest_documents", 0)
     for stats in summary["roots"].values():
         stats.setdefault("manifest_documents", 0)
@@ -630,19 +630,23 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        if args.json:
+        if args.json is not None:
+            if not args.json.strip():
+                parser.error("--json path must not be empty")
             if os.path.isdir(args.json):
                 parser.error(f"--json is a directory: {args.json}")
             for target in args.targets:
                 is_dir = os.path.isdir(target)
+                is_carve = is_dir and os.path.isfile(os.path.join(target, "index.json"))
                 source = os.path.join(target, "index.json") if is_dir else target
                 if gx.same_report_path(args.json, source):
                     parser.error(f"--json would overwrite the input {source}")
                 if is_dir and os.path.isfile(args.json):
-                    root = os.path.normcase(os.path.abspath(target))
-                    dest = os.path.normcase(os.path.abspath(args.json))
-                    if dest.endswith(".bin") and dest.startswith(root + os.sep):
-                        parser.error(f"--json would overwrite an input file: {args.json}")
+                    if is_carve:
+                        root = os.path.normcase(os.path.realpath(target))
+                        dest = os.path.normcase(os.path.realpath(args.json))
+                        if dest.lower().endswith((".bin", ".bk2")) and dest.startswith(root + os.sep):
+                            parser.error(f"--json would overwrite an input file: {args.json}")
                     for path in gx.input_files([target]):
                         if gx.same_report_path(args.json, path):
                             parser.error(f"--json would overwrite the input {path}")
@@ -663,7 +667,7 @@ def main(argv=None) -> int:
     graph = build_graph(documents)
     graph["summary"]["mode"] = gx.document_mode(args.targets)
     print_summary(graph)
-    if args.json:
+    if args.json is not None:
         try:
             write_json(args.json, graph)
         except OSError as exc:

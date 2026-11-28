@@ -8,9 +8,11 @@
 // exposed buffers form an offscreen ring; each present blits the current slot into the acquired native image.
 #include "../shims/dxgi_swapchain.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -43,6 +45,16 @@ struct Fake {
     unsigned destroyed_images = 0;
     VkSwapchainKHR live = VK_NULL_HANDLE;     // the swapchain that can acquire
     VkSwapchainKHR retired = VK_NULL_HANDLE;  // retired by a vkCreateSwapchainKHR, failed or not
+    // For kevincommits' mock-driver findings in #1608 (RT-SWAPCHAIN-MOCK-FINDINGS):
+    std::vector<VkSwapchainKHR> old_swapchains;  // oldSwapchain of every vkCreateSwapchainKHR, failed or not
+    std::vector<VkSwapchainKHR> destroyed_swapchains;
+    unsigned unsupported_surfaces = 0;  // the next N surface-support queries answer VK_FALSE
+    unsigned surface_support_calls = 0;
+    unsigned destroyed_surfaces = 0;
+    VkCompositeAlphaFlagsKHR supported_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    VkCompositeAlphaFlagBitsKHR create_alpha = VkCompositeAlphaFlagBitsKHR(0);
+    bool linear_filter = true;  // the format can be filtered with optimal tiling
+    VkFilter blit_filter = VK_FILTER_MAX_ENUM;
 };
 Fake g;
 
@@ -60,10 +72,21 @@ VKAPI_ATTR VkResult VKAPI_CALL create_win32_surface(VkInstance, const VkWin32Sur
     if (out) *out = reinterpret_cast<VkSurfaceKHR>(kSurface);
     return VK_SUCCESS;
 }
-VKAPI_ATTR void VKAPI_CALL destroy_surface(VkInstance, VkSurfaceKHR, const VkAllocationCallbacks*) {}
+VKAPI_ATTR void VKAPI_CALL destroy_surface(VkInstance, VkSurfaceKHR, const VkAllocationCallbacks*) {
+    ++g.destroyed_surfaces;
+}
 VKAPI_ATTR VkResult VKAPI_CALL surface_support(VkPhysicalDevice, std::uint32_t, VkSurfaceKHR, VkBool32* out) {
-    if (out) *out = VK_TRUE;
+    ++g.surface_support_calls;
+    const bool unsupported = g.unsupported_surfaces > 0;
+    if (unsupported) --g.unsupported_surfaces;
+    if (out) *out = unsupported ? VK_FALSE : VK_TRUE;
     return VK_SUCCESS;
+}
+VKAPI_ATTR void VKAPI_CALL format_properties(VkPhysicalDevice, VkFormat, VkFormatProperties* props) {
+    std::memset(props, 0, sizeof(*props));
+    props->optimalTilingFeatures = VK_FORMAT_FEATURE_BLIT_SRC_BIT | VK_FORMAT_FEATURE_BLIT_DST_BIT |
+                                   VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    if (g.linear_filter) props->optimalTilingFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
 }
 VKAPI_ATTR VkResult VKAPI_CALL surface_caps(VkPhysicalDevice, VkSurfaceKHR, VkSurfaceCapabilitiesKHR* caps) {
     if (!caps) return VK_ERROR_INITIALIZATION_FAILED;
@@ -76,6 +99,7 @@ VKAPI_ATTR VkResult VKAPI_CALL surface_caps(VkPhysicalDevice, VkSurfaceKHR, VkSu
     caps->supportedUsageFlags = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                 VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     caps->currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+    caps->supportedCompositeAlpha = g.supported_alpha;
     return VK_SUCCESS;
 }
 VKAPI_ATTR VkResult VKAPI_CALL surface_formats(VkPhysicalDevice, VkSurfaceKHR, std::uint32_t* count,
@@ -107,6 +131,8 @@ VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice, const VkSwapchainCreat
                                                 const VkAllocationCallbacks*, VkSwapchainKHR* out) {
     if (!info || !out) return VK_ERROR_INITIALIZATION_FAILED;
     // The Vulkan rule this test leans on: oldSwapchain is retired even when creation fails.
+    g.old_swapchains.push_back(info->oldSwapchain);
+    g.create_alpha = info->compositeAlpha;
     if (info->oldSwapchain) g.retired = info->oldSwapchain;
     if (g.fail_swapchain_creates) {
         --g.fail_swapchain_creates;
@@ -118,7 +144,9 @@ VKAPI_ATTR VkResult VKAPI_CALL create_swapchain(VkDevice, const VkSwapchainCreat
     g.live = *out;
     return VK_SUCCESS;
 }
-VKAPI_ATTR void VKAPI_CALL destroy_swapchain(VkDevice, VkSwapchainKHR, const VkAllocationCallbacks*) {}
+VKAPI_ATTR void VKAPI_CALL destroy_swapchain(VkDevice, VkSwapchainKHR swapchain, const VkAllocationCallbacks*) {
+    g.destroyed_swapchains.push_back(swapchain);
+}
 VKAPI_ATTR VkResult VKAPI_CALL get_images(VkDevice, VkSwapchainKHR, std::uint32_t* count, VkImage* images) {
     if (!count) return VK_ERROR_INITIALIZATION_FAILED;
     if (images) {
@@ -200,7 +228,8 @@ VKAPI_ATTR void VKAPI_CALL cmd_barrier(VkCommandBuffer, VkPipelineStageFlags, Vk
                                        const VkMemoryBarrier*, std::uint32_t, const VkBufferMemoryBarrier*,
                                        std::uint32_t, const VkImageMemoryBarrier*) {}
 VKAPI_ATTR void VKAPI_CALL cmd_blit(VkCommandBuffer, VkImage src, VkImageLayout, VkImage dst, VkImageLayout,
-                                    std::uint32_t, const VkImageBlit*, VkFilter) {
+                                    std::uint32_t, const VkImageBlit*, VkFilter filter) {
+    g.blit_filter = filter;
     g.blit_src = src;
     g.blit_dst = dst;
 }
@@ -220,6 +249,7 @@ const Entry kEntries[] = {
     {"vkGetPhysicalDeviceSurfaceFormatsKHR", as_function(surface_formats)},
     {"vkGetPhysicalDeviceSurfacePresentModesKHR", as_function(surface_present_modes)},
     {"vkGetPhysicalDeviceMemoryProperties", as_function(memory_properties)},
+    {"vkGetPhysicalDeviceFormatProperties", as_function(format_properties)},
     {"vkCreateSwapchainKHR", as_function(create_swapchain)},
     {"vkDestroySwapchainKHR", as_function(destroy_swapchain)},
     {"vkGetSwapchainImagesKHR", as_function(get_images)},
@@ -406,6 +436,121 @@ int run_failed_resize(const char* label, std::uint32_t requested, std::uint32_t 
     return 0;
 }
 
+std::unique_ptr<leonida::VulkanSwapchain> make(leonida::SubmitMutex& mutex) {
+    return std::make_unique<leonida::VulkanSwapchain>(get_instance_proc, reinterpret_cast<VkInstance>(1),
+                                                      reinterpret_cast<VkPhysicalDevice>(2), get_device_proc,
+                                                      reinterpret_cast<VkDevice>(3), reinterpret_cast<VkQueue>(4), 0,
+                                                      mutex, /*diagnostics=*/nullptr);
+}
+HWND window() { return reinterpret_cast<HWND>(static_cast<std::uintptr_t>(1)); }
+
+// (a) A failed vkCreateSwapchainKHR still retires its oldSwapchain. The shim must not keep it: it is destroyed,
+// nothing is acquired from it, and the next create does not pass it as oldSwapchain again
+// (VUID-VkSwapchainCreateInfoKHR-oldSwapchain-01933).
+int run_retired_after_failed_create() {
+    g = Fake{};
+    g.returned_images = 4;
+    leonida::SubmitMutex mutex;
+    const auto swapchain = make(mutex);
+    if (!swapchain->create(window(), 64, 64, VK_FORMAT_B8G8R8A8_UNORM, 2)) return fail("(a) create");
+    const VkSwapchainKHR first = g.live;
+    g.fail_swapchain_creates = 1;
+    if (swapchain->resize(64, 64, VK_FORMAT_UNDEFINED, 2)) return fail("(a) resize succeeded");
+    if (std::find(g.destroyed_swapchains.begin(), g.destroyed_swapchains.end(), first) ==
+        g.destroyed_swapchains.end())
+        return fail("(a) the retired swapchain was not destroyed");
+    if (swapchain->image_count() != 0) return fail("(a) buffers are exposed without a swapchain");
+    std::uint32_t index = 0;
+    if (swapchain->acquire_next_image(index)) return fail("(a) acquired from the retired swapchain");
+    g.fail_swapchain_creates = 1;
+    if (swapchain->resize(64, 64, VK_FORMAT_UNDEFINED, 2)) return fail("(a) second resize succeeded");
+    if (g.old_swapchains.size() != 3 || g.old_swapchains[2] != VK_NULL_HANDLE)
+        return fail("(a) the retired swapchain was passed as oldSwapchain again");
+    if (!swapchain->resize(64, 64, VK_FORMAT_UNDEFINED, 2) || swapchain->image_count() != 2)
+        return fail("(a) no recovery after the failed creates");
+    return present_one("(a) recovered", *swapchain);
+}
+
+// (b) BufferCount 4 on 2 native images, and the ring of 4 can't be made. Nothing may stay exposed: without the
+// ring, image() and resource_binding() index the 2 native images, with indices up to 3.
+int run_failed_ring_exposes_nothing() {
+    g = Fake{};
+    g.returned_images = 2;
+    leonida::SubmitMutex mutex;
+    const auto swapchain = make(mutex);
+    if (!swapchain->create(window(), 64, 64, VK_FORMAT_B8G8R8A8_UNORM, 4)) return fail("(b) create");
+    if (swapchain->image_count() != 4 || !swapchain->is_offscreen()) return fail("(b) no ring of 4");
+    g.fail_image_creates = 1;
+    if (swapchain->resize(64, 64)) return fail("(b) resize succeeded");
+    if (swapchain->is_offscreen()) return fail("(b) the ring survived its failed rebuild");
+    if (swapchain->image_count() != 0) {
+        std::fprintf(stderr, "FAIL: (b) %u buffers exposed over 2 native images after the failed ring\n",
+                     swapchain->image_count());
+        return 1;
+    }
+    for (std::uint32_t i = 0; i < 4; ++i)
+        if (swapchain->image(i) || swapchain->resource_binding(i).image) return fail("(b) a buffer is still exposed");
+    if (swapchain->present(0)) return fail("(b) presented without buffers");
+    if (!swapchain->resize(64, 64, VK_FORMAT_UNDEFINED, 4) || swapchain->image_count() != 4)
+        return fail("(b) no recovery");
+    return present_one("(b) recovered", *swapchain);
+}
+
+// (c) A surface the queue family cannot present to is destroyed, and the next create() asks again.
+int run_unsupported_surface() {
+    g = Fake{};
+    g.unsupported_surfaces = 1;
+    leonida::SubmitMutex mutex;
+    const auto swapchain = make(mutex);
+    if (swapchain->create(window(), 64, 64)) return fail("(c) create on an unsupported surface succeeded");
+    if (g.destroyed_surfaces != 1) return fail("(c) the unsupported surface was kept");
+    if (!g.old_swapchains.empty()) return fail("(c) a swapchain was created on the unsupported surface");
+    if (!swapchain->create(window(), 64, 64)) return fail("(c) the second create failed");
+    if (g.surface_support_calls != 2) return fail("(c) the second create did not check surface support");
+    return 0;
+}
+
+// (d) The blit filters only when it scales and the format allows it, and the composite alpha is one the surface
+// offers.
+int run_filter_and_alpha() {
+    struct FilterCase {
+        const char* label;
+        std::uint32_t size;  // the surface is 64x64
+        bool linear;
+        VkFilter expected;
+    };
+    const FilterCase filters[] = {
+        {"(d) 1:1 blit", 64, true, VK_FILTER_NEAREST},
+        {"(d) scaled blit, filterable format", 32, true, VK_FILTER_LINEAR},
+        {"(d) scaled blit, format without linear filtering", 32, false, VK_FILTER_NEAREST},
+    };
+    for (const FilterCase& c : filters) {
+        g = Fake{};
+        g.returned_images = 2;
+        g.linear_filter = c.linear;
+        leonida::SubmitMutex mutex;
+        const auto swapchain = make(mutex);
+        if (!swapchain->create(window(), c.size, c.size, VK_FORMAT_B8G8R8A8_UNORM, 2)) return fail(c.label);
+        if (const int r = present_one(c.label, *swapchain)) return r;
+        if (g.blit_filter != c.expected) {
+            std::fprintf(stderr, "FAIL: %s: filter %d, expected %d\n", c.label, int(g.blit_filter),
+                         int(c.expected));
+            return 1;
+        }
+    }
+    leonida::SubmitMutex mutex;
+    g = Fake{};
+    g.supported_alpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+    if (!make(mutex)->create(window(), 64, 64)) return fail("(d) create with INHERIT only");
+    if (g.create_alpha != VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR)
+        return fail("(d) a composite alpha the surface does not offer");
+    g = Fake{};
+    g.supported_alpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR | VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR;
+    if (!make(mutex)->create(window(), 64, 64) || g.create_alpha != VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
+        return fail("(d) opaque is no longer the first choice");
+    return 0;
+}
+
 struct Case {
     const char* label;
     std::uint32_t requested;
@@ -446,7 +591,13 @@ int main() {
         if (const int result = run_failed_resize(c.label, c.requested, c.native, c.offscreen, c.fail_swapchain))
             return result;
     }
+    // Each finding runs even when an earlier one fails, so a run shows all of them.
+    int findings_failed = 0;
+    for (int (*run)() : {run_retired_after_failed_create, run_failed_ring_exposes_nothing, run_unsupported_surface,
+                         run_filter_and_alpha})
+        findings_failed |= run();
+    if (findings_failed) return 1;
     std::printf("dxgi_swapchain_count_test: PASS (3 cases: extra native images, min above request, "
-                "request above min; 4 failed-resize cases)\n");
+                "request above min; 4 failed-resize cases; 4 mock-driver findings)\n");
     return 0;
 }

@@ -138,6 +138,56 @@ class StaleBuildTests(unittest.TestCase):
         found = stale_build.program_sources(self.root, "cmt")
         self.assertEqual(rel(self.root, found), ["runtime/test/cmt.cpp", "runtime/test/helper.h"])
 
+    def test_block_comment_and_raw_string_includes_ignored_while_inline_comment_prefix_followed(self):
+        write(self.root, "runtime/test/hidden_blk.h", "")
+        write(self.root, "runtime/test/hidden_raw.h", "")
+        write(self.root, "runtime/test/after_str.h", "")
+        write(
+            self.root,
+            "runtime/test/comments.cpp",
+            '/*\n#include "hidden_blk.h"\n*/\n'
+            'const char *s = R"(\n#include "hidden_raw.h"\n)";\n'
+            'const char *open_blk = "/*";\n'
+            '#include "after_str.h"\n'
+            '/* note */ #include "helper.h"\n',
+        )
+        found = stale_build.program_sources(self.root, "comments")
+        self.assertEqual(
+            rel(self.root, found),
+            ["runtime/test/after_str.h", "runtime/test/comments.cpp", "runtime/test/helper.h"],
+        )
+
+    def test_utf8_bom_first_line_include_is_followed(self):
+        bom_cpp = os.path.join(self.root, "runtime", "test", "bom.cpp")
+        with open(bom_cpp, "wb") as f:
+            f.write(b'\xef\xbb\xbf#include "helper.h"\nint main() {}\n')
+        found = stale_build.program_sources(self.root, "bom")
+        self.assertEqual(rel(self.root, found), ["runtime/test/bom.cpp", "runtime/test/helper.h"])
+
+    def test_backslash_include_resolves_and_absolute_include_is_ignored(self):
+        write(self.root, "runtime/test/sub/nested.h", "#pragma once\n")
+        outside = write(self.root, "outside.h", "#pragma once\n")
+        abs_inc = outside.replace("\\", "/")
+        write(
+            self.root,
+            "runtime/test/paths.cpp",
+            f'#include "sub\\nested.h"\n#include "{abs_inc}"\n',
+        )
+        found = stale_build.program_sources(self.root, "paths")
+        self.assertEqual(rel(self.root, found), ["runtime/test/paths.cpp", "runtime/test/sub/nested.h"])
+
+    def test_sub_ulp_nanosecond_mtime_difference_is_detected(self):
+        base_ns = BASE * 1_000_000_000
+        os.utime(self.exe, ns=(base_ns, base_ns))
+        os.utime(self.cpp, ns=(base_ns, base_ns))
+        os.utime(self.x, ns=(base_ns, base_ns))
+        os.utime(self.helper, ns=(base_ns + 100, base_ns + 100))
+        if os.stat(self.helper).st_mtime_ns <= os.stat(self.exe).st_mtime_ns:
+            self.skipTest("filesystem does not preserve 100ns mtime precision")
+        # 100 ns is below float64 ULP at 1.7e9 (~238 ns), so float getmtime rounds both equal.
+        self.assertEqual(os.path.getmtime(self.helper), os.path.getmtime(self.exe))
+        self.assertEqual(stale_build.newer_sources(self.exe, self.root, "prog"), ["runtime/test/helper.h"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,0 +1,20 @@
+GPU:      NVIDIA GeForce RTX 5070 (Blackwell)
+Driver:   NVIDIA 616.92 (32.0.16.1692, proprietary)
+Subgroup: 32..32 (default 32)
+OS:       Windows 11 x64, build 26300
+Commit:   b1619e0a307ddc6e1362a2523f6ebb3038005bd6
+Tools:    llvm-mc 23.1.6 (conda-forge AMDGPU), Vulkan SDK SPIRV-Tools,
+          Python 3.13.17, pre-built runtime-windows CI artifact (b1619e0)
+CPU:      AMD Ryzen 7 5700X
+RAM:      32 GB DDR4
+
+run_gpu_tests.py:
+  Native: 212/271 passed, 57 skipped, 2 failed.
+  LEONIDA_W64_EMULATE=1: 249/271 passed, 20 skipped, 2 failed.
+
+Failed (in both profiles):
+- cs_imgatomic_ext:
+  6 of 64 sint words differ; first word 32:
+  got 0x0badf00d, expected 0x00000101
+- cs_texture_uav:
+  exit 1: [rt] d3d12: texture view format lacks the required formatless storage image access: 98

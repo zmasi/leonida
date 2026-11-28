@@ -233,7 +233,13 @@ def fail_fast(data, wanted=None, dlls=None):
     direct = slot_calls(img, slots)
     out = {}
     for key, entry in thunk_calls.items():
-        sites = sorted([(rva, rva + 5) for rva in entry["call"]] + [(rva, rva + 6) for rva in direct.get(key, [])])
+        site_map = {}
+        for rva in entry["call"]:
+            at = img.offset(rva, 1)
+            site_map[rva] = rva + (6 if at is not None and img.data[at] == 0xFF else 5)
+        for rva in direct.get(key, []):
+            site_map[rva] = rva + 6
+        sites = sorted(site_map.items())
         fatal = []
         for rva, after in sites:
             cond = classify(img, after)

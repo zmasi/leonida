@@ -4,11 +4,13 @@ Usage:
     python -I tools/import_call_sites.py <image> [--import DLL!NAME ...] [--dll DLL ...] [--json]
 
 An MSVC image calls an imported function through a thunk, `jmp qword [rip+disp32]` through the import's address-table
-slot, and reaches the thunk with `call rel32` (or `jmp rel32` as a tail call). This finds each wanted import's thunk,
-then every `E8`/`E9 rel32` in an executable section whose target is that thunk. Nothing is run and nothing is
-disassembled, so this is a byte pattern: a stray `E8` or `E9` inside another instruction that happens to land on a
-thunk would be counted too, which is rare, and a call that goes through a register (`call rax` after a load of the
-slot) is not seen. Read the counts as a lower bound for indirect uses and an upper bound for direct ones.
+slot, and reaches the thunk with `call rel32` (or `jmp rel32` as a tail call), or directly with `call qword [rip+disp32]`
+through the slot. This finds each wanted import's thunk and direct call sites, then every `E8`/`E9 rel32` in an
+executable section whose target is that thunk, plus every `FF 15 disp32` targeting the slot directly. Nothing is run
+and nothing is disassembled, so this is a byte pattern: a stray `E8`, `E9` or `FF 15` inside another instruction that
+happens to land on a thunk or slot would be counted too, which is rare, and a call that goes through a register
+(`call rax` after a load of the slot) is not seen. Read the counts as a lower bound for indirect uses and an upper bound
+for direct ones.
 
 With no `--import` and no `--dll`, ordinary and delay-loaded imports are listed. An import named `#N` is an ordinal
 import. Slots with the same `DLL!NAME` spelling contribute to one row. If both tables claim the same slot RVA, the
@@ -29,6 +31,7 @@ if ROOT not in sys.path:
 import pe_inspect  # noqa: E402
 
 JMP_INDIRECT = re.compile(b"\xff\x25")
+CALL_INDIRECT = re.compile(b"\xff\x15")
 REL_BRANCH = re.compile(b"[\xe8\xe9]")
 
 
@@ -115,6 +118,13 @@ def call_sites(data, wanted=None, dlls=None):
             key = thunks.get(rva + s + 5 + struct.unpack_from("<i", blob, s + 1)[0])
             if key:
                 out[key]["call" if blob[s] == 0xE8 else "jmp"].append(rva + s)
+        for m in CALL_INDIRECT.finditer(blob):
+            s = m.start()
+            if s + 6 > len(blob):
+                continue
+            target = rva + s + 6 + struct.unpack_from("<i", blob, s + 2)[0]
+            if target in slots:
+                out[slots[target]]["call"].append(rva + s)
     for entry in out.values():
         for field in entry.values():
             field.sort()

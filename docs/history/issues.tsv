@@ -1,0 +1,136 @@
+number	title	author	labels
+4	Would you consider MIT License?	`Ahmet-Dedeler`	
+94	Wave64 on 32-lane subgroups (NVIDIA, Intel): decide how to handle cross-half operations	`ttd0x`	
+217	[REQUEST] Is a Linux build planned?	`xBh4ne`	
+313	D3D12 ÔåÆ Vulkan layer: critical path, who builds what, open methods	`KoertLichtendonk`	
+330	Please make playable on RDNA1	`jacknico1106-byte`	
+644	Full-corpus counts from a second verified copy on native Linux: 25,032 of 26,503 shaders translate clean; the README line reads as all 26,503	`gingertonik`	
+660	Feature Request: Use SDL3 as the backend for the GameInput shim (DualSense & gyro support)	`Kabosune`	
+725	Proposal: a read-only view of who works on what (experimental demo, no process change)	`ttd0x`	
+780	FSR: the shipping Xbox upscaler has one provider and one fixed configuration (static analysis, answers `#302`'s open end)	`T-Crypt`	
+799	CI & DevEx: eliminate path-filter blind spots, enforce strict workflow linting, and align local tooling	`sombraSoft`	
+857	AMD Windows driver crashes creating lds_fuzz wave64 programs translated with --wave64-emulate	`UlteriorMotive00`	
+884	RTX 4080 / NVIDIA 621.01: the corpus's two largest compute pipelines fail to compile (NVVM), a few take 8-16 GB and up to 26 min, and --jobs 14 crashed the driver	`Proudnoob4`	
+1021	Proposal: exercise XAsync completion from an EXE mapped by gta6rt	`tylerstraub`	
+1079	Resilience: keep a synced backup/mirror of the repo outside GitHub	`NethminaYasas`	
+1203	valu_fuzz f16: f16 multiply gives +0 instead of -0 on Apple A18 Pro (MoltenVK)	`undeadhuman37`	
+1434	Please Allow Us to Choose the Game Installation Location	`Fakinha15`	
+1504	Can you remove the supposed telemetry in the game?	`nambatwelb012-max`	
+1540	AMD Radeon 8060S (Windows): vk_overlapping_occlusion triggers GPU TDR and d3d12_r9g9b9e5_uav fails on RENDER_TARGET support	`danielbercu`	
+1626	d3d12_command_objects ┬º3.3: the builder's '+0x490' call has 29 sites (18 hoisted through 'r9'), and the arguments match 'D3D12_GLOBAL_BARRIER' byte for byte	`MoonYueya`	
+1629	Dashboard: Maintainer insights, Contributor overview and more	`CLHelper`	
+1725	Runtime tests d3d12_descriptor, d3d12_copy_xfmt and d3d12_vulkan_device fail on Intel UHD 770 (Xe-LP, 101.7092)	`CowBoYdu76`	
+1790	Full-package name coverage: 177,087 named streams across 150 GiB, and where the mount XMLs are	`JoshRob297`	
+1889	testing single game shaders on real data before the runtime can draw	`Silliana`	
+1891	PS_DeferredTextured gbuffer layout (normals are packed kinda weird)	`Silliana`	
+1901	idea: decode the isa directly instead of going through llvm-mc text	`Silliana`	
+2375	Low-VRAM GPUs (4 GB, no Resizable BAR; GTX 1650/1660-class laptops): where memory goes today, and a budget-aware placement proposal	`gkissel`	
+2947	[Feature Request] Add macOS support (Native / Apple Silicon)	`vladislav-vasilenko`	
+3124	KosmicKrisp: OpImageQueryLod ignores sampler mipLodBias (ps_ssharp_lod fails natively on Mesa 26.3.1)	`Jolymmiles`	
+3125	KosmicKrisp: f32-NaN bit patterns canonicalized to 0x7fc00000 in vk_harness R32G32B32A32_SFLOAT attachment	`Jolymmiles`	
+3127	llvmpipe: emulated MeshEXT shader draws 0 primitives when OpSetMeshOutputsEXT counts are loaded from Workgroup memory after barrier loop (ms_tri)	`Jolymmiles`	
+3174	GPU tests: 9 failures on Intel Arc B580 (Mesa 26.2.5) with texture/sample crashes and per-lane wave branch mismatch	`iksZ2`	bug
+3396	[Feature/Contribution] Leonida Quick Install ÔÇô Automated Setup	`cmyk-ux`	
+3752	CMake reuses stale SPIR-V after a translator helper changes (BUILD-1064)	`lumenpearson`	bug
+3828	Slow ci	`Jolymmiles`	
+3911	spirv_asm changes decimal f16 and f32 constant bits	`lumenpearson`	bug
+3934	Security checks and overall code quality	`I-I-IT`	
+3980	What Will Happen When the Project Gets Updated?	`Fakinha15`	
+3990	the sky passes all share one atmosphere cbuffer	`Silliana`	
+4126	Geometry capture loses the storage class of a derived input pointer	`lumenpearson`	bug
+4237	Python SPIR-V assembler encodes BF16 constants as IEEE half	`lumenpearson`	bug
+4286	Python SPIR-V assembler silently emits nonfinite decimal f64 constants	`lumenpearson`	bug
+4315	ActivateRays pipeline compilation runs out of memory on RX 9060 XT with RADV	`btwmaks`	bug
+4322	Python SPIR-V assembler rejects the DebugPrintf spelling from spirv-dis	`lumenpearson`	bug
+4330	Python SPIR-V assembler rounds hex-float constants to nearest; spirv-as truncates toward zero	`mrbean56`	
+4420	NVIDIA GTX 1060 (Pascal, 582.78): three runtime GPU tests fail on clean main	`ray3242`	
+4480	Wave64 planner misses SGPR masks with one constant half	`lumenpearson`	bug
+4613	AMD Windows driver: native wave64 subgroup shuffle returns wrong values (gfx1036, reduced SPIR-V attached)	`UlteriorMotive00`	
+4709	Intel ANV (Gen12, Mesa 26.3.1): vk_predicated_copy fails because transfer commands after a dispatch count CS invocations in a statistics query	`junaydirfan`	
+4759	shadow record type + material cbuffer stuff that sorta looks broken but i dont think it is?	`Silliana`	
+4810	d3d12_vulkan_device_test: 8 invalid-argument cases where the layer accepts what an older NVIDIA runtime refuses (per-vendor divergence, needs a ruling)	`xiaochen200000`	
+4922	manifest: reuse the hash input buffer to halve peak chunk memory per worker	`shdann`	
+4949	Would Leonida use a standalone Rust tool for offline BCPack DDS export?	`wish131400`	
+4952	Feat.req. Native VR / OpenXR support	`necros2k7`	
+4995	[Feature Request] some form of mod framework setup once the exe is available.	`jfmherokiller`	
+5033	Feature suggestion: Dynamic PlayStation / Nintendo / Steam controller glyph switching via SDL3	`Kabosune`	
+5262	Standalone mesh shader checks accept NaN pixel readbacks	`reviewbd`	
+5267	FMA index metadata follows later option changes when translation and indexing are separated	`reviewbd`	
+5273	Standalone ms_wave_info_s3 skips a valid 32-wide subgroup draw	`reviewbd`	
+5516	docs/design.md: the --pc-tail-ubo row counts 185 shaders / 109 tail readers, and calls the GPU harness binding a follow-up; both are stale	`TurboSosiska304`	
+5517	docs/design.md: the v_pack_b32_f16 "input neg" row says abs is still refused, but the translator implements and tests it	`TurboSosiska304`	
+5519	docs/shader_validation.md: salu_diff is described as an 87-opcode reference, but it generates 99 by default	`TurboSosiska304`	
+5521	docs/README.md: the fspx row says 13 of 29 translate, but docs/fspx.md now reports 17 of 29	`TurboSosiska304`	
+5533	AMD Windows driver 32.0.21045.29003 (gfx1036): v_pk_ashrrev_i16 reads the low half of a VGPR whose high half v_med3_f16 just wrote	`XFlawless1`	
+5600	meshlet_page: a zero-meshlet group spins parse_page forever	`TurboSosiska304`	
+6043	Texture quality switch for low-VRAM GPUs: leave the top mips of sampled textures out (LEONIDA_TEXTURE_MIP_DROP)	`gkissel`	
+6172	ms_wave_info_s3 intermittently fails on RX 7900 XT / RADV NAVI31 (pass rate 100% -> 2.5%, same binaries)	`SlopTart`	
+6217	Feature request: Intel XeSS	`DealsBeam`	
+6256	Map viewer: horizontal scrolling slows the free camera	`EchoOfCode`	
+6296	GPU suite on GTX 1070 (Pascal, NVIDIA 550.163.01): fail set shifts run-to-run; cs_imgstore SIGSEGVs in driver JIT 4/5	`SlopTart`	
+6378	First-boot readiness: trace startup phase entry/completion and thread identity	`kacper-serewis`	
+6379	First-boot readiness: add bounded local boot capture with hang evidence	`kacper-serewis`	
+6380	First-boot readiness: rehearse inspection through boot-summary with real synthetic tools	`kacper-serewis`	
+6382	[Feature Request] Add an Option to Disable Ray Tracing	`AorusHub`	
+6497	ms_wave_info_s3 fails natively on Intel Arc / Mesa ANV (VK_EXT_mesh_shader, no emulation)	`Tomat0r`	
+6623	KosmicKrisp: nir_to_msl emits (NAN) (0x7fc00000) for uint constants (0xffffffff) in cs_bvh / cs_bvh32	`TheAirborneCoder`	
+6784	Hardware oracle on an RDNA2 iGPU (gfx1036): s_buffer_load with negative offsets differs from the RX 6800 rule; two oracle tool gaps	`vanoizer`	
+6824	Retail 1.0.2.1 on Windows with open PRs merged: reaches main, stops at XMemAllocatePhysicalPages	`roxopls`	
+7030	ps_texture_b_cl fails on Intel Arc 140V (Windows 101.9175): OpImageSampleImplicitLod Bias\	MinLod drops MinLod clamp	`yanjuca` |
+7034	Short request, most of us don't have 400 gigs available on an ssd. Pls make it so that the installation files could say be on a harddrive, and the actual game files could be on our ssd. So the actual important bit of the 400 gigs can stay on the SSD.	`junkmail-test`	
+7140	Q19: the retail executable's own root signatures carry no 0x03000000 flag ÔÇö mask should be conditional	`Hugo373`	
+7148	make_game.py and first_light.py silently reuse a stale vk_pipeline_check / vk_harness on Linux	`gkissel`	
+7280	cs_store: the second 16-bit half of a dword is never written on RADV Polaris (RX 580, Mesa 26.3.1)	`xLuXurx`	bug
+7288	Boot-path PRs: which one supersedes which, and rebases ready to pull (stops 1-4, 6, 16-17)	`IAmNotSiob`	
+7587	MoltenVK ignores sampler mip LOD bias on explicit samples	`fkarg`	
+7772	TCP channel on game_scarlett_master	`0xMirasio`	
+7831	Retail boot: xmem physical-page ABI and guest allocation-type bits block the 185 MB reservation; next stop is a RAGE singleton registration that never runs (AV at game+0x5eb24bf)	`Dimi42FR`	
+7845	hashdict: a space or a typo in --archives silently drops that archive	`JohannFaust666`	
+7871	test_bink_index: baseline failure on main (expected error text omits (KB2))	`ray3242`	
+7872	test_docs_links: strip_fences() mis-pairs code fences and hides real heading anchors	`ray3242`	
+7968	gta6rt --run: first boot of the retail executable (RT-5) reaches the TLS process-attach callbacks, then 0xc0000005 at exe+0x104075	`tib1rgitta-eng`	
+7972	d3d12_sparse_queue_family_contract crashes with 0xC0000005 on AMD RX 6600 (RDNA2)	`forduxproduction`	bug
+8041	Add a SHA check for the EXE file	`CLHelper`	
+8179	Issue with tools/pc_checker.py	`javafixer`	bug
+8282	Two stops in 'docs/retail_boot_chain.md' with a working recipe: main-image TLS slot 0, and the DStorage factory call	`MoonYueya`	
+8295	Automated malware / supply-chain security review for incoming PRs	`KewaiiGamer`	
+8306	ms_wave_info_s3 fails natively on NVIDIA RTX 5080 (Windows, subgroup 32): all pixels read back -1	`lukasas74`	
+8320	Live status page for retail boot stops, D3D12 progress and major PRs (doesleonidaboot.com)	`doesleonidaboot`	
+8369	ms_wave_info_s3 fails consistently on NVIDIA RTX 5070 Ti (Windows)	`Hayden-King1`	
+8404	Verify the SHA-256 of the executable (and DLLs) before the runtime loads them	`Stinna810`	
+8426	main dde82f27 on AMD RX 7900 XTX: 6 ctest + 1 GPU-suite failures; `#5873` + `#7133` + `#6149` + `#7136` together fix 4 of them	`Urban225`	
+8452	--run: access violation at +0x104075 - the image reads TLS index 0 hardcoded, and index 0 is not the main image	`Epic-Y`	
+8594	Archive layer: the .rpf directory is a driver setting, and there is a verified path-to-bytes resolver	`JoshRob297`	
+8618	viewer: three.js is loaded from CDNs with no integrity check (index.html import map, studio.html fallbacks)	`lukasas74`	
+8677	ms_wave_info_s3 fails on RTX 3050 A Laptop GPU (Windows 11, driver 621.35)	`Codecontinent-GH`	bug
+8720	main dde82f27 on NVIDIA RTX 4070: 4 ctest failures; `#8496` fixes d3d12_vulkan_device, d3d12_depth_resolve is new	`ersinhf`	
+8781	Independent RTX 4090 testing ÔÇô cross-lane discrepancies and wave64 mask reproduction	`molleman131`	
+8851	Start here, AI coding agents: GTA VI boot log, open tasks and PRs to check (no game needed for half of them)	`ASTROWwwW`	
+8886	main 867d922f on native Windows: 28 standard-library tests fail, each has a tested fix in an open PR	`loyrox`	
+8917	Tracker cleanup: 45 open issues to close, and comments that need removing	`ramenbellic`	
+8919	Start here, AI coding agents: PR cleanup, ~4,000 open PRs to sort into close / merge lists for the maintainers (no game needed)	`ASTROWwwW`	
+8933	_Find_lower_bound crash	`ze5u`	
+9038	Proposal: run the tests of a pull request merged with 'main', in a container with no network	`maciejszulia`	
+9107	Q7: the retail executable calls XboxBvhBuilder at 24 sites ÔÇö build and rehydrate both live	`Hugo373`	
+9113	Q6: the retail executable names no present API ÔÇö no DXGI import, no PresentX string	`Hugo373`	
+9142	d3d12_buffer_tiles fails on Intel UHD 730 (Windows): native D3D12 reads zeros from mapped tiles, the layer passes	`username634`	
+9181	main 867d922 under Wine 11.21 on Linux (RTX 3070 Ti + RADV iGPU): 16 ctest failures, open PRs fix 9 of them	`NurRobin`	
+9223	Retail title hard-codes TLS slot 0 at 14,680 sites; after `#9023` the boot failure is deterministic at +0x104075	`YHH-520`	
+9306	cs_fma_fused fails on Intel Arc Graphics (Windows): driver splits GLSL Fma, no VK_KHR_shader_fma	`n0odlepanda`	
+9366	Fix the runtime	`prodelbit-byte`	bug
+9414	RT-5: device slot 15 faults once the console command-list stage is passed (call through our own vtable)	`bobczan`	
+9446	GTA VI startup blocker on 'main'	`ConstnatlyLucid`	
+9460	Proposal: show PR status as labels to manage the backlog (like T3 Code)	`ZeroRho`	
+9544	main 6312c057f on AMD RX 9070 XT (RDNA4, Windows 26300): 5 ctest failures; `#5873` verified to fix one here	`icecreammule277-dot`	
+9561	**Title:** ms_wave_info_s3 fails persistently with LEONIDA_MESH_COMPUTE=1 on RX 5700 XT (RDNA1); persists after reboot and shader cache reset	`camsay1996`	
+9632	main 5d74c27 on AMD RX 6650 XT (RDNA2, Windows): 6 ctest failures; five open PRs together fix all but d3d12_texture_tiles	`JappertjeV`	
+9644	Wine 11.22: TLS static guard crash bypassed with /Zc:threadSafeInit-, now hitting nullptr at game_scarlett_master.exe+0x104075	`ze5u`	
+9677	Coordinating who works on what (59)	`KoertLichtendonk`	
+9763	main 5d74c27 on macOS (Apple M5): 30 tests fail, each has a tested fix in an open PR	`Michele0303`	
+9764	w64_graphics stops testing the remaining fixtures after a harness timeout	`kyleabruzzo`	
+9786	GPU test: ps_imgatomic loses atomic updates intermittently on MoltenVK 1.4.2 (Apple M5 Pro); KosmicKrisp passes	`GeorgiyDemo`	
+9812	main 2d53a8055 does not build: missing include, two acphal static_asserts, and a half-merged DescriptorHeap constructor	`bobczan`	
+9814	Proposal: blind, randomly assigned peer review (any%5) to handle the PR volume, with a working copy to look at	`tibzejoker`	
+9870	main 2d53a8055: test_image_atomics_guard (47 failures) and test_image_cube_store_glc (Windows LLVM_MC) still red; their fix PRs closed without landing	`aelogonpin`	
+9898	Contributing	`Callimann8`	
+10024	RTX 4070 Ti (621.35): 5 GPU test failures at e56d979	`SimSalabimse`	bug

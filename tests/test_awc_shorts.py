@@ -287,6 +287,41 @@ class ShortsTest(unittest.TestCase):
         import awc_shorts
         self.check_truncated_bank_skipped(awc_shorts, 2)
 
+    def test_publish_cleans_up_staged_file_when_replace_fails_even_if_readonly(self):
+        path = os.path.join(self.tmp.name, "shorts.csv")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("a,b\n")
+        os.chmod(path, 0o444)
+
+        real_unlink = os.unlink
+
+        def windows_strict_unlink(p):
+            mode = os.stat(p).st_mode
+            if not (mode & 0o200):
+                raise PermissionError(13, f"Access is denied: {p}")
+            return real_unlink(p)
+
+        with mock.patch.object(shorts, "replace_retry", side_effect=OSError(13, "Permission denied")), \
+             mock.patch("os.unlink", side_effect=windows_strict_unlink):
+            with self.assertRaises(OSError):
+                shorts._write_catalog(path, [])
+
+        leftover = [f for f in os.listdir(self.tmp.name) if f.startswith(".shorts-")]
+        self.assertEqual(leftover, [])
+
+    def test_publish_applies_published_mode_on_windows(self):
+        path = os.path.join(self.tmp.name, "shorts_win.csv")
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(p, mode):
+            chmod_calls.append((p, mode))
+            real_chmod(p, mode)
+
+        with mock.patch("os.name", "nt"), mock.patch("os.chmod", side_effect=track_chmod):
+            shorts._write_catalog(path, [])
+        self.assertTrue(len(chmod_calls) > 0)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

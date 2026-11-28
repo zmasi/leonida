@@ -202,6 +202,25 @@ class MergeCheckTest(unittest.TestCase):
         code, [result] = self.run_check("20=new-path")
         self.assertEqual((code, result["verdict"], result["duplicates"]), (0, "clean", {}))
 
+    def test_non_utf8_lines_must_match_before_their_samples_are_decoded(self):
+        path = "docs/legacy.txt"
+        original = b"".join(line.encode() + b" caf\xe9\n" for line in PARAGRAPH.splitlines())
+        with open(os.path.join(self.repo, path), "wb") as f:
+            f.write(original)
+        self.commit("Add a Windows-1252 document")
+        for branch, block, expected in (("distinct", original.replace(b"\xe9", b"\xe8"), {}),
+                                        ("identical", original, {path: 3})):
+            with self.subTest(branch=branch):
+                self.git("checkout", "-q", "-b", branch, "main")
+                with open(os.path.join(self.repo, path), "ab") as f:
+                    f.write(block)
+                self.commit("Append three lines")
+                self.git("checkout", "-q", "main")
+                code, [row] = self.run_check(f"25={branch}")
+                self.assertEqual((code, row["duplicates"]), (int(bool(expected)), expected))
+                if expected:
+                    self.assertEqual(row["duplicate_samples"][path], original.decode("utf-8", "replace").splitlines())
+
     def test_a_gitlink_update_needs_no_submodule_objects(self):
         path = "deps/sample"
         oid_length = len(self.git("rev-parse", "main"))

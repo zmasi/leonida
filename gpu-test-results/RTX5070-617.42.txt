@@ -1,0 +1,39 @@
+GPU:        NVIDIA GeForce RTX 5070 (Blackwell), subgroup 32..32
+Driver:     NVIDIA 617.42 (Windows 32.0.16.1742), Vulkan 1.4.363
+Subgroup:   32..32 (minSubgroupSize 32, maxSubgroupSize 32)
+OS:         Windows 11, 10.0.26200.9974
+Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31 (main, 2026-11-24)
+Tools:      llvm-mc 21.1.8 (native, built by scripts\build_llvm_mc.ps1),
+            SPIRV-Tools v2026.4 (Vulkan SDK 1.4.363.1), CMake 3.31.6-msvc6,
+            Ninja 1.12.1, MSVC 19.44.35229, Python 3.11.9
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 1, tier C: 1
+            native:                 197/248 passed, 49 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  229/248 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe, cs_imgload_d16_tfe: both exit 1 with "r32 sint (sint view):
+            64 bad, texel(5,3) = 2071", in native and emulated runs alike. The same
+            pair is the known #31 tfe case in the RTX 5070 (621.14) entry above, and the
+            native/emulated totals here (197/248, 229/248) match that entry exactly.
+            Same two failures on a different driver build: this is #31, not a new defect.
+Skipped:    native: 49 skips = the 16 documented "run by d3d12_*_test /
+            w64_graphics.py" cases, plus 32 wave64 compute/mesh cases that need a
+            64-wide subgroup this device does not have ("no 64-wide compute subgroup
+            on this device"), plus ps_w64x_readlane ("this device cannot require a
+            64-wide fragment subgroup: subgroup 32..32").
+            LEONIDA_W64_EMULATE=1: 17 skips = the same 16 documented cases, plus
+            ps_w64x_readlane. Every wave64 case that can run under emulation ran
+            and passed.
+Notes:
+- Value of this entry: the RTX 5070 already has an entry on driver 621.14. This one is
+  a different driver build (617.42) on the same GPU. It produces the same totals
+  (197/248 native, 229/248 emulated) and fails exactly the same #31 tfe pair and
+  nothing else, which is evidence that on this hardware the tfe failure follows the
+  test, not the driver.
+- Built with the Developer PowerShell for VS 2022 through the CMake + Ninja path
+  (scripts\build_runtime.ps1), not the cl.exe fallback.
+- llvm-mc built locally by scripts\build_llvm_mc.ps1 (LLVM 21.1.8 with the AMDGPU
+  target), verified by assembling `v_lshlrev_b16_e64 v34, v27, v27 op_sel:[0,1,1]`
+  for gfx1013 before the runs.
+- Every other pixel, compute, vertex and geometry case was exact in both modes.
+- build.py and check.py were not run separately on this machine; the counts here come
+  from run_gpu_tests.py, which builds and translates the same fixtures.

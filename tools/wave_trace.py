@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import os
 from pathlib import Path
 import random
 import sys
@@ -20,6 +21,10 @@ COLUMNS = [f"v{r}" for r in wave_diff.VREGS] + ["s6 mask", "s8 mask", "EXEC", "V
 
 def select_case(seed, case_index, max_ops):
     """Advance the same RNG stream as `wave_diff --wave 32`."""
+    if type(case_index) is not int or case_index < 0:
+        raise ValueError("case_index must be a nonnegative integer")
+    if type(max_ops) is not int or max_ops < 1:
+        raise ValueError("max_ops must be a positive integer")
     rng = random.Random(seed)
     for _ in range(case_index + 1):
         case = wave_diff.generate_case(rng, rng.randrange(1, max_ops + 1), WAVE)
@@ -64,10 +69,33 @@ def inspect_case(seed, case_index, max_ops):
             "columns": COLUMNS, "steps": steps, "first_mismatch": first}
 
 
+_DATA_MARKER = "<!-- WAVE_TRACE_DATA -->"
+
+
 def render_report(report):
     template = HERE.joinpath("wave_trace.html").read_text(encoding="utf-8")
-    payload = json.dumps(report, separators=(",", ":")).replace("<", "\\u003c")
-    return template.replace("<!-- WAVE_TRACE_DATA -->", payload, 1)
+    if _DATA_MARKER not in template:
+        raise ValueError("wave_trace.html is missing the data placeholder")
+    payload = (
+        json.dumps(report, separators=(",", ":"), allow_nan=False)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+    )
+    return template.replace(_DATA_MARKER, payload, 1)
+
+
+def _write_new_text(path, text):
+    """Create `path` exclusively and write `text`; unlink partial output if writing fails."""
+    with path.open("x", encoding="utf-8", newline="\n") as stream:
+        try:
+            stream.write(text)
+        except BaseException:
+            stream.close()
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            raise
 
 
 def main(argv=None):
@@ -75,24 +103,35 @@ def main(argv=None):
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--case", type=int, default=0, help="zero-based index in the seeded wave32 run")
     parser.add_argument("--max-ops", type=int, default=12, help="same generator bound as wave_diff")
-    parser.add_argument("--out", type=Path, required=True, help="new HTML report path")
+    parser.add_argument("--out", required=True, help="new HTML report path")
     args = parser.parse_args(argv)
     if args.case < 0:
         parser.error("--case must be nonnegative")
     if args.max_ops < 1:
         parser.error("--max-ops must be at least 1")
+    if not args.out.strip():
+        parser.error("--out must not be empty")
+    if args.out.endswith(os.sep) or (os.altsep and args.out.endswith(os.altsep)):
+        parser.error("--out must be a file path, not a directory")
+    out_path = Path(args.out)
+    if os.path.lexists(out_path):
+        print(f"wave_trace: output already exists: {out_path}", file=sys.stderr)
+        return 2
+    out_dir = os.path.dirname(os.path.abspath(out_path))
+    if not os.path.isdir(out_dir):
+        print(f"wave_trace: output directory does not exist: {out_dir}", file=sys.stderr)
+        return 2
     try:
         report = inspect_case(args.seed, args.case, args.max_ops)
         html = render_report(report)
-        with args.out.open("x", encoding="utf-8", newline="\n") as stream:
-            stream.write(html)
-    except (OSError, wave_diff.cf_ref.ProgramError) as exc:
+        _write_new_text(out_path, html)
+    except (OSError, ValueError, wave_diff.cf_ref.ProgramError) as exc:
         print(f"wave_trace: {exc}", file=sys.stderr)
         return 2
 
     skipped = sum(step["unavailable"] is not None for step in report["steps"])
     first = report["first_mismatch"]
-    print(f"{args.out} ({len(report['steps'])} checkpoints, {skipped} unavailable)")
+    print(f"{out_path} ({len(report['steps'])} checkpoints, {skipped} unavailable)")
     if first is not None:
         mismatch = report["steps"][first]["mismatch"]
         column = report["columns"][mismatch["column"]]

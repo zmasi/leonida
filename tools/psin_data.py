@@ -72,6 +72,7 @@ FILL = b"\xaa" * 8
 ROW = 16
 ELEMENT = psin_index.ARRAY_ELEMENT
 MAX_DEPTH = 64
+MAX_ALIGN_LOG2 = 16
 
 SCALARS = {
     0x01: "<?", 0x10: "<b", 0x11: "<B", 0x12: "<h", 0x13: "<H", 0x14: "<i", 0x15: "<I", 0x16: "<q", 0x17: "<Q",
@@ -91,6 +92,8 @@ def block_table(blob, first):
 
     Raises ValueError when a row has the wrong fill or no 0x70 padding ends the table before `first`.
     """
+    if first < 8 or first > len(blob):
+        raise ValueError(f"first section offset {first} is outside the {len(blob)}-byte blob")
     blocks, at = [], 8
     while at + 8 <= first:
         kind = struct.unpack_from("<I", blob, at)[0]
@@ -103,7 +106,7 @@ def block_table(blob, first):
     else:
         raise ValueError("block table has no 0x70 end padding before the first section")
     end = (at + 15) & ~15
-    if blob[at:end] != b"\x70" * (end - at):
+    if end > first or blob[at:end] != b"\x70" * (end - at):
         raise ValueError(f"block table end padding at {at} is not 0x70")
     at = end
     out = []
@@ -165,7 +168,12 @@ class Container:
         t = m["type"]
         if t == 0x05:
             s = self.structs.get(m["ref"])
-            return 1 << s["align_log2"] if s else 8
+            if s is None:
+                return 8
+            align_log2 = s["align_log2"]
+            if not 0 <= align_log2 <= MAX_ALIGN_LOG2:
+                return None
+            return 1 << align_log2
         if t in VECTOR16:
             return 16
         if t == 0x32:
@@ -181,6 +189,8 @@ class Container:
         if not ks or not vs:
             return None
         ka, va = self.align_of(key), self.align_of(value)
+        if not ka or not va:
+            return None
         voff = -(-ks // va) * va
         a = max(ka, va)
         return voff, -(-(voff + vs) // a) * a
@@ -217,6 +227,7 @@ class Walker:
         self.keep = keep
         self.cover = [bytearray(size) for _, _, size in container.blocks]
         self.seen = set()
+        self._visiting = set()
         self._block_bases = [base for _, base, _ in container.blocks]
         self._block_ends = [base + size for _, base, size in container.blocks]
         self._limit = None
@@ -307,6 +318,9 @@ class Walker:
 
     def value(self, m, members, at, depth):
         c, st, blob = self.c, self.stats, self.c.blob
+        if depth > MAX_DEPTH:
+            st["max depth exceeded"] += 1
+            return None
         t = m["type"]
         st[f"type {t:02x}"] += 1
         need = self._read_size(m)
@@ -409,7 +423,15 @@ class Walker:
             if end is None or at < 0 or at + size * n > end:
                 st["fixed array out of bounds"] += 1
                 return None
-            return self.elements(el, members, at, n, depth)
+            frame = ("array", t, id(members), idx, at)
+            if frame in self._visiting:
+                st["container cycle"] += 1
+                return None
+            self._visiting.add(frame)
+            try:
+                return self.elements(el, members, at, n, depth)
+            finally:
+                self._visiting.discard(frame)
         if t == 0x54:
             end = self._active_end(at)
             if end is None or at < 0 or at + 8 > end:
@@ -422,7 +444,15 @@ class Walker:
             if at + 8 + size * n > end:
                 st["inline array out of bounds"] += 1
                 return None
-            return self.elements(el, members, at + 8, n, depth)
+            frame = ("array", t, id(members), idx, at)
+            if frame in self._visiting:
+                st["container cycle"] += 1
+                return None
+            self._visiting.add(frame)
+            try:
+                return self.elements(el, members, at + 8, n, depth)
+            finally:
+                self._visiting.discard(frame)
         if t == 0x5C:
             count, capacity = struct.unpack_from("<II", blob, at)
             where = at + 8
@@ -441,12 +471,18 @@ class Walker:
         want = el["ref"] if el["type"] == 0x05 else el["type"]
         st[f"{kind} block type matches element" if btype == want else f"{kind} block type differs"] += 1
         self.mark(number, absolute, size * count)
+        frame = ("array", t, id(members), idx, absolute)
+        if frame in self._visiting:
+            st["container cycle"] += 1
+            return None
         _, blk_base, blk_size = c.blocks[number - 1]
         prev_limit = self._limit
         self._limit = blk_base + blk_size
+        self._visiting.add(frame)
         try:
             return self.elements(el, members, absolute, count, depth)
         finally:
+            self._visiting.discard(frame)
             self._limit = prev_limit
 
     def map(self, m, members, at, depth):
@@ -515,9 +551,14 @@ class Walker:
                      if blob[absolute + i * slot:absolute + i * slot + ks] != bytes(ks)]
             st[f"{kind} used slots == count" if len(slots) == count else f"{kind} used slots != count"] += 1
         st[f"{kind} pairs"] += len(slots)
+        frame = ("map", t, id(members), m["ref"], absolute)
+        if frame in self._visiting:
+            st["container cycle"] += 1
+            return None
         _, blk_base, blk_size = c.blocks[number - 1]
         prev_limit = self._limit
         self._limit = blk_base + blk_size
+        self._visiting.add(frame)
         try:
             for s in slots:
                 k = self.value(key, members, s, depth + 1)
@@ -525,6 +566,7 @@ class Walker:
                 if self.keep:
                     pairs.append([k, v])
         finally:
+            self._visiting.discard(frame)
             self._limit = prev_limit
         return pairs if self.keep else None
 
@@ -547,6 +589,8 @@ def measure(blob, stats):
 
 
 def collect(src, limit=None):
+    if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit < 1):
+        raise ValueError("limit must be at least 1")
     stats = collections.Counter()
     seen = 0
     for _name, blob in psin_index.files_in(src):
@@ -558,7 +602,7 @@ def collect(src, limit=None):
             r, b = stats["bytes reached"] - before[0], stats["bytes"] - before[1]
             stats["containers fully reached" if r == b else "containers partly reached"] += 1
         seen += 1
-        if limit and seen >= limit:
+        if limit is not None and seen >= limit:
             break
     return dict(sorted(stats.items()))
 

@@ -14,8 +14,8 @@ notes). Text formats (disassembly, .obj, .spvasm)
 have no magic and stay with the extension check.
 
 A compressed file hides those magics from both checks, so the script looks inside what the standard library opens:
-each member of a zip (found by its central directory too, so with bytes in front of it) or a tar, and the stream of
-a gzip, bzip2 or xz file, nested up to three levels, is matched the same way. What's inside is read into memory
+each member of a zip (found by its central directory too, so with bytes in front of it) or a tar (including V7), and
+the stream of a gzip, bzip2 or xz file, nested up to three levels, is matched the same way. What's inside is read into memory
 under a budget per checked file (64 MiB expanded, 10,000 members), so a zip bomb can't make the check run long.
 7-Zip, Zstandard and RAR files, which it can't open, archives that fail to open and archives over the budget are
 reported as archives that can't be checked.
@@ -183,6 +183,13 @@ def archive_kind(f, head):
     if stream:
         return stream[0]
     if head[TAR_MAGIC[0]:TAR_MAGIC[0] + len(TAR_MAGIC[1])] == TAR_MAGIC[1]:
+        return "tar archive"
+    # V7 tar has no ustar marker. Validate only its first header here; member reads still use the shared budget.
+    try:
+        tarfile.TarInfo.frombuf(head[:tarfile.BLOCKSIZE], tarfile.ENCODING, "surrogateescape")
+    except tarfile.HeaderError:
+        pass
+    else:
         return "tar archive"
     # is_zipfile finds the end-of-central-directory record, so a zip with bytes in front of it (a self-extracting
     # archive, a spanned zip starting PK\x07\x08) is found as zipfile itself would open it.

@@ -78,6 +78,23 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             with self.subTest(source=name):
                 self.assertTrue((ROOT / "runtime" / "test" / name).is_file())
 
+    def test_a_program_that_opens_a_window_links_user32(self):
+        """BUILD-FALLBACK-SANDBOX-USER32: CMake's Visual Studio and Ninja builds link kernel32, user32, gdi32 ... to
+        every program (CMAKE_CXX_STANDARD_LIBRARIES), but a plain cl line links none of them. vk_sandbox opens a
+        window, so without user32.lib the link stopped at 14 unresolved __imp_ symbols and the fallback exited 1."""
+        window_api = re.compile(r"\b(CreateWindowExW|RegisterClassW|PeekMessageW|DefWindowProcW|GetAsyncKeyState)\b")
+        checked = 0
+        for line in self.body.splitlines():
+            source = re.search(r'"\$src\\test\\([A-Za-z0-9_]+\.cpp)"', line)
+            if not source or " cl " not in f" {line}":
+                continue
+            text = (ROOT / "runtime" / "test" / source.group(1)).read_text(encoding="utf-8", errors="replace")
+            if window_api.search(text):
+                checked += 1
+                with self.subTest(source=source.group(1)):
+                    self.assertRegex(line, r"/link (\S+ )*user32\.lib( |$)")
+        self.assertGreaterEqual(checked, 1)
+
     def test_the_pipeline_checker_gets_the_stack_reserve_cmake_gives_it(self):
         """BUILD-1457: a driver compiles on vk_pipeline_check's threads, and AMD's Windows compiler overflows the
         1 MB PE default. CMake links the checker with /STACK:<LEONIDA_PIPELINE_CHECK_STACK>; the fallback has to pass
@@ -140,6 +157,8 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
         def run_probe(vs_dir: Path, path_dirs: list[Path]) -> tuple[str, str]:
             ps = (
                 "$ErrorActionPreference = 'Stop'\n"
+                # A redirected powershell.exe writes the OEM code page, and the probe prints paths.
+                "[Console]::OutputEncoding = New-Object Text.UTF8Encoding $false\n"
                 "$vs = $env:LEONIDA_VS_DIR\n"
                 + snippet
                 + "\nWrite-Output \"CMAKE=$cmake\"\nWrite-Output \"NINJA=$ninja\"\n"
@@ -147,7 +166,7 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             env = dict(os.environ, PATH=";".join(str(p) for p in path_dirs), LEONIDA_VS_DIR=str(vs_dir))
             res = subprocess.run(
                 ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", ps],
-                env=env, capture_output=True, text=True, check=True, timeout=30,
+                env=env, capture_output=True, text=True, encoding="utf-8", check=True, timeout=30,
             )
             found = {}
             for line in res.stdout.splitlines():
@@ -157,7 +176,8 @@ class FallbackBuildsTheHarnesses(unittest.TestCase):
             return found.get("CMAKE", ""), found.get("NINJA", "")
 
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
+            root = Path(tmp) / "tools-\u00f8"
+            root.mkdir()
             vs_empty = root / "vs_empty"
             msys_dir = root / "msys_bin"
             native_cmake_dir = root / "native_cmake_bin"

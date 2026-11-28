@@ -1,0 +1,77 @@
+UPDATE 2026-11-25, re-run on current main. The sections below are the earlier measurement at 21625bca8
+(2026-11-24) and are kept for reference; where they differ, THIS block is current.
+
+Commit:     5fab93967 (main, 2026-11-25, merge of #1630); same container, driver, llvm-mc 19.1.1, system
+            Vulkan headers (VK_HEADER_VERSION 275), CMake + Ninja Release build as below
+run_gpu_tests.py: 277 shaders: 276 translated, 276 pass spirv-val (both modes); ps_ij_computed is still not
+            translated ("computed I/J pair under --bary-fallback: no PerVertexKHR inputs")
+            native:                 203/268 passed, 62 skipped, 3 failed
+            LEONIDA_W64_EMULATE=1:  238/268 passed, 27 skipped, 3 failed
+Failed:     cs_fmt_int_narrow: "word 34: expected 0xffffffff, got 0x00000000"; cs_imgatomic_ext: "6 of 64 sint
+            words differ; first word 32: got 0x0badf00d, expected 0x00000101" (open fix #1518);
+            cs_signed_zero_nan: "0x80000000 0x80000000 0x80000000 0x8000 0x1 0x0 0x1 0x7c00". Same three in both
+            modes. The cs_imgload_tfe pair, which failed at 21625bca8, passes now.
+Device:     Intel(R) Graphics (ARL) (subgroup 8..32).
+AI-assisted (Claude Code): rebuilt main at 5fab93967 on this GPU and ran run_gpu_tests.py native and
+under LEONIDA_W64_EMULATE=1; counts and FAIL lines are copied from those runs. The skip lists and per-fixture
+notes further down were NOT re-derived for this commit.
+------------------------------------------------------------------------------
+
+GPU:        Intel(R) Graphics (ARL) (Arrow Lake-H, PCI 8086:7d51, integrated), Core Ultra 7 255H
+Driver:     ANV (Intel open-source Mesa driver, Mesa 25.2.8-0ubuntu0.24.04.5), Vulkan 1.4.318
+Subgroup:   8..32 (minSubgroupSize 8, maxSubgroupSize 32)
+OS:         Ubuntu 24.04.4 LTS container, kernel 7.3.3-300.fc45.x86_64
+Commit:     21625bca8c675c62f9dbffc318ce6a59d57faf31 (main, 2026-11-24)
+Tools:      llvm-mc 19.1.1 (Ubuntu LLVM), SPIRV-Tools v2025.1, glslangValidator 15.1.0,
+            Python 3.12.3, system Ubuntu Vulkan headers (VK_HEADER_VERSION 275), not the
+            pinned 1.4.363 SDK; docs/testing.md says older headers skip features such as
+            VK_KHR_maintenance8
+run_gpu_tests.py: 257 shaders: 256 translated, 256 pass spirv-val (both modes)
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 1, tier C: 1
+            native:                 189/248 passed, 55 skipped, 4 failed
+            LEONIDA_W64_EMULATE=1:  221/248 passed, 23 skipped, 4 failed
+            Arithmetic: native 189 + 55 + 4 = 248; emulated 221 + 23 + 4 = 248.
+Failed:     cs_fmt_int_narrow, cs_imgload_d16_tfe, cs_imgload_tfe and
+            cs_signed_zero_nan, with the same printed result in both modes:
+            cs_fmt_int_narrow: word 34: expected 0xffffffff, got 0x00000000.
+            cs_imgload_d16_tfe and cs_imgload_tfe: exit 1; the result line retains only
+            "MESA: warning: Support for this platform is experimental with Xe KMD, bug reports
+            may be ignored." A filtered cs_imgload rerun reproduced both failures, but no
+            underlying mismatch was printed. Neither log contains the "r32 sint (sint view):
+            64 bad, texel(5,3) = 2071" signature, so that signature is not verified here.
+            cs_signed_zero_nan: 0x80000000 0x80000000 0x80000000 0x8000 0x1 0x0 0x1 0x7c00.
+Skipped:    native 55 = 16 documented "run by d3d12_*_test / w64_graphics.py" cases
+            + 31 "no 64-wide compute subgroup on this device"
+            + 1 "no 64-wide subgroup on this device" (the mesh case)
+            + 3 "unsupported: VK_KHR_maintenance8 (non-constant texel Offset)"
+            + 1 "this device cannot require a 64-wide fragment subgroup: subgroup 8..32"
+            + 1 "fragment subgroup ran at 16 lanes on 8..32 device; needs 32"
+            + 1 "fragment subgroup may run narrower than 32 on 8..32 device; needs 32"
+            + 1 "computed I/J pairs need PerVertexKHR inputs: no --bary-fallback /
+            --f16-interp-fallback".
+            Emulated 23 = the same 55 except all 32 no-64-wide-subgroup skips run; that is
+            16 documented + 3 maintenance8 + 3 fragment-subgroup + 1 computed-I/J = 23.
+Notes:
+- The one shader not translated in both modes is ps_ij_computed. The exact translator reason
+  is "1  computed I/J pair under --bary-fallback: no PerVertexKHR inputs". The run also emits
+  bary fallback GS names for ps_bary, ps_persp_bary, ps_scc_mask32 and ps_uniform_branch.
+- vulkaninfo advertises VK_EXT_mesh_shader, but not VK_KHR_fragment_shader_barycentric or
+  VK_KHR_maintenance8. Thus the three maintenance8 skips are not exposed by this Mesa driver;
+  the barycentric fallback explains the untranslated computed-I/J fixture. Mesh support is
+  exposed, while the device still has no 64-wide subgroup.
+- cs_signed_zero_nan: word 5 = 0 is the documented Mesa 25.2+ NIR range-analysis bug (docs/testing.md
+  records it on ANV 25.2.8: NIR folds the NaN check despite SignedZeroInfNanPreserve). It is not
+  the whole failure: word 2 reads 0x80000000 where scripts/run_gpu_tests.py:1219 wants 0x80008000,
+  and the documented bug does not explain that word, so it is an additional unexplained mismatch. cs_fmt_int_narrow does not appear in docs/testing.md's Known
+  problems (or elsewhere in that file), so word 34 = 0 may be a new driver observation.
+- Compared with IntelMTL.txt at 84347bb on ANV Mesa 26.2.7 (194/248 native, 52 skipped,
+  2 failed; 226/248 emulated, 20 skipped, 2 failed), this older Mesa 25.2.8 adds the known
+  cs_signed_zero_nan failure and the unlisted cs_fmt_int_narrow failure, and skips the three
+  maintenance8 fixtures. Both records have the tfe pair failing; the MTL record verifies the
+  2071 signature, whereas this ARL run does not preserve enough output to verify it.
+- The suite logs contain synthetic fixture results only, no game data.
+- AI-assisted (pi coding agent operated by the repo contributor): built main at 21625bca
+  (CMake+Ninja on this GPU), ran run_gpu_tests.py native and under LEONIDA_W64_EMULATE=1
+  (TMPDIR worked around a root-owned stale temp file from an earlier run), diagnosed the
+  256/257 translate detail above, reproduced the tfe pair with one filtered run, and extracted
+  the numbers from the run logs.

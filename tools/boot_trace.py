@@ -6,6 +6,9 @@ survives a crash; `runtime/README.md`, "Startup trace"), and the D3D12 proxy wri
 triage needs: modules, unimplemented calls and their callers, DllMain/TLS results, exceptions and the exit, then
 the D3D12 calls by outcome and the first call per method.
 
+With LEONIDA_TRACE_PIPELINE_COMPILE=1, the D3D12 log also reports time spent building and waiting for Vulkan
+pipelines. Builds with a recorded start and no matching end are counted separately.
+
 The method field can contain spaces (`SetMarker/BeginEvent with unknown metadata`), so the parser takes the
 outcome as the last field instead of assuming a single-word method. PowerShell 5.1 wraps the first stderr line of
 a native program in an error record (`program.exe : [d3d12-trace] #1 ...`), so a `<name> : ` prefix before the
@@ -38,6 +41,18 @@ PACING_LINE = re.compile(
     r"p50_us=(\d+) p95_us=(\d+) p99_us=(\d+) "
     r"latency_samples=(\d+) latency_p50_us=(\d+) latency_p95_us=(\d+) latency_p99_us=(\d+)\s*$"
 )
+PIPELINE_PREFIX = r"^(?:.+ : )?\[rt\] pipeline-"
+PIPELINE_BEGIN = re.compile(
+    PIPELINE_PREFIX + r"compile-begin trigger=(?P<trigger>\S+) tid=(?P<tid>\d+) bytes=\d+ "
+    r"variant=(?P<variant>\d+) begin_ms=\d+ key=(?P<key>\S+) shaders=.*$"
+)
+PIPELINE_END = re.compile(
+    PIPELINE_PREFIX + r"compile trigger=(?P<trigger>\S+) tid=(?P<tid>\d+) start_us=\d+ "
+    r"us=(?P<us>\d+) hit=(?P<hit>-1|0|1) bytes=\d+ variant=(?P<variant>\d+) "
+    r"result=(?P<result>-?\d+) end_ms=\d+ key=(?P<key>\S+) shaders=.*$"
+)
+PIPELINE_USE = re.compile(PIPELINE_PREFIX + r"use trigger=\S+ tid=\d+ us=(\d+) ready=([01]) end_ms=\d+\s*$")
+PIPELINE_ID = ("tid", "trigger", "variant", "key")
 D3D12_PROBLEMS = ("failed", "unsupported", "refused", "partial")
 D3D12_OUTCOMES = frozenset((*D3D12_PROBLEMS, "called", "ok", "ignored"))
 
@@ -205,8 +220,36 @@ def parse_startup(path: str, limit: int = 10) -> dict:
     return trace
 
 
+def _record_pipeline_timing(line: str, timing: dict, active: dict) -> bool:
+    if match := PIPELINE_BEGIN.match(line):
+        key = match.group(*PIPELINE_ID)
+        active[key] = active.get(key, 0) + 1
+        timing["started"] += 1
+        return True
+    if match := PIPELINE_END.match(line):
+        key = match.group(*PIPELINE_ID)
+        count = active.get(key, 0)
+        if count > 1:
+            active[key] -= 1
+        elif count:
+            del active[key]
+        else:
+            timing["completions_without_start"] += 1
+        timing["completed"] += 1
+        timing["non_success_results"] += int(match["result"]) != 0
+        timing["cache_hits"] += match["hit"] == "1"
+        timing["max_compile_us"] = max(timing["max_compile_us"], int(match["us"]))
+        return True
+    if match := PIPELINE_USE.match(line):
+        timing["logged_waits"] += 1
+        timing["waits_not_ready"] += match[2] == "0"
+        timing["max_wait_us"] = max(timing["max_wait_us"], int(match[1]))
+        return True
+    return False
+
+
 def parse_d3d12(path: str, limit: int = 10) -> dict:
-    """Read the `--trace-d3d12` stderr lines, ignoring the runtime's ordinary diagnostics."""
+    """Read D3D12 calls and selected runtime diagnostics from stderr."""
     trace = {
         "path": path,
         "calls": 0,
@@ -224,9 +267,14 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
         "sequence_breaks": [],
         "frame_pacing": None,
     }
+    timing = dict.fromkeys(("started", "completed", "completions_without_start", "non_success_results",
+                            "cache_hits", "max_compile_us", "logged_waits", "waits_not_ready", "max_wait_us"), 0)
+    active = {}
     with _open_text(path) as fh:
         for line in fh:
             stripped = line.rstrip("\n")
+            if _record_pipeline_timing(stripped, timing, active):
+                continue
             pacing_match = PACING_LINE.match(stripped)
             if pacing_match:
                 trace["frame_pacing"] = {
@@ -275,6 +323,9 @@ def parse_d3d12(path: str, limit: int = 10) -> dict:
             "is it the stderr log of a --trace-d3d12 run, with the Vulkan device enabled?"
         )
     trace["last_call"] = {"seq": seq, "method": method, "outcome": outcome}
+    if timing["started"] or timing["completed"] or timing["logged_waits"]:
+        timing["starts_without_completion"] = sum(active.values())
+        trace["pipeline_timing"] = timing
     return trace
 
 
@@ -311,6 +362,8 @@ def counts_only(summary: dict) -> dict:
         }
         if d3d12.get("frame_pacing") is not None:
             counters["d3d12"]["frame_pacing"] = dict(d3d12["frame_pacing"])
+        if "pipeline_timing" in d3d12:
+            counters["d3d12"]["pipeline_timing"] = dict(d3d12["pipeline_timing"])
     return counters
 
 
@@ -408,9 +461,21 @@ def format_text(summary: dict, limit: int) -> str:
         outcomes = ", ".join(f"{k} {v}" for k, v in sorted(d3d12["outcomes"].items()))
         out.append(
             f"  {d3d12['calls']} call(s), {d3d12['ignored_lines']} other line(s)"
-            " (the [rt] diagnostics are not summarized)"
+            " (other [rt] diagnostics are not summarized)"
             + (f": {outcomes}" if outcomes else "")
         )
+        if timing := d3d12.get("pipeline_timing"):
+            out.append(
+                f"  Vulkan pipelines: {timing['started']} started, {timing['completed']} completed, "
+                f"{timing['starts_without_completion']} without a recorded completion, "
+                f"{timing['completions_without_start']} without a recorded start, "
+                f"{timing['non_success_results']} non-success result(s), {timing['cache_hits']} cache hit(s), "
+                f"longest compile {timing['max_compile_us']} us"
+            )
+            out.append(
+                f"  Vulkan pipeline waits: {timing['logged_waits']} logged, "
+                f"{timing['waits_not_ready']} ended without a pipeline, longest {timing['max_wait_us']} us"
+            )
         if fp := d3d12.get("frame_pacing"):
             line = (
                 f"  frame pacing: {fp['frames']} frame(s), {fp['samples']} interval(s), "
