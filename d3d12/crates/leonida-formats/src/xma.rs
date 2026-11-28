@@ -63,6 +63,27 @@ pub fn packet(data: &[u8], index: usize) -> Option<Packet> {
     })
 }
 
+/// Bits of a packet after its header.
+const PAYLOAD_BITS: usize = PACKET_BITS - HEADER_BITS;
+
+impl Packet {
+    /// Where in its packet's payload the first frame begins, if one does: a
+    /// packet with no frames, `0x7fff` (none) or a damaged offset past the
+    /// payload names no frame start (it would point into a later packet's
+    /// header or payload).
+    fn first_frame(&self) -> Option<usize> {
+        let bit = self.first_frame_bit as usize;
+        (self.frames > 0 && bit < PAYLOAD_BITS).then_some(bit)
+    }
+}
+
+/// The bit in `data` where the first frame of packet `index` begins, if one
+/// does (see [`Packet`]: a header can also say that none does, or be damaged).
+pub fn first_frame(data: &[u8], index: usize) -> Option<usize> {
+    let bit = packet(data, index)?.first_frame()?;
+    index.checked_mul(PACKET_BITS)?.checked_add(HEADER_BITS + bit)
+}
+
 /// One frame's bits gathered out of its packets.
 #[derive(Debug, Clone)]
 pub struct Frame {
@@ -126,6 +147,11 @@ impl Cursor<'_> {
 /// Reads the frame starting at bit `start` (a frame start inside a packet's
 /// payload) of `data`, a buffer of whole packets of one stream.
 pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
+    // No frame begins inside a packet header: such a start (from a damaged
+    // first-frame offset) would read the header's bits as audio.
+    if start % PACKET_BITS < HEADER_BITS {
+        return None;
+    }
     let mut cursor = Cursor { data, pos: start };
     let bits = cursor.bits(LENGTH_BITS)? as usize;
     if bits <= LENGTH_BITS as usize || bits == 0x7fff {
@@ -156,7 +182,10 @@ pub fn read_frame(data: &[u8], start: usize) -> Option<Frame> {
 fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
     let index = start / PACKET_BITS;
     let header = packet(data, index)?;
-    let mut at = index * PACKET_BITS + HEADER_BITS + header.first_frame_bit as usize;
+    // A damaged header that names no first frame in this packet's payload
+    // cannot say which frame `start` is: give up rather than count from a
+    // later packet.
+    let mut at = first_frame(data, index)?;
     let mut number = 0;
     while at < start {
         let mut cursor = Cursor { data, pos: at };
@@ -186,7 +215,7 @@ fn next_frame(data: &[u8], start: usize, end: usize) -> Option<usize> {
             next += 1 + header.skip as usize;
             header = packet(data, next)?;
         }
-        end = next * PACKET_BITS + HEADER_BITS + header.first_frame_bit as usize;
+        end = first_frame(data, next)?;
     }
     (end / 8 < data.len()).then_some(end)
 }
@@ -1231,6 +1260,61 @@ mod tests {
         assert_eq!(frame.bits, bits);
         assert_eq!(frame.next, Some(3 * PACKET_BITS + HEADER_BITS));
         assert_eq!(read_frame(&data, 3 * PACKET_BITS + HEADER_BITS).unwrap().next, None);
+    }
+
+    /// A first-frame offset is 15 bits but a payload is 16352: an offset at
+    /// or past the payload's end (other than `0x7fff`, none) is damage and
+    /// names no frame. Followed, it led into a later packet's header, whose
+    /// bits were then read as a frame.
+    #[test]
+    fn first_frame_offsets_past_the_payload_name_no_frame() {
+        let header = |frames: u32, first: u32| (frames << 26) | (first << 11);
+        // Packet 0: one frame filling its payload. Packet 1 says its first
+        // frame begins 8 bits past its payload's end: inside packet 2's header.
+        let mut data = vec![0u8; 3 * PACKET_BYTES];
+        put_bits(&mut data, 0, 32, header(1, 0));
+        put_bits(&mut data, HEADER_BITS, LENGTH_BITS, PAYLOAD_BITS as u32);
+        let damaged = PAYLOAD_BITS as u32 + 8;
+        put_bits(&mut data, PACKET_BITS, 32, header(1, damaged));
+        let header_bits = PACKET_BITS + HEADER_BITS + damaged as usize;
+        assert_eq!(header_bits, 2 * PACKET_BITS + 8);
+        put_bits(&mut data, header_bits, LENGTH_BITS, 100);
+        let frame = read_frame(&data, HEADER_BITS).unwrap();
+        assert_eq!(frame.bits, PAYLOAD_BITS);
+        assert_eq!(frame.next, None, "the frame after it must not be in a header");
+        assert_eq!(first_frame(&data, 1), None);
+        assert!(read_frame(&data, header_bits).is_none(), "a start inside a header");
+
+        // The last valid offset still names a frame; the first past it does not.
+        let mut edge = vec![0u8; 2 * PACKET_BYTES];
+        put_bits(&mut edge, 0, 32, header(1, PAYLOAD_BITS as u32 - 1));
+        assert_eq!(first_frame(&edge, 0), Some(PACKET_BITS - 1));
+        set_bits(&mut edge, 0, 32, header(1, PAYLOAD_BITS as u32));
+        assert_eq!(first_frame(&edge, 0), None);
+        // No frames, or the 0x7fff "none" offset, name no frame either.
+        set_bits(&mut edge, 0, 32, header(0, 0));
+        assert_eq!(first_frame(&edge, 0), None);
+        set_bits(&mut edge, 0, 32, header(1, 0x7fff));
+        assert_eq!(first_frame(&edge, 0), None);
+
+        // A buffer that starts with a continuation (`0x7fff`): the start a
+        // caller computes as `HEADER_BITS + first_frame_bit` lands in packet
+        // 2's header and must not be read as a frame.
+        let mut data = vec![0u8; 3 * PACKET_BYTES];
+        put_bits(&mut data, 0, 32, header(0, 0x7fff));
+        let start = HEADER_BITS + 0x7fff;
+        assert_eq!(start / PACKET_BITS, 2);
+        assert!(start % PACKET_BITS < HEADER_BITS);
+        put_bits(&mut data, start, LENGTH_BITS, 200);
+        assert!(read_frame(&data, start).is_none());
+
+        // A frame start in a packet whose own offset is damaged cannot be
+        // placed among that packet's frames: no next frame.
+        let mut data = vec![0u8; 2 * PACKET_BYTES];
+        put_bits(&mut data, 0, 32, header(2, PAYLOAD_BITS as u32 + 100));
+        put_bits(&mut data, HEADER_BITS + 100, LENGTH_BITS, 200);
+        let frame = read_frame(&data, HEADER_BITS + 100).unwrap();
+        assert_eq!((frame.bits, frame.next), (200, None));
     }
 
     /// The direct sum `imdct_half` stands for (FFmpeg's naive inverse MDCT:
