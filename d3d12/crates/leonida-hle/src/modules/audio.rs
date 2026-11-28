@@ -178,16 +178,41 @@ fn heap_unmap(apu: u32) -> Option<*mut u8> {
         .then(|| (host + (apu - start) as usize) as *mut u8)
 }
 
+/// Raw host pointer to `len` bytes at `apu` when one heap block holds them all.
+fn heap_span_in(heap: &Heap, apu: u32, len: usize) -> Option<*mut u8> {
+    let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
+    let offset = (apu - start) as usize;
+    (offset.checked_add(len)? <= heap.blocks[&host].size).then_some((host + offset) as *mut u8)
+}
+
 /// `len` bytes of title memory at a device address, if one heap block holds
 /// them all.
 fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
     let heap = lock(&HEAP);
-    let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
-    let offset = (apu - start) as usize;
-    (offset.checked_add(len)? <= heap.blocks[&host].size)
-        // SAFETY: inside a live heap block, which the title and the audio
-        // hardware share like on the console.
-        .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
+    let ptr = heap_span_in(&heap, apu, len)?;
+    // SAFETY: inside a live heap block, which the title and the audio
+    // hardware share like on the console.
+    Some(unsafe { std::slice::from_raw_parts_mut(ptr, len) })
+}
+
+/// Stores `1u32` to a title notification word inside a live heap block: a
+/// single aligned `u32` volatile store when 4-byte aligned (so a polling title
+/// thread never sees a torn `0xFFFFFF01`), or four volatile byte stores when
+/// misaligned, matching `runtime/shims/acphal.cpp`.
+fn write_notification(notification: u32) {
+    let heap = lock(&HEAP);
+    let Some(word) = heap_span_in(&heap, notification, 4) else {
+        return;
+    };
+    if word.addr() & 3 == 0 {
+        // SAFETY: 4-byte-aligned word inside a live heap block (`HEAP` held).
+        unsafe { word.cast::<u32>().write_volatile(1) };
+    } else {
+        for (i, byte) in 1u32.to_le_bytes().into_iter().enumerate() {
+            // SAFETY: all 4 bytes lie inside a live heap block (`HEAP` held).
+            unsafe { word.add(i).write_volatile(byte) };
+        }
+    }
 }
 
 pub extern "system" fn ApuAlloc(
@@ -882,17 +907,8 @@ extern "system" fn submit(
         done[12..].copy_from_slice(&state.frame().to_le_bytes());
         state.post(COMMAND_COMPLETED, &done);
     }
-    if notification != 0
-        && let Some(word) = heap_bytes(notification, 4)
-    {
-        // All four bytes inside one heap block, written one at a time: the
-        // title may name a misaligned word, which is written all the same
-        // (as `runtime/shims/acphal.cpp` does).
-        for (byte, value) in word.iter_mut().zip(1u32.to_le_bytes()) {
-            // SAFETY: a byte of a live heap block, which the title reads as
-            // volatile.
-            unsafe { std::ptr::write_volatile(byte, value) };
-        }
+    if notification != 0 {
+        write_notification(notification);
     }
     S_OK
 }
@@ -1382,6 +1398,48 @@ mod tests {
         assert_eq!(read(), [1, 0, 0, 0, 0xaa, 0xaa]);
 
         (m.release)(acp);
+        ApuFree(ptr);
+    }
+
+    #[test]
+    fn aligned_notification_stores_are_never_torn() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        let _serial = lock(&CONTEXT_TESTS);
+        const WORDS: usize = 4096;
+        let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, (WORDS * 4) as u32, 16, 1), S_OK);
+        // SAFETY: `WORDS` 4-byte-aligned `u32` slots live until `reader.join()`.
+        let slots = unsafe { std::slice::from_raw_parts(ptr.cast::<AtomicU32>(), WORDS) };
+        for slot in slots {
+            slot.store(u32::MAX, Ordering::Relaxed);
+        }
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    for slot in slots {
+                        let v = slot.load(Ordering::Relaxed);
+                        assert!(v == u32::MAX || v == 1, "torn notification store: {v:#010x}");
+                    }
+                }
+            });
+            let mut acp = std::ptr::null_mut();
+            assert_eq!(AcpHalCreate(&mut acp), S_OK);
+            // SAFETY: just created.
+            let m = unsafe { (*acp).vtable };
+            for i in 0..WORDS {
+                assert_eq!(
+                    (m.submit)(acp, 12, 0, u32::MAX, std::ptr::null(), apu + (i * 4) as u32),
+                    S_OK
+                );
+            }
+            done.store(true, Ordering::Release);
+            reader.join().unwrap();
+            for slot in slots {
+                assert_eq!(slot.load(Ordering::Relaxed), 1);
+            }
+            (m.release)(acp);
+        });
         ApuFree(ptr);
     }
 
