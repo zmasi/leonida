@@ -347,24 +347,51 @@ the type reaches the driver). The runtime's calls are correct; the import works.
 [wineland-child-rendering patch][ge-patch]; [Wine 11.0][wine-buffer] and Valve's wine at GE's base (`a47c73f52`) have no
 such function and leave a type they do not map as it is. No GE-Proton release with a change to this function was found on 2026-11-27 (GE-Proton11-14 is the newest tag).
 
-The correction is one change to that function's mask: keep the host-allocation bit next to the fd and dma-buf bits
-(`and 0x201` becomes `and 0x281`). Its source:
+In a GE-Proton11-14 Wine source tree **after** the GE patch series, save the following block as
+`win32u-forward-host-allocation.patch` and run `git apply --check win32u-forward-host-allocation.patch` before applying
+it. This is a Wine change, not a patch to the port or its installed binaries.
 
 ```diff
+--- a/dlls/win32u/vulkan.c
++++ b/dlls/win32u/vulkan.c
+@@ -71,6 +71,9 @@
+                                                VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
+ static const UINT EXTERNAL_MEMORY_FD_BITS = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT |
+                                             VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++/* Host pointer imports (VK_EXT_external_memory_host) are made on the host as the application asks, so a buffer
++ * created for one must keep the handle type for the import to be a valid one (VUID-vkBindBufferMemory-memory-02985). */
 +static const UINT EXTERNAL_MEMORY_HOST_BITS = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
-@@ static UINT map_external_memory_handle_types( UINT handle_types )
+ static const UINT EXTERNAL_SEMAPHORE_WIN32_BITS = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+                                                   VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
+                                                   VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+@@ -655,11 +658,11 @@
+
+ static UINT map_external_memory_handle_types( UINT handle_types )
+ {
 -    UINT host_handle_types = handle_types & EXTERNAL_MEMORY_FD_BITS;
 +    UINT host_handle_types = handle_types & (EXTERNAL_MEMORY_FD_BITS | EXTERNAL_MEMORY_HOST_BITS);
+
+     if (handle_types & EXTERNAL_MEMORY_WIN32_BITS)
+         host_handle_types |= get_host_external_memory_type();
 -    if (handle_types & ~(EXTERNAL_MEMORY_WIN32_BITS | EXTERNAL_MEMORY_FD_BITS))
 +    if (handle_types & ~(EXTERNAL_MEMORY_WIN32_BITS | EXTERNAL_MEMORY_FD_BITS | EXTERNAL_MEMORY_HOST_BITS))
+         FIXME( "Unsupported handle types %#x\n", handle_types );
+     return host_handle_types;
+ }
 ```
 
-(the last line only decides whether the `FIXME` prints). Built from the GE-Proton11-14 sources (Valve wine `a47c73f52`,
-wine-staging `6cc805ea`, GE's patches) and run on a Radeon Pro Vega II (RADV, Khronos validation 1.4.341), the shipped
-and the unchanged build give 6 validation errors, all 02985, at the 6 `create_host_buffer` binds of a synthetic probe
-built from 431ceba4f, and the corrected build 0, with the same imports and the same bytes. Only that call site was
-traced; the console-heap and scratch imports in `shims/d3d12_vulkan_device.cpp` build the same buffer info and fall under
-the same mask, untraced.
+The host-allocation bit now reaches the driver; the last changed line keeps the diagnostic consistent with that
+mask. The following are **reported bind errors**, not counts from the separate capability-query test below. Both
+444-step runs used `431ceba4f`, a 32 MiB arena, default host-import settings, Vega II, RADV Mesa 26.0.8 and Khronos
+validation 1.4.341. Only the sandboxed `win32u` changed (Valve Wine `a47c73f52`, wine-staging `6cc805ea`, GE's patches).
+
+| PCI adapter | `LEONIDA_GEOMETRY_MB` | Shipped `win32u` | Corrected `win32u` |
+|---|---|---:|---:|
+| `1e:00.0` | unset | 6 | 0 |
+| `0b:00.0` | `16` | 10 (layer's duplicate-report limit) | 0 |
+
+On `1e`, the independently rebuilt **unmodified** module also gave six errors. Each matched a traced
+`Resource::create_host_buffer` create/bind pair. No other runtime import site was traced.
 
 `vk_host_region_import_test 1 --strict` is the repeatable check, and a different one from the bind above: it fails at
 the capability query, before any buffer is created, imported or bound (the default run skips there, as it must on a
