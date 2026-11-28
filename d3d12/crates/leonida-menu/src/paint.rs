@@ -46,6 +46,16 @@ const TOGGLE_ON: Colour = [84, 200, 120, 255];
 const HELP_BOX: Colour = [0, 0, 0, 205];
 const WARN: Colour = [255, 192, 84, 255];
 
+/// Clamps a layout scale factor to `[0.25, 8.0]`, falling back to `1.0` for
+/// non-finite or non-positive values (matching [`crate::overlay::Painter::paint`]).
+pub(crate) fn clamp_scale(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 {
+        scale.clamp(0.25, 8.0)
+    } else {
+        1.0
+    }
+}
+
 /// The faces at one scale.
 pub struct Fonts {
     pub script: Atlas,
@@ -56,6 +66,7 @@ pub struct Fonts {
 
 impl Fonts {
     pub fn new(source: &dyn FontSource, scale: f32) -> Fonts {
+        let scale = clamp_scale(scale);
         let px = |base: f32| (base * scale).round().max(6.0) as u32;
         Fonts {
             script: source.atlas(Face::Script, px(TITLE_PX)),
@@ -127,10 +138,14 @@ pub(crate) struct Canvas {
 
 impl Canvas {
     pub(crate) fn new(w: u32, h: u32) -> Canvas {
+        let len = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|n| n.checked_mul(4))
+            .expect("canvas pixel buffer size overflow");
         Canvas {
-            w: w as i32,
-            h: h as i32,
-            px: vec![0; (w * h * 4) as usize],
+            w: i32::try_from(w).expect("canvas width exceeds i32::MAX"),
+            h: i32::try_from(h).expect("canvas height exceeds i32::MAX"),
+            px: vec![0; len],
         }
     }
 
@@ -260,7 +275,7 @@ fn wrap(atlas: &Atlas, text: &str, width: i32) -> Vec<String> {
 
 /// Paints `view` at `fonts.scale` (1: a 1080-line picture).
 pub fn paint(view: &View, fonts: &Fonts) -> Layers {
-    let s = fonts.scale;
+    let s = clamp_scale(fonts.scale);
     let px = |v: f32| (v * s).round() as i32;
     let (width, header, subtitle, row, arrows, gap, line, pad) = (
         px(WIDTH),
@@ -506,5 +521,23 @@ mod tests {
         let lines = wrap(&f.body, &view().footer, 400);
         assert!(lines.len() >= 2);
         assert!(lines.iter().all(|l| f.body.measure(l) <= 400));
+    }
+
+    #[test]
+    fn nonfinite_and_extreme_scales_paint_cleanly() {
+        let v = view();
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -3.0, 1e9] {
+            let mut f = Fonts::new(&Dots, bad);
+            assert!(f.scale.is_finite() && (0.25..=8.0).contains(&f.scale));
+            let l = paint(&v, &f);
+            assert!(l.width > 0 && l.height > 0);
+            assert_eq!(l.pixels.len(), (l.width * 2 * l.height * 4) as usize);
+
+            // Direct caller mutating `Fonts::scale` to a non-finite value must also stay safe.
+            f.scale = bad;
+            let l2 = paint(&v, &f);
+            assert!(l2.width > 0 && l2.height > 0);
+            assert!(l2.scale.is_finite() && (0.25..=8.0).contains(&l2.scale));
+        }
     }
 }

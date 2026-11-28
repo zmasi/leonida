@@ -265,10 +265,20 @@ impl Menu {
                 let forward = input == Input::Right;
                 let value = match (&item.kind, backend.value(item.id)) {
                     (Kind::Number { min, max, step, .. }, Value::Number(v)) => {
-                        let v = if forward { v + step } else { v - step };
+                        if !min.is_finite()
+                            || !max.is_finite()
+                            || min > max
+                            || !step.is_finite()
+                            || *step <= 0.0
+                        {
+                            return false;
+                        }
+                        let base = if v.is_finite() { v.clamp(*min, *max) } else { *min };
+                        let next = if forward { base + step } else { base - step };
                         // Steps land on the grid, not on the sum's rounding error.
-                        let v = (v / step).round() * step;
-                        Value::Number(v.clamp(*min, *max))
+                        let grid = (next / step).round() * step;
+                        let next = if grid.is_finite() { grid } else { next };
+                        Value::Number(next.clamp(*min, *max))
                     }
                     (Kind::Choice(options), Value::Index(i)) if !options.is_empty() => {
                         let n = options.len();
@@ -676,5 +686,59 @@ mod tests {
         assert_eq!(v.rows[0].right, Right::Submenu);
         assert_eq!(v.caption, "MAIN");
         assert_eq!(v.rows[4].right, Right::Nothing);
+    }
+
+    #[test]
+    fn invalid_number_steps_or_bounds_do_not_produce_nan_or_panic() {
+        for (min, max, step) in [
+            (0.0, 10.0, 0.0),
+            (0.0, 10.0, -0.5),
+            (0.0, 10.0, f64::NAN),
+            (0.0, 10.0, f64::INFINITY),
+            (10.0, 0.0, 1.0),
+            (f64::NAN, 10.0, 1.0),
+        ] {
+            let mut b = Fake::default();
+            let mut m = Menu::new(
+                vec![Page {
+                    title: "P",
+                    items: vec![Item::new(
+                        "n",
+                        "Bad",
+                        "",
+                        Kind::Number {
+                            min,
+                            max,
+                            step,
+                            decimals: 1,
+                            suffix: "",
+                        },
+                    )],
+                }],
+                3,
+            );
+            m.handle(Input::Toggle, &mut b);
+            assert!(!m.handle(Input::Right, &mut b));
+            assert!(!m.handle(Input::Left, &mut b));
+            assert!(b.done.is_empty());
+            assert_eq!(b.value("n"), Value::Number(1.0));
+        }
+
+        // A non-finite current value from a backend recovers into `[min, max]`.
+        let mut b = Fake::default();
+        b.values.insert("n", Value::Number(f64::NAN));
+        let mut m = Menu::new(
+            vec![Page {
+                title: "P",
+                items: vec![Item::new("n", "Num", "", NUMBER)],
+            }],
+            3,
+        );
+        m.handle(Input::Toggle, &mut b);
+        assert!(m.handle(Input::Right, &mut b));
+        let Value::Number(v) = b.value("n") else {
+            panic!("expected Value::Number");
+        };
+        assert!(v.is_finite() && (0.0..=2.0).contains(&v), "got {v}");
     }
 }

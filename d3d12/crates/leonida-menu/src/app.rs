@@ -101,7 +101,13 @@ pub(crate) fn height() -> u32 {
 
 /// The scale for a picture `height` lines high.
 pub fn scale_for(height: u32) -> f32 {
-    (height.max(1) as f32 / 1080.0 * knobs::MENU_SCALE.get()).max(0.25)
+    let knob = knobs::MENU_SCALE.get();
+    let knob = if knob.is_finite() && knob > 0.0 {
+        knob
+    } else {
+        1.0
+    };
+    crate::paint::clamp_scale(height.max(1) as f32 / 1080.0 * knob)
 }
 
 /// Starts the menu's thread (once; nothing when disabled or off Windows).
@@ -164,6 +170,7 @@ impl App {
 
     /// A new picture if the view or the scale changed since the last.
     pub fn repaint(&mut self, scale: f32) -> Option<Layers> {
+        let scale = crate::paint::clamp_scale(scale);
         let view = self.menu.view(&self.backend);
         if self
             .last
@@ -306,5 +313,40 @@ mod tests {
         knobs::MENU_SCALE.set(1.0);
         assert_eq!(scale_for(2160), 2.0);
         assert_eq!(scale_for(1080), 1.0);
+    }
+
+    #[test]
+    fn scale_for_and_repaint_clamp_nonfinite_and_extreme_scales() {
+        struct ResetMenuScale;
+        impl Drop for ResetMenuScale {
+            fn drop(&mut self) {
+                knobs::MENU_SCALE.set(1.0);
+            }
+        }
+        let _one = knobs::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _reset = ResetMenuScale;
+
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 0.0, -2.0] {
+            knobs::MENU_SCALE.set(bad);
+            assert_eq!(scale_for(1080), 1.0, "bad knob {bad}");
+            assert_eq!(scale_for(2160), 2.0, "bad knob {bad} at 2160p");
+        }
+        knobs::MENU_SCALE.set(100.0);
+        assert_eq!(scale_for(1080), 8.0);
+        knobs::MENU_SCALE.set(0.01);
+        assert_eq!(scale_for(1080), 0.25);
+        knobs::MENU_SCALE.set(1.0);
+
+        let mut app = App::new(Box::new(crate::font::Dots));
+        app.handle(Input::Toggle);
+        let first = app.repaint(f32::NAN).expect("NaN scale falls back to 1.0");
+        assert_eq!(first.scale, 1.0);
+        assert!(
+            app.repaint(f32::NAN).is_none(),
+            "clamped NaN scale must not trigger infinite repaints"
+        );
+        assert!(app.repaint(f32::INFINITY).is_none());
+        let huge = app.repaint(100.0).expect("finite extreme scale clamps to 8.0");
+        assert_eq!(huge.scale, 8.0);
     }
 }

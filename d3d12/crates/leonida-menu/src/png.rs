@@ -4,12 +4,35 @@
 /// A PNG of `width * height` pixels, `channels` bytes each (3: RGB, 4:
 /// RGBA), rows `pitch` bytes apart in `pixels`.
 pub fn encode(width: u32, height: u32, channels: u8, pitch: usize, pixels: &[u8]) -> Vec<u8> {
-    assert!(channels == 3 || channels == 4);
-    let row = width as usize * usize::from(channels);
-    let mut raw = Vec::with_capacity((row + 1) * height as usize);
-    for y in 0..height as usize {
+    assert!(channels == 3 || channels == 4, "PNG channels must be 3 or 4");
+    assert!(width > 0 && height > 0, "PNG dimensions must be non-zero");
+    let w = width as usize;
+    let h = height as usize;
+    let row = w
+        .checked_mul(usize::from(channels))
+        .expect("PNG row byte length overflow");
+    assert!(
+        pitch >= row,
+        "PNG row pitch ({pitch}) smaller than row width ({row})"
+    );
+    let raw_len = row
+        .checked_add(1)
+        .and_then(|stride| stride.checked_mul(h))
+        .expect("PNG raw scanline buffer size overflow");
+    let needed = (h - 1)
+        .checked_mul(pitch)
+        .and_then(|last| last.checked_add(row))
+        .expect("PNG pixel buffer span overflow");
+    assert!(
+        pixels.len() >= needed,
+        "PNG pixel buffer ({}) shorter than required span ({needed})",
+        pixels.len()
+    );
+    let mut raw = Vec::with_capacity(raw_len);
+    for y in 0..h {
+        let at = y * pitch;
         raw.push(0);
-        raw.extend_from_slice(&pixels[y * pitch..y * pitch + row]);
+        raw.extend_from_slice(&pixels[at..at + row]);
     }
     let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
     let mut header = Vec::new();
@@ -25,7 +48,8 @@ pub fn encode(width: u32, height: u32, channels: u8, pitch: usize, pixels: &[u8]
 }
 
 fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], data: &[u8]) {
-    png.extend((data.len() as u32).to_be_bytes());
+    let len = u32::try_from(data.len()).expect("PNG chunk exceeds u32::MAX");
+    png.extend(len.to_be_bytes());
     let start = png.len();
     png.extend(kind);
     png.extend(data);
@@ -56,5 +80,23 @@ mod tests {
         assert_eq!(&png[12..16], b"IHDR");
         assert_eq!(png[25], 6);
         assert_eq!(&png[png.len() - 8..png.len() - 4], b"IEND");
+    }
+
+    #[test]
+    #[should_panic(expected = "pitch")]
+    fn rejects_pitch_smaller_than_row() {
+        let _ = encode(2, 2, 4, 0, &[0u8; 16]);
+    }
+
+    #[test]
+    #[should_panic(expected = "non-zero")]
+    fn rejects_zero_dimensions() {
+        let _ = encode(0, 1, 4, 0, &[]);
+    }
+
+    #[test]
+    #[should_panic(expected = "overflow")]
+    fn rejects_overflowing_span() {
+        let _ = encode(1, 3, 4, (usize::MAX / 2) + 4, &[0u8; 16]);
     }
 }
