@@ -98,6 +98,9 @@ mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
 mod rect;
+mod salu_scc;
+#[cfg(all(test, windows))]
+mod salu_scc_tests;
 mod sampler;
 mod shader;
 mod threading;

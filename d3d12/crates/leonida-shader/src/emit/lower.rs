@@ -7044,17 +7044,21 @@ impl<'a> Lower<'a> {
                 };
                 let r = self.s.m.bin(c, Bin::Add, a, b);
                 let carry = if name == "s_add_u32" {
-                    Some(self.s.m.cmp(c, pred::IULT, r, a))
+                    self.s.m.cmp(c, pred::IULT, r, a)
                 } else {
-                    None
+                    super::salu_scc::signed_overflow(&mut self.s.m, c, a, b, r, false)
                 };
-                (r, carry)
+                (r, Some(carry))
             }
             "s_sub_u32" | "s_sub_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
                 let r = self.s.m.bin(c, Bin::Sub, a, b);
-                let carry = (name == "s_sub_u32").then(|| self.s.m.cmp(c, pred::IULT, a, b));
-                (r, carry)
+                let carry = if name == "s_sub_u32" {
+                    self.s.m.cmp(c, pred::IULT, a, b)
+                } else {
+                    super::salu_scc::signed_overflow(&mut self.s.m, c, a, b, r, true)
+                };
+                (r, Some(carry))
             }
             "s_addc_u32" | "s_subb_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
@@ -7133,9 +7137,9 @@ impl<'a> Lower<'a> {
             }
             "s_lshl1_add_u32" | "s_lshl2_add_u32" | "s_lshl3_add_u32" | "s_lshl4_add_u32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
-                let k = self.s.m.i32(u32::from(name.as_bytes()[6] - b'0'));
-                let t = self.s.m.bin(c, Bin::Shl, a, k);
-                (self.s.m.bin(c, Bin::Add, t, b), None)
+                let k = u32::from(name.as_bytes()[6] - b'0');
+                let (r, carry) = super::salu_scc::lshl_add_u32(&mut self.s.m, c, a, b, k);
+                (r, Some(carry))
             }
             "s_min_u32" | "s_max_u32" | "s_min_i32" | "s_max_i32" => {
                 let (a, b) = (src32(self, 0)?, src32(self, 1)?);
