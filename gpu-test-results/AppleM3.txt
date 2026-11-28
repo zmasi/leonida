@@ -1,0 +1,74 @@
+GPU:        Apple M3 (Apple GPU, 10 cores), subgroup 4..32 (MoltenVK), 32..32 (KosmicKrisp)
+Driver:     MoltenVK 1.4.2 (Homebrew bottle), Vulkan 1.4.357 (loader 1.4.363.0)
+Subgroup:   4..32 (no native 64-wide, no mesh, no geometry stage, no PerVertexKHR)
+OS:         macOS 26.5.1 (25F80), arm64
+Commit:     a73a57e13 (main, 2026-11-26)
+Tools:      llvm-mc 23.1.6 (Homebrew, AMDGPU target), SPIRV-Tools v2026.4 (Homebrew), Apple clang 17.0.0,
+            CMake 4.5.1, Python 3.15.2 (also 3.12.16 for the semantic suite)
+
+MoltenVK 1.4.2, the default (the test programs load it directly):
+run_gpu_tests.py: 277 shaders: 276 translated, 276 pass spirv-val (the one left is the computed I/J pair that
+            needs PerVertexKHR inputs)
+            native:                 195/268 passed, 70 skipped, 3 failed
+            LEONIDA_W64_EMULATE=1:  229/268 passed, 36 skipped, 3 failed
+build.py:   on main it still stops at cs_dpp_cmp.asm (no llvm-mc encoding for a VOPC compare in DPP form).
+            With #1444 applied locally and not committed: 301 shaders, 301 translated, 301 pass spirv-val
+            (six mesh fixtures not built: no VK_EXT_mesh_shader).
+check.py:   185 of 234 pass, 44 skipped, 5 failed (with #1444's build.py output)
+ctest:      106/108 on main: a fresh build stops at generated/cs_null_descriptors.spv, so root_signature and
+            vk_null_descriptor are Not Run. With #2096: 108/108 passed, 3 skipped (shader_library_corpus,
+            vk_device_markers, vk_sync_validation).
+Validation: the whole run_gpu_tests.py run under LEONIDA_VK_VALIDATION=1, through the loader with #2178,
+            filtering the three messages docs/testing.md lists for MoltenVK (06296, 08740, 09582): 195/268
+            passed, the same three failures. The layer reports nothing else on any fixture.
+Failed:     cs_fma_fused: word 7 (f16) reads 0x00000000, want 0x00007351 (known row; #1724 takes the f16
+            operands at run time and then passes).
+            ps_ssharp: point bias +1: (0,0) reads (1.0, 0.0, 0.502, 0.502), want (0.502, 0.502, 0.502,
+            0.502). MoltenVK drops the sampler's mipLodBias on this GPU; #1774 applies it in the shader.
+            cs_imgatomic_ext: 6 of 64 sint words, first word 32 reads 0x0badf00d, want 0x00000101 (#1518).
+check.py only: ps_ij_computed and ps_interp_f16_high: "vk_harness failed or returned no pixels" (no
+            PerVertexKHR inputs; #2176 takes the f16 interpolation fallback from the device).
+DPP:        cs_dpp, cs_dpp8, cs_dpp_bank, cs_dpp_bound, cs_dpp_cmp, cs_dpp_fi, cs_dpp_mask, cs_dpp_ops and
+            cs_dpp_row pass on MoltenVK 1.4.2 and KosmicKrisp, in run_gpu_tests.py and check.py (cs_dpp_w64
+            skips: no 64-wide subgroup). That is a Mac run for docs/design.md's DPP row ("not yet run on a
+            Mac"); its hand-written FI=0 case with an absent source lane is still CPU-only.
+Repeats:    ps_imgatomic passed 30 of 30 runs on MoltenVK here (the M5/M5 Pro failure of docs/testing.md
+            does not reproduce on the M3).
+Fuzzers:    f32_fuzz 40 programs (seed 1): 38 match, 2 undefined in SPIR-V (Log2 of -0.0, InverseSqrt of
+            -4.0), the same on all three drivers. valu_fuzz --family mem: 40/40 on MoltenVK and KosmicKrisp.
+            valu_fuzz --family f16: 40/40 on KosmicKrisp, 39/40 on MoltenVK; the one mismatch is a -0
+            product from v_mul_f16 read back as +0 (the known MoltenVK row: SPIRV-Cross's spvFMul is
+            fma(l, r, 0); SPIRV-Cross 300681bb makes it fma(l, r, -0.0), not yet in MoltenVK).
+
+KosmicKrisp (Mesa 26.3.1, Homebrew), same machine, commit and test programs, through the Vulkan loader
+(LEONIDA_VULKAN_LOADER=/opt/homebrew/opt/vulkan-loader/lib/libvulkan.1.dylib,
+VK_DRIVER_FILES=/opt/homebrew/share/vulkan/icd.d/kosmickrisp_mesa_icd.aarch64.json); subgroup 32..32:
+run_gpu_tests.py: 190/268 passed, 73 skipped, 5 failed
+            224/268 passed, 39 skipped, 5 failed (LEONIDA_W64_EMULATE=1)
+check.py:   179 of 234 pass, 49 skipped, 6 failed (with #1444's build.py output)
+Failed:     cs_bvh, cs_bvh32 (out[3] reads 0x7fc00000, want 0xffffffff), ps_cndmask_sign_mods,
+            ps_valu16_mad_sel, and in check.py cs_fmt_all word 293 (0x80007e00, want 0x80007c01): one cause,
+            emit_src_component in Mesa's src/kosmickrisp/compiler/msl_type_inference.c prints every
+            float-typed NaN constant as (NAN). The rows are in #2229.
+            cs_imgatomic_ext: as on MoltenVK (#1518).
+            cs_fma_fused passes with main's fixture; with #1724's (run-time f16 operands) word 7 reads
+            0x00007352, want 0x00007351: the TwoSum of the round-to-odd FMA is reassociated, because
+            KosmicKrisp compiles every library with MTLMathModeFast and Metal ignores a per-op
+            "#pragma METAL fp math_mode(safe)" inside a fast library (measured in a standalone Metal kernel).
+With two local Mesa patches (NaN constants printed by their bits; libraries compiled safe, with a fast
+pragma on the ops that have no float controls), KosmicKrisp built from mesa-26.3.1: run_gpu_tests.py
+194/268 passed, 1 failed (cs_imgatomic_ext); 228/268 emulated; check.py 184 of 234, 1 failed (the same);
+#1724's cs_fma_fused passes. Same run time as the stock driver (45 s against 44 s, warm cache).
+
+llvmpipe (Mesa 26.3.1, Homebrew, LLVM 23.1.6, 128 bits), same machine, through the loader
+(VK_DRIVER_FILES=/opt/homebrew/share/vulkan/icd.d/lvp_icd.aarch64.json); subgroup 4..4:
+run_gpu_tests.py: 177/268 passed, 90 skipped, 1 failed
+            212/268 passed, 55 skipped, 1 failed (LEONIDA_W64_EMULATE=1)
+check.py:   120 of 234 pass, 113 skipped, 1 failed (with #1444's build.py output; most skips are "can't run
+            this shader at 32 lanes on request" and "subgroup 4 is narrower than 32 lanes")
+Failed:     cs_imgatomic_ext (#1518).
+Fuzzers:    valu_fuzz needs 32 lanes natively; with --emulate, f16 40/40.
+
+Python on this machine: semantic suite 498 files, 6351 tests, 0 failed (Python 3.15.2 and 3.12.16); the
+standard-library loop of the macOS CI job fails only tests/test_calibrated_texture_extra.py (#2101) and
+tests/test_mod_pack_output_alias.py (#2175).

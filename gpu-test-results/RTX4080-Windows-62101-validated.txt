@@ -1,0 +1,91 @@
+RTX 4080: independent validation of existing fixes #1518 and #2261
+================================================================
+
+Claim: GPU-RTX4080-62101-02F71CCF
+https://github.com/ProjectLeonida/mandy/issues/1608#issuecomment-7233144239
+
+Baseline: 02f71ccfe78160997a02950607be583af87e1180
+PR #1518: 7bcb5ba529ae11e211fde82a652171b57e05328e
+  Applied only runtime/test/shaders/cs_imgatomic_ext.asm (two descriptor values).
+PR #2261: 409da28db73dd249c24c4aba175a33369ebbcc7b
+  Applied only runtime/test/d3d12_texture_uav_test.cpp; rebuilt that test target.
+  #2261 was closed without merge when this report was prepared. These measurements
+  validate that historical head; they do not imply upstream acceptance.
+Both fixes belong to their existing authors. This contribution is validation only.
+
+Machine and tools
+-----------------
+GPU: NVIDIA GeForce RTX 4080, 16376 MiB VRAM, subgroup 32..32.
+Driver: NVIDIA 621.01, Vulkan 1.4.357.
+CPU: AMD Ryzen 9 7950X3D; 64 GB installed RAM (63.03 GiB OS-visible).
+OS: native Windows 11 Pro 25H2, build 26200.9711.
+Python 3.14.5; llvm-mc 23.1.6 with AMDGPU; SPIRV-Tools 2026.4;
+glslang 16.6.0; CMake 4.2.3-msvc3; Ninja 1.13.2; MSVC 19.51.36244;
+MSVC tools 14.51.36231; Windows SDK 10.0.26100.0.
+Vulkan-Headers: 6802bb4733b63ed5efd3adb308a6c885ef180ea1.
+
+Complete synthetic GPU runs
+--------------------------
+                              PASS  SKIP  FAIL  TOTAL  EXIT
+Baseline, native                212    57     2    271     1
+Baseline, wave64 emulation      249    20     2    271     1
+Both fixes, native              214    57     0    271     0
+Both fixes, wave64 emulation    251    20     0    271     0
+
+All four complete runs: 281/281 shaders translated and passed spirv-val.
+One complete run per configuration; timings are not performance benchmarks.
+Final runs had no LEONIDA_DESCRIPTOR_TABLE override.
+Native baseline UTC start: 2026-11-28T03:06:44Z.
+Emulated baseline UTC start: 2026-11-28T03:08:05Z.
+Native fixed UTC start: 2026-11-28T03:17:49Z.
+Emulated fixed UTC start: 2026-11-28T03:19:01Z.
+
+Focused controls
+----------------
+cs_imgatomic_ext failed on baseline and in an isolated rerun in each mode:
+six sint words differed; word 32 was 0x0badf00d instead of 0x00000101.
+With #1518, --filter cs_imgatomic passes all three cases (cs_imgatomic,
+cs_imgatomic3d, cs_imgatomic_ext), 3/3 in native and emulated modes.
+The fixture's old volume key missed the tagged whole-mip descriptor entry.
+
+cs_texture_uav baseline and isolated reruns failed in both modes: first 1D texel
+remained 0x11 instead of 0x3f9. The shader expects a tagged descriptor table,
+but this bare-SPIR-V harness has no shader-library index, so the runtime's
+plain default supplies no kind bits and the shader routes stores to fallback.
+
+Same unpatched executable as baseline (SHA-256 verified):
+  Default: FAIL in both modes.
+  LEONIDA_DESCRIPTOR_TABLE=tagged: PASS 1/1 in both modes.
+With #2261 and its test executable rebuilt:
+  Default, override unset: PASS 1/1 in both modes.
+  Forced LEONIDA_DESCRIPTOR_TABLE=plain: FAIL 0/1, native negative control.
+Direct patched harness: 14 GPU cases passed, 10 compared with Windows WARP;
+format/range/refusal checks passed. Descriptor-only CTest: 1/1 passed.
+Intentional format-refusal diagnostics also occur in the passing run.
+
+Reproduction
+------------
+Initialize the MSVC x64 environment and put the named shader tools on PATH.
+cmake -S runtime -B runtime/build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVulkan_INCLUDE_DIR=<pinned-headers>/include -DLEONIDA_REQUIRE_VULKAN=ON
+cmake --build runtime/build --parallel 8 --target vk_harness vk_texture_test vk_sampler_test vk_compute_test vk_store_test vk_bindless_test d3d12_texture_uav_test
+
+Process-local settings: LEONIDA_VK_DEVICE=4080; LLVM_MC=<llvm-mc.exe>;
+VK_LOADER_LAYERS_DISABLE=~implicit~; DISABLE_RTSS_LAYER=1;
+DISABLE_VULKAN_OBS_CAPTURE=1; LEONIDA_GPU_TEST_TIMEOUT=120;
+LEONIDA_TEST_DIR=<local-scratch>; PYTHONUNBUFFERED=1; PYTHONIOENCODING=utf-8.
+LEONIDA_W64_EMULATE=0 for native, 1 for emulation; separate work folders per run.
+python -u -I scripts/run_gpu_tests.py --build runtime/build --work <per-run-work> --assembler spirv-as --require-pass
+For the focused cases, add --filter cs_imgatomic or --filter cs_texture_uav.
+ctest --test-dir runtime/build -C RelWithDebInfo -R '^d3d12_texture_uav$' --output-on-failure
+
+Scope
+-----
+Synthetic repository fixtures only. No game files, game-derived data, keys,
+decryption, Xbox Live or Rockstar services were used. No game-playability claim.
+Built the seven named test targets and dependencies, not the complete runtime.
+Full CTest, translator semantic suite and separate w64_graphics.py were not run.
+SPIR-V module validation ran; Vulkan API/GPU-assisted validation was not enabled.
+Remaining skips are subgroup limitations and cases delegated to other harnesses.
+The original RTX4080.txt is preserved. No production runtime/translator changes.
+Counts and controls independently recomputed from saved logs by a second agent.
+AI-assisted: OpenAI Codex for setup, local execution and independent evidence review.

@@ -1,0 +1,46 @@
+GPU:        NVIDIA GeForce RTX 4060 Laptop GPU (Ada, PCI 10de:28a0), 8 GB VRAM, subgroup 32..32
+            CPU Intel Core i7-13620H, 32 GB DDR5-5600 RAM; an Intel UHD Graphics iGPU is also present
+Driver:     NVIDIA 610.78 (proprietary, Windows), Vulkan SDK 1.4.363.0 (loader and validation tools)
+Subgroup:   32..32 (the run_gpu_tests.py device line shows subgroup 32..32)
+OS:         Windows 11 Home Single Language 10.0.26300 (en-US)
+Commit:     24a29f8b4e17e186882d08d2aa0cc71f8eb5c388 (main, 2026-11-25)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools with the AMDGPU target), SPIRV-Tools v2026.4,
+            CMake 3.31.6 (Visual Studio 2022 Build Tools) + Ninja 1.12.1, MSVC 19.44.35230, Python 3.12.10
+run_gpu_tests.py: 274 shaders: 274 translated, 274 pass spirv-val
+            native:                 209/264 passed, 54 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:  243/264 passed, 20 skipped, 1 failed
+Failed:     cs_imgatomic_ext (native and emulated alike): 6 of 64 sint words differ, first word 32: got
+            0x0badf00d, expected 0x00000101. This is the failure open pull request #1518 addresses (the
+            fixture's volume T# key against what vk_store_test now expects). With that pull request's
+            fixture applied at the same commit, `run_gpu_tests.py --filter cs_imgatomic --require-pass`
+            passes 3/3 (cs_imgatomic, cs_imgatomic3d, cs_imgatomic_ext: all 64 words exact), native and with
+            LEONIDA_W64_EMULATE=1, with LEONIDA_VK_DEVICE=4060 set (the filtered output has no device line).
+Skipped:    native: 33 "no 64-wide compute subgroup on this device", 1 "no 64-wide subgroup on this device"
+            (the wave64 compute fixtures, which the emulated run runs), 1 "this device cannot require a 64-wide
+            fragment subgroup: subgroup 32..32" (ps_w64x_readlane, skipped in the emulated run too), plus
+            19 "run by d3d12_*_test / w64_graphics.py" cases. Emulated: those 19 plus the 64-wide fragment
+            one, 20 in all.
+ctest:      ctest --test-dir runtime\build -C RelWithDebInfo: 448 registered, 2 disabled (gameinput and
+            gameinput_script, no SDL3), 11 skipped (no game directory, no validation layer, and similar),
+            433 passed, 2 failed. Both failures are in the comparison with the host's native D3D12, which
+            this PC runs on the Intel UHD Graphics iGPU, not on the RTX 4060 (see the notes):
+            - d3d12_root_args_validation: line 194, CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE)
+              fails in the hardware pass; the same line as open pull request #1165 (an Intel driver that
+              removes its device). The test walks the hardware adapters in DXGI order; which one failed
+              was not printed, and the Intel iGPU is the likely one. Not rerun with that change.
+            - d3d12_texture_tiles: "alias tile 0 at (0,0): got 0x1cc0200, expected 0xcc020000" (line 239),
+              in the 256 x 240, linear offset 1 case. The test printed "Native D3D12: Intel(R) UHD
+              Graphics" before it, and the layer's own replay on the RTX 4060 had already completed that
+              case and the 256 x 256, offset 4 one. It looks like the Intel CopyTiles byte-offset rounding
+              open pull request #964 handles (measured there on an Iris Xe); not rerun with that change.
+              LEONIDA_HOST_ADAPTER=4060 does not change the adapter this test picks.
+Notes:
+- Built with scripts\build_runtime.ps1 (Ninja, RelWithDebInfo, MSVC) at the commit above; the tests ran from
+  runtime\build with --build runtime\build. The PC also lists the Intel UHD and Microsoft Dozen devices to
+  Vulkan, so LEONIDA_VK_DEVICE=4060 was set for every run; the device line of both runs names the RTX 4060.
+  d3d12_texture_tiles takes its native D3D12 adapter itself and printed the Intel iGPU, so its native side is
+  not the RTX 4060; d3d12_root_args_validation walks the hardware adapters in DXGI order.
+- The commit above is the one built and tested; origin/main had moved 17 commits ahead when this record
+  was written, none of them touching the GPU test fixtures or scripts.
+- AI-assisted (Claude Code ran the build and tests and wrote this file from the run output). No game files,
+  nothing online.
