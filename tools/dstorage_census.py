@@ -1,4 +1,8 @@
-"""Summarize a local LEONIDA_DSTORAGE_TRACE=1 run in one pass (no filenames in the report)."""
+"""Summarize a local LEONIDA_DSTORAGE_TRACE=1 run in one pass (no filenames in the report).
+
+A trace that cannot be read, or a ds-request line with a missing or malformed field, is one ERROR line and exit
+code 2.
+"""
 import argparse
 from collections import Counter, defaultdict
 import json
@@ -6,7 +10,28 @@ import re
 import sys
 
 
+class TraceError(Exception):
+    """A ds-request line the census cannot read: names the line and the field."""
+
+
 def census(lines, from_file=None):
+    """Summarize the trace; a line with a missing or malformed field raises TraceError."""
+    seen = [0]
+
+    def counted():
+        for line in lines:
+            seen[0] += 1
+            yield line
+
+    try:
+        return _census(counted(), from_file)
+    except KeyError as exc:
+        raise TraceError(f"line {seen[0]}: ds-request has no {exc.args[0]}=") from None
+    except ValueError as exc:
+        raise TraceError(f"line {seen[0]}: ds-request has a malformed number ({exc})") from None
+
+
+def _census(lines, from_file=None):
     groups = defaultdict(Counter)
     errors = Counter()
     priorities = Counter()
@@ -83,15 +108,28 @@ def census(lines, from_file=None):
     return result
 
 
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("trace")
+    parser.add_argument("--from-file", metavar="SUBSTRING",
+                        help="start with the first matching source path, then include all queues and files")
+    args = parser.parse_args(argv)
+    try:
+        with open(args.trace, encoding="utf-8", errors="replace") as stream:
+            report = census(stream, args.from_file)
+    except OSError as exc:  # a missing trace, a folder, no permission: one line, not a traceback
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    except TraceError as exc:
+        print(f"ERROR: {args.trace}: {exc}", file=sys.stderr)
+        return 2
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
 if __name__ == "__main__":
     try:  # a redirected stdout is strict ANSI code page under -I; write '?' for what it cannot encode
         sys.stdout.reconfigure(errors="replace")
     except AttributeError:
         pass
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("trace")
-    parser.add_argument("--from-file", metavar="SUBSTRING",
-                        help="start with the first matching source path, then include all queues and files")
-    args = parser.parse_args()
-    with open(args.trace, encoding="utf-8", errors="replace") as stream:
-        print(json.dumps(census(stream, args.from_file), indent=2, sort_keys=True))
+    sys.exit(main())

@@ -437,6 +437,11 @@ pub struct Structured {
     /// Blocks whose closing branch the whole wave takes together ([`structure_wide`]): its
     /// `when` is still the lane's own bit; the wave goes by all of them.
     pub wide: HashSet<usize>,
+    /// Those of [`Self::wide`] that each host wave decides for itself, from its own lanes
+    /// ([`structure_wide_host`]): the branches that close or leave a loop. Two host waves of
+    /// one console wave may then go different ways, so their blocks are not ones every lane
+    /// of the console wave runs.
+    pub host_wide: HashSet<usize>,
     /// Per block closed by a branch on a lane mask: whether the console takes it when some
     /// lane's `when` holds (`true`) or when every lane's does (`false`).
     pub wave_any: Vec<Option<bool>>,
@@ -469,8 +474,25 @@ pub fn structure(program: &Program) -> Result<Structured, ShaderError> {
 /// run as two host waves, which exchange that decision and can then meet (a group barrier)
 /// inside the branch.
 pub fn structure_wide(program: &Program, wide: &HashSet<usize>) -> Result<Structured, ShaderError> {
+    structure_wide_host(program, wide, &HashSet::new())
+}
+
+/// [`structure_wide`], with the branches of `host` taken together too, but by each host wave
+/// on its own ([`Structured::host_wide`]). For the branches that close or leave a loop a lane
+/// would otherwise leave when its own bit says so: a host whose lanes do not come together
+/// again behind such a loop (NVIDIA: lanes that left early run on in a wave of their own)
+/// would give the cross-lane code behind it a part of the wave.
+/// From trustno1-coder/VIctory-NVIDIA 64d4931 (trustno1-coder, GPL-3.0), which has it from
+/// readmet3xt-lab's foxhound 0.2.0-pre.3; used only with `LEONIDA_LOOPS_WAVE`
+/// (`crate::emit`'s `loops_wave`).
+pub fn structure_wide_host(
+    program: &Program,
+    wide: &HashSet<usize>,
+    host: &HashSet<usize>,
+) -> Result<Structured, ShaderError> {
     let mut l = Lanes::new(program)?;
-    l.wide = wide.clone();
+    l.wide = wide.union(host).copied().collect();
+    l.host = host.difference(wide).copied().collect();
     loop {
         let execs = l.masks_in_order();
         let cond = l.paths()?;
@@ -532,6 +554,8 @@ struct Lanes<'a> {
     active: HashSet<Value>,
     /// See [`Structured::wide`].
     wide: HashSet<usize>,
+    /// See [`Structured::host_wide`].
+    host: HashSet<usize>,
     /// SCC values of [`Self::scc_lane`] that are set when EVERY lane's bit is (`s_cmp_eq` of
     /// two masks: "no lane differs"); the others are set when some lane's is.
     scc_every: HashSet<Value>,
@@ -615,6 +639,7 @@ impl<'a> Lanes<'a> {
             when: vec![None; blocks.len()],
             active: HashSet::new(),
             wide: HashSet::new(),
+            host: HashSet::new(),
             scc_every: HashSet::new(),
             wave_any: vec![None; blocks.len()],
         })
@@ -860,6 +885,7 @@ impl<'a> Lanes<'a> {
             paired_masks: if self.p.wave64 { self.masks } else { Map::default() },
             active: self.active,
             wide: self.wide,
+            host_wide: self.host,
             wave_any: self.wave_any,
             scc_some: self
                 .scc_lane

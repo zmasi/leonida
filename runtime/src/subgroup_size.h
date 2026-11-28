@@ -121,17 +121,21 @@ inline SubgroupRequest decide_subgroup_size(const ShaderEntry& entry, const Subg
         return r;
     }
     r.wanted = entry.subgroup_size ? entry.subgroup_size : (entry.wave64 ? 64 : 32);
-    if (!caps.default_size && !caps.max_size) {
+    // VkPhysicalDeviceSubgroupSizeControlProperties guarantees power-of-two bounds with 1 <= min <= max; a half-zero
+    // (min == 0, max > 0), inverted, or non-power-of-two range cannot prove requiredSubgroupSize is valid (-02761).
+    const bool valid_range = subgroup_is_power_of_two(caps.min_size) && subgroup_is_power_of_two(caps.max_size) &&
+                             caps.min_size <= caps.max_size;
+    if (!caps.default_size && !valid_range) {
         r.outcome = SubgroupOutcome::unknown_device;
         return r;
     }
 
     const bool compute_like = r.stage == VK_SHADER_STAGE_COMPUTE_BIT || r.stage == VK_SHADER_STAGE_MESH_BIT_EXT;
     const std::uint64_t max_invocations = std::uint64_t(r.wanted) * caps.max_compute_workgroup_subgroups;
-    const bool fixed = caps.min_size && caps.min_size == caps.max_size && caps.min_size == r.wanted;
+    const bool fixed = valid_range && caps.min_size == caps.max_size && caps.min_size == r.wanted;
     const bool requirable =
-        caps.subgroup_size_control && (caps.required_stages & r.stage) && subgroup_is_power_of_two(r.wanted) &&
-        r.wanted >= caps.min_size && r.wanted <= caps.max_size &&
+        valid_range && caps.subgroup_size_control && (caps.required_stages & r.stage) &&
+        subgroup_is_power_of_two(r.wanted) && r.wanted >= caps.min_size && r.wanted <= caps.max_size &&
         (!compute_like || subgroup_workgroup_fits(entry.local_size, max_invocations));
 
     if (fixed) {

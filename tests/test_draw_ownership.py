@@ -21,6 +21,7 @@ import os
 import struct
 import sys
 import unittest
+import unittest.mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -274,6 +275,81 @@ class ReverseScanTests(unittest.TestCase):
         # only their parent is unknown.
         for geo in self.off["d_geos"]:
             dwo.geometry_shape_check(self.system, geo)
+
+
+class BoundsAndHexdumpTests(unittest.TestCase):
+    def test_system_pointer_rejects_graphics_and_high_pointers_as_non_system(self):
+        buf = bytearray(256)
+        for bad in (dwo.GRAPHICS_BASE + 0x10, 0x70000000, 0x1_50000010):
+            with self.subTest(raw=hex(bad)):
+                struct.pack_into("<Q", buf, 80, bad)
+                with self.assertRaises(dwo.OutOfSegmentError) as ctx:
+                    dwo.walk_chain(bytes(buf), 0)
+                self.assertIn("not a 0x50000000-based system pointer", str(ctx.exception))
+
+    def test_reverse_pointers_caps_at_graphics_base(self):
+        # Simulate a segment whose length exceeds GRAPHICS_BASE - PTR_BASE without allocating 256 MiB.
+        buf = bytearray(32)
+        struct.pack_into("<Q", buf, 0, dwo.PTR_BASE + 0)
+        struct.pack_into("<Q", buf, 8, dwo.PTR_BASE + 16)
+        with unittest.mock.patch.object(dwo, "GRAPHICS_BASE", dwo.PTR_BASE + 16):
+            idx = dwo.reverse_pointers(bytes(buf))
+        self.assertEqual(idx, {0: [0]})
+
+    def test_geometry_shape_check_rejects_non_graphics_high_pointers(self):
+        b = Builder(4096)
+        geo = build_geometry(b)
+        vb = struct.unpack_from("<Q", b.buf, geo + 8)[0] - dwo.PTR_BASE
+        for bad in (0x70000000, 0xFFFFFFFF_FFFFFFFF):
+            with self.subTest(raw=hex(bad)):
+                mut = bytearray(b.buf)
+                struct.pack_into("<Q", mut, vb + 24, bad)
+                with self.assertRaises(dwo.WalkError) as ctx:
+                    dwo.geometry_shape_check(bytes(mut), geo)
+                self.assertIn("not a 0x60000000-based graphics pointer", str(ctx.exception))
+
+    def test_hexdump_stops_at_eof_and_validates_args(self):
+        buf = bytes(range(24))
+        # At offset 8 with nbytes=32, only 16 bytes remain: must produce 1 row, not a blank row past EOF.
+        dump = dwo._hexdump(buf, 8, 32)
+        self.assertEqual(len(dump.splitlines()), 1)
+        self.assertEqual(dump, f"+0x000008  {buf[8:24].hex(' ')}")
+        # Works on memoryview too.
+        self.assertEqual(dwo._hexdump(memoryview(buf), 16, 32), f"+0x000010  {buf[16:24].hex(' ')}")
+        self.assertEqual(dwo._hexdump(buf, 24, 32), "")
+        self.assertEqual(dwo._hexdump(buf, 0, 0), "")
+        with self.assertRaises(ValueError):
+            dwo._hexdump(buf, -1, 16)
+        with self.assertRaises(ValueError):
+            dwo._hexdump(buf, 0, -1)
+        with self.assertRaises(TypeError):
+            dwo._hexdump(buf, True, 16)
+
+    def test_classify_parent_near_eof_and_bad_index(self):
+        buf = bytearray(32)
+        struct.pack_into("<Q", buf, 24, dwo.PTR_BASE + 0)
+        parents = dwo.classify_parent(bytes(buf), 0)
+        self.assertEqual(len(parents), 1)
+        self.assertEqual(parents[0]["context_offset"], 16)
+        self.assertEqual(len(parents[0]["context_dump"].splitlines()), 1)
+
+        with self.assertRaises(dwo.OutOfSegmentError):
+            dwo.classify_parent(bytes(buf), 0, index={0: [len(buf)]})
+        with self.assertRaises(TypeError):
+            dwo.classify_parent(bytes(buf), 0, index={0: [True]})
+
+    def test_bool_and_non_int_offsets_rejected(self):
+        system, _, off = build_segment()
+        for bad in (True, False, 1.5, "0"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    dwo.walk_chain(system, bad)
+                with self.assertRaises(TypeError):
+                    list(dwo.walk_drawable(system, bad))
+                with self.assertRaises(TypeError):
+                    dwo.classify_parent(system, bad)
+                with self.assertRaises(TypeError):
+                    dwo.geometry_shape_check(system, bad)
 
 
 if __name__ == "__main__":

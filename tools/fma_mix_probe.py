@@ -145,6 +145,7 @@ def expected(case):
 
 def half(case, word):
     """The f16 a case wrote, or None when the other half of the destination lost the sentinel."""
+    word &= 0xFFFFFFFF
     keep, mine = (word & 0xFFFF, word >> 16) if case.hi else (word >> 16, word & 0xFFFF)
     other = SENTINEL & 0xFFFF
     return mine if keep == other else None
@@ -254,7 +255,9 @@ def translate_cs(work, cases=CASES):
 
 def run_vulkan(build, cases=CASES):
     """[word per case] from vk_compute_test, or raise RuntimeError with the reason (Unavailable-like: FileNotFound)."""
-    sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
+    shaders_dir = os.path.join(ROOT, "runtime", "test", "shaders")
+    if shaders_dir not in sys.path:
+        sys.path.insert(0, shaders_dir)
     from compute_fixture import find_test_program
     folder = find_test_program(build, "vk_compute_test")
     if folder is None:
@@ -268,13 +271,19 @@ def run_vulkan(build, cases=CASES):
         with open(sa, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
         try:
-            r = subprocess.run(["spirv-as", sa, "-o", sv, "--target-env", "vulkan1.2"], capture_output=True, text=True)
+            r = subprocess.run(
+                ["spirv-as", sa, "-o", sv, "--target-env", "vulkan1.2"],
+                capture_output=True, text=True, errors="replace",
+            )
         except FileNotFoundError:
             raise FileNotFoundError("spirv-as is not on PATH (SPIRV-Tools)") from None
         if r.returncode:
             raise RuntimeError("spirv-as failed: " + (r.stderr or r.stdout).strip()[:300])
         env = dict(os.environ, VKC_SGPRS=",".join(f"0x{w:x}" for w in sgpr_words(cases)))
-        r = subprocess.run([exe, sv, "1", "dump"], capture_output=True, text=True, env=env, timeout=120)
+        r = subprocess.run(
+            [exe, sv, "1", "dump"],
+            capture_output=True, text=True, errors="replace", env=env, timeout=120,
+        )
     msg = r.stdout + r.stderr
     m = re.search(r"^out\[0\.\.7\] = ((?:[0-9]+ ){7}[0-9]+)$", msg, re.MULTILINE)
     if r.returncode == 77:
@@ -299,7 +308,19 @@ def hw_lines(case):
 def run_hw(oracle, cases=CASES):
     from hw_oracle import asm
     got = oracle.run([asm.Kernel(hw_lines(c), 32, 1, 1, raw=True, mode=HW_MODE) for c in cases], words=1)
-    return [None if isinstance(w, str) else w[0] for w in got], [w for w in got if isinstance(w, str)]
+    if not isinstance(got, (list, tuple)) or len(got) != len(cases):
+        got_desc = len(got) if isinstance(got, (list, tuple)) else type(got).__name__
+        raise RuntimeError(f"hardware oracle returned {got_desc} results for {len(cases)} cases")
+    words, rejected = [], []
+    for case, w in zip(cases, got):
+        if isinstance(w, str):
+            words.append(None)
+            rejected.append(w)
+        elif isinstance(w, (list, tuple)) and len(w) >= 1 and isinstance(w[0], int) and not isinstance(w[0], bool):
+            words.append(w[0] & 0xFFFFFFFF)
+        else:
+            raise RuntimeError(f"hardware oracle returned invalid result for case {case.name}: {w!r}")
+    return words, rejected
 
 
 # ---- driver ----
@@ -319,7 +340,18 @@ def main(argv=None):
     ap.add_argument("--build", help="the runtime build folder holding vk_compute_test (for --oracle vulkan)")
     ap.add_argument("--hw-arch", help="GPU architecture to assemble for (default: detected; LEONIDA_HW_ARCH)")
     a = ap.parse_args(argv)
-    sides = {s.strip() for s in a.oracle.split(",") if s.strip()} - {"translator"}
+    if a.hw_arch is not None:
+        a.hw_arch = a.hw_arch.strip()
+        if not a.hw_arch:
+            ap.error("--hw-arch must not be empty")
+    if a.build is not None:
+        a.build = a.build.strip()
+        if not a.build:
+            ap.error("--build must not be empty")
+    oracle_tokens = [s.strip() for s in a.oracle.split(",")]
+    if not any(oracle_tokens) or any(not s for s in oracle_tokens):
+        ap.error("--oracle must be a comma-separated list of sides: translator, hw, vulkan")
+    sides = set(oracle_tokens) - {"translator"}
     if sides - {"hw", "vulkan"}:
         ap.error(f"unknown --oracle side(s): {', '.join(sorted(sides - {'hw', 'vulkan'}))}")
     if "vulkan" in sides and not a.build:
@@ -349,12 +381,16 @@ def main(argv=None):
             try:
                 print(f"hardware oracle: {oracle.device}")
                 words, rejected = run_hw(oracle)
+            except runner.Unavailable as e:
+                print(f"hardware oracle unavailable: {e}")
+                return 77
             finally:
                 oracle.close()
             for why in rejected:
                 print(f"  {why}")
             rules.append(report(f"hw (native, {oracle.arch})", list(zip(CASES, words))))
-    except (RuntimeError, OSError, subprocess.SubprocessError, spirv_mini_interp.UnsupportedConstruct) as e:
+    except (RuntimeError, OSError, subprocess.SubprocessError, spirv_mini_interp.UnsupportedConstruct,
+            rdna2spirv.Unsupported) as e:
         print(f"harness error: {e}")
         return 2
     if None in rules or len(set(rules)) != 1:

@@ -124,6 +124,36 @@ class WriteIndexTest(unittest.TestCase):
         R.write_index(str(self.path), self.index)
         self.assertEqual(self.path.stat().st_mode & 0o777, probe.stat().st_mode & 0o777)
 
+    def test_publish_cleans_up_staged_file_when_replace_fails_even_if_readonly(self):
+        os.chmod(self.path, 0o444)
+        real_unlink = os.unlink
+
+        def windows_strict_unlink(p):
+            mode = os.stat(p).st_mode
+            if not (mode & 0o200):
+                raise PermissionError(13, f"Access is denied: {p}")
+            return real_unlink(p)
+
+        with patch.object(R, "replace_retry", side_effect=OSError(13, "Permission denied")), \
+             patch("os.unlink", side_effect=windows_strict_unlink):
+            with self.assertRaisesRegex(OSError, "Permission denied"):
+                R.write_index(str(self.path), self.index)
+
+        leftover = [f for f in os.listdir(self.out) if f.startswith(".index-")]
+        self.assertEqual(leftover, [])
+
+    def test_publish_applies_published_mode_on_windows(self):
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(p, mode):
+            chmod_calls.append((str(p), mode))
+            real_chmod(p, mode)
+
+        with patch.object(R.os, "name", "nt"), patch.object(R.os, "chmod", side_effect=track_chmod):
+            R.write_index(str(self.path), self.index)
+        self.assertTrue(any(".index-" in p and mode == R.published_mode(str(self.path)) for p, mode in chmod_calls), chmod_calls)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -233,23 +233,27 @@ def main(argv=None):
     except runner.Unavailable as exc:
         print(f"SKIP: {exc}", file=sys.stderr)
         return 77
-    if asm.family(oracle.arch) != "gfx10":
-        print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
-        return 77
-    out = {"arch": oracle.arch, "waves": {}}
-    mismatches = 0
-    for wave in waves:
-        res = probe_wave(oracle, asm, wave)
-        out["waves"][str(wave)] = res
-        if res["cases_ok"] != res["cases_total"]:
-            mismatches += 1
-        print(f"wave{wave} ({oracle.arch}): {res['cases_ok']}/{res['cases_total']} ds_permute_b32 cases exact")
-    if args.json_out is not None:
-        err = write_json_report(args.json_out, out)
-        if err:
-            print(f"error: {err}", file=sys.stderr)
-            return 1
-    return 1 if mismatches else 0
+    try:
+        if asm.family(oracle.arch) != "gfx10":
+            print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
+            return 77
+        out = {"arch": oracle.arch, "waves": {}}
+        mismatches = 0
+        for wave in waves:
+            res = probe_wave(oracle, asm, wave)
+            out["waves"][str(wave)] = res
+            if res["cases_ok"] != res["cases_total"]:
+                mismatches += 1
+            print(f"wave{wave} ({oracle.arch}): {res['cases_ok']}/{res['cases_total']} ds_permute_b32 cases exact")
+        if args.json_out is not None:
+            err = write_json_report(args.json_out, out)
+            if err:
+                print(f"error: {err}", file=sys.stderr)
+                return 1
+        return 1 if mismatches else 0
+    finally:
+        if hasattr(oracle, "close"):
+            oracle.close()
 
 
 if __name__ == "__main__":

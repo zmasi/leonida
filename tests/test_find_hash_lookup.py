@@ -22,15 +22,22 @@ import find_hash_lookup as fhl  # noqa: E402
 TEXT_RVA, TEXT_RAW = 0x1000, 0x400
 
 
-def pe(code):
-    """A minimal PE32+ file whose only section, .text (executable), holds `code`."""
+def pe(code, vsize=None, rsize=None, raw_offset=None):
+    """A minimal PE32+ file whose only section, .text (executable), holds `code`.
+
+    The optional fields let a test describe a truncated section (raw offset past EOF, zero vsize) while the file
+    itself stays well-formed enough to parse its headers.
+    """
     header = bytearray(TEXT_RAW)
     header[0:2] = b"MZ"
     struct.pack_into("<I", header, 0x3C, 0x40)
     header[0x40:0x44] = b"PE\0\0"
     struct.pack_into("<HHIIIHH", header, 0x44, 0x8664, 1, 0, 0, 0, 0xF0, 0x22)
     first = 0x44 + 20 + 0xF0
-    struct.pack_into("<8sIIIIIIHHI", header, first, b".text", len(code), TEXT_RVA, len(code), TEXT_RAW,
+    struct.pack_into("<8sIIIIIIHHI", header, first, b".text",
+                     len(code) if vsize is None else vsize, TEXT_RVA,
+                     len(code) if rsize is None else rsize,
+                     TEXT_RAW if raw_offset is None else raw_offset,
                      0, 0, 0, 0, 0x60000020)
     return bytes(header) + code
 
@@ -126,6 +133,107 @@ class FindHashLookupTest(unittest.TestCase):
             r = subprocess.run([sys.executable, "-I", TOOL, exe, "--json", missing], capture_output=True, text=True)
             self.assertEqual(r.returncode, 2, r.stderr)
             self.assertIn("ERROR: cannot write", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_zero_call_target_produces_no_candidates(self):
+        """A hash that appears in code but has no E8 in the following window yields an empty candidates list."""
+        # Build a PE whose .text is just `mov ecx, <hash>; ret; <NOP padding>` -- no E8 anywhere.
+        value = fhl.joaat("player_story000_00")
+        code = b"\xB9" + struct.pack("<I", value) + b"\xC3" + b"\x90" * 59
+        data = pe(code)
+        report = fhl.rank(data, [("player_story000_00", value)])
+        self.assertEqual(report["hashes"][0]["occurrences"], 1)
+        self.assertEqual(report["candidates"], [],
+                         "no E8 in window → candidates must be empty")
+
+    def test_zero_window_produces_no_candidates(self):
+        """window=0 means the search tail is empty; no candidates regardless of calls nearby."""
+        data, _lookup, _decoy = image()
+        hashes = [("player_story000_00", fhl.joaat("player_story000_00")),
+                  ("cs_mandy", fhl.joaat("cs_mandy"))]
+        report = fhl.rank(data, hashes, window=0)
+        self.assertEqual(report["candidates"], [],
+                         "window=0 must yield no candidates")
+
+    def test_negative_window_raises(self):
+        """rank() with window < 0 must raise ValueError naming its own parameter, not just the CLI flag."""
+        data, _, _ = image()
+        with self.assertRaises(ValueError) as raised:
+            fhl.rank(data, [("player_story000_00", fhl.joaat("player_story000_00"))], window=-1)
+        self.assertRegex(str(raised.exception), r"^window must be >= 0, got -1$")
+
+    def test_non_positive_top_raises(self):
+        """rank() with top <= 0 must raise ValueError naming its own parameter; top=-1 returns a wrong slice."""
+        data, _, _ = image()
+        hashes = [("player_story000_00", fhl.joaat("player_story000_00"))]
+        with self.assertRaises(ValueError) as raised:
+            fhl.rank(data, hashes, top=0)
+        self.assertRegex(str(raised.exception), r"^top must be >= 1, got 0$")
+        with self.assertRaises(ValueError) as raised:
+            fhl.rank(data, hashes, top=-1)
+        self.assertRegex(str(raised.exception), r"^top must be >= 1, got -1$")
+
+    def test_truncated_pe_does_not_crash(self):
+        """A truncated PE's section size is clamped to the bytes actually present in the file."""
+        data, _, _ = image()
+        truncated = data[:-100]                      # .text claims 0x400 bytes, only 0x39C remain
+        sections = fhl.sections(truncated)
+        self.assertEqual(len(sections), 1)
+        _name, _rva, raw, size, _executable = sections[0]
+        self.assertEqual(raw, TEXT_RAW)
+        self.assertEqual(size, len(truncated) - raw)
+        self.assertLessEqual(size, len(truncated) - raw)
+        report = fhl.rank(truncated, [("player_story000_00", fhl.joaat("player_story000_00"))])
+        self.assertIsInstance(report["candidates"], list)
+
+    def test_section_raw_pointer_past_eof_clamps_to_zero(self):
+        """A section whose raw pointer is beyond EOF must get size 0, never a negative size or a scan past EOF."""
+        data = pe(b"\x90" * 16, raw_offset=0x10000)
+        sections = fhl.sections(data)
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(sections[0][2], 0x10000)
+        self.assertEqual(sections[0][3], 0)
+        self.assertLessEqual(sections[0][3], max(0, len(data) - sections[0][2]))
+
+    def test_section_zero_vsize_uses_raw_size(self):
+        """vsize == 0 means 'use the raw size', clamped by what the file actually holds."""
+        data = pe(b"\x90" * 16, vsize=0, rsize=8)
+        sections = fhl.sections(data)
+        self.assertEqual(len(sections), 1)
+        self.assertEqual(sections[0][3], 8)
+        shorter = pe(b"\x90" * 4, vsize=0, rsize=8)
+        self.assertEqual(fhl.sections(shorter)[0][3], 4)
+
+    def test_cli_negative_window_exits_with_error(self):
+        """--window -1 on the CLI must exit non-zero with an ERROR line, no traceback."""
+        data, _, _ = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            r = subprocess.run(
+                [sys.executable, "-I", TOOL, exe, "--window", "-1"],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("ERROR", r.stderr)
+            self.assertIn("--window", r.stderr)      # CLI keeps the flag name, rank() uses its parameter name
+            self.assertNotIn("Traceback", r.stderr)
+
+    def test_cli_top_zero_exits_with_error(self):
+        """--top 0 on the CLI must exit non-zero with an ERROR line, no traceback."""
+        data, _, _ = image()
+        with tempfile.TemporaryDirectory() as tmp:
+            exe = os.path.join(tmp, "image.exe")
+            with open(exe, "wb") as f:
+                f.write(data)
+            r = subprocess.run(
+                [sys.executable, "-I", TOOL, exe, "--top", "0"],
+                capture_output=True, text=True,
+            )
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("ERROR", r.stderr)
+            self.assertIn("--top", r.stderr)         # CLI keeps the flag name, rank() uses its parameter name
             self.assertNotIn("Traceback", r.stderr)
 
 

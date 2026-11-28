@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "shader_disasm.py")
@@ -500,6 +501,47 @@ class DisasmOutputCollisionTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assert_unchanged(inp, data)
         self.assertTrue(os.path.isfile(os.path.join(self.dir, "foo.s")))
+
+
+class DisasmAutoBackendTest(unittest.TestCase):
+    @staticmethod
+    def _import_shader_disasm():
+        sys.path.insert(0, os.path.join(ROOT, "tools"))
+        try:
+            import shader_disasm
+            return shader_disasm
+        finally:
+            sys.path.pop(0)
+
+    def test_auto_backend_falls_back_to_python_on_invalid_words(self):
+        shader_disasm = self._import_shader_disasm()
+        code = bytes.fromhex("02 1a 28 f4 00 00 00 fa") + b"\x00\x00\x81\xbf"
+        with mock.patch.object(
+            shader_disasm,
+            "run_mc",
+            return_value=("\ts_endpgm\n", 2, "<stdin>:1:1: warning: invalid instruction encoding\n"),
+        ):
+            asm, bad, err = shader_disasm.disasm(code, "gfx1013", backend="auto", wave32=True)
+        self.assertEqual(bad, 0)
+        self.assertEqual(err, "")
+        self.assertIn("[s104,s105,vcc_lo,vcc_hi]", asm)
+        self.assertIn("s_endpgm", asm)
+
+    def test_auto_backend_preserves_clean_llvm_mc_output(self):
+        shader_disasm = self._import_shader_disasm()
+        with mock.patch.object(shader_disasm, "run_mc", return_value=(ASM, 0, "")), \
+             mock.patch.object(shader_disasm.rdna2_decode, "disasm_bytes") as py_disasm:
+            asm, bad, err = shader_disasm.disasm(CODE, "gfx1013", backend="auto", wave32=True)
+        self.assertEqual((asm, bad, err), (ASM, 0, ""))
+        py_disasm.assert_not_called()
+
+    def test_auto_backend_keeps_llvm_mc_when_python_not_better(self):
+        shader_disasm = self._import_shader_disasm()
+        mc_result = ("\ts_nop 0\n", 1, "warning: invalid instruction encoding\n")
+        with mock.patch.object(shader_disasm, "run_mc", return_value=mc_result), \
+             mock.patch.object(shader_disasm.rdna2_decode, "disasm_bytes", return_value=("\ts_nop 0\n", 1)):
+            asm, bad, err = shader_disasm.disasm(CODE, "gfx1013", backend="auto", wave32=True)
+        self.assertEqual((asm, bad, err), mc_result)
 
 
 if __name__ == "__main__":

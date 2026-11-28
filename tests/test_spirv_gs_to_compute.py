@@ -438,3 +438,139 @@ def test_pointers_derived_from_interface_access_chains_take_the_new_storage_clas
     ).replace("%y = OpLoad %float %py", "%y = OpLoad %float %py\n%pu = OpAccessChain %ptr_in_uint %pc %u0")
     with pytest.raises(gsc.Unsupported, match="unhandled type"):
         gsc.rewrite(odd)
+
+
+def _validate_module(tmp_path: Path, name: str, assembly: str) -> None:
+    if not HAVE_SPIRV:
+        return
+    module = tmp_path / f"{name}.spv"
+    subprocess.run(["spirv-as", "--target-env", "vulkan1.2", "-", "-o", str(module)],
+                   input=assembly, text=True, check=True)
+    res = subprocess.run(["spirv-val", "--target-env", "vulkan1.2", str(module)],
+                         capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+def test_emits_shader_capability_when_geometry_implied_it(tmp_path: Path) -> None:
+    geometry = PHI_GS.replace("OpCapability Shader\n", "")
+    _validate_module(tmp_path, "geometry", geometry)
+    lowered, _ = gsc.rewrite(geometry)
+    assert "OpCapability Geometry" not in lowered
+    assert lowered.splitlines().count("OpCapability Shader") == 1
+    _validate_module(tmp_path, "compute", lowered)
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+def test_converts_64bit_vertex_index_with_uconvert(tmp_path: Path) -> None:
+    geometry = PHI_GS.replace(
+        "OpCapability Geometry",
+        "OpCapability Geometry\nOpCapability Int64",
+    ).replace(
+        "%uint = OpTypeInt 32 0",
+        "%uint = OpTypeInt 32 0\n%ulong = OpTypeInt 64 0",
+    ).replace(
+        "%u0 = OpConstant %uint 0",
+        "%u0 = OpConstant %uint 0\n%ul0 = OpConstant %ulong 0",
+    ).replace(
+        "%p = OpAccessChain %ptr_in_v4 %in_pos %x",
+        "%p = OpAccessChain %ptr_in_v4 %in_pos %ul0",
+    )
+    _validate_module(tmp_path, "geometry", geometry)
+    lowered, _ = gsc.rewrite(geometry)
+    assert "OpUConvert %uint %ul0" in lowered
+    assert "OpBitcast %uint %ul0" not in lowered
+    _validate_module(tmp_path, "compute", lowered)
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+def test_lowers_output_variable_readback_load(tmp_path: Path) -> None:
+    geometry = PHI_GS.replace(
+        "OpStore %out_pos %v",
+        "OpStore %out_pos %v\n%v_back = OpLoad %v4float %out_pos\nOpStore %out_pos %v_back",
+    )
+    _validate_module(tmp_path, "geometry", geometry)
+    lowered, _ = gsc.rewrite(geometry)
+    assert "%v_back = OpLoad %v4float %gsc_out0" in lowered
+    assert "%out_pos" not in lowered
+    _validate_module(tmp_path, "compute", lowered)
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+def test_strips_decorate_string_and_decorate_id_for_removed_vars(tmp_path: Path) -> None:
+    geometry = PHI_GS.replace(
+        "OpCapability Geometry",
+        'OpCapability Geometry\nOpExtension "SPV_GOOGLE_decorate_string"',
+    ).replace(
+        "OpDecorate %out_pos BuiltIn Position",
+        'OpDecorate %out_pos BuiltIn Position\n'
+        'OpDecorateString %in_pos UserSemantic "POSITION"\n'
+        'OpDecorateStringGOOGLE %out_pos HlslSemanticGOOGLE "SV_POSITION"',
+    )
+    _validate_module(tmp_path, "geometry", geometry)
+    lowered, _ = gsc.rewrite(geometry)
+    assert "OpDecorateString " not in lowered
+    assert "OpDecorateStringGOOGLE " not in lowered
+    assert "%in_pos" not in lowered and "%out_pos" not in lowered
+    _validate_module(tmp_path, "compute", lowered)
+
+
+@pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val on PATH")
+def test_handles_inline_comments_on_entrypoint_phi_emit_and_return(tmp_path: Path) -> None:
+    geometry = PHI_GS.replace(
+        'OpEntryPoint Geometry %main "main" %in_pos %out_pos',
+        'OpEntryPoint Geometry %main "main" %in_pos %out_pos ; entry comment',
+    ).replace(
+        "%x = OpPhi %uint %u1 %t %u0 %entry",
+        "%x = OpPhi %uint %u1 %t %u0 %entry ; join",
+    ).replace(
+        "OpEmitVertex",
+        "OpEmitVertex ; emit vertex",
+    ).replace(
+        "OpEndPrimitive",
+        "OpEndPrimitive ; end prim",
+    ).replace(
+        "OpReturn",
+        "OpReturn ; finish",
+    )
+    _validate_module(tmp_path, "geometry", geometry)
+    lowered, _ = gsc.rewrite(geometry)
+    assert "%x = OpPhi %uint %u1 %t %u0 %gsc_body" in lowered
+    assert "OpEmitVertex" not in lowered
+    assert "OpEndPrimitive" not in lowered
+    assert "%gsc_metabase" in lowered
+    _validate_module(tmp_path, "compute", lowered)
+
+
+def test_rejects_helper_function_geometry_uses_and_stream_ops() -> None:
+    helper_emit = PHI_GS.replace(
+        "%main = OpFunction",
+        "%helper = OpFunction %void None %fn\n"
+        "%h_entry = OpLabel\n"
+        "OpEmitVertex\n"
+        "OpReturn\n"
+        "OpFunctionEnd\n"
+        "%main = OpFunction",
+    ).replace("OpEmitVertex\nOpEmitVertex", "%call = OpFunctionCall %void %helper\nOpEmitVertex", 1)
+    with pytest.raises(gsc.Unsupported, match="non-entry function"):
+        gsc.rewrite(helper_emit)
+
+    helper_var = PHI_GS.replace(
+        "%main = OpFunction",
+        "%helper = OpFunction %void None %fn\n"
+        "%h_entry = OpLabel\n"
+        "%hp = OpAccessChain %ptr_in_v4 %in_pos %u0\n"
+        "OpReturn\n"
+        "OpFunctionEnd\n"
+        "%main = OpFunction",
+    )
+    with pytest.raises(gsc.Unsupported, match="non-entry function"):
+        gsc.rewrite(helper_var)
+
+    stream_gs = PHI_GS.replace("OpEmitVertex", "OpEmitStreamVertex %u0", 1)
+    with pytest.raises(gsc.Unsupported, match="OpEmitStreamVertex"):
+        gsc.rewrite(stream_gs)
+
+    end_stream_gs = PHI_GS.replace("OpEndPrimitive", "OpEndStreamPrimitive %u0", 1)
+    with pytest.raises(gsc.Unsupported, match="OpEndStreamPrimitive"):
+        gsc.rewrite(end_stream_gs)

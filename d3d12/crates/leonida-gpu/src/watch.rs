@@ -2568,6 +2568,218 @@ impl Landed {
 
 static LANDED: Landed = Landed([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
 
+/// Which bytes of a 4 KiB page: its 512 cells of 8 bytes, a bit each.
+pub(crate) type Cells = [u64; 8];
+
+/// The cells of the bytes `[from, to)` of a page (offsets in it).
+pub(crate) fn cells_between(from: usize, to: usize) -> Cells {
+    let mut cells = [0u64; 8];
+    if from < to {
+        for cell in from / 8..=(to.min(KERNEL_PAGE) - 1) / 8 {
+            cells[cell / 64] |= 1 << (cell % 64);
+        }
+    }
+    cells
+}
+
+/// A page of [`LandedCells`]: the span of frames it was last noted in (its number and one; 0: never; all ones:
+/// being turned over), the cells noted in that span and those noted in the span before it.
+struct PageCells {
+    span: std::sync::atomic::AtomicU32,
+    now: [std::sync::atomic::AtomicU64; 8],
+    before: [std::sync::atomic::AtomicU64; 8],
+}
+
+type CellsPiece = [PageCells; Landed::PAGES];
+
+/// [`Landed`] by cells of 8 bytes: where in a page what shaders wrote was put into title memory, lately. A page
+/// says that a shader's write went into it; the title keeps its own constants beside what its shaders write
+/// (a ring in the heap the skinning passes write), and by pages those looked written by shaders for as long as
+/// a neighbour 16 bytes away was: every copy of the title's into them at its place in a list waited for the
+/// flights, 50 to 65 ms of a 110 ms frame (2026-11-27). Pieces of 256 MiB as there, made (all zeros, which the
+/// system commits page by page) when a page of theirs is first noted, and never let go.
+struct LandedCells([std::sync::atomic::AtomicPtr<CellsPiece>; Landed::PIECES]);
+
+impl LandedCells {
+    /// Frames in a span: "lately" is this span and the one before it, 512 to 1,023 frames.
+    const SPAN: u64 = 512;
+
+    fn span(frame: u64) -> u32 {
+        ((frame / Self::SPAN) as u32 & 0x3fff_ffff) + 1
+    }
+
+    fn page(&self, page: usize, make: bool) -> Option<&PageCells> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        let place = self.0.get(page / Landed::PAGES)?;
+        let mut piece = place.load(Acquire);
+        if piece.is_null() {
+            if !make {
+                return None;
+            }
+            let layout = std::alloc::Layout::new::<CellsPiece>();
+            // SAFETY: a layout of some size; all zeros is a piece no page of which was noted.
+            let made = unsafe { std::alloc::alloc_zeroed(layout) }.cast::<CellsPiece>();
+            if made.is_null() {
+                return None;
+            }
+            piece = match place.compare_exchange(std::ptr::null_mut(), made, AcqRel, Acquire) {
+                Ok(_) => made,
+                Err(there) => {
+                    // SAFETY: made just now with this layout, and another thread's is there.
+                    unsafe { std::alloc::dealloc(made.cast(), layout) };
+                    there
+                }
+            };
+        }
+        // SAFETY: a piece, which is never freed.
+        Some(unsafe { &(&*piece)[page % Landed::PAGES] })
+    }
+
+    fn note(&self, page: usize, cells: &Cells, frame: u64) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Relaxed, Release};
+        let Some(p) = self.page(page, true) else {
+            return;
+        };
+        let span = Self::span(frame);
+        loop {
+            let was = p.span.load(Acquire);
+            if was == span {
+                break;
+            }
+            if was == u32::MAX {
+                std::hint::spin_loop();
+                continue;
+            }
+            if p.span.compare_exchange(was, u32::MAX, AcqRel, Acquire).is_ok() {
+                // Turned over: what was noted in the span just before this one is kept as "before".
+                for (now, before) in p.now.iter().zip(&p.before) {
+                    let noted = now.swap(0, Relaxed);
+                    before.store(if was != 0 && was.wrapping_add(1) == span { noted } else { 0 }, Relaxed);
+                }
+                p.span.store(span, Release);
+                break;
+            }
+        }
+        for (now, &more) in p.now.iter().zip(cells) {
+            if more != 0 && now.load(Relaxed) & more != more {
+                now.fetch_or(more, Relaxed);
+            }
+        }
+    }
+
+    /// Whether one of `cells` of `page` was noted in the span of `frame` or the one before it.
+    fn lately(&self, page: usize, cells: &Cells, frame: u64) -> bool {
+        use std::sync::atomic::Ordering::{Acquire, Relaxed};
+        let Some(p) = self.page(page, false) else {
+            return false;
+        };
+        let span = Self::span(frame);
+        let was = p.span.load(Acquire);
+        if was == u32::MAX {
+            // Being turned over: something is landing there now.
+            return true;
+        }
+        if was == span {
+            (0..8).any(|i| (p.now[i].load(Relaxed) | p.before[i].load(Relaxed)) & cells[i] != 0)
+        } else if was != 0 && was.wrapping_add(1) == span {
+            (0..8).any(|i| p.now[i].load(Relaxed) & cells[i] != 0)
+        } else {
+            false
+        }
+    }
+}
+
+static LANDED_CELLS: LandedCells = LandedCells([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
+
+/// What shaders wrote went into title memory in these cells: for each, the 4 KiB page (its number) and the
+/// cells in it. Beside the pages' note ([`landing`], [`landed_beside`]), which says no more than the page. The
+/// same pages at other addresses are noted as well, as there.
+pub(crate) fn landing_cells(pages: &[(usize, Cells)]) {
+    let (Some(first), Some(last)) = (pages.iter().map(|p| p.0).min(), pages.iter().map(|p| p.0).max()) else {
+        return;
+    };
+    let frame = crate::frame::current();
+    for (page, cells) in pages {
+        LANDED_CELLS.note(*page, cells, frame);
+    }
+    for (block, others) in elsewhere(first * KERNEL_PAGE, (last - first + 1) * KERNEL_PAGE) {
+        let block = block / KERNEL_PAGE;
+        for (page, cells) in pages.iter().filter(|p| (block..block + BLOCK / KERNEL_PAGE).contains(&p.0)) {
+            for other in &others {
+                LANDED_CELLS.note(page - block + other / KERNEL_PAGE, cells, frame);
+            }
+        }
+    }
+}
+
+/// [`landing_cells`] for every byte of `[at, at + len)`: a caller that does not know which of them change.
+pub(crate) fn landing_cells_whole(at: usize, len: usize) {
+    if len == 0 {
+        return;
+    }
+    let pages: Vec<(usize, Cells)> = (at / KERNEL_PAGE..=(at + len - 1) / KERNEL_PAGE)
+        .map(|page| {
+            let base = page * KERNEL_PAGE;
+            (page, cells_between(at.max(base) - base, (at + len).min(base + KERNEL_PAGE) - base))
+        })
+        .collect();
+    landing_cells(&pages);
+}
+
+/// Whether shaders' writes went into bytes of `[at, at + len)` (by cells of 8) in the last 512 to 1,023
+/// frames. [`landed_lately`] asks by pages.
+pub(crate) fn landed_lately_exact(at: usize, len: usize) -> bool {
+    if len == 0 {
+        return false;
+    }
+    let frame = crate::frame::current();
+    (at / KERNEL_PAGE..=(at + len - 1) / KERNEL_PAGE).any(|page| {
+        let base = page * KERNEL_PAGE;
+        let cells = cells_between(at.max(base) - base, (at + len).min(base + KERNEL_PAGE) - base);
+        LANDED_CELLS.lately(page, &cells, frame)
+    })
+}
+
+#[cfg(test)]
+mod cells_tests {
+    use super::*;
+
+    #[test]
+    fn cells_are_the_bytes_of_a_page_by_eights() {
+        assert_eq!(cells_between(0, 0), [0; 8]);
+        assert_eq!(cells_between(0, 1), [1, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(cells_between(7, 9), [3, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(cells_between(8, 16), [2, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(cells_between(4088, 4096), [0, 0, 0, 0, 0, 0, 0, 1 << 63]);
+        assert_eq!(cells_between(0, 4096), [u64::MAX; 8]);
+    }
+
+    /// The case the cells are for: the title's constants end where a shader's small buffer begins.
+    #[test]
+    fn a_write_beside_other_bytes_of_the_page_is_not_one_into_them() {
+        static NOTED: LandedCells = LandedCells([const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; Landed::PIECES]);
+        let page = 0xd66bb;
+        NOTED.note(page, &cells_between(0xe30, 0xe88), 1000);
+        // The constants at 0xc00..0xe30, and the shader's bytes.
+        assert!(!NOTED.lately(page, &cells_between(0xc00, 0xe30), 1000));
+        assert!(NOTED.lately(page, &cells_between(0xe30, 0xe31), 1000));
+        assert!(NOTED.lately(page, &cells_between(0xe00, 0xe38), 1000));
+        assert!(!NOTED.lately(page, &cells_between(0xe88, 0x1000), 1000));
+        assert!(!NOTED.lately(page + 1, &cells_between(0, 0x1000), 1000));
+        // Known through the next span of frames, forgotten in the one after.
+        assert!(NOTED.lately(page, &cells_between(0xe30, 0xe88), 1000 + LandedCells::SPAN));
+        assert!(!NOTED.lately(page, &cells_between(0xe30, 0xe88), 1000 + 2 * LandedCells::SPAN));
+        // A note in the next span keeps the one before beside it; one two spans on drops both.
+        NOTED.note(page, &cells_between(0x100, 0x108), 1000 + LandedCells::SPAN);
+        assert!(NOTED.lately(page, &cells_between(0xe30, 0xe88), 1000 + LandedCells::SPAN));
+        assert!(NOTED.lately(page, &cells_between(0x100, 0x108), 1000 + LandedCells::SPAN));
+        NOTED.note(page, &cells_between(0x200, 0x208), 1000 + 3 * LandedCells::SPAN);
+        assert!(!NOTED.lately(page, &cells_between(0x100, 0x108), 1000 + 3 * LandedCells::SPAN));
+        assert!(!NOTED.lately(page, &cells_between(0xe30, 0xe88), 1000 + 3 * LandedCells::SPAN));
+        assert!(NOTED.lately(page, &cells_between(0x200, 0x208), 1000 + 3 * LandedCells::SPAN));
+    }
+}
+
 /// A page's number, spread.
 #[derive(Default)]
 struct PageHash(u64);
@@ -3538,6 +3750,105 @@ pub fn title_memory_splitting(at: usize, len: usize) {
 /// does.
 static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
+/// Whether a read in place that names its range ([`title_memory_reading_range`])
+/// waits only for the changes of mapping that touch that range
+/// (`LEONIDA_REMAP_SPANS=0`: for every change, as before; `LEONIDA_AB` can
+/// name it).
+///
+/// [`MAPPING`] is one lock for all of title memory, and while the world
+/// streams the runtime holds it most of the time: the GPU's page mappings come
+/// 16 pages to a hold, each page an unmapping and a mapping the kernel takes
+/// 0.1 to 3 ms for. Standing at a save with the idle camera (Series X profile,
+/// Ryzen 5 7600X, 2026-11-27) that was 5 to 13 ms a frame held and 2 to 7 ms
+/// of all threads' texture refreshes waiting; in a run where the title streamed
+/// through the measurement, 192 ms a frame held, 352 ms of refreshes waiting
+/// and frames of 160 to 580 ms (logs s3-base, s4-thin6). Nearly every refresh
+/// that waited was of a texture whose pages the change did not touch: the
+/// title maps the pages of the textures that arrive, and the refreshes are of
+/// all the textures the frame draws with.
+///
+/// What a change unmaps for its moment is known before it begins: the views
+/// its pages lie in ([`title_memory_remapping_of`]; a page of a longer view
+/// takes the whole view away and brings the rest back). A read of memory
+/// outside those views meets no gap, so it goes on beside the change. A
+/// change that does not say what it touches counts as touching everything.
+fn remap_spans() -> bool {
+    crate::toggled!("LEONIDA_REMAP_SPANS")
+}
+
+/// What changes of mapping touch and what is read in place beside them
+/// ([`remap_spans`]).
+struct Spans {
+    /// The number of the last change that declared its spans.
+    last: u64,
+    /// Changes under way or waiting to begin: their number, and the spans
+    /// (first byte, past the last) they may unmap for their moment.
+    changing: Vec<(u64, Vec<(usize, usize)>)>,
+    /// Ranges being read in place by readers that named them.
+    reading: Vec<(usize, usize)>,
+}
+
+impl Spans {
+    /// Whether a change touches `[start, end)`.
+    fn changes(&self, start: usize, end: usize) -> bool {
+        self.changing.iter().any(|(_, of)| of.iter().any(|&(a, b)| a < end && start < b))
+    }
+
+    /// Whether a named read is under way in what change `number` touches.
+    fn read(&self, number: u64) -> bool {
+        self.changing.iter().find(|(n, _)| *n == number).is_some_and(|(_, of)| {
+            self.reading.iter().any(|&(start, end)| of.iter().any(|&(a, b)| a < end && start < b))
+        })
+    }
+}
+
+static SPANS: Mutex<Spans> = Mutex::new(Spans { last: 0, changing: Vec::new(), reading: Vec::new() });
+
+/// A change or a named read ended: who waits for it looks again.
+static SPANS_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Since the last frame-rate line, of the reads in place that named their
+/// range ([`title_memory_reading_range`], with [`remap_spans`]): how many
+/// there were, how many went on beside a change under way that did not touch
+/// them, and how many waited for one that did.
+pub(crate) static SPAN_READS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// `of`, in order and with those that touch joined.
+fn joined(of: &[(usize, usize)]) -> Vec<(usize, usize)> {
+    let mut sorted: Vec<(usize, usize)> = of.iter().copied().filter(|&(a, b)| a < b).collect();
+    sorted.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+    for (a, b) in sorted {
+        match out.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => out.push((a, b)),
+        }
+    }
+    out
+}
+
+/// A change of mapping is to begin that may unmap `of` for its moment: no
+/// named read of them begins from now on, and those under way are waited
+/// for. Its number, for [`undeclare`].
+fn declare(of: &[(usize, usize)]) -> u64 {
+    let mut spans = SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    spans.last += 1;
+    let number = spans.last;
+    spans.changing.push((number, joined(of)));
+    while spans.read(number) {
+        spans = SPANS_MOVED.wait(spans).unwrap_or_else(|e| e.into_inner());
+    }
+    number
+}
+
+/// Change `number` is done.
+fn undeclare(number: u64) {
+    let mut spans = SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    spans.changing.retain(|(n, _)| *n != number);
+    drop(spans);
+    SPANS_MOVED.notify_all();
+}
+
 /// What the runtime holds while it changes what title memory shows
 /// ([`title_memory_remapping`]).
 pub struct Remapping(
@@ -3547,6 +3858,8 @@ pub struct Remapping(
     Option<i32>,
     /// Who took it.
     &'static std::panic::Location<'static>,
+    /// Its number among the changes that declared what they touch ([`SPANS`]).
+    u64,
 );
 
 impl Drop for Remapping {
@@ -3567,6 +3880,9 @@ impl Drop for Remapping {
                 tracing::info!(n, held_ms = held / 1000, at = %self.3, "a change of mapping held title memory still for long");
             }
         }
+        // What it took away is back: named reads of it may begin (the others
+        // when the lock goes, right after this).
+        undeclare(self.4);
         if let Some(before) = self.2 {
             use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority};
             // SAFETY: a plain call on this thread.
@@ -3704,10 +4020,25 @@ fn readable_view(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEM_MAPPED, MEMORY_BASIC_INFORMATION, PAGE_READONLY, PAGE_READWRITE, VirtualQuery,
     };
+    // (A page Windows has in memory that can be shared and read is a view's
+    // or an image's, and is read at the next try either way; of any other the
+    // region says.)
+    if page_ask()
+        && let Some((PAGE_READONLY | PAGE_READWRITE, true)) = page_protection(at)
+    {
+        return true;
+    }
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    #[cfg(feature = "diagnostics")]
+    {
+        fault_count(FA_REGIONS, 1);
+        fault_count(FA_REGIONS_NS, began.elapsed().as_nanos() as u64);
+    }
     n != 0
         && info.State == MEM_COMMIT
         && info.Type == MEM_MAPPED
@@ -3734,6 +4065,17 @@ pub(crate) fn lost(what: &'static str, at: usize, len: usize) {
 /// around the whole change, the unmapping and the mapping again.
 #[track_caller]
 pub fn title_memory_remapping() -> Remapping {
+    // Nothing said of what it touches: everything.
+    title_memory_remapping_of(&[(0, usize::MAX)])
+}
+
+/// [`title_memory_remapping`], for a change that unmaps nothing outside `of`
+/// (first byte, past the last) for its moment: every view that holds a page
+/// it changes, whole (a page of a longer view takes the view away and brings
+/// the rest back). Reads in place that named a range outside `of` go on
+/// beside it ([`title_memory_reading_range`]); all others wait as before.
+#[track_caller]
+pub fn title_memory_remapping_of(of: &[(usize, usize)]) -> Remapping {
     // For the title's own threads ([`came_back`]).
     install();
     let met = MET.load(std::sync::atomic::Ordering::Relaxed);
@@ -3761,6 +4103,9 @@ pub fn title_memory_remapping() -> Remapping {
         }
     });
     let asked = std::time::Instant::now();
+    // The named reads of what it touches end first, and none begins; then
+    // the reads that named nothing.
+    let number = declare(of);
     let changing = MAPPING.write().unwrap_or_else(|e| e.into_inner());
     let got = std::time::Instant::now();
     REMAP_TIMES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3772,7 +4117,60 @@ pub fn title_memory_remapping() -> Remapping {
         got,
         before.filter(|&b| b < windows_sys::Win32::System::Threading::THREAD_PRIORITY_HIGHEST),
         std::panic::Location::caller(),
+        number,
     )
+}
+
+/// What a read of a range of title memory in place holds
+/// ([`title_memory_reading_range`]).
+pub enum RangeReading {
+    /// As [`title_memory_reading`]: no change of mapping at all meanwhile.
+    Whole(#[allow(dead_code)] Reading),
+    /// The range, noted in [`SPANS`]: no change that touches it meanwhile.
+    Range(usize, usize),
+}
+
+impl Drop for RangeReading {
+    fn drop(&mut self) {
+        let RangeReading::Range(start, end) = *self else {
+            return;
+        };
+        let mut spans = SPANS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = spans.reading.iter().position(|&r| r == (start, end)) {
+            spans.reading.swap_remove(at);
+        }
+        let waited_for = !spans.changing.is_empty();
+        drop(spans);
+        if waited_for {
+            SPANS_MOVED.notify_all();
+        }
+    }
+}
+
+/// For reading `[at, at + len)` of title memory in place: until what it
+/// returns is dropped, the runtime changes no mapping that touches the range,
+/// so memory found mapped there stays mapped. A change elsewhere goes on
+/// beside the read ([`remap_spans`]; without it this is
+/// [`title_memory_reading`]). Not to be taken by a thread that holds another
+/// of these or a [`Reading`], nor held across anything that maps title memory.
+pub fn title_memory_reading_range(at: usize, len: usize) -> RangeReading {
+    if !remap_spans() {
+        return RangeReading::Whole(title_memory_reading());
+    }
+    let (start, end) = (at, at.saturating_add(len.max(1)));
+    let count = |i: usize| SPAN_READS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    count(0);
+    let mut spans = SPANS.lock().unwrap_or_else(|e| e.into_inner());
+    if spans.changes(start, end) {
+        count(2);
+        while spans.changes(start, end) {
+            spans = SPANS_MOVED.wait(spans).unwrap_or_else(|e| e.into_inner());
+        }
+    } else if !spans.changing.is_empty() {
+        count(1);
+    }
+    spans.reading.push((start, end));
+    RangeReading::Range(start, end)
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -3951,6 +4349,8 @@ pub(crate) fn install() {
     };
     unsafe extern "system" fn on_write(info: *mut EXCEPTION_POINTERS) -> i32 {
         let _fault = crate::timeline::span("a fault looked at");
+        #[cfg(feature = "diagnostics")]
+        let _timed = FaultTimed(std::time::Instant::now(), page_ask());
         // SAFETY: the system passes the exception being dispatched.
         let r = unsafe { &*(*info).ExceptionRecord };
         const READ: usize = 0;
@@ -4037,15 +4437,135 @@ pub(crate) fn install() {
     });
 }
 
+/// Whether a fault asks Windows about its one page before it asks about the
+/// region around it (`LEONIDA_PAGE_ASK=0`: the region only, as before).
+///
+/// `VirtualQuery` answers for the whole run of pages around an address that
+/// are alike and walks to the end of it to say how long it is, with the
+/// address space held against every change of protection meanwhile; a title
+/// thread whose write faulted on a block another thread had just opened asks
+/// so ([`writable`]). `QueryWorkingSetEx` says what one page is and walks
+/// nothing. (After KyleS98/VIctory-Neo 0fb1e38.)
+fn page_ask() -> bool {
+    crate::toggled!("LEONIDA_PAGE_ASK")
+}
+
+/// What Windows says of the one page `at` lies in, where it has that page in
+/// memory: its protection, and whether it is a page that can be shared (a
+/// view's). `None`: the page is not in memory (never touched, trimmed,
+/// reserved, free), or Windows would not say; the region says then.
+fn page_protection(at: usize) -> Option<(u32, bool)> {
+    use windows_sys::Win32::System::ProcessStatus::{K32QueryWorkingSetEx, PSAPI_WORKING_SET_EX_INFORMATION};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
+    // SAFETY: plain data, the address asked about in it.
+    let mut info: PSAPI_WORKING_SET_EX_INFORMATION = unsafe { std::mem::zeroed() };
+    info.VirtualAddress = at as *mut _;
+    // SAFETY: our own process; one record of that size.
+    let ok = unsafe { K32QueryWorkingSetEx(GetCurrentProcess(), std::ptr::from_mut(&mut info).cast(), size_of_val(&info) as u32) } != 0;
+    // SAFETY: every form of the answer is these bits.
+    let flags = unsafe { info.VirtualAttributes.Flags };
+    // Bit 0: the page is in memory; then bits 4 to 14 are its protection and
+    // bit 15 says that it can be shared.
+    let said = (ok && flags & 1 != 0).then(|| (((flags >> 4) & 0x7ff) as u32, flags >> 15 & 1 != 0));
+    #[cfg(feature = "diagnostics")]
+    {
+        fault_count(if said.is_some() { FA_PAGES } else { FA_PAGES_UNSAID }, 1);
+        fault_count(FA_PAGES_NS, began.elapsed().as_nanos() as u64);
+    }
+    said
+}
+
+/// Since the last frame line: what the title's faults asked Windows, and how
+/// long they were looked at. Questions about a region ([`writable`] and
+/// [`readable_view`] with `VirtualQuery`) and their nanoseconds; questions
+/// about one page that the page answered, those it did not, and the
+/// nanoseconds of both; faults looked at with [`page_ask`] off and their
+/// nanoseconds, and the same with it on (all threads).
+#[cfg(feature = "diagnostics")]
+static FAULT_ASKS: [std::sync::atomic::AtomicU64; 9] = [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+#[cfg(feature = "diagnostics")]
+const FA_REGIONS: usize = 0;
+#[cfg(feature = "diagnostics")]
+const FA_REGIONS_NS: usize = 1;
+#[cfg(feature = "diagnostics")]
+const FA_PAGES: usize = 2;
+#[cfg(feature = "diagnostics")]
+const FA_PAGES_UNSAID: usize = 3;
+#[cfg(feature = "diagnostics")]
+const FA_PAGES_NS: usize = 4;
+#[cfg(feature = "diagnostics")]
+const FA_FAULTS: usize = 5;
+
+#[cfg(feature = "diagnostics")]
+fn fault_count(what: usize, n: u64) {
+    FAULT_ASKS[what].fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// A fault being looked at by the handler: counted with its time when it is
+/// done, by whether faults ask about their page.
+#[cfg(feature = "diagnostics")]
+struct FaultTimed(std::time::Instant, bool);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for FaultTimed {
+    fn drop(&mut self) {
+        let at = FA_FAULTS + 2 * usize::from(self.1);
+        fault_count(at, 1);
+        fault_count(at + 1, self.0.elapsed().as_nanos() as u64);
+    }
+}
+
+/// The faults' line of the frame lines, per frame ([`FAULT_ASKS`]).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn fault_asks_line(frames: f64) {
+    let n: Vec<f64> = FAULT_ASKS.iter().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames).collect();
+    if n.iter().all(|&v| v == 0.0) {
+        return;
+    }
+    tracing::info!(
+        "the title's faults per frame, all threads (LEONIDA_PAGE_ASK): {:.0} looked at in {:.2} ms asking about regions only, {:.0} in {:.2} ms \
+         asking about the page first; questions about a region {:.0} in {:.3} ms, about one page {:.0} answered and {:.0} not in {:.3} ms",
+        n[FA_FAULTS],
+        n[FA_FAULTS + 1] / 1e6,
+        n[FA_FAULTS + 2],
+        n[FA_FAULTS + 3] / 1e6,
+        n[FA_REGIONS],
+        n[FA_REGIONS_NS] / 1e6,
+        n[FA_PAGES],
+        n[FA_PAGES_UNSAID],
+        n[FA_PAGES_NS] / 1e6,
+    );
+}
+
 /// Whether `at` is committed read-write memory now.
 fn writable(at: usize) -> bool {
+    use windows_sys::Win32::System::Memory::PAGE_READWRITE;
+    if page_ask()
+        && let Some((protection, _)) = page_protection(at)
+    {
+        return protection == PAGE_READWRITE;
+    }
+    writable_region(at)
+}
+
+/// [`writable`], by the region `at` lies in.
+fn writable_region(at: usize) -> bool {
     use windows_sys::Win32::System::Memory::{
         MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
     };
+    #[cfg(feature = "diagnostics")]
+    let began = std::time::Instant::now();
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
     let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    #[cfg(feature = "diagnostics")]
+    {
+        fault_count(FA_REGIONS, 1);
+        fault_count(FA_REGIONS_NS, began.elapsed().as_nanos() as u64);
+    }
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
 }
 
@@ -5433,6 +5953,72 @@ mod tests {
         writing(top, PAGE);
         title_memory_remapped(top, usize::MAX);
     }
+
+    /// What Windows says of one page is what the region around it says of
+    /// it: a committed page that can be written, one that can only be read
+    /// and one that is only reserved, in private memory and in a view; of a
+    /// page it does not have in memory the region is asked.
+    /// (`LEONIDA_PAGE_ASK`.)
+    #[test]
+    fn a_fault_asks_about_its_one_page() {
+        use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+        const KERNEL_PAGE: usize = 4096;
+        let protect = |at: usize, to: u32| {
+            let mut old = 0;
+            // SAFETY: a committed page of the test's own.
+            assert_ne!(unsafe { VirtualProtect(at as *const _, KERNEL_PAGE, to, &mut old) }, 0);
+        };
+        // SAFETY: four pages reserved, the first three committed; freed at the end.
+        let p = unsafe { VirtualAlloc(std::ptr::null(), 4 * KERNEL_PAGE, MEM_RESERVE, PAGE_READWRITE) } as usize;
+        assert_ne!(p, 0);
+        // SAFETY: inside the reservation.
+        assert_ne!(unsafe { VirtualAlloc(p as *const _, 3 * KERNEL_PAGE, MEM_COMMIT, PAGE_READWRITE) } as usize, 0);
+        let (written, read_only, untouched, reserved) = (p, p + KERNEL_PAGE, p + 2 * KERNEL_PAGE, p + 3 * KERNEL_PAGE);
+        // SAFETY: committed pages of ours.
+        unsafe {
+            (written as *mut u8).write(1);
+            (read_only as *mut u8).write(1);
+        }
+        protect(read_only, PAGE_READONLY);
+        assert_eq!(page_protection(written), Some((PAGE_READWRITE, false)));
+        assert_eq!(page_protection(read_only), Some((PAGE_READONLY, false)));
+        // (Committed and never touched: not in memory, unless Windows brought
+        // it in beside its neighbour.)
+        assert!(matches!(page_protection(untouched), None | Some((PAGE_READWRITE, false))));
+        assert_eq!(page_protection(reserved), None);
+        for (at, can) in [(written, true), (read_only, false), (untouched, true), (reserved, false)] {
+            assert_eq!(writable(at), can, "page {}", (at - p) / KERNEL_PAGE);
+            assert_eq!(writable_region(at), can, "page {} by its region", (at - p) / KERNEL_PAGE);
+        }
+        assert!(!readable_view(written), "private memory is no view");
+        // Made writable again, as a fault of another thread opens a block.
+        protect(read_only, PAGE_READWRITE);
+        assert_eq!(page_protection(read_only), Some((PAGE_READWRITE, false)));
+        assert!(writable(read_only));
+        // SAFETY: our allocation.
+        unsafe { VirtualFree(p as *mut _, 0, MEM_RELEASE) };
+
+        // A view, as title memory is: read-only as a guard leaves it, and open again.
+        let (section, one, two) = two_views(BLOCK);
+        // SAFETY: the views just mapped.
+        unsafe {
+            (one as *mut u8).write(1);
+            assert_eq!((two as *const u8).read(), 1);
+        }
+        assert_eq!(page_protection(one), Some((PAGE_READWRITE, true)));
+        assert!(writable(one) && readable_view(one));
+        // (A page of the view nothing touched.)
+        assert!(matches!(page_protection(one + KERNEL_PAGE), None | Some((PAGE_READWRITE, true))));
+        assert!(writable(one + KERNEL_PAGE) && readable_view(one + KERNEL_PAGE));
+        protect(one, PAGE_READONLY);
+        assert_eq!(page_protection(one), Some((PAGE_READONLY, true)));
+        assert!(!writable(one) && !writable_region(one) && readable_view(one));
+        assert!(writable(two), "the other view of the page is as it was");
+        protect(one, PAGE_READWRITE);
+        assert_eq!(page_protection(one), Some((PAGE_READWRITE, true)));
+        assert!(writable(one));
+        drop_views(section, &[one, two], BLOCK);
+    }
 }
 
 #[cfg(test)]
@@ -5482,6 +6068,80 @@ mod mapping_tests {
         drop(changing);
         reader.join().unwrap();
         assert!(read.load(Ordering::SeqCst));
+    }
+
+    /// Addresses no test maps anything at: what is asked of them is only
+    /// who waits for whom.
+    const FAR: usize = 0x7a00_0000_0000;
+
+    /// Runs `f` on a thread of its own; what tells when it is done.
+    fn beside(f: impl FnOnce() + Send + 'static) -> (std::thread::JoinHandle<()>, mpsc::Receiver<()>) {
+        let (done, wait) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            f();
+            let _ = done.send(());
+        });
+        (thread, wait)
+    }
+
+    /// A read that names its range waits for a change that touches the range,
+    /// and a change for the named reads of what it touches. (Who goes on
+    /// beside whom is asked of the table itself, below: other tests change
+    /// mappings in this process, and a test that held one of these while it
+    /// waited for a thread of its own to pass could wait for them in a ring.)
+    #[test]
+    fn a_named_read_and_a_change_of_its_memory_wait_for_each_other() {
+        use super::{title_memory_reading_range, title_memory_remapping_of};
+        // A change holds two spans; a read of a byte of the second does not begin.
+        let changing = title_memory_remapping_of(&[(FAR, FAR + 0x1_0000), (FAR + 0x4_0000, FAR + 0x5_0000)]);
+        let (touched, done) = beside(|| drop(title_memory_reading_range(FAR + 0x4_ffff, 16)));
+        assert!(done.recv_timeout(Duration::from_millis(100)).is_err(), "a read began in memory being changed");
+        drop(changing);
+        done.recv_timeout(Duration::from_secs(60)).expect("the read went on after the change");
+        touched.join().unwrap();
+        // A read holds a range; a change of a view around its second page does not begin.
+        const AT: usize = FAR + 0x100_0000;
+        let reading = title_memory_reading_range(AT + 0x1_0000, 0x2_0000);
+        let (touching, done) = beside(|| drop(title_memory_remapping_of(&[(AT + 0x2_0000, AT + 0x3_0000)])));
+        assert!(done.recv_timeout(Duration::from_millis(100)).is_err(), "the mapping changed under a named read");
+        drop(reading);
+        done.recv_timeout(Duration::from_secs(60)).expect("the change went on after the read");
+        touching.join().unwrap();
+    }
+
+    /// What touches what, to the byte: a change's spans and a read's range
+    /// that only meet at their ends do not wait for each other, and a change
+    /// that names nothing touches everything.
+    #[test]
+    fn only_what_touches_waits() {
+        use super::{Spans, joined};
+        let mut spans = Spans { last: 2, changing: Vec::new(), reading: Vec::new() };
+        spans.changing.push((1, joined(&[(0x1_0000, 0x2_0000), (0x4_0000, 0x5_0000)])));
+        // A read: between the spans, at their ends, inside one.
+        assert!(!spans.changes(0x2_0000, 0x4_0000));
+        assert!(!spans.changes(0, 0x1_0000) && !spans.changes(0x5_0000, 0x6_0000));
+        assert!(spans.changes(0x1_ffff, 0x2_0000) && spans.changes(0x3_ffff, 0x4_0001) && spans.changes(0, usize::MAX));
+        // A change: the reads under way in its spans, and no others.
+        spans.reading.push((0x2_0000, 0x4_0000));
+        assert!(!spans.read(1));
+        spans.reading.push((0x4_8000, 0x4_8010));
+        assert!(spans.read(1));
+        // One that says nothing of what it touches waits for every read, and every read for it.
+        spans.changing.push((2, joined(&[(0, usize::MAX)])));
+        assert!(spans.read(2) && spans.changes(0x2_0000, 0x2_0001));
+        spans.reading.clear();
+        assert!(!spans.read(1) && !spans.read(2));
+        // A change that is done is no longer in the table: nothing waits for it.
+        assert!(!spans.read(7));
+    }
+
+    /// The spans a change declares are kept in order, those that touch as one.
+    #[test]
+    fn declared_spans_are_joined() {
+        use super::joined;
+        assert_eq!(joined(&[(30, 40), (10, 20), (20, 25), (5, 5), (38, 50)]), vec![(10, 25), (30, 50)]);
+        assert_eq!(joined(&[(0, usize::MAX), (7, 9)]), vec![(0, usize::MAX)]);
+        assert!(joined(&[]).is_empty());
     }
 }
 

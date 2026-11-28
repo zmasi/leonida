@@ -1221,5 +1221,392 @@ class GlbIndexComponentTypeTest(unittest.TestCase):
                     self.assertIn("expected unsigned integer", lines[0])
 
 
+class ValidationAndIoHardeningTests(unittest.TestCase):
+    """Regression tests for output guards, atomic JSON reports, GLB/skeleton/JSON validation, and CLI errors."""
+
+    @staticmethod
+    def _simple_part_dict(name: str = "hand_fr1_000_nude_cull") -> dict:
+        return {
+            "name": name,
+            "coord_space": "y-up",
+            "positions": [[0.0, 0.0, 0.0], [0.2, 0.0, 0.0], [0.0, 0.2, 0.0]],
+            "triangles": [[0, 1, 2]],
+        }
+
+    @staticmethod
+    def _run_cli(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-I", os.path.join(TOOLS, "ped_assemble.py"), *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    @staticmethod
+    def _read_bytes(path: str) -> bytes:
+        with open(path, "rb") as f:
+            return f.read()
+
+    @staticmethod
+    def _read_text(path: str) -> str:
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+
+    def test_output_overwrite_and_collision_guards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            part_json = os.path.join(tmp, "part.json")
+            ref_json = os.path.join(tmp, "ref.json")
+            with open(part_json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(self._simple_part_dict("hand_fr1_000_nude_cull"), f)
+            with open(ref_json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(self._simple_part_dict("feet_fr1_000_nude_cull"), f)
+
+            part_glb = os.path.join(tmp, "part.glb")
+            ok = self._run_cli("assemble", part_json, "-o", part_glb, "--no-cull", "--no-standing-offset")
+            self.assertEqual(ok.returncode, 0, ok.stderr)
+
+            orig_glb = self._read_bytes(part_glb)
+            orig_json = self._read_bytes(part_json)
+
+            # 1. assemble -o overwrites GLB input
+            r = self._run_cli("assemble", part_glb, "-o", part_glb, "--no-cull", "--no-standing-offset")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("would overwrite input", r.stderr)
+            self.assertEqual(self._read_bytes(part_glb), orig_glb)
+
+            # 2. assemble --json overwrites input
+            out_glb = os.path.join(tmp, "fresh.glb")
+            r = self._run_cli("assemble", part_json, "-o", out_glb, "--json", part_json, "--no-cull")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("would overwrite input", r.stderr)
+            self.assertFalse(os.path.exists(out_glb))
+            self.assertEqual(self._read_bytes(part_json), orig_json)
+
+            # 3. assemble -o == --json collision
+            r = self._run_cli("assemble", part_json, "-o", out_glb, "--json", out_glb, "--no-cull")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("resolve to the same file", r.stderr)
+            self.assertFalse(os.path.exists(out_glb))
+
+            # 4. assemble --manifest refuses to overwrite a manifest-referenced part
+            manifest = os.path.join(tmp, "manifest.json")
+            with open(manifest, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"coord_space": "y-up", "parts": ["part.glb"]}, f)
+            r = self._run_cli("assemble", "--manifest", manifest, "-o", part_glb, "--no-cull")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("would overwrite input", r.stderr)
+            self.assertEqual(self._read_bytes(part_glb), orig_glb)
+
+            # 5. assemble refuses to overwrite an external PNG referenced by a JSON part
+            tex_png = os.path.join(tmp, "skin.png")
+            tex_bytes = _make_1x1_png(200, 150, 120)
+            with open(tex_png, "wb") as f:
+                f.write(tex_bytes)
+            tex_part = self._simple_part_dict("textured")
+            tex_part["material"] = {"name": "m", "base_color_png": "skin.png"}
+            tex_part_json = os.path.join(tmp, "tex_part.json")
+            with open(tex_part_json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(tex_part, f)
+            r = self._run_cli("assemble", tex_part_json, "-o", out_glb, "--json", tex_png, "--no-cull")
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("would overwrite input", r.stderr)
+            self.assertEqual(self._read_bytes(tex_png), tex_bytes)
+
+            # 6. existing directory as -o
+            sub_dir = os.path.join(tmp, "out_dir")
+            os.mkdir(sub_dir)
+            r = self._run_cli("assemble", part_json, "-o", sub_dir, "--no-cull")
+            self.assertEqual(r.returncode, 2)
+            self.assertNotIn("Traceback", r.stderr)
+            self.assertIn("existing directory", r.stderr)
+
+            # 7. cull-overlap refuses overwriting --target and -o == --json
+            r = self._run_cli("cull-overlap", "--target", part_json, "--ref", ref_json, "-o", part_json)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("would overwrite input", r.stderr)
+            self.assertEqual(self._read_bytes(part_json), orig_json)
+
+            culled_out = os.path.join(tmp, "culled.json")
+            r = self._run_cli(
+                "cull-overlap", "--target", part_json, "--ref", ref_json,
+                "-o", culled_out, "--json", culled_out,
+            )
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("resolve to the same file", r.stderr)
+            self.assertFalse(os.path.exists(culled_out))
+
+            # 8. inspect-seams refuses overwriting input via --json
+            r = self._run_cli("inspect-seams", part_json, "--json", part_json)
+            self.assertEqual(r.returncode, 2)
+            self.assertIn("would overwrite input", r.stderr)
+            self.assertEqual(self._read_bytes(part_json), orig_json)
+
+    def test_atomic_json_report_rejects_nan_and_preserves_existing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = os.path.join(tmp, "report.json")
+            sentinel = '{"keep": true}\n'
+            with open(report_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(sentinel)
+
+            with self.assertRaises(pa.PedAssembleError):
+                pa._write_json_report(report_path, {"bad": float("nan")})
+
+            self.assertEqual(self._read_text(report_path), sentinel)
+            self.assertEqual(os.listdir(tmp), ["report.json"])
+
+            with self.assertRaises(pa.PedAssembleError):
+                pa._write_json_report(tmp, {"ok": 1})
+
+        bad_mat_part = pa.MeshPart(
+            name="bad_mat",
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+            coord_space="y-up",
+            material=pa.MaterialSpec(name="m", metallic_factor=float("nan")),
+        )
+        with self.assertRaises(pa.PedAssembleError):
+            pa.build_assembled_glb([bad_mat_part], apply_standing=False)
+
+        bad_alpha_part = pa.MeshPart(
+            name="bad_alpha",
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+            coord_space="y-up",
+            material=pa.MaterialSpec(name="m", alpha_mode="BOGUS"),
+        )
+        with self.assertRaises(pa.PedAssembleError):
+            pa.build_assembled_glb([bad_alpha_part], apply_standing=False)
+
+    def test_glb_chunk_bounds_and_oob_triangle_indices(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1. total_len < 20 inside a >=20-byte file
+            short_total = os.path.join(tmp, "short_total.glb")
+            with open(short_total, "wb") as f:
+                f.write(b"glTF" + struct.pack("<II", 2, 16) + b"\x00" * 16)
+            with self.assertRaises(pa.PedAssembleError):
+                pa.read_glb_parts(short_total)
+
+            # 2. chunk_len exceeds total_len (with trailing bytes after total_len)
+            doc_bytes = b'{"asset":{"version":"2.0"}} '
+            overlong = os.path.join(tmp, "overlong_chunk.glb")
+            total_len = 12 + 8 + len(doc_bytes)
+            with open(overlong, "wb") as f:
+                f.write(
+                    b"glTF"
+                    + struct.pack("<II", 2, total_len)
+                    + struct.pack("<II", len(doc_bytes) + 16, pa.CHUNK_TYPE_JSON)
+                    + doc_bytes
+                    + b" " * 16
+                )
+            with self.assertRaisesRegex(pa.PedAssembleError, "exceeds GLB length"):
+                pa.read_glb_parts(overlong)
+
+            # 3. Trailing bytes inside total_len after last chunk
+            trailing = os.path.join(tmp, "trailing.glb")
+            with open(trailing, "wb") as f:
+                f.write(
+                    b"glTF"
+                    + struct.pack("<II", 2, total_len + 2)
+                    + struct.pack("<II", len(doc_bytes), pa.CHUNK_TYPE_JSON)
+                    + doc_bytes
+                    + b"\x00\x00"
+                )
+            with self.assertRaisesRegex(pa.PedAssembleError, "trailing"):
+                pa.read_glb_parts(trailing)
+
+            # 4. Out-of-range triangle index inside a structurally valid GLB
+            pos_bytes = struct.pack("<9f", 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
+            bad_idx = struct.pack("<3H", 0, 1, 9) + b"\x00\x00"
+            doc = {
+                "asset": {"version": "2.0"},
+                "buffers": [{"byteLength": len(pos_bytes) + len(bad_idx)}],
+                "bufferViews": [
+                    {"buffer": 0, "byteOffset": 0, "byteLength": len(pos_bytes)},
+                    {"buffer": 0, "byteOffset": len(pos_bytes), "byteLength": 6},
+                ],
+                "accessors": [
+                    {"bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3"},
+                    {"bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR"},
+                ],
+                "meshes": [{"name": "m", "primitives": [{"attributes": {"POSITION": 0}, "indices": 1}]}],
+                "nodes": [{"name": "m", "mesh": 0}],
+            }
+            oob_glb = os.path.join(tmp, "oob_idx.glb")
+            with open(oob_glb, "wb") as f:
+                f.write(GlbIndexComponentTypeTest._pack_glb(doc, pos_bytes + bad_idx))
+            with self.assertRaisesRegex(pa.PedAssembleError, "out-of-range vertex index"):
+                pa.read_glb_parts(oob_glb)
+
+    def test_skeleton_hierarchy_and_ibm_validation(self):
+        part = pa.MeshPart(
+            name="tri",
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+            coord_space="y-up",
+        )
+
+        # Self-parent cycle
+        self_cycle = pa.SkeletonSpec(
+            name="self_cycle",
+            coord_space="y-up",
+            joints=[pa.SkeletonJoint(name="Root", parent=0)],
+        )
+        with self.assertRaisesRegex(pa.PedAssembleError, "own parent"):
+            pa.build_assembled_glb([part], skeleton=self_cycle, apply_standing=False)
+
+        # Multi-joint cycle (0 -> 1 -> 0)
+        two_cycle = pa.SkeletonSpec(
+            name="two_cycle",
+            coord_space="y-up",
+            joints=[
+                pa.SkeletonJoint(name="A", parent=1),
+                pa.SkeletonJoint(name="B", parent=0),
+            ],
+        )
+        with self.assertRaisesRegex(pa.PedAssembleError, "cyclic"):
+            pa.build_assembled_glb([part], skeleton=two_cycle, apply_standing=False)
+
+        # Out-of-range & bool parent
+        for bad_parent in (5, -2, True):
+            skel = pa.SkeletonSpec(
+                name="bad_parent",
+                coord_space="y-up",
+                joints=[pa.SkeletonJoint(name="Root", parent=bad_parent)],
+            )
+            with self.assertRaisesRegex(pa.PedAssembleError, "invalid parent"):
+                pa.build_assembled_glb([part], skeleton=skel, apply_standing=False)
+
+        # Invalid skeleton coord_space
+        bad_space = pa.SkeletonSpec(
+            name="bad_space",
+            coord_space="x-up",
+            joints=[pa.SkeletonJoint(name="Root", parent=-1)],
+        )
+        with self.assertRaisesRegex(pa.PedAssembleError, "coord_space"):
+            pa.build_assembled_glb([part], skeleton=bad_space, apply_standing=False)
+
+        # Wrong-length IBM on y-up skeleton
+        short_ibm = pa.SkeletonSpec(
+            name="short_ibm",
+            coord_space="y-up",
+            joints=[pa.SkeletonJoint(name="Root", parent=-1, inverse_bind_matrix=(1.0,) * 12)],
+        )
+        with self.assertRaisesRegex(pa.PedAssembleError, "16 finite numbers"):
+            pa.build_assembled_glb([part], skeleton=short_ibm, apply_standing=False)
+
+        # Float32-overflowing IBM raises PedAssembleError (not raw OverflowError)
+        huge_ibm = pa.SkeletonSpec(
+            name="huge_ibm",
+            coord_space="y-up",
+            joints=[pa.SkeletonJoint(name="Root", parent=-1, inverse_bind_matrix=(1e40,) + (0.0,) * 15)],
+        )
+        with self.assertRaisesRegex(pa.PedAssembleError, "float32"):
+            pa.build_assembled_glb([part], skeleton=huge_ibm, apply_standing=False)
+
+        # Non-finite standing offset
+        with self.assertRaises(pa.PedAssembleError):
+            pa.build_assembled_glb([part], standing_offset=float("inf"), apply_standing=True)
+
+    def test_cli_and_api_tolerance_validation(self):
+        part = pa.MeshPart(
+            name="tri",
+            positions=[(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0)],
+            triangles=[(0, 1, 2)],
+            coord_space="y-up",
+        )
+        with self.assertRaises(pa.PedAssembleError):
+            pa.standing_offset_vector(float("nan"))
+        with self.assertRaises(pa.PedAssembleError):
+            pa.find_coplanar_overlap_indices(part, [part], centroid_tol=-0.01)
+        with self.assertRaises(pa.PedAssembleError):
+            pa.find_coplanar_overlap_indices(part, [part], normal_cos_min=float("nan"))
+        with self.assertRaises(pa.PedAssembleError):
+            pa.find_coplanar_overlap_indices(part, [part], normal_cos_min=1.5)
+        with self.assertRaises(pa.PedAssembleError):
+            pa.analyze_edge_topology([part], weld_tol=-1e-4)
+        with self.assertRaises(pa.PedAssembleError):
+            pa.count_mesh_islands(part.positions, part.triangles, by_position=True, quant_tol=float("inf"))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "part.json")
+            out = os.path.join(tmp, "out.glb")
+            with open(p, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(self._simple_part_dict(), f)
+
+            for cli_args in (
+                ("assemble", p, "-o", out, "--waist-tol", "-0.01"),
+                ("assemble", p, "-o", out, "--normal-cos", "nan"),
+                ("assemble", p, "-o", out, "--standing-offset", "inf"),
+                ("cull-overlap", "--target", p, "--ref", p, "--tol", "-0.5"),
+                ("inspect-seams", p, "--weld-tol", "nan"),
+            ):
+                with self.subTest(args=cli_args):
+                    r = self._run_cli(*cli_args)
+                    self.assertEqual(r.returncode, 2)
+                    self.assertNotIn("Traceback", r.stderr)
+
+    def test_malformed_json_manifest_cycles_material_and_cli_oserror(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1. Cyclic manifests (a -> b -> a)
+            a_path = os.path.join(tmp, "a.json")
+            b_path = os.path.join(tmp, "b.json")
+            with open(a_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"parts": ["b.json"]}, f)
+            with open(b_path, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"parts": ["a.json"]}, f)
+            with self.assertRaisesRegex(pa.PedAssembleError, "cyclic manifest"):
+                pa.load_parts_from_path(a_path)
+
+            # 2. Malformed JSON syntax via CLI -> single ERROR line, exit 2
+            bad_json = os.path.join(tmp, "bad.json")
+            with open(bad_json, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{broken")
+            r_json = self._run_cli("inspect-seams", bad_json)
+            self.assertEqual(r_json.returncode, 2)
+            self.assertNotIn("Traceback", r_json.stderr)
+            self.assertIn("ERROR:", r_json.stderr)
+
+            # 3. Invalid base64 PNG spec raises PedAssembleError (not binascii.Error)
+            bad_b64 = os.path.join(tmp, "bad_b64.json")
+            p_b64 = self._simple_part_dict()
+            p_b64["material"] = {"name": "m", "base_color_png": "base64:!!!not-base64!!!"}
+            with open(bad_b64, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(p_b64, f)
+            with self.assertRaisesRegex(pa.PedAssembleError, "base64"):
+                pa.load_parts_from_path(bad_b64)
+
+            # 4. Malformed material fields
+            for label, mat in (
+                ("bcf_none", {"base_color_factor": None}),
+                ("alpha_bogus", {"alpha_mode": "BOGUS"}),
+                ("metallic_bool", {"metallic_factor": True}),
+            ):
+                with self.subTest(material=label):
+                    mp = os.path.join(tmp, f"mat_{label}.json")
+                    d = self._simple_part_dict()
+                    d["material"] = mat
+                    with open(mp, "w", encoding="utf-8", newline="\n") as f:
+                        json.dump(d, f)
+                    with self.assertRaises(pa.PedAssembleError):
+                        pa.load_parts_from_path(mp)
+
+            # 5. Out-of-range triangle index in JSON part
+            oob_json = os.path.join(tmp, "oob.json")
+            d_oob = self._simple_part_dict()
+            d_oob["triangles"] = [[0, 1, 9]]
+            with open(oob_json, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(d_oob, f)
+            with self.assertRaisesRegex(pa.PedAssembleError, "out-of-range vertex index"):
+                pa.load_parts_from_path(oob_json)
+
+            # 6. Missing input file via CLI exits 2 with clean ERROR line (no FileNotFoundError traceback)
+            missing = os.path.join(tmp, "does_not_exist.json")
+            out = os.path.join(tmp, "out.glb")
+            r_missing = self._run_cli("assemble", missing, "-o", out)
+            self.assertEqual(r_missing.returncode, 2)
+            self.assertNotIn("Traceback", r_missing.stderr)
+            self.assertIn("ERROR:", r_missing.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

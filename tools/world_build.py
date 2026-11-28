@@ -38,6 +38,7 @@ import stat
 import statistics
 import sys
 import tempfile
+import unicodedata
 
 try:
     import fcntl
@@ -1272,9 +1273,12 @@ def _exclusive_output(out_dir: str):
     # and a successful one must contain only chunks/ and world.json.  Key it on the resolved
     # path so every spelling of one folder (8.3 names, junctions, symlinks) shares a lock; for
     # a folder that does not exist yet, realpath resolves the part that does and appends the rest.
-    key = hashlib.sha256(
-        os.path.normcase(os.path.realpath(out_dir)).encode("utf-8", "surrogatepass")
-    ).hexdigest()[:20]
+    # Fold conservatively on every platform: the output volume may ignore case or
+    # Unicode normalization even when os.path.normcase does not (APFS, for example).
+    # Distinct folders that fold alike can contend, but cannot publish concurrently.
+    resolved = os.path.normcase(os.path.realpath(out_dir))
+    lock_name = unicodedata.normalize("NFD", unicodedata.normalize("NFD", resolved).casefold())
+    key = hashlib.sha256(lock_name.encode("utf-8", "surrogatepass")).hexdigest()[:20]
     lock_path = os.path.join(tempfile.gettempdir(), _WORLD_BUILD_LOCK + key)
     with open(lock_path, "a+b") as fh:
         fd = fh.fileno()

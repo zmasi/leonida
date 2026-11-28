@@ -55,6 +55,7 @@ public:
     Hasher() { value(key_version); }
 
     void bytes(const void* data, std::size_t size) {
+        if (!data || size == 0) return;
         const auto* p = static_cast<const std::uint8_t*>(data);
         std::uint64_t h = hash_;
         for (std::size_t i = 0; i < size; ++i) {
@@ -83,8 +84,10 @@ private:
 
 // <dir>/<kind>-<key as 16 lowercase hex digits>.bin
 inline std::filesystem::path entry_path(const std::filesystem::path& dir, const char* kind, std::uint64_t key) {
-    char name[64];
-    std::snprintf(name, sizeof(name), "%s-%016llx.bin", kind, static_cast<unsigned long long>(key));
+    char suffix[24];
+    std::snprintf(suffix, sizeof(suffix), "-%016llx.bin", static_cast<unsigned long long>(key));
+    std::string name(kind && *kind ? kind : "entry");
+    name += suffix;
     return dir / name;
 }
 

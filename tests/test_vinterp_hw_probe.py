@@ -1,5 +1,5 @@
 """Unit tests for tools/vinterp_hw_probe.py (SHADER-430). Standard library only; no GPU or game files needed."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from fractions import Fraction
 import io
 import sys
@@ -116,6 +116,96 @@ class VinterpHwProbeTests(unittest.TestCase):
                 rc = probe.main(["--oracle", "hw"])
         self.assertEqual(rc, 77)
         self.assertIn("no AMD GPU", out.getvalue())
+
+    def test_empty_hw_arch_rejected_and_translator_error_exits_2(self):
+        for argv in (["--hw-arch", ""], ["--hw-arch", "   "]):
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    probe.main(argv)
+                self.assertEqual(cm.exception.code, 2)
+
+        out = io.StringIO()
+        with unittest.mock.patch.object(
+            probe, "run_translator_checks", side_effect=probe.rdna2spirv.Unsupported("unsupported op")
+        ), redirect_stdout(out):
+            rc = probe.main(["--oracle", "translator"])
+        self.assertEqual(rc, 2)
+        self.assertIn("harness error: unsupported op", out.getvalue())
+
+    def test_run_hw_tuple_cu0_selection_malformed_batches_and_errors(self):
+        class StubOracle:
+            device = "mock-gfx1035"
+            arch = "gfx1035"
+
+            def __init__(self, run_fn):
+                self._run_fn = run_fn
+                self.closed = False
+
+            def run(self, kernels, words=5):
+                return self._run_fn(kernels)
+
+            def close(self):
+                self.closed = True
+
+        # Tuple entries are accepted and CU0 (HW_ID1 bit 8 == 0) is preferred over CU1 (0x100).
+        case_idx = {"i": 0}
+        order = list(probe.CASES) * 2
+
+        def cu0_tuple_run(_ks):
+            c = order[case_idx["i"]]
+            case_idx["i"] += 1
+            cu1 = (0, 0, 0, 0, 0x100)
+            cu0 = c.expected_hw + (0,)
+            return (cu1, cu0, cu1, cu1)
+
+        oracle = StubOracle(cu0_tuple_run)
+        out = io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle), redirect_stdout(out):
+            rc = probe.main(["--oracle", "hw"])
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertTrue(oracle.closed)
+
+        # Malformed batches and all-rejected batches return exit 2 (harness error) and close oracle.
+        for label, bad_fn in (
+            ("empty_batch", lambda _ks: []),
+            ("none_batch", lambda _ks: None),
+            ("short_batch", lambda _ks: [(0, 0, 0, 0, 0)] * 2),
+            ("short_words", lambda _ks: [[0, 1]] * 4),
+            ("bool_words", lambda _ks: [[True, 0, 0, 0, 0]] * 4),
+            ("all_rejected", lambda _ks: ["assembler rejected"] * 4),
+        ):
+            with self.subTest(case=label):
+                oracle = StubOracle(bad_fn)
+                out = io.StringIO()
+                with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle), redirect_stdout(out):
+                    rc = probe.main(["--oracle", "hw"])
+                self.assertEqual(rc, 2, out.getvalue())
+                self.assertIn("harness error:", out.getvalue())
+                self.assertTrue(oracle.closed)
+
+        # RuntimeError during oracle.run() exits 2 and closes oracle.
+        def raise_runtime(_ks):
+            raise RuntimeError("gpu hung")
+
+        oracle = StubOracle(raise_runtime)
+        out = io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle), redirect_stdout(out):
+            rc = probe.main(["--oracle", "hw"])
+        self.assertEqual(rc, 2, out.getvalue())
+        self.assertIn("harness error: gpu hung", out.getvalue())
+        self.assertTrue(oracle.closed)
+
+        # runner.Unavailable during oracle.run() exits 77 and closes oracle.
+        def raise_unavail(_ks):
+            raise hw_runner.Unavailable("mode unsupported")
+
+        oracle = StubOracle(raise_unavail)
+        out = io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle), redirect_stdout(out):
+            rc = probe.main(["--oracle", "hw"])
+        self.assertEqual(rc, 77, out.getvalue())
+        self.assertIn("hardware oracle unavailable: mode unsupported", out.getvalue())
+        self.assertTrue(oracle.closed)
 
 
 if __name__ == "__main__":

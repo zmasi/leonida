@@ -367,6 +367,33 @@ int main() {
         free_thunk(unwind_remap);
     }
     free_thunk(nullptr);
+    check(finish_thunk(nullptr, 16, {0x01, 0, 0, 0}) == nullptr, "finish_thunk refuses null thunk buffer");
+
+    // Zero direct callers: redirect_image_calls succeeds and frees the unused thunk and its function table.
+    uint8_t* img_zero = alloc_near(reinterpret_cast<const void*>(&remap_lucia), 0x2000);
+    check(img_zero != nullptr, "synthetic PE64 image for zero-caller check allocated");
+    if (img_zero) {
+        std::memset(img_zero, 0, 0x2000);
+        IMAGE_SECTION_HEADER sec_z{};
+        std::memcpy(sec_z.Name, ".text", 5);
+        sec_z.Misc.VirtualSize = 0x100;
+        sec_z.VirtualAddress = 0x1000;
+        sec_z.SizeOfRawData = 0x100;
+        sec_z.Characteristics = IMAGE_SCN_MEM_EXECUTE | IMAGE_SCN_CNT_CODE;
+        init_pe64(img_zero, 0x2000, {sec_z});
+        put(img_zero + 0x1000, {0x89, 0xC8, 0xC3});  // target with no direct E8/E9 callers
+        uint8_t* unused_thunk = nullptr;
+        const HookResult rz = redirect_image_calls(img_zero, 0x1000, [&](uint8_t* target) {
+            unused_thunk = make_remap_thunk(target, 0, &remap_lucia, target);
+            return unused_thunk;
+        });
+        DWORD64 base = 0;
+        check(rz.ok && rz.redirected == 0 && unused_thunk != nullptr,
+              "redirect_image_calls succeeds with zero redirected branches");
+        check(unused_thunk && RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(unused_thunk) + 1, &base, nullptr) == nullptr,
+              "unused thunk and its function table are freed when zero branches were redirected");
+        VirtualFree(img_zero, 0, MEM_RELEASE);
+    }
 
     std::printf("code_hooks_test: %d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

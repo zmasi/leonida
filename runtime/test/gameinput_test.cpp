@@ -169,6 +169,17 @@ DWORD g_reading_sleep_ms = 0;  // makes on_reading slow, for the Dispatch quota 
 SDL_Joystick* g_requeue_pad = nullptr;  // set: on_reading queues one more reading from inside the callback
 bool g_requeue_down = false;
 
+// A reading callback that cancels itself with GAMEINPUT_CURRENT_CALLBACK_TOKEN_VALUE on its first call.
+IGameInput* g_self_input = nullptr;
+bool g_self_stop = false;    // StopCallback instead of UnregisterCallback
+bool g_self_result = false;  // what UnregisterCallback returned inside the callback
+int g_self_calls = 0;
+void CALLBACK on_self_cancel(GameInputCallbackToken, void*, IGameInputReading*, bool) {
+    if (++g_self_calls != 1) return;
+    if (g_self_stop) g_self_input->StopCallback(kCurrentCallbackToken);
+    else g_self_result = g_self_input->UnregisterCallback(kCurrentCallbackToken, 0);
+}
+
 void CALLBACK on_reading(GameInputCallbackToken, void*, IGameInputReading* reading, bool) {
     if (reading) ++g_reading_events;
     if (g_reading_sleep_ms) Sleep(g_reading_sleep_ms);
@@ -232,6 +243,11 @@ bool fake_focus() { return g_focus; }
 int g_cursor_x = 0, g_cursor_y = 0;
 bool fake_cursor(int* x, int* y) {
     *x = g_cursor_x;
+    *y = g_cursor_y;
+    return true;
+}
+bool fake_cursor_with_offset(int* x, int* y) {
+    *x = g_cursor_x + 4096;
     *y = g_cursor_y;
     return true;
 }
@@ -827,6 +843,19 @@ void test_keyboard_pad_sticks(IGameInput* input, IGameInputDevice* kb) {
     g_focus = true;
     rt::gameinput::poll();
     check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: no mouse jump when focus returns");
+
+    rt::gameinput::set_cursor_source(fake_cursor_with_offset);
+    rt::gameinput::poll();
+    check(sticks_at_rest(pad_state(input, kb)), "keyboard pad: a new cursor source sets a baseline");
+    g_cursor_x += 4;
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 4096 / 32767.0f),
+          "keyboard pad: motion from the new cursor source reaches the stick");
+    rt::gameinput::set_cursor_source(fake_cursor);
+    rt::gameinput::poll();
+    check(approx(pad_state(input, kb).rightThumbstickX, 3584 / 32767.0f),
+          "keyboard pad: changing cursor source lets previous motion decay without a jump");
+    settle();
 }
 
 // Runs with no other pad connected and the device callback from main still registered.
@@ -1715,6 +1744,65 @@ void test_haptic_motors(IGameInput* input) {
 
 }  // namespace
 
+// A pad plugged in after the title started, with the title holding a dispatcher (RT-GAMEINPUT-LATE-PAD). The title
+// registers its device callback with no pad present, a first pad arrives and is moved on every poll (the keyboard pad's
+// mouse stick), and the title runs one queued item a frame (Dispatch(0)). No reading callback is registered, so those
+// readings are work no callback wants: they must not queue ahead of the second pad's connect event.
+void test_late_pad_behind_dispatcher(IGameInput* input) {
+    check(rt::gameinput::connected_count() == 0, "late pad: nothing connected at the start");
+    IGameInputDispatcher* dispatcher = nullptr;
+    check(input->CreateDispatcher(&dispatcher) == S_OK && dispatcher, "late pad: CreateDispatcher");
+    if (!dispatcher) return;
+    GameInputCallbackToken token = 0;
+    check(input->RegisterDeviceCallback(nullptr, GameInputKindGamepad, GameInputDeviceConnected,
+                                        GameInputBlockingEnumeration, nullptr, on_device, &token) == S_OK,
+          "late pad: RegisterDeviceCallback with no pad present");
+    const auto connects_to_us = [&](IGameInputDevice** last) {
+        size_t n = 0;
+        for (const DeviceEvent& e : g_device_events)
+            if (e.token == token && e.previous == GameInputDeviceNoStatus && (e.current & GameInputDeviceConnected)) {
+                ++n;
+                if (last) *last = e.device;
+            }
+        return n;
+    };
+    Pad first, late;
+    attach(first, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+    rt::gameinput::poll();
+    while (dispatcher->Dispatch(0)) {}
+    check(connects_to_us(nullptr) == 1, "late pad: the first pad's connect reaches the callback");
+
+    int16_t x = 0;
+    const auto frame = [&] {  // four polls with the first pad's stick moving, then one item dispatched
+        for (int i = 0; i < 4; ++i) {
+            x = static_cast<int16_t>(x == 8000 ? -8000 : 8000);
+            SDL_SetJoystickVirtualAxis(first.js, SDL_GAMEPAD_AXIS_RIGHTX, x);
+            rt::gameinput::poll();
+        }
+        dispatcher->Dispatch(0);
+    };
+    for (int f = 0; f < 50; ++f) frame();
+    attach(late, "Leonida virtual DualSense", 0x054C, 0x0CE6, false, true);
+    for (int f = 0; f < 10 && connects_to_us(nullptr) < 2; ++f) frame();
+    IGameInputDevice* late_dev = nullptr;
+    check(connects_to_us(&late_dev) == 2 && late_dev && late_dev->GetDeviceInfo()->vendorId == 0x054C,
+          "late pad: a pad connected later reaches the callback within a few frames");
+    if (late_dev && late.js) {
+        SDL_SetJoystickVirtualButton(late.js, SDL_GAMEPAD_BUTTON_SOUTH, true);
+        rt::gameinput::poll();
+        IGameInputReading* r = current(input, late_dev);
+        check(buttons_of(r) & GameInputGamepadA, "late pad: its A press reads through the device it was handed");
+        if (r) r->Release();
+    }
+    input->UnregisterCallback(token, 0);
+    while (dispatcher->Dispatch(UINT64_MAX)) {}
+    dispatcher->Release();
+    detach(first);
+    detach(late);
+    rt::gameinput::poll();
+    check(rt::gameinput::connected_count() == 0, "late pad: both pads closed");
+}
+
 int main(int argc, char** argv) {
     // Only virtual pads: no real controller on the test machine may show up.
     for (const char* hint : {SDL_HINT_JOYSTICK_HIDAPI, SDL_HINT_JOYSTICK_RAWINPUT, SDL_HINT_JOYSTICK_WGI,
@@ -2126,6 +2214,32 @@ int main(int argc, char** argv) {
     if (wait) CloseHandle(wait);
     if (dispatcher) dispatcher->Release();
 
+    // ---- GAMEINPUT_CURRENT_CALLBACK_TOKEN_VALUE: the running callback inside one, nothing outside ----
+    // Measured on the host's GameInput (0.2309, Windows 11): UnregisterCallback(CURRENT) inside a callback returns
+    // true and removes it; outside a callback it returns false.
+    check(!input->UnregisterCallback(kCurrentCallbackToken, 0), "current token: UnregisterCallback outside a callback is false");
+    input->StopCallback(kCurrentCallbackToken);  // outside a callback: names nothing, stops nothing
+    g_self_input = input;
+    for (bool stop : {false, true}) {
+        g_self_stop = stop;
+        g_self_calls = 0;
+        g_self_result = false;
+        GameInputCallbackToken self_token = 0;
+        check(input->RegisterReadingCallback(dev, GameInputKindGamepad, 0.0f, nullptr, on_self_cancel, &self_token) == S_OK,
+              "current token: register the self-cancelling callback");
+        for (bool down : {true, false, true, false}) {  // four changes: without the token a callback sees several
+            SDL_SetJoystickVirtualButton(xbox.js, SDL_GAMEPAD_BUTTON_NORTH, down);
+            rt::gameinput::poll();
+        }
+        check(g_self_calls == 1, stop ? "current token: StopCallback inside the callback stops it (one call for four changes)"
+                                      : "current token: UnregisterCallback inside the callback removes it (one call for four changes)");
+        if (stop)
+            check(input->UnregisterCallback(self_token, 0), "current token: the stopped callback stays registered");
+        else
+            check(g_self_result && !input->UnregisterCallback(self_token, 0),
+                  "current token: UnregisterCallback returned true and the real token is gone");
+    }
+
     // ---- unplug and replug ----
     const size_t events_before_unplug = g_device_events.size();
     detach(xbox);
@@ -2265,6 +2379,52 @@ int main(int argc, char** argv) {
     release_all(seen);
     if (pair_ref) pair_ref->Release();
 
+    // A slow reader: a press that came and went between two reads of a pad is answered once, then the real state.
+    // Sleeps are 150 ms, three times kSlowReaderUs (50 ms), so a loaded CI machine cannot make the reader look fast.
+    if (IGameInputReading* r = current(input, dev)) r->Release();
+    Sleep(150);
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, true);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, false);
+    rt::gameinput::poll();
+    {
+        IGameInputReading* first = current(input, dev);
+        IGameInputReading* second = current(input, dev);
+        check(first && second && (buttons_of(first) & GameInputGamepadX) && !(buttons_of(second) & GameInputGamepadX),
+              "a slow reader sees a missed press once");
+        if (first) first->Release();
+        if (second) second->Release();
+    }
+
+    // Two slow-read pads: each one's missed press comes back on its own pad only.
+    if (IGameInputReading* r = current(input, dev)) r->Release();
+    if (IGameInputReading* r = current(input, dsdev)) r->Release();
+    Sleep(150);
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, true);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, false);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(ds.js, SDL_GAMEPAD_BUTTON_NORTH, true);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(ds.js, SDL_GAMEPAD_BUTTON_NORTH, false);
+    rt::gameinput::poll();
+    {
+        IGameInputReading* ds_first = current(input, dsdev);
+        IGameInputReading* x_first = current(input, dev);
+        IGameInputReading* ds_second = current(input, dsdev);
+        IGameInputReading* x_second = current(input, dev);
+        check(ds_first && device_of(ds_first) == dsdev && (buttons_of(ds_first) & GameInputGamepadY) &&
+                  !(buttons_of(ds_first) & GameInputGamepadX),
+              "two slow-read pads: the DualSense gets its own missed press, not the Xbox pad's");
+        check(x_first && device_of(x_first) == dev && (buttons_of(x_first) & GameInputGamepadX) &&
+                  !(buttons_of(x_first) & GameInputGamepadY),
+              "two slow-read pads: the Xbox pad gets its own missed press, not the DualSense's");
+        check(ds_second && x_second && !(buttons_of(ds_second) & GameInputGamepadY) && !(buttons_of(x_second) & GameInputGamepadX),
+              "two slow-read pads: each missed press comes once");
+        for (IGameInputReading* r : {ds_first, x_first, ds_second, x_second})
+            if (r) r->Release();
+    }
+
     // Ageing: a reading leaves the history once the reading after it is more than half a second old.
     IGameInputReading* aged = current(input, dev);
     SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, true);
@@ -2314,6 +2474,25 @@ int main(int argc, char** argv) {
     check(idle && aged && fresh && idle->Release() == 0 && aged->Release() == 0 && fresh->Release() == 0,
           "history: dropped readings are freed once the title releases them");
 
+    // Unplugging drops a pending missed press: the first slow read after replugging is the pad's real state.
+    if (IGameInputReading* r = current(input, dev)) r->Release();
+    Sleep(150);
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, true);
+    rt::gameinput::poll();
+    SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, false);
+    rt::gameinput::poll();
+    detach(xbox2);
+    rt::gameinput::poll();
+    attach(xbox2, "Leonida virtual Xbox pad", 0x045E, 0x0B12, true);
+    rt::gameinput::poll();
+    Sleep(150);
+    {
+        IGameInputReading* after = current(input, dev);
+        check(after && device_of(after) == dev && !(buttons_of(after) & GameInputGamepadX),
+              "close_pad drops a pending missed press: no stale press after replugging");
+        if (after) after->Release();
+    }
+
     if (reading) reading->Release();
     dev->Release();
     detach(xbox2);
@@ -2330,6 +2509,7 @@ int main(int argc, char** argv) {
     test_haptic_motors(input);
     test_raw_hid(input);
     test_raw_report_during_reconnect(input);
+    test_late_pad_behind_dispatcher(input);
     input->Release();
 
     std::printf("%d checks, %d failures\n", g_checks, g_failures);

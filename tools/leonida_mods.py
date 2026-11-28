@@ -61,6 +61,14 @@ class Swap:
 
 
 @dataclass
+class Camera:
+    """A manifest's "camera" section (docs/modding.md, "First-person view")."""
+    view_mode: str
+    first_person_value: int = 4
+    contexts: list[int] = field(default_factory=list)
+
+
+@dataclass
 class ModInfo:
     folder: str
     path: str
@@ -68,6 +76,7 @@ class ModInfo:
     enabled: bool
     game_version: str
     swaps: list[Swap] = field(default_factory=list)
+    camera: Camera | None = None
     warnings: list[str] = field(default_factory=list)
     raw: dict = field(default_factory=dict)
 
@@ -92,6 +101,9 @@ def joaat(name: str) -> int:
 def parse_model_id(text: str) -> int:
     if not isinstance(text, str) or not text:
         raise ValueError("empty model name")
+    text = text.strip()
+    if not text:
+        raise ValueError("empty model name")
     if text.startswith(("0x", "0X")):
         digits = text[2:]
         if not digits:
@@ -100,6 +112,41 @@ def parse_model_id(text: str) -> int:
             raise ValueError(f"{text} is not a 32-bit hash")
         return int(digits, 16)
     return joaat(text)
+
+
+def whole_number(value: object, maximum: int) -> bool:
+    """A JSON number that is a whole value in [0, maximum], as `whole_number` in runtime/src/mods.h: 4.0 counts,
+    true and "4" do not."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 <= value <= maximum and \
+        value == int(value)
+
+
+def parse_camera(data: dict, folder: str) -> Camera | None:
+    """The "camera" section, checked as `parse_mod` in runtime/src/mods.h checks it, so `check` refuses what the
+    runtime would skip. None when the manifest has no such section."""
+    if "camera" not in data:
+        return None
+    section = data["camera"]
+    if not isinstance(section, dict):
+        raise ModsError(f'{folder}: "camera" must be an object')
+    view = section.get("view_mode")
+    if not isinstance(view, str) or view not in ("first_person", "default"):
+        raise ModsError(f'{folder}: "camera": "view_mode" must be "first_person" or "default"')
+    camera = Camera(view)
+    if "first_person_value" in section:
+        if not whole_number(section["first_person_value"], 255):
+            raise ModsError(f'{folder}: "camera": "first_person_value" must be a whole number 0-255')
+        camera.first_person_value = int(section["first_person_value"])
+    if "contexts" in section:
+        contexts = section["contexts"]
+        if not isinstance(contexts, list):
+            raise ModsError(f'{folder}: "camera": "contexts" must be a list of numbers')
+        for context in contexts:
+            if not whole_number(context, 0xFFFFFFFF):
+                raise ModsError(f'{folder}: "camera": "contexts" must be a list of whole numbers from 0 to '
+                                "4294967295")
+            camera.contexts.append(int(context))
+    return camera
 
 
 def validate_manifest(data: object, folder: str, path: str = "") -> ModInfo:
@@ -121,13 +168,10 @@ def validate_manifest(data: object, folder: str, path: str = "") -> ModInfo:
         raise ModsError(f'{folder}: "enabled" must be true or false')
     mod.enabled = enabled
     swaps = data.get("archetype_swaps")
-    if swaps is None:
-        mod.warnings.append("no archetype_swaps; this mod currently changes nothing")
-        return mod
-    if not isinstance(swaps, list):
+    if "archetype_swaps" in data and not isinstance(swaps, list):   # null too, as the runtime
         raise ModsError(f'{folder}: "archetype_swaps" must be a list')
     seen = {}
-    for index, item in enumerate(swaps):
+    for index, item in enumerate(swaps or []):
         label = f"archetype_swaps[{index}]"
         if not isinstance(item, dict) or not isinstance(item.get("from"), str) or \
                 not isinstance(item.get("to"), str):
@@ -148,15 +192,32 @@ def validate_manifest(data: object, folder: str, path: str = "") -> ModInfo:
             mod.warnings.append(f'{label} repeats {seen[swap.from_id]}; the later swap wins')
         seen[swap.from_id] = label
         mod.swaps.append(swap)
-    if not mod.swaps:
-        mod.warnings.append("archetype_swaps is empty; this mod currently changes nothing")
+    mod.camera = parse_camera(data, folder)
+    if not mod.swaps and mod.camera is None:
+        # A "camera" section is a change of its own (mods/first_person has nothing else).
+        mod.warnings.append(("no archetype_swaps" if swaps is None else "archetype_swaps is empty") +
+                            "; this mod currently changes nothing")
     return mod
+
+
+def manifest_text(path: str) -> str:
+    """mod.json's text, read the way `parse_mod` in runtime/src/mods.h reads it: a UTF-8 byte-order mark in front
+    (Notepad's "UTF-8 with BOM", Windows PowerShell 5.1's `-Encoding utf8`) is skipped, and UTF-16 (PowerShell
+    5.1's `>`) is named instead of being reported as broken JSON."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    elif len(raw) >= 2 and (raw[:2] in (b"\xff\xfe", b"\xfe\xff") or 0 in raw[:2]):
+        raise ModsError(f"{MANIFEST} is UTF-16; save it as UTF-8")
+    return raw.decode("utf-8")
 
 
 def read_manifest(path: str, folder: str) -> ModInfo:
     try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
+        data = json.loads(manifest_text(path))
+    except ModsError as exc:
+        raise ModsError(f"{folder}: {exc}") from None
     except UnicodeDecodeError as exc:
         raise ModsError(f"{folder}: {MANIFEST} is not UTF-8 ({exc})") from exc
     except json.JSONDecodeError as exc:
@@ -241,6 +302,20 @@ def safe_folder_name(text: str) -> str:
     return cleaned or "mod"
 
 
+def portable_name(name: str) -> bool:
+    """True when `name` is a file or folder name Windows and POSIX both keep as written: no separator, control or
+    reserved character, no trailing dot or space, and not a device name (`NUL`, `con.txt`, `COM1 .log`).
+
+    This is the test for a name that already exists, such as a package member. `safe_folder_name` is not: it makes
+    a tidy folder label out of free text, so it also collapses runs of spaces and cuts at 80 characters, and a name
+    it would have written differently is not thereby unsafe."""
+    if not name or name in (".", "..") or name != name.rstrip(" ."):
+        return False
+    if any(ord(c) < 32 or c in '<>:"/\\|?*' for c in name):
+        return False
+    return name.split(".", 1)[0].rstrip(" ").upper() not in WINDOWS_RESERVED
+
+
 def simple_selector(name: str) -> str:
     if not name or name in (".", "..") or os.path.basename(name) != name:
         raise ModsError(f"{name!r} is not an installed mod folder name")
@@ -289,7 +364,7 @@ def zip_parts(name: str) -> tuple[str, ...]:
     if not parts or parts[0] == "/" or ".." in parts or "." in parts:
         raise ModsError(f"unsafe ZIP member name {name!r}")
     for part in parts:
-        if safe_folder_name(part) != part:
+        if not portable_name(part):
             raise ModsError(f"unsafe ZIP member name {name!r}")
     return parts
 
@@ -325,9 +400,8 @@ def write_manifest(path: str, data: dict) -> None:
 
 def set_enabled_in_manifest(manifest_path: str, enabled: bool) -> None:
     try:
-        with open(manifest_path, encoding="utf-8") as f:
-            data = json.load(f)
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        data = json.loads(manifest_text(manifest_path))
+    except (ModsError, OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ModsError(f"cannot update {manifest_path}: {exc}") from exc
     if not isinstance(data, dict):
         raise ModsError(f"{manifest_path} is not a JSON object")
@@ -488,10 +562,15 @@ def pack_mod(mods_dir: str, selector: str, output: str, force: bool) -> str:
         dirs.sort()
         for name in sorted(files):
             full = os.path.join(base, name)
+            member = PurePosixPath(folder, os.path.relpath(full, path).replace(os.sep, "/")).as_posix()
+            try:
+                zip_parts(member)       # what install checks: a package this writes is one it accepts
+            except ModsError:
+                raise ModsError(f"{full} has a name a package cannot carry (install would refuse it); "
+                                "rename it and pack again") from None
             if same_report_path(output, full):
                 raise ModsError("the package output aliases a file in the mod being packed")
-            member = PurePosixPath(folder, os.path.relpath(full, path).replace(os.sep, "/"))
-            members.append((full, member.as_posix()))
+            members.append((full, member))
     os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED) as archive:
         for full, member in members:
@@ -558,6 +637,13 @@ def port_from_mods_dir(mods_dir: str | None) -> str | None:
     return None
 
 
+def describe_camera(camera: Camera) -> str:
+    if camera.view_mode != "first_person":
+        return "default (the game's own view)"
+    contexts = "contexts " + ", ".join(str(c) for c in camera.contexts) if camera.contexts else "every context"
+    return f"first_person (value {camera.first_person_value}; {contexts})"
+
+
 def swap_conflicts(mods: list[ModInfo]) -> tuple[dict[tuple[str, int], str], list[dict[str, str]]]:
     """Find enabled archetype swaps that override an earlier enabled swap in load order."""
     previous: dict[int, str] = {}
@@ -586,10 +672,13 @@ def print_report(mods_dir: str, mods: list[ModInfo], errors: list[str]) -> None:
         print("no mods installed")
         return
     overrides, _ = swap_conflicts(mods)
+    camera_owner = None
     for mod in mods:
         state = "enabled" if mod.enabled else "disabled"
         version = f", game {mod.game_version}" if mod.game_version else ""
         swaps = f"{len(mod.swaps)} swap" + ("" if len(mod.swaps) == 1 else "s")
+        if mod.camera is not None:
+            swaps += ", camera"
         print(f"{mod.folder}: {mod.name} [{state}; {swaps}{version}]")
         for warning in mod.warnings:
             print(f"  warning: {warning}")
@@ -598,6 +687,12 @@ def print_report(mods_dir: str, mods: list[ModInfo], errors: list[str]) -> None:
             conflict = f"  (overrides {prev})" if prev else ""
             print(f"  archetype {swap.from_name} (0x{swap.from_id:08X}) -> {swap.to_name} "
                   f"(0x{swap.to_id:08X}){conflict}")
+        if mod.camera is not None:
+            # The last enabled folder with a "camera" section decides (camera_of in runtime/src/mods.h).
+            conflict = f"  (overrides {camera_owner})" if mod.enabled and camera_owner else ""
+            print(f"  camera {describe_camera(mod.camera)}{conflict}")
+            if mod.enabled:
+                camera_owner = mod.folder
     for error in errors:
         print(f"skipped {error}")
 
@@ -625,6 +720,11 @@ def report_json(mods_dir: str, mods: list[ModInfo], errors: list[str]) -> str:
             "game_version": m.game_version,
             "warnings": m.warnings,
             "archetype_swaps": [swap_entry(m, idx, s) for idx, s in enumerate(m.swaps)],
+            "camera": None if m.camera is None else {
+                "view_mode": m.camera.view_mode,
+                "first_person_value": m.camera.first_person_value,
+                "contexts": m.camera.contexts,
+            },
         } for m in mods],
         "conflicts": conflicts,
         "errors": errors,

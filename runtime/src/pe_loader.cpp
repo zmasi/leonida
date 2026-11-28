@@ -2,6 +2,7 @@
 
 #include <windows.h>
 #include <intrin.h>
+#include <share.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
@@ -10,7 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <fstream>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -77,9 +78,16 @@ std::string path_utf8(const std::filesystem::path& path) {
 }
 
 std::vector<uint8_t> read_file(const std::filesystem::path& p) {
-    std::ifstream f(p, std::ios::binary);
-    if (!f) throw std::runtime_error("cannot open " + path_utf8(p));
-    return {std::istreambuf_iterator<char>(f), {}};
+    std::unique_ptr<std::FILE, decltype(&std::fclose)> file(
+        _wfsopen(p.c_str(), L"rb", _SH_DENYNO), std::fclose);
+    if (!file) throw std::runtime_error("cannot open " + path_utf8(p));
+
+    std::vector<uint8_t> bytes;
+    std::array<uint8_t, 64 * 1024> block;
+    while (const auto count = std::fread(block.data(), 1, block.size(), file.get()))
+        bytes.insert(bytes.end(), block.data(), block.data() + count);
+    if (std::ferror(file.get())) throw std::runtime_error("cannot read " + path_utf8(p));
+    return bytes;
 }
 
 template <class T>
@@ -1526,6 +1534,8 @@ void* Loader::load_runtime_module_w(const std::wstring& basename, uint32_t flags
         if (prefer_host_copy(narrow)) return nullptr;
 
     std::lock_guard lock(mutex_);
+    // As load_runtime_module: a run-time load, so DllMain gets a null lpvReserved.
+    const RuntimeLoadScope dynamic(runtime_loads_);
     Module* existing = find_wide_module(basename);
     const std::filesystem::path candidate = game_dir_ / basename;
     std::error_code ec;
@@ -1912,6 +1922,25 @@ void Loader::initialize_tls(Module& m) {
                 throw std::runtime_error(m.name + ": reserved TLS index is out of range");
         }
 
+        // An EXE's code may read its TLS at index 0 directly (/GA); index 0 is gta6rt.exe's here (pe_loader.h,
+        // tls_ga_slot). Patched before any of the image's code runs, TLS callbacks included, and before the owner is
+        // published below: from then on a thread event (install_thread_block) reads m.tls_ga_slot
+        // (RT-LOADER-RUNTIME-SCOPE-AND-TLS-SLOT).
+        if (executable && total && index != 0 && ga_tls_patch_enabled()) {
+            static const DWORD ga_slot = TlsAlloc();
+            if (ga_slot == TLS_OUT_OF_INDEXES || ga_slot >= 64) {
+                std::fprintf(stderr, "[rt] loader: %s: no TlsAlloc slot below 64 for its index-0 TLS reads\n",
+                             m.name.c_str());
+            } else {
+                m.tls_ga_sites = patch_ga_tls_reads(m, ga_slot);
+                if (m.tls_ga_sites) m.tls_ga_slot = ga_slot;
+                std::fprintf(stderr,
+                             "[rt] loader: %s: %zu index-0 TLS reads (gs:[58h]) now read its own TLS (TlsSlots[%lu]); "
+                             "its module TLS index is %u\n",
+                             m.name.c_str(), m.tls_ga_sites, static_cast<unsigned long>(ga_slot), index);
+            }
+        }
+
         // The fields are complete before a thread event can see the owner.
         ExclusiveTlsLock lock;
         Module* expected = nullptr;
@@ -1929,26 +1958,6 @@ void Loader::initialize_tls(Module& m) {
         // The index lives in a writable section and protect_sections() has not run yet, so the write needs no
         // VirtualProtect dance.
         if (index_rva) *reinterpret_cast<uint32_t*>(m.base + index_rva) = index;
-    }
-    {
-        // An EXE's code may read its TLS at index 0 directly (/GA); index 0 is gta6rt.exe's here (pe_loader.h,
-        // tls_ga_slot). Patched before any of the image's code runs, TLS callbacks included.
-        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m.base);
-        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m.base + dos->e_lfanew);
-        if (!(nt->FileHeader.Characteristics & IMAGE_FILE_DLL) && total && index != 0 && ga_tls_patch_enabled()) {
-            static const DWORD ga_slot = TlsAlloc();
-            if (ga_slot == TLS_OUT_OF_INDEXES || ga_slot >= 64) {
-                std::fprintf(stderr, "[rt] loader: %s: no TlsAlloc slot below 64 for its index-0 TLS reads\n",
-                             m.name.c_str());
-            } else {
-                m.tls_ga_sites = patch_ga_tls_reads(m, ga_slot);
-                if (m.tls_ga_sites) m.tls_ga_slot = ga_slot;
-                std::fprintf(stderr,
-                             "[rt] loader: %s: %zu index-0 TLS reads (gs:[58h]) now read its own TLS (TlsSlots[%lu]); "
-                             "its module TLS index is %u\n",
-                             m.name.c_str(), m.tls_ga_sites, static_cast<unsigned long>(ga_slot), index);
-            }
-        }
     }
     try {
         install_thread_block(m);

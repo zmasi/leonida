@@ -114,7 +114,7 @@ Vulkan layer is not playable on any platform yet. What runs where today, for the
 | macOS (Apple Silicon) | The Python tools and the Vulkan test tools run natively, on MoltenVK (Homebrew) or KosmicKrisp. The runtime is Windows code and runs as on Linux, under Wine: CrossOver, arm64 with FEX or x86-64 under Rosetta (#1706, #1707, #1924; #3119 fixes the last loader tests there). Known gaps: no geometry stage and no `VK_EXT_mesh_shader` (those tests are skipped), 32-wide subgroups (wave64 shaders run emulated), and MoltenVK's float handling (`PerVertexKHR`, NaN compares, -0, the cost of `NoContraction`); [docs/testing.md](docs/testing.md) lists each (#2947). |
 | AMD RDNA1 (RX 5000) | A supported target: close to the console's RDNA2, and its 64-wide subgroups run the wave64 shaders natively. RX 5700 XT results pass the GPU test suite (#146); on RADV, pixel shaders without fragment barycentrics have a known difference (*Known problems* in [docs/testing.md](docs/testing.md)) (#330). |
 
-GPU results from every platform are collected in #166; how to run the tests is in [docs/testing.md](docs/testing.md).
+GPU results from every platform are submitted as pull requests adding a file to [gpu-test-results/](gpu-test-results); how to run the tests is in [docs/testing.md](docs/testing.md).
 
 ## How to build
 
@@ -229,6 +229,12 @@ skips a shader without `shaderSignedZeroInfNanPreserveFloat32`; needs PR #664's 
 `VK_KHR_maintenance8`) and `--mesh-compute` (mesh shaders as compute, for devices without `VK_EXT_mesh_shader`;
 on by itself on Intel's Windows Vulkan driver, whose native mesh draws crash, BUILD-2202, unless `--native-mesh`).
 Each is documented in [docs/design.md](docs/design.md).
+
+`--mesh-serial-waves` is forwarded and saved the same way. It is off by default: with wave64 emulation it runs
+the waves of a mesh shader one after the other in 64 invocations instead of side by side (docs/design.md, "Mesh
+shaders with their waves in series"). Only a wave64 mesh shader of more than 64 threads, a multiple of 64, with no
+LDS instruction, store or atomic takes that form; every other shader, and every shader translated natively or with
+`--mesh-compute`, comes out as before, so turning it on retranslates everything but changes only those.
 
 The build records which llvm-mc command and version produced the disassembly. Changing either, or reusing a work
 folder that predates this record, reruns disassembly and translation while keeping the extracted shader inputs.

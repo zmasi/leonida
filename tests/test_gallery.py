@@ -1,8 +1,10 @@
 """Unit tests for tools/gallery.py standalone 3D Studio & Asset Gallery server."""
 import functools
+import http.server
 import json
 import io
 import os
+import re
 import socket
 import struct
 import sys
@@ -676,6 +678,7 @@ class TestGalleryCommandLine(unittest.TestCase):
                               side_effect=[OSError("address in use"), None]) as bind,
             mock.patch.object(gallery.http.server.HTTPServer, "server_port", 8081, create=True),
             mock.patch.object(gallery.http.server.HTTPServer, "serve_forever") as serve,
+            mock.patch.object(gallery.http.server.HTTPServer, "server_close") as close,
             mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
         ):
             self.assertEqual(gallery.main(["--models-dir", assets, "--textures-dir", assets, "--no-browser"]), 0)
@@ -683,6 +686,98 @@ class TestGalleryCommandLine(unittest.TestCase):
                              [("127.0.0.1", 8080), ("127.0.0.1", 8081)])
             self.assertIn("http://localhost:8081", stdout.getvalue())
             serve.assert_called_once_with()
+            close.assert_called_once_with()
+
+    def test_ephemeral_port_zero_reports_actual_bound_port_and_closes_socket(self) -> None:
+        orig_close = gallery.http.server.HTTPServer.server_close
+        closed_filenos: list[int] = []
+
+        def spy_close(server: gallery.http.server.HTTPServer) -> None:
+            orig_close(server)
+            closed_filenos.append(server.socket.fileno())
+
+        with (
+            tempfile.TemporaryDirectory() as assets,
+            mock.patch.object(gallery.webbrowser, "open") as open_browser,
+            mock.patch.object(gallery.http.server.HTTPServer, "serve_forever", return_value=None),
+            mock.patch.object(gallery.http.server.HTTPServer, "server_close", autospec=True, side_effect=spy_close),
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO) as stdout,
+        ):
+            gallery.start_server(
+                port=0, models_dir=assets, textures_dir=assets, open_browser=True, retry_next_port=False,
+            )
+
+        open_browser.assert_called_once()
+        url = open_browser.call_args.args[0]
+        match = re.fullmatch(r"http://localhost:(\d+)", url)
+        self.assertIsNotNone(match, url)
+        port = int(match.group(1))
+        self.assertGreater(port, 0)
+        self.assertLessEqual(port, 65535)
+        self.assertIn(f"Web Studio URL:     {url}", stdout.getvalue())
+        self.assertEqual(closed_filenos, [-1])
+
+    def test_occupied_port_is_refused_and_implicit_port_falls_back_on_real_sockets(self) -> None:
+        first = None
+        for _ in range(10):
+            candidate = http.server.HTTPServer(("127.0.0.1", 0), gallery.StudioHandler)
+            port = candidate.server_port
+            if port < 65535:
+                try:
+                    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+                        probe.bind(("127.0.0.1", port + 1))
+                    first = candidate
+                    break
+                except OSError:
+                    pass
+            candidate.server_close()
+        self.assertIsNotNone(first, "could not allocate an adjacent ephemeral port pair")
+
+        try:
+            with tempfile.TemporaryDirectory() as assets:
+                with (
+                    mock.patch.object(gallery.http.server.HTTPServer, "serve_forever", return_value=None),
+                    mock.patch.object(sys, "stdout", new_callable=io.StringIO),
+                ):
+                    with self.assertRaisesRegex(gallery.GalleryListenError, f"can't listen on port {first.server_port}"):
+                        gallery.start_server(
+                            port=first.server_port, models_dir=assets, textures_dir=assets,
+                            open_browser=False, retry_next_port=False,
+                        )
+
+                stdout = io.StringIO()
+                with (
+                    mock.patch.object(gallery.http.server.HTTPServer, "serve_forever", return_value=None),
+                    mock.patch.object(sys, "stdout", stdout),
+                ):
+                    gallery.start_server(
+                        port=first.server_port, models_dir=assets, textures_dir=assets,
+                        open_browser=False, retry_next_port=True,
+                    )
+                self.assertIn(f"http://localhost:{first.server_port + 1}", stdout.getvalue())
+        finally:
+            first.server_close()
+
+    def test_server_socket_closes_when_browser_launch_fails(self) -> None:
+        orig_close = gallery.http.server.HTTPServer.server_close
+        closed_filenos: list[int] = []
+
+        def spy_close(server: gallery.http.server.HTTPServer) -> None:
+            orig_close(server)
+            closed_filenos.append(server.socket.fileno())
+
+        with (
+            tempfile.TemporaryDirectory() as assets,
+            mock.patch.object(gallery.webbrowser, "open", side_effect=RuntimeError("no browser")),
+            mock.patch.object(gallery.http.server.HTTPServer, "server_close", autospec=True, side_effect=spy_close),
+            mock.patch.object(sys, "stdout", new_callable=io.StringIO),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "no browser"):
+                gallery.start_server(
+                    port=0, models_dir=assets, textures_dir=assets, open_browser=True, retry_next_port=False,
+                )
+
+        self.assertEqual(closed_filenos, [-1])
 
 
 if __name__ == "__main__":

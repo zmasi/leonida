@@ -359,13 +359,16 @@ def write_json_report(path, report):
     try:
         with staged:
             json.dump(report, staged, indent=1)
-        if os.name != "nt":
-            os.chmod(staged.name, published_mode(destination))
+        os.chmod(staged.name, published_mode(destination))
         replace_retry(staged.name, destination)
     finally:
         try:
+            os.chmod(staged.name, 0o600)
+        except OSError:
+            pass
+        try:
             os.unlink(staged.name)
-        except FileNotFoundError:
+        except OSError:
             pass
 
 

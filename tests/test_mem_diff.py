@@ -202,5 +202,58 @@ class GlobalOffsetRegression(unittest.TestCase):
         self.assertEqual(status, "match", detail)
 
 
+class CompareAndHarnessRegression(unittest.TestCase):
+    def _simple_prog(self):
+        return program(
+            ["v_mov_b32 v8, 1", "v_mov_b32 v9, 2", "v_mov_b32 v10, 3", "v_mov_b32 v11, 4"],
+            {},
+        )
+
+    def test_interpreter_bug_is_harness_error_not_skip(self):
+        from unittest import mock
+
+        prog = self._simple_prog()
+        with mock.patch.object(md, "run_fragment", side_effect=md.UnsupportedConstruct("unsupported op")):
+            status, detail = md.run_one("ps_mem_unsup", prog)
+        self.assertEqual(status, "skip")
+        self.assertIn("mini_interp unsupported", detail)
+
+        with mock.patch.object(md, "run_fragment", side_effect=RuntimeError("interpreter bug")):
+            with self.assertRaisesRegex(RuntimeError, "interpreter bug"):
+                md.run_one("ps_mem_bug", prog)
+            counts, first = md.run_suite(1, seed=1, max_ops=1, families=["s_load"])
+        self.assertEqual(counts["harness-error"], 1)
+        self.assertEqual(counts["skip"], {})
+        self.assertIn("interpreter bug", first)
+
+    def test_zero_valued_extra_memory_entry_matches_without_index_error(self):
+        from unittest import mock
+
+        prog = self._simple_prog()
+
+        def fake_run_fragment(_spvasm, memory=None):
+            memory[0x9000] = 0
+            return {"%out_mrt0": [1, 2, 3, 4]}
+
+        with mock.patch.object(md, "run_fragment", side_effect=fake_run_fragment):
+            status, detail = md.run_one("ps_mem_zero_mem", prog)
+        self.assertEqual((status, detail), ("match", ""))
+
+    def test_overlong_export_reports_shape_mismatch_without_index_error(self):
+        from unittest import mock
+
+        prog = self._simple_prog()
+        with mock.patch.object(md, "run_fragment", return_value={"%out_mrt0": [1, 2, 3, 4, 5]}):
+            status, detail = md.run_one("ps_mem_overlong", prog)
+        self.assertEqual(status, "mismatch")
+        self.assertIn("expected 4 words, translated 5", detail)
+
+    def test_duplicate_families_do_not_skew_generation(self):
+        dedup = md.generate_program(random.Random(9), 12, families=["s_load", "global"])
+        duped = md.generate_program(random.Random(9), 12, families=["s_load", "s_load", "s_load", "global"])
+        self.assertEqual(duped.lines, dedup.lines)
+        self.assertEqual(duped.memory, dedup.memory)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -387,9 +387,19 @@ def main(argv: list[str] | None = None) -> int:
             if source and same_report_path(args.json, source):
                 ap.error(f"--json {args.json} would overwrite the input {source}")
 
+    if args.header is not None and not os.path.isfile(args.header):
+        print(f"ERROR: d3d12.h not found: {args.header}", file=sys.stderr)
+        return 2
     known: dict[str, uuid.UUID] = {}
     if header and os.path.isfile(header):
-        known.update(read_iids(header))
+        try:
+            known.update(read_iids(header))
+        except OSError as e:
+            print(f"ERROR: cannot read {header}: {e.strerror or e}", file=sys.stderr)
+            return 2
+        except ValueError as e:
+            print(f"ERROR: cannot read {header}: a MIDL_INTERFACE GUID is malformed ({e})", file=sys.stderr)
+            return 2
     for pair in args.known:
         name, _, value = pair.partition("=")
         try:

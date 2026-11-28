@@ -170,6 +170,15 @@ def blob_rows(path, limit=None):
     return rows
 
 
+def lookup_stage(stages, stem):
+    """Return the exact stage for stem, or an unambiguous case-folded match."""
+    if stem in stages:
+        return stages[stem]
+    folded = stem.casefold()
+    matched = [stage for key, stage in stages.items() if key.casefold() == folded]
+    return matched[0] if len(matched) == 1 else None
+
+
 def summarize(row, stage=None):
     """Decode one blob_rows() row for the text and JSON output."""
     out = {"name": row["name"], "payload": row["payload"], "stage": stage}
@@ -223,6 +232,9 @@ def main(argv=None):
     if not os.path.exists(args.path):
         print(f"ERROR: {args.path} does not exist", file=sys.stderr)
         return 2
+    if not (os.path.isfile(args.path) or os.path.isdir(args.path)):
+        print(f"ERROR: {args.path} is not a file or directory", file=sys.stderr)
+        return 2
     try:
         rows = blob_rows(args.path, args.limit)
     except OSError as e:
@@ -230,12 +242,12 @@ def main(argv=None):
         return 2
     try:
         stages = fssm_header.stage_index(args.path)
-    except RecursionError:
+    except (OSError, ValueError, RecursionError):
         stages = {}
     decoded = []
     for row in rows:
         stem = os.path.splitext(row["name"])[0]
-        decoded.append(summarize(row, stages.get(stem)))
+        decoded.append(summarize(row, lookup_stage(stages, stem)))
     summary = tally(decoded)
 
     if args.json:
@@ -266,7 +278,8 @@ def main(argv=None):
     if total["stage_known"]:
         print(f"API stage matches the index: {total['stage_matches']}/{total['stage_known']}")
     else:
-        print("(no index.json found: no stage to compare the API id with)")
+        why = "no inspected blob in index.json" if stages else "no index.json found"
+        print(f"({why}: no stage to compare the API id with)")
     return 0
 
 

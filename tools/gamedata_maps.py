@@ -62,10 +62,13 @@ import math
 import os
 import struct
 import sys
+import tempfile
 import unicodedata
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import file_mode  # noqa: E402
+import replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 MAGIC = (b"MHIU", b"PAMH")
@@ -205,13 +208,14 @@ def parse_pamh(blob: bytes) -> dict:
             raise ValueError(f"PAMH row {y} leaves the {width}-cell width")
         if start == 0 and count == width:
             full_width += 1
-        for i in range(count):
-            x = start + i
-            at = offset + x
-            if at < 0 or at >= half:
-                raise ValueError(f"PAMH row {y} leaves the {half}-cell row data")
-            maximum[y * width + x] = data[at]
-            minimum[y * width + x] = data[half + at]
+        if count == 0:
+            continue
+        source = offset + start
+        if source < 0 or source + count > half:
+            raise ValueError(f"PAMH row {y} leaves the {half}-cell row data")
+        dst = y * width + start
+        maximum[dst:dst + count] = data[source:source + count]
+        minimum[dst:dst + count] = data[half + source:half + source + count]
 
     inversions = sum(1 for hi, lo in zip(maximum, minimum) if lo > hi)
     return {
@@ -298,20 +302,34 @@ def parse_payload(blob: bytes) -> dict:
     raise ValueError(f"unsupported payload magic {blob[:4]!r}")
 
 
+def _row_nonneg_int(row: dict, key: str, default: int = 0) -> int:
+    val = row.get(key)
+    if val is None:
+        return default
+    if type(val) is not int or val < 0:
+        raise ValueError(f"index row {key!r} must be a non-negative integer, got {val!r}")
+    return val
+
+
 def _read_row(directory: str, row: dict) -> bytes:
     path = os.path.join(directory, f'{row["off"]:012x}.bin')
     try:
         with open(path, "rb") as f:
             return f.read()
     except OSError:
-        return bytes.fromhex(row.get("head", ""))
+        head = row.get("head")
+        if head is None:
+            return b""
+        if not isinstance(head, str):
+            raise ValueError(f"index row 'head' must be a hex string, got {type(head).__name__}") from None
+        return bytes.fromhex(head)
 
 
 def _join(row: dict, data: bytes) -> dict:
     out = {
         "offset": row["off"],
         "offset_hex": f'{row["off"]:x}',
-        "stored": row.get("stored", len(data)),
+        "stored": _row_nonneg_int(row, "stored", len(data)),
         "size": len(data),
         "chunks": 1,
     }
@@ -321,7 +339,7 @@ def _join(row: dict, data: bytes) -> dict:
 
 def _read_index_rows(directory: str) -> list[dict]:
     index_path = os.path.join(directory, "index.json")
-    with open(index_path, encoding="utf-8") as f:
+    with open(index_path, encoding="utf-8-sig") as f:
         index = json.load(f)
     # A hand-edited or half-written index used to fail as `error: 'files'`, naming neither the folder nor the
     # file. Name the index and the malformed row like gamedata_blobs.check_carve_index does.
@@ -331,6 +349,9 @@ def _read_index_rows(directory: str) -> list[dict]:
     for i, row in enumerate(rows):
         if not isinstance(row, dict) or "off" not in row:
             raise ValueError(f"{index_path}: row {i} needs an 'off'")
+        off = row["off"]
+        if type(off) is not int or off < 0:
+            raise ValueError(f"{index_path}: row {i} 'off' must be a non-negative integer")
     return sorted(rows, key=lambda r: r["off"])
 
 
@@ -351,15 +372,18 @@ def read_payloads(directory: str, rows: list[dict] | None = None) -> list[dict]:
         parts = [data]
         j = i
         # The header's size bounds the join, so any whole number of 64 KiB blocks may continue (as in gamedata_index).
-        while size < target_size and rows[j].get("size", 0) and rows[j]["size"] % 65536 == 0 and j + 1 < len(rows):
+        while size < target_size and j + 1 < len(rows):
+            row_size = _row_nonneg_int(rows[j], "size", 0)
+            if not row_size or row_size % 65536 != 0:
+                break
             nxt = _read_row(directory, rows[j + 1])
-            if nxt[:4] in MAGIC or nxt.startswith((b"<?xml", b"\xef\xbb\xbf<")):
+            if not nxt or nxt[:4] in MAGIC or nxt.startswith((b"<?xml", b"\xef\xbb\xbf<")):
                 break
             parts.append(nxt)
             size += len(nxt)
             j += 1
         payload = _join(rows[i], b"".join(parts))
-        payload["stored"] = sum(rows[x].get("stored", 0) for x in range(i, j + 1))
+        payload["stored"] = sum(_row_nonneg_int(rows[x], "stored", 0) for x in range(i, j + 1))
         payload["chunks"] = j - i + 1
         out.append(payload)
         i = j + 1
@@ -501,6 +525,35 @@ def _make_parent(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
+def _write_json(path: str, payload: dict) -> None:
+    text = json.dumps(payload, indent=1, allow_nan=False) + "\n"
+    _make_parent(path)
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path) or "."
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=parent,
+            prefix=f".{os.path.basename(abs_path)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(text)
+        os.chmod(tmp_path, file_mode.published_mode(abs_path))
+        replace_retry.replace(tmp_path, abs_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("carve_dir", help="rpf9_carve.py output directory")
@@ -549,11 +602,9 @@ def main() -> int:
         if census:
             out["pamh_census"] = census
         try:
-            _make_parent(a.json)
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(out, f, indent=1)
-        except OSError as e:
-            print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            _write_json(a.json, out)
+        except (OSError, ValueError) as e:
+            print(f"error: cannot write {a.json}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
             return 1
         print("wrote", a.json)
     return 0

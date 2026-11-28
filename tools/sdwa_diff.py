@@ -366,10 +366,15 @@ def read_raw(st, tok, f16):
         return st.s.get(int(tok[1:]), 0)
     if tok in FLOAT_CONSTS:
         return FLOAT_CONSTS_F16[tok] if f16 else FLOAT_CONSTS[tok]
-    return int(tok, 0) & M32
+    try:
+        return int(tok, 0) & M32
+    except ValueError:
+        raise RefError(f"operand {tok!r}") from None
 
 
 def select(value, sel, sext):
+    if sel not in SEL:
+        raise RefError(f"unknown SDWA selector {sel!r}")
     off, w = SEL[sel]
     v = (value >> off) & ((1 << w) - 1)
     if sext and w < 32:
@@ -378,6 +383,10 @@ def select(value, sel, sext):
 
 
 def place(old, res, width, sel, unused):
+    if sel not in SEL:
+        raise RefError(f"unknown SDWA selector {sel!r}")
+    if unused not in UNUSED:
+        raise RefError(f"unknown dst_unused mode {unused!r}")
     off, w = SEL[sel]
     res &= M32
     if w == 32:
@@ -413,6 +422,9 @@ def step(st, line):
     if clamp and not clamp_kind:
         raise RefError(f"{op}: clamp not modelled")
     f16 = family == "f16"
+    want_argc = 2 if form == "vop1" else 4 if form == "cndmask" else 3
+    if len(args) != want_argc:
+        raise RefError(f"{op}: expected {want_argc} operands, got {len(args)}")
     srcs = args[1:3] if form in ("vop2", "vopc", "cndmask") else args[1:2]
     vals = []
     for i, text in enumerate(srcs):
@@ -432,6 +444,8 @@ def step(st, line):
     else:
         r = fn(vals[0], vals[1] if len(vals) > 1 else 0)
     r = _clamp(clamp_kind, r) if clamp else r
+    if not (args[0].startswith("v") and args[0][1:].isdigit()):
+        raise RefError(f"{op}: bad destination {args[0]!r}")
     d = int(args[0][1:])
     st.v[d] = place(st.v.get(d, 0), r, width, mods.get("dst_sel", "DWORD"), mods.get("dst_unused", "UNUSED_PAD"))
 
@@ -592,6 +606,9 @@ def translated(lines, name="ps_sdwa"):
 
 
 def _diff(lines, want, got, label):
+    if not isinstance(got, (list, tuple)) or len(got) != 4:
+        got_desc = f"{len(got)} words" if isinstance(got, (list, tuple)) else type(got).__name__
+        raise RuntimeError(f"{label} returned {got_desc} (expected 4 words)")
     bad = [k for k in range(4) if want[k] != got[k]]
     if not bad:
         return None
@@ -660,12 +677,19 @@ def vk_verdict(lines, hw, got):
 def hw_prepare(oracle, programs, wave=32):
     """Run every program on the hardware in batches. Returns per program the four words, or a str reason. wave 64 runs
     each in a wave64 wave with VCC as a 64-bit lane mask."""
+    if oracle is None:
+        raise RuntimeError("hardware oracle required for backend 'hw'")
+    batch = programs
     if wave == 64:
         import vk_fuzz_run
         from hw_oracle import asm
-        programs = [asm.Kernel([vk_fuzz_run.wave64_text(ln) for ln in p], wave=64, threads=1, words=4)
-                    for p in programs]
-    return oracle.run(programs)
+        batch = [asm.Kernel([vk_fuzz_run.wave64_text(ln) for ln in p], wave=64, threads=1, words=4)
+                 for p in programs]
+    res = oracle.run(batch)
+    if not isinstance(res, (list, tuple)) or len(res) != len(programs):
+        got = len(res) if isinstance(res, (list, tuple)) else type(res).__name__
+        raise RuntimeError(f"hardware oracle returned {got} results for {len(programs)} programs")
+    return res
 
 
 def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=None, wave=32, build=None, work=None,
@@ -741,13 +765,23 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.programs < 1 or a.max_ops < 1:
         ap.error("--programs and --max-ops must be at least 1")
+    if a.hw_arch is not None:
+        a.hw_arch = a.hw_arch.strip()
+        if not a.hw_arch:
+            ap.error("--hw-arch must not be empty")
+    if a.build is not None:
+        a.build = a.build.strip()
+        if not a.build:
+            ap.error("--build must not be empty")
+    if a.work is not None:
+        a.work = a.work.strip()
+        if not a.work:
+            ap.error("--work must not be empty")
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
     if not backends or any(t not in ("translator", "hw", "vk") for t in backends):
         ap.error("--oracle takes translator, hw, vk (with hw) or a comma-separated mix")
     if "vk" in backends and "hw" not in backends:
         ap.error("--oracle vk judges the translated programs against the hardware's words: use --oracle hw,vk")
-    global KNOWN
-    KNOWN = a.known or backends == ("hw",)
     if a.list_ops:
         for name in sorted(OPS):
             family, form, width, _, clamp = OPS[name]
@@ -774,11 +808,20 @@ def main(argv=None):
         except runner.Unavailable as e:
             print(f"hardware oracle unavailable: {e}")
             return 77
-        if asm.family(oracle.arch) != "gfx10":
+        try:
+            fam = asm.family(oracle.arch)
+        except ValueError as e:
+            print(f"hardware oracle unavailable: {e}")
+            oracle.close()
+            return 77
+        if fam != "gfx10":
             print(f"hardware oracle unavailable: {oracle.arch} has no SDWA (GFX9 and GFX10 only)")
             oracle.close()
             return 77
         print(f"hardware oracle: {oracle.device}")
+    global KNOWN
+    prev_known = KNOWN
+    KNOWN = a.known or backends == ("hw",)
     try:
         counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, backends, oracle, a.wave, a.build, a.work,
                                      a.vk_constants)
@@ -802,12 +845,17 @@ def main(argv=None):
             return check(lines, backends, (lambda l: hw_prepare(oracle, [l], a.wave)[0]) if oracle else None)
         for i, problem, lines in failures[: None if a.all_failures else 1]:
             small = shrink(lines, check_fn)
-            print(f"MISMATCH program {i}: {check_fn(small) or problem}")
+            try:
+                detail = check_fn(small) or problem
+            except Skip:
+                detail = problem
+            print(f"MISMATCH program {i}: {detail}")
             print("\n".join("\t" + line for line in small))
     except (RefError, RuntimeError) as e:
         print(f"harness error: {e}")
         return 2
     finally:
+        KNOWN = prev_known
         if oracle:
             oracle.close()
     if failures or vk_bad:

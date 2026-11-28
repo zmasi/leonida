@@ -20,6 +20,20 @@ class CellFit(unittest.TestCase):
         self.assertGreaterEqual(cf.fit_fraction(q, ext, 0.0325), 0.99)
         self.assertLess(cf.fit_fraction(q, ext, 0.03125), 0.5)
 
+    def test_control_mean_includes_late_tiles_and_weights_duplicates(self):
+        from unittest.mock import patch
+        fits = dict.fromkeys(cf.DOC_CELLS + cf.OTHER_CELLS, 1.0)
+        small = {"ext": (1, 1, 0), "fit": fits}
+        large = {"ext": (1, 2, 0), "fit": fits}
+        flat = {"ext": (0, 0, 0), "fit": dict.fromkeys(fits, 0.0)}
+        tiles = [small] * 20 + [large, flat]
+        with patch.object(cf, "baseline", side_effect=lambda extent, cell: extent / 4) as baseline:
+            report = cf.summarise_control(tiles)
+            self.assertEqual(report["cells"]["0.0625"], {"fit": 21, "baseline_mean": round(5.5 / 21, 4)})
+            self.assertEqual(baseline.call_count, 2 * len(fits))
+            self.assertEqual(report, cf.summarise_control(list(reversed(tiles))))
+            self.assertIsNone(cf.summarise_control([flat])["cells"]["0.0625"]["baseline_mean"])
+
     def test_baseline_is_small_for_a_fine_step(self):
         self.assertLess(cf.baseline(2.0625, 0.0625), 0.06)
         # a 128 m extent's step is 128/65535, a little over 1/512 m: it drifts off a 1/32 m grid, so the static
@@ -38,6 +52,27 @@ class CellFit(unittest.TestCase):
         self.assertEqual(s["cells"]["0.03125"]["meshes"], 1)
         self.assertEqual(s["cells"]["0.0325"]["meshes"], 0)
         self.assertEqual(s["fit_none"], 0)
+
+    def test_output_cannot_overwrite_a_common_carve_input(self):
+        import subprocess
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as root:
+            archive = Path(root) / "nav.rpf"
+            archive.write_bytes(b"9FPR" + (8).to_bytes(4, "little") + bytes(8))
+            doc = Path(root) / "vehicle.bin"
+            original = b"<CVehiclePoints><ModelName>Test</ModelName></CVehiclePoints>"
+            doc.write_bytes(original)
+            alias = Path(root) / "report.json"
+            os.link(doc, alias)
+            for output in (doc, alias):
+                with self.subTest(output=output):
+                    proc = subprocess.run([sys.executable, "-I", cf.__file__, str(archive), "--common", root,
+                                           "--out", str(output)], capture_output=True, text=True)
+                    self.assertEqual(proc.returncode, 2)
+                    self.assertIn("--common", proc.stderr)
+                    self.assertEqual(doc.read_bytes(), original)
 
     def test_name_hashes_cover_case_and_suffix(self):
         h = cf.name_hashes({"Wagon01"})

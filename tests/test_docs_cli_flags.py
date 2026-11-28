@@ -21,15 +21,20 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FLAG = re.compile(r"(?<![\w-])(--[a-z][\w-]*)")
 SOURCE_SUFFIXES = (".py", ".ps1", ".cpp", ".cc", ".c", ".h", ".hpp", ".cmake", ".txt", ".cs", ".cjs", ".js", ".html",
-                   ".bat", ".sh", ".yml", ".yaml", ".csproj")
-# Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself, and
-# the spirv-opt passes docs/embedded_shaders.md tried on one module.
+                   ".bat", ".sh", ".yml", ".yaml", ".csproj", ".rs")
+# Flags of other programs the docs quote: gh (AGENTS.md), pip (docs/shader_validation.md), argparse itself,
+# cargo test / git-filter-repo (d3d12/docs/), and the spirv-opt passes docs/embedded_shaders.md tried on one module.
 FOREIGN = {"--search", "--state", "--index-url", "--help",
            "--strip-components", "--override-channels",
+           "--invert-paths", "--test-threads", "--ignored", "--nocapture",
            "--ssa-rewrite", "--eliminate-dead-code-aggressive", "--eliminate-dead-branches", "--merge-blocks",
            "--cfg-cleanup", "--merge-return", "--scalar-replacement"}
-# Pages that quote another project's tree (SCARAB, americas-recomp).
-OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md"}
+# Pages that quote another project's tree (SCARAB, americas-recomp, VIctory).
+OTHER_PROJECTS = {"docs/fssm_crosscheck.md", "docs/d3d12_xs_surface.md", "docs/port_plan.md"}
+CLAP_LONG_FIELD = re.compile(
+    r"#\[arg\([^\]]*\blong\b[^\]]*\)\](?:\s*(?:///[^\n]*|#\[[^\]]*\]))*\s*(?:pub(?:\([^)]*\))?\s+)?([a-z][a-z0-9_]*)\s*:",
+    re.MULTILINE,
+)
 COMMAND = re.compile(r"\bpython3?(?: -I)? ((?:tools|scripts)/[\w/]+\.py|make_game\.py)\b")
 PS1_COMMAND = re.compile(
     r"(?:powershell(?:\.exe)?\s+.*?-File\s+|(?:\./|\.\\|&|\.)\s*|\b)((?:tools|scripts)[\\/][\w./\\-]+\.ps1)\b",
@@ -127,6 +132,11 @@ def extract_ps1_params(content):
         if vars_found:
             params.add(vars_found[-1].lower())
     return params
+
+
+def clap_long_flags(rust_source):
+    """CLI `--kebab-case` flags derived by clap `#[arg(long)]` struct fields in Rust source."""
+    return [f"--{name.replace('_', '-')}" for name in CLAP_LONG_FIELD.findall(rust_source)]
 
 
 def unknown_flags(pages, code):
@@ -243,10 +253,21 @@ class DocsCliFlags(unittest.TestCase):
         ps1_pages = {"docs/b.md": "```\n.\\scripts\\test.ps1 -ValidParam -BadParam\n```\n"}
         ps1_sources = {"scripts/test.ps1": "param([string]$ValidParam)"}
         self.assertEqual(ps1_flag_mismatches(ps1_pages, ps1_sources), [("docs/b.md:2", "scripts/test.ps1", "-BadParam")])
+        rust = '#[arg(long)]\n/// doc\npub one_submit: bool,\n#[arg(short, long)]\nno_merge: bool,\n'
+        self.assertEqual(clap_long_flags(rust), ["--one-submit", "--no-merge"])
 
     def test_docs_name_existing_flags(self):
         files = tracked_files()
-        code = "\n".join(read(p) for p in files if p.endswith(SOURCE_SUFFIXES) and not p.startswith("docs/"))
+        parts = []
+        for p in files:
+            if p.endswith(SOURCE_SUFFIXES) and not p.startswith("docs/"):
+                text = read(p)
+                parts.append(text)
+                if p.endswith(".rs"):
+                    flags = clap_long_flags(text)
+                    if flags:
+                        parts.append(" ".join(flags))
+        code = "\n".join(parts)
         pages = {p: read(p) for p in files if p.endswith(".md") and p not in OTHER_PROJECTS}
         self.assertTrue(code and pages)
         missing = unknown_flags(pages, code)

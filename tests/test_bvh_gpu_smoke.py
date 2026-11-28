@@ -1,10 +1,13 @@
 """tools/bvh_gpu_smoke.py without a GPU or game files: the heap image, the word count and the judging of runs, with
 a fake vk_compute_test in place of the real one."""
+import os
 import struct
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -200,6 +203,113 @@ class Cli(unittest.TestCase):
             with self.assertRaises(SystemExit) as e:
                 smoke.translate(d, d, 32768)
             self.assertIn("XboxBvhBuilder.dll", str(e.exception))
+
+    def test_temp_work_dir_is_cleaned_up_on_success_and_error(self):
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            seen_work = []
+
+            def fake_translate(_game_dir, work_dir, _max_sm):
+                work_dir = Path(work_dir)
+                seen_work.append(work_dir)
+                self.assertTrue(work_dir.is_dir())
+                (work_dir / "Demo.spv").write_bytes(b"")
+                return work_dir
+
+            temp_base = root_path / "tmpbase"
+            temp_base.mkdir()
+            with mock.patch.object(smoke, "find_vk_compute_test", return_value=root_path / "vkc"), \
+                    mock.patch.object(smoke, "translate", side_effect=fake_translate), \
+                    mock.patch.object(smoke, "smoke", return_value=[{"name": "Demo", "status": "pass",
+                                                                      "words_changed": 0, "detail": ""}]), \
+                    mock.patch.object(smoke.tempfile, "gettempdir", return_value=str(temp_base)):
+                rc = smoke.main(["--game-dir", root])
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(seen_work), 1)
+                self.assertFalse(seen_work[0].exists(), f"leaked temp work dir: {seen_work[0]}")
+
+                def failing_translate(_game_dir, work_dir, _max_sm):
+                    seen_work.append(Path(work_dir))
+                    raise SystemExit("translate failed")
+
+                with mock.patch.object(smoke, "translate", side_effect=failing_translate):
+                    with self.assertRaises(SystemExit):
+                        smoke.main(["--game-dir", root])
+                self.assertEqual(len(seen_work), 2)
+                self.assertFalse(seen_work[1].exists(), f"leaked temp work dir on error: {seen_work[1]}")
+
+                explicit_work = root_path / "keep_work"
+                explicit_work.mkdir()
+                rc = smoke.main(["--game-dir", root, "--work", str(explicit_work)])
+                self.assertEqual(rc, 0)
+                self.assertTrue(explicit_work.is_dir())
+
+    def test_nonpositive_max_shared_memory_rejected(self):
+        for bad in ("0", "-64"):
+            with self.subTest(val=bad):
+                with self.assertRaises(SystemExit) as cm:
+                    smoke.main(["--spirv", ".", "--max-shared-memory", bad])
+                self.assertEqual(cm.exception.code, 2)
+
+    def test_json_rejects_directory_and_input_aliases(self):
+        with tempfile.TemporaryDirectory() as d:
+            dpath = Path(d)
+            spv_dir = dpath / "spirv"
+            spv_dir.mkdir()
+            spv = spv_dir / "Demo.spv"
+            spv.write_bytes(b"spv")
+            out_dir = dpath / "out_dir"
+            out_dir.mkdir()
+            game_dir = dpath / "game"
+            game_dir.mkdir()
+            dll = game_dir / "XboxBvhBuilder.dll"
+            dll.write_bytes(b"dll")
+
+            cases = [
+                (["--spirv", str(spv_dir), "--json", str(out_dir)], out_dir, None),
+                (["--spirv", str(spv_dir), "--json", str(spv)], spv, b"spv"),
+                (["--game-dir", str(game_dir), "--json", str(dll)], dll, b"dll"),
+            ]
+            for argv, target, expected in cases:
+                with mock.patch.object(smoke, "smoke") as run_smoke:
+                    with self.assertRaises(SystemExit) as cm:
+                        smoke.main(argv)
+                    self.assertEqual(cm.exception.code, 2)
+                    run_smoke.assert_not_called()
+                if expected is not None:
+                    self.assertEqual(target.read_bytes(), expected)
+
+    def test_json_atomic_write_preserves_existing_and_cleans_ro_staging(self):
+        with tempfile.TemporaryDirectory() as d:
+            dpath = Path(d)
+            (dpath / "Demo.spv").write_bytes(b"")
+            report = dpath / "report.json"
+            previous = '{"previous": true}\n'
+            report.write_text(previous, encoding="utf-8", newline="\n")
+            os.chmod(report, 0o444)
+            fake_results = [{"name": "Demo", "status": "pass", "words_changed": 0, "detail": ""}]
+            try:
+                with mock.patch.object(smoke, "find_vk_compute_test", return_value=dpath / "vkc"), \
+                        mock.patch.object(smoke, "smoke", return_value=fake_results), \
+                        mock.patch.object(os, "replace", side_effect=PermissionError("replace denied")):
+                    rc = smoke.main(["--spirv", str(dpath), "--json", str(report)])
+                self.assertEqual(rc, 2)
+                self.assertEqual(report.read_text(encoding="utf-8"), previous)
+                self.assertEqual([p.name for p in dpath.iterdir() if p.name.startswith(".bvh_gpu_smoke-")], [])
+
+                if os.name == "nt":
+                    with mock.patch.object(smoke, "find_vk_compute_test", return_value=dpath / "vkc"), \
+                            mock.patch.object(smoke, "smoke", return_value=fake_results):
+                        rc = smoke.main(["--spirv", str(dpath), "--json", str(report)])
+                    self.assertEqual(rc, 2)
+                    self.assertEqual(report.read_text(encoding="utf-8"), previous)
+                    self.assertEqual([p.name for p in dpath.iterdir() if p.name.startswith(".bvh_gpu_smoke-")], [])
+            finally:
+                for entry in dpath.iterdir():
+                    try:
+                        os.chmod(entry, 0o600)
+                    except OSError:
+                        pass
 
 
 if __name__ == "__main__":

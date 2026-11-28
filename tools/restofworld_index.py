@@ -33,7 +33,9 @@ import zlib
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
+import replace_retry  # noqa: E402
 from file_mode import published_mode  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from zero_span import gap_split  # noqa: E402
 
 # zlib stream start, or Bink 2 video ('KB2' + revision letter). Kept in step with rpf9_carve.py.
@@ -280,8 +282,23 @@ def classify(data, offset, stored):
 
 
 
+def _check_nonneg_int(name, value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer, got {value!r}")
+
+
+def _check_pos_int(name, value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be a positive integer, got {value!r}")
+
+
 def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
     """Walk an RPF9 data area. Returns (rows, summary). No TOC is read or decrypted."""
+    if start is not None and (isinstance(start, bool) or not isinstance(start, int)):
+        raise ValueError(f"start must be an integer, got {start!r}")
+    if limit is not None:
+        _check_pos_int("limit", limit)
+    _check_pos_int("max_inflate", max_inflate)
     rows = []
     zero = unread = skipped = 0
     t0 = time.time()
@@ -294,7 +311,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
             pos = start if start is not None else first
             if not 0 <= pos <= size:
                 raise ValueError("start offset is outside the archive")
-            end = min(size, pos + limit) if limit else size
+            end = min(size, pos + limit) if limit is not None else size
             span_start = pos
             last = pos
             while pos < end:
@@ -303,6 +320,9 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     break
                 s = found.start()
                 if m[s:s + 3] == b"KB2":
+                    if s + 0x1C > end:
+                        pos = s + 1
+                        continue
                     blen = (_u32(m, s + 4) or 0) + 8
                     w, h = _u32(m, s + 0x14), _u32(m, s + 0x18)
                     if not (64 <= blen <= end - s and w and h and 16 <= w <= 8192 and 16 <= h <= 8192):
@@ -311,7 +331,7 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
                     z, u = gap_split(m, last, s)
                     zero += z
                     unread += u
-                    rows.append(classify(m[s:s + 256], s, blen))
+                    rows.append(classify(m[s:min(s + 256, s + blen)], s, blen))
                     last = pos = s + blen
                     continue
                 d = zlib.decompressobj()
@@ -371,14 +391,42 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
     return rows, summary
 
 
+def _nonneg_int_or_none(value):
+    return None if isinstance(value, bool) or not isinstance(value, int) or value < 0 else value
+
+
 def _carve_index(path):
     """rpf9_carve.py's index.json in `path`: ({file name: stored bytes}, summary), or ({}, {}) without one."""
     try:
-        with open(os.path.join(path, "index.json"), encoding="utf-8") as f:
+        with open(os.path.join(path, "index.json"), encoding="utf-8-sig") as f:
             index = json.load(f)
-        stored = {f"{int(e['off']):012x}.bin": int(e["stored"]) for e in index.get("files", [])}
+        if not isinstance(index, dict):
+            return {}, {}
+        files = index.get("files", [])
+        if not isinstance(files, list):
+            return {}, {}
+        stored = {}
+        for e in files:
+            if not isinstance(e, dict):
+                return {}, {}
+            off = _nonneg_int_or_none(e.get("off"))
+            st = _nonneg_int_or_none(e.get("stored"))
+            if off is None or st is None:
+                return {}, {}
+            ext = ".bk2" if e.get("type") == "bink2" else ".bin"
+            stored[f"{off:012x}{ext}"] = st
         summary = index.get("summary", {})
-        return stored, summary if isinstance(summary, dict) else {}
+        if not isinstance(summary, dict):
+            summary = {}
+        else:
+            clean = {}
+            span = _nonneg_int_or_none(summary.get("span"))
+            zero = _nonneg_int_or_none(summary.get("zero_padding", 0))
+            unread = _nonneg_int_or_none(summary.get("unread_bytes", 0))
+            if span is not None and zero is not None and unread is not None:
+                clean = {"span": span, "zero_padding": zero, "unread_bytes": unread}
+            summary = clean
+        return stored, summary
     except (OSError, ValueError, TypeError, KeyError, AttributeError):
         return {}, {}
 
@@ -389,6 +437,7 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
     With rpf9_carve.py's index.json in the folder, each file's stored (compressed) size and the carve's span,
     zero padding and unread bytes come from it, so compressed_bytes and readable_fraction mean what they mean in
     archive mode. Without it, a file's stored size can only be its length on disk (the inflated size)."""
+    _check_pos_int("max_inflate", max_inflate)
     rows = []
     skipped = 0
     t0 = time.time()
@@ -453,10 +502,11 @@ def write_output(path, rows, summary):
     tmp = None
     try:
         if os.path.splitext(path)[1].lower() == ".json":
+            payload = json.dumps({"summary": summary, "files": rows}, indent=1, allow_nan=False) + "\n"
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="\n", dir=parent,
                                              prefix=".restofworld_index-", suffix=".tmp", delete=False) as f:
                 tmp = f.name
-                json.dump({"summary": summary, "files": rows}, f, indent=1)
+                f.write(payload)
         else:
             with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=parent,
                                              prefix=".restofworld_index-", suffix=".tmp", delete=False) as f:
@@ -467,7 +517,7 @@ def write_output(path, rows, summary):
                     writer.writerow([f"0x{row['offset']:x}" if i == 0 else ("" if row[c] is None else row[c])
                                      for i, c in enumerate(COLUMNS)])
         os.chmod(tmp, published_mode(path))
-        os.replace(tmp, path)
+        replace_retry.replace(tmp, path)
     except BaseException:
         if tmp is not None:
             try:
@@ -501,20 +551,38 @@ def byte_count(text):
     return value
 
 
-def _samefile(source, out):
-    """True when `out` names the same existing file as `source`.
-
-    os.path.samefile needs both paths on disk, so a not-yet-written output is
-    reported as "no alias" instead of forcing a scan or a write first. Any other
-    comparison failure propagates for the caller to report.
-    """
+def _same_stat(st, path):
     try:
-        return os.path.samefile(source, out)
-    except FileNotFoundError:
+        return os.path.samestat(st, os.stat(path))
+    except OSError:
         return False
 
 
-def main():
+def _overwrites_source(source, out):
+    if same_report_path(source, out):
+        return True
+    if not os.path.isdir(source):
+        return False
+    target_real = os.path.realpath(os.path.abspath(out))
+    target_dir = os.path.dirname(target_real)
+    try:
+        target_stat = os.stat(target_real)
+    except OSError:
+        target_stat = None
+    in_source = same_report_path(target_dir, source)
+    if same_report_path(os.path.join(source, "index.json"), out):
+        return True
+    for name in sorted(os.listdir(source)):
+        if name == "index.json" or name.endswith(".bin") or name.endswith(".bk2"):
+            full = os.path.join(source, name)
+            if (target_stat is not None and _same_stat(target_stat, full)) or (
+                (in_source or os.path.islink(full)) and same_report_path(full, out)
+            ):
+                return True
+    return False
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("source", help="an .rpf archive or a directory of carved .bin/.bk2 files")
     ap.add_argument("out", help="output path ending in .csv or .json")
@@ -523,7 +591,7 @@ def main():
     ap.add_argument("--max-inflate", type=byte_count, default=MAX_INFLATE,
                     help="skip a stream that inflates above this many bytes (default: 512 MiB)")
     ap.add_argument("--quiet", action="store_true")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
     if os.path.isdir(args.source) and (args.start is not None or args.limit is not None):
         ap.error("--start and --limit apply to a single archive, not a directory")
     if os.path.isdir(args.out):
@@ -532,15 +600,7 @@ def main():
     if not os.path.isdir(folder):
         ap.error(f"{folder} is not a folder, so {args.out} cannot be written")
     try:
-        overwrites_source = _samefile(args.source, args.out)
-        if not overwrites_source and os.path.isdir(args.source) and os.path.isfile(args.out):
-            # Protect scanned payloads and their carve manifest, including hard-link aliases.
-            for name in sorted(os.listdir(args.source)):
-                if name == "index.json" or name.endswith(".bin") or name.endswith(".bk2"):
-                    full = os.path.join(args.source, name)
-                    if os.path.isfile(full) and _samefile(full, args.out):
-                        overwrites_source = True
-                        break
+        overwrites_source = _overwrites_source(args.source, args.out)
     except OSError as e:
         ap.error(f"cannot compare source and output paths: {e}")
     if overwrites_source:
@@ -556,8 +616,8 @@ def main():
         sys.exit(f"{args.source}: {e.strerror or e}")
     try:
         write_output(args.out, rows, summary)
-    except OSError as e:
-        print(f"ERROR: cannot write {args.out}: {e.strerror or e}", file=sys.stderr)
+    except (OSError, ValueError) as e:
+        print(f"ERROR: cannot write {args.out}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
         return 1
     if not args.quiet:
         print(json.dumps({k: summary[k] for k in

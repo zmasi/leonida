@@ -64,8 +64,8 @@ def find_ffmpeg(explicit: str):
     return found
 
 
-def _read_opus_id(stream: BinaryIO) -> tuple[bytes, bytes] | None:
-    """Read the Opus ID packet and serial, leaving the stream at the next page."""
+def _read_opus_id(stream: BinaryIO) -> tuple[bytes, bytes, int] | None:
+    """Read the Opus ID packet, serial and page number, leaving the stream at the next page."""
     header = stream.read(27)
     if len(header) != 27 or header[:6] != b"OggS\x00\x02":
         return None
@@ -77,7 +77,7 @@ def _read_opus_id(stream: BinaryIO) -> tuple[bytes, bytes] | None:
     packet = stream.read(size)
     if len(packet) != size or size < 19 or not packet.startswith(b"OpusHead"):
         return None
-    return packet, header[14:18]
+    return packet, header[14:18], struct.unpack_from("<I", header, 18)[0]
 
 
 def looks_like_opus(path: str) -> bool:
@@ -97,7 +97,7 @@ def ogg_output_samples(path: str) -> int:
             identification = _read_opus_id(f)
             if identification is None:
                 return 0
-            head, serial = identification
+            head, serial, sequence = identification
             if head[8] >= 16 or head[9] == 0:
                 return 0
             pre_skip, = struct.unpack_from("<H", head, 10)
@@ -107,6 +107,9 @@ def ogg_output_samples(path: str) -> int:
                 f.seek(offset)
                 hdr = f.read(27)
                 if len(hdr) != 27 or hdr[:4] != b"OggS" or hdr[4] != 0 or hdr[14:18] != serial:
+                    return 0
+                sequence = (sequence + 1) & 0xffffffff
+                if struct.unpack_from("<I", hdr, 18)[0] != sequence:
                     return 0
                 htype = hdr[5]
                 if htype not in (0x00, 0x01, 0x04, 0x05):

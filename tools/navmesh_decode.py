@@ -94,7 +94,7 @@ COLUMNS = [
     "offset", "class", "streams", "stored", "inflated", "complete", "checks_failed",
     "version", "root_index", "n_structs", "n_enums", "n_blocks", "pages_4k", "root_hash", "cover_nodes",
     "flags", "sector", "vertices", "polygons", "pool", "special_links", "volumes", "data_size",
-    "groups", "entries", "extent",
+    "groups", "entries", "extent", "first_stream_bytes", "runtime_data_end",
 ]
 
 
@@ -311,7 +311,7 @@ def decode_7a(b, len0, nstreams, stats):
     chk["reserved_zero"] = _zero(b, 0x18, 0x20) and _zero(b, 0x24, 0x28) and _zero(b, 0x50, 0x60)
     chk["block_map"] = block_map_ok(b, nstreams, size=24)
     row = {"version": version, "root_index": root_index, "n_structs": n28, "n_enums": n30, "n_blocks": n38,
-           "pages_4k": n4e, "root_hash": None, "cover_nodes": None}
+           "pages_4k": n4e, "root_hash": None, "cover_nodes": None, "first_stream_bytes": len0}
 
     # Instance blocks: {u32 struct hash, u32 byte size, u64 pointer}.
     blocks = []
@@ -385,6 +385,8 @@ def decode_7a(b, len0, nstreams, stats):
     bm = offset_of(_u64(b, 8))
     if chk["blocks_in_bounds"] and blocks and bm is not None and q38 is not None:
         data_end = max([t + size for _, size, t in blocks] + [q38 + 16 * n38, bm + 24])
+        if chk["block_map"]:
+            row["runtime_data_end"] = data_end
         pages = (data_end + 4095) // 4096
         stream_end = len0 if data_end <= len0 else len(b)
         if pages * 4096 < stream_end:

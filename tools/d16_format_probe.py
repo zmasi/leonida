@@ -40,14 +40,18 @@ import argparse
 import functools
 import json
 import os
+import stat
 import struct
 import sys
+import tempfile
 from fractions import Fraction
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 # name: (GFX10 unified buffer format code, kind, bits of the x channel). The codes are the translator's FORMATS
 # table (tools/rdna2spirv.py); 10_10_10_2 (50) holds x in its low 10 bits.
@@ -289,13 +293,64 @@ def self_test():
     return 0
 
 
+def _resolve_report_target(path):
+    return os.path.realpath(path) if os.path.islink(path) else os.path.abspath(path)
+
+
+def validate_report_path(path):
+    """Fail fast before running the GPU sweep when an existing ancestor blocks --json creation."""
+    target = _resolve_report_target(path)
+    if os.path.isdir(target):
+        print(f"ERROR: cannot write {path}: destination is a directory", file=sys.stderr)
+        return False
+    parent = os.path.dirname(target)
+    probe = parent
+    while probe and not os.path.exists(probe):
+        next_probe = os.path.dirname(probe)
+        if next_probe == probe:
+            break
+        probe = next_probe
+    if probe and os.path.exists(probe) and not os.path.isdir(probe):
+        print(f"ERROR: cannot write {path}: parent {probe} is not a directory", file=sys.stderr)
+        return False
+    return True
+
+
 def write_report(path, doc):
-    """Write the JSON report, creating its folder; one ERROR line instead of a traceback on failure."""
+    """Write the JSON report atomically (preserving symlinks/mode, supporting /dev/null); one ERROR line on failure."""
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(doc, f, indent=1)
-    except OSError as e:
+        payload = json.dumps(doc, indent=1, allow_nan=False) + "\n"
+        target = _resolve_report_target(path)
+        if os.path.exists(target):
+            st = os.stat(target)
+            if stat.S_ISDIR(st.st_mode):
+                raise IsADirectoryError(f"{path} is a directory")
+            if not stat.S_ISREG(st.st_mode):
+                with open(target, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(payload)
+                return True
+        parent = os.path.dirname(target) or "."
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".d16-format-probe-", suffix=".tmp")
+        try:
+            try:
+                f = open(fd, "w", encoding="utf-8", newline="\n")
+            except BaseException:
+                os.close(fd)
+                raise
+            with f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp_path, published_mode(target))
+            replace_retry(tmp_path, target)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+    except (OSError, ValueError) as e:
         print(f"ERROR: cannot write {path}: {e}", file=sys.stderr)
         return False
     return True
@@ -311,13 +366,28 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
-    fmts = [f for f in a.formats.split(",") if f]
-    waves = [int(w) for w in a.waves.split(",") if w.strip().isdigit()]
-    bad = [f for f in fmts if f not in FORMATS] + [w for w in a.waves.split(",") if w and w not in ("32", "64")]
-    if bad or not fmts or not waves:
-        ap.error("unknown or empty: " + ", ".join(bad or ["--formats/--waves"]))
-    if a.json and os.path.isdir(a.json):
-        ap.error(f"--json {a.json} is a folder, not a file")
+    if a.hw_arch is not None:
+        a.hw_arch = a.hw_arch.strip()
+        if not a.hw_arch:
+            ap.error("--hw-arch must not be empty")
+    fmt_tokens = [f.strip() for f in a.formats.split(",")]
+    wave_tokens = [w.strip() for w in a.waves.split(",")]
+    if not any(fmt_tokens) or any(not f for f in fmt_tokens):
+        ap.error("--formats must be a comma-separated list of format names")
+    if not any(wave_tokens) or any(not w for w in wave_tokens):
+        ap.error("--waves must be a comma-separated list of 32 and/or 64")
+    fmts = list(dict.fromkeys(fmt_tokens))
+    bad = [f for f in fmts if f not in FORMATS] + [w for w in wave_tokens if w not in ("32", "64")]
+    if bad:
+        ap.error("unknown or empty: " + ", ".join(bad))
+    waves = list(dict.fromkeys(int(w) for w in wave_tokens))
+    if a.json is not None:
+        if not a.json.strip():
+            ap.error("--json must not be empty")
+        if os.path.isdir(a.json):
+            ap.error(f"--json {a.json} is a folder, not a file")
+        if not validate_report_path(a.json):
+            return 2
     from hw_oracle import asm, runner
     try:
         oracle = runner.open_oracle(arch=a.hw_arch)
@@ -325,7 +395,12 @@ def main(argv=None):
         print(f"hardware oracle unavailable: {e}")
         return 77
     try:
-        if asm.family(oracle.arch) != "gfx10":
+        try:
+            fam = asm.family(oracle.arch)
+        except ValueError as e:
+            print(f"hardware oracle unavailable: {e}")
+            return 77
+        if fam != "gfx10":
             print(f"hardware oracle unavailable: {oracle.arch} is not GFX10; the descriptor here is GFX10's (RDNA2)")
             return 77
         print(f"hardware oracle: {oracle.device}")

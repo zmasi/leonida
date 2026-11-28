@@ -74,6 +74,29 @@ class Interface(unittest.TestCase):
         with self.assertRaises(ValueError):
             vs.vs_spvasm(layout(params=(0, 1)), f16_halves={"0": [1, 29]})
 
+    def test_pc_tail_address_dwords_uses_set_1_uniform_block(self):
+        lay = dict(layout(clip=1, params=(0, 4)), push_constant_bytes=128,
+                   address_dwords=None, pc_tail_address_dwords=[4, 5])
+        asm = vs.vs_spvasm(lay)
+        entry = asm.split("OpEntryPoint Vertex", 1)[1].splitlines()[0]
+        self.assertIn("%pc_tail", entry)
+        self.assertNotIn("%pc ", entry)
+        self.assertNotIn("PushConstant", asm)
+        self.assertIn("OpDecorate %PcTail Block", asm)
+        for k in range(6):
+            self.assertIn(f"OpMemberDecorate %PcTail {k} Offset {4 * k}", asm)
+        self.assertIn("OpDecorate %pc_tail DescriptorSet 1", asm)
+        self.assertIn("OpDecorate %pc_tail Binding 0", asm)
+        self.assertIn("%alo_p = OpAccessChain %_ptr_Uniform_uint_tail %pc_tail %c4", asm)
+        self.assertIn("%ahi_p = OpAccessChain %_ptr_Uniform_uint_tail %pc_tail %c5", asm)
+
+    def test_pc_tail_address_dwords_rejects_malformed_values(self):
+        for bad in ([], [4], [4, 5, 6], [-1, 5], [4, 4], [64, 65], [70000, 70001], [True, 5], ["4", "5"], "45", 4):
+            with self.subTest(bad=bad):
+                lay = dict(layout(), pc_tail_address_dwords=bad)
+                with self.assertRaises(ValueError):
+                    vs.vs_spvasm(lay)
+
     def test_the_index_drives_write_for_index(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(vs.write_for_index(tmp), [])       # no index.json: nothing to do
@@ -136,6 +159,30 @@ class Assembly(unittest.TestCase):
                     self.assertEqual(f.read(), b"new shader")
 
             self.assertEqual(sorted(os.listdir(tmp)), ["index.json", "ms_a.mesh_vs.spv", "ms_a.mesh_vs.spvasm"])
+
+    def test_pc_tail_layouts_assemble_and_validate(self):
+        if not HAVE_SPIRV_TOOLS:
+            self.skipTest("spirv-as / spirv-val not on PATH")
+
+        def tail_layout(**kw):
+            lay = dict(layout(**kw), push_constant_bytes=128, address_dwords=None, pc_tail_address_dwords=[4, 5])
+            return lay
+
+        f16_lay = tail_layout(params=(0, 1))
+        f16_lay["f16_halves"] = {"0": [29, 30]}
+        layouts = {
+            "ms_tail_plain": tail_layout(),
+            "ms_tail_clip": tail_layout(clip=1),
+            "ms_tail_full": tail_layout(clip=5, cull=2, params=(2, 5)),
+            "ms_tail_f16": f16_lay,
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            write_index(tmp, {name: {"mesh_compute": lay} for name, lay in layouts.items()})
+            built = vs.build_for_index(tmp)
+            self.assertEqual([os.path.basename(p) for p in built],
+                             [name + ".mesh_vs.spv" for name in sorted(layouts)])
+            for spv in built:
+                self.assertGreater(os.path.getsize(spv), 0)
 
     def test_a_rejected_shader_names_the_tool(self):
         if not HAVE_SPIRV_TOOLS:

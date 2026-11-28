@@ -2207,6 +2207,11 @@ fn typed_d16_table_uav_roundtrip_uint_sint_and_float() {
     body.extend_from_slice(&s_load_dwordx4_off(8, 4, 0));
     body.extend_from_slice(&s_load_dwordx4_off(12, 4, 32));
     body.extend_from_slice(&s_load_dwordx4_off(16, 4, 64));
+    // A table slot used only by d16 accesses gets an unsigned twin. Read
+    // a whole channel from each typed slot as well, so both retain their
+    // declared formats and the d16 operations need the table's format bits.
+    body.extend_from_slice(&mubuf_idxen(0x00, 6, 0, 8));
+    body.extend_from_slice(&mubuf_idxen(0x00, 7, 0, 12));
     // buffer_load_format_d16_xyzw v[2:3], v0, s[8:11], 0 idxen (op 0x83)
     body.extend_from_slice(&mubuf_idxen(0x83, 2, 0, 8));
     // buffer_store_format_d16_xyzw v[2:3], v0, s[12:15], 0 idxen (op 0x87)

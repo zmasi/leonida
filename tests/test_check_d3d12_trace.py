@@ -63,6 +63,22 @@ class CheckD3D12TraceRunnerTests(unittest.TestCase):
         self.assertIn("fixture.exe exited with 3", result.stderr)
         self.assertIn("fixture output", result.stderr)
 
+    def test_runner_timeout_does_not_wait_for_a_child_holding_the_output(self):
+        # A grandchild inherits the launcher's stdout and stderr and outlives the limit, as a Wine fixture can: the
+        # check must still fail at about the limit, not when that child lets go of the output (PR #9920 review).
+        started = time.monotonic()
+        result = self.check(
+            "import subprocess, sys, time\n"
+            "subprocess.Popen([sys.executable, '-I', '-c', 'import time; time.sleep(30)'])\n"
+            "time.sleep(60)\n",
+            runner_timeout=2,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("fixture.exe: no exit within 2s", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertLess(elapsed, 15, "the check waited for the child that holds the output")
+
     @unittest.skipUnless(os.name == "posix", "requires POSIX process groups and flock")
     def test_runner_timeout_stops_the_fixture_it_started(self):
         import fcntl

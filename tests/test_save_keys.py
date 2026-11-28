@@ -211,6 +211,35 @@ class Resolve(unittest.TestCase):
         self.assertNotIn("Traceback", r.stderr)
         self.assertEqual(r.stdout, "")      # refused before the resolve ran
 
+    def test_out_naming_a_directory_is_refused_before_resolving(self):
+        saves_dir = os.path.join(self.dir, "saves_dir")
+        reports_dir = os.path.join(self.dir, "reports_dir")
+        os.makedirs(saves_dir)
+        os.makedirs(reports_dir)
+        with open(os.path.join(saves_dir, "slot.jsav"), "wb") as f:
+            with open(self.jsav, "rb") as src:
+                f.write(src.read())
+        for out, inputs in ((saves_dir, [saves_dir]), (reports_dir, [self.jsav])):
+            with self.subTest(out=os.path.basename(out)):
+                r = self.resolve_cli(*inputs, "--dict", self.dict, "--out", out)
+                self.assertEqual(r.returncode, 1, r.stderr)
+                self.assertIn("is a directory", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(r.stdout, "")
+
+    def test_out_problem_delegates_to_shared_same_report_path(self):
+        alias = os.path.join(self.dir, "STRINGS_ALIAS.BIN")
+        self.assertFalse(os.path.exists(alias))
+        with mock.patch.object(sk, "same_report_path", side_effect=lambda a, b: b == self.dict) as guard:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()) as out_buf:
+                rc = sk.main(["resolve", self.jsav, "--dict", self.dict, "--out", alias])
+        self.assertEqual(rc, 1)
+        self.assertTrue(guard.called)
+        self.assertIn("refusing to overwrite", err.getvalue())
+        self.assertEqual(out_buf.getvalue(), "")
+        self.assertFalse(os.path.exists(alias))
+
     def test_rejects_negative_compose_count(self):
         result = self.resolve_cli(self.dir, "--dict", self.dict, "--compose", "-1")
         self.assertEqual(result.returncode, 2, result.stderr)

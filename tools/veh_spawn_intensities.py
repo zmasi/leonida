@@ -24,9 +24,12 @@ import json
 import math
 import os
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_file  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 DOC_ROOT = "CGraphicsDefinitionsData"
@@ -79,7 +82,7 @@ def aggregate(items):
     signatures: dict[tuple, int] = {}
     for item in items:
         signatures[item["sets"]] = signatures.get(item["sets"], 0) + 1
-    width = max(len(sig) for sig in signatures)
+    width = max((len(sig) for sig in signatures), default=0)
     per_set = []
     for index in range(width):
         columns = [sig[index] for sig in signatures if len(sig) > index]
@@ -94,8 +97,10 @@ def aggregate(items):
         "signature_groups": sorted(signatures.values(), reverse=True),
         "set_counts": sorted({len(item["sets"]) for item in items}),
         "per_set_ranges": per_set,
-        "bands_with_mud": [sum(1 for sig in signatures if len(sig) > index and sig[index][3] > 0.0)
-                           for index in range(width)],
+        "bands_with_mud": [
+            sum(1 for sig in signatures if len(sig) > index and (sig[index][2] > 0.0 or sig[index][3] > 0.0))
+            for index in range(width)
+        ],
         "rain_groups": len(rain),
         "rain_group_sizes": sorted(rain.values(), reverse=True),
     }
@@ -133,30 +138,75 @@ def census(path):
     return result
 
 
+def _would_overwrite_input(source, out_path):
+    if same_report_path(source, out_path):
+        return True
+    if not os.path.isdir(source):
+        return False
+    if same_report_path(os.path.join(source, "index.json"), out_path):
+        return True
+    try:
+        with os.scandir(source) as entries:
+            for entry in entries:
+                if entry.name.lower().endswith((".bin", ".bk2")) and entry.is_file():
+                    if same_report_path(entry.path, out_path):
+                        return True
+    except OSError:
+        pass
+    return False
+
+
+def _write_json_atomic(path, doc):
+    abs_path = os.path.abspath(path)
+    folder = os.path.dirname(abs_path) or "."
+    os.makedirs(folder, exist_ok=True)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", newline="\n", dir=folder,
+            prefix=".veh-spawn-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp_path = f.name
+            json.dump(doc, f, indent=1, sort_keys=True, allow_nan=False)
+            f.write("\n")
+        os.chmod(tmp_path, published_mode(abs_path))
+        replace_file(tmp_path, abs_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def main(argv=None) -> int:
     cli = argparse.ArgumentParser(description=__doc__)
     cli.add_argument("input", help="a rebuilt CGraphicsDefinitionsData XML file or a rpf9_carve directory")
     cli.add_argument("--json", help="write the same aggregate census here")
     args = cli.parse_args(argv)
-    if args.json and same_report_path(args.input, args.json):
-        print("ERROR: --json must not overwrite the input", file=sys.stderr)
-        return 2
+    if args.json is not None:
+        if not args.json.strip():
+            print("ERROR: --json path must not be empty", file=sys.stderr)
+            return 2
+        if os.path.isdir(args.json):
+            print(f"ERROR: --json is a directory: {args.json}", file=sys.stderr)
+            return 2
+        if _would_overwrite_input(args.input, args.json):
+            print("ERROR: --json must not overwrite the input", file=sys.stderr)
+            return 2
     try:
         census_out = census(args.input)
-    except (OSError, CensusError, ET.ParseError, KeyError, TypeError, ValueError) as e:
+    except (OSError, CensusError, ET.ParseError, KeyError, TypeError, ValueError, RecursionError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
-    print(json.dumps(census_out, sort_keys=True))
-    if args.json:
+    if args.json is not None:
         try:
-            folder = os.path.dirname(os.path.abspath(args.json))
-            os.makedirs(folder, exist_ok=True)
-            with open(args.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(census_out, f, indent=1, sort_keys=True)
-                f.write("\n")
+            _write_json_atomic(args.json, census_out)
         except OSError as e:
             print(f"ERROR: cannot write {args.json}: {e.strerror or e}", file=sys.stderr)
             return 2
+    print(json.dumps(census_out, sort_keys=True, allow_nan=False))
     return 0
 
 

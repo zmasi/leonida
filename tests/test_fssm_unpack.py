@@ -740,6 +740,84 @@ class TestMainDirectoryProcessing(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.src)),
                          ["fssm", "fssm_index.json", "fssm_index.json.tmp", "shader_a.dxbc"])
 
+    def test_parts_rejects_invalid_dxbc_magic_and_20byte_truncated_xbch(self):
+        with self.assertRaisesRegex(ValueError, "invalid DXBC magic"):
+            fssm_unpack.parts(b"JUNK" + bytes(28))
+
+        for trunc_len in (20, 23):
+            with self.subTest(trunc_len=trunc_len):
+                bad_blob = b"XBCH" + bytes(trunc_len - 4)
+                dxbc = make_dxbc([(b"DXIL", make_xdat({0x0D: bad_blob}))])
+                with self.assertRaises(struct.error):
+                    fssm_unpack.unpack(dxbc)
+
+    def test_empty_carve_index_is_rejected(self):
+        with open(os.path.join(self.src, "shader_a.dxbc"), "wb") as f:
+            f.write(make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))]))
+        for bad in ("", "   "):
+            with self.subTest(carve_index=bad):
+                res = subprocess.run([sys.executable, "-I", TOOL, self.src, "--carve-index", bad],
+                                     capture_output=True, text=True, errors="replace")
+                self.assertEqual(res.returncode, 2, res.stdout + res.stderr)
+                self.assertIn("--carve-index must not be empty", res.stderr)
+                self.assertFalse(os.path.exists(os.path.join(self.src, "fssm")))
+
+    def test_directory_at_index_or_fssm_output_and_index_write_error_exit_2_cleanly(self):
+        shader = make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))])
+        with open(os.path.join(self.src, "shader_a.dxbc"), "wb") as f:
+            f.write(shader)
+
+        # Directory at fssm_index.json fails upfront before creating fssm/.
+        idx_dir = os.path.join(self.src, "fssm_index.json")
+        os.mkdir(idx_dir)
+        res = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True, errors="replace")
+        self.assertEqual(res.returncode, 2, res.stderr)
+        self.assertIn("destination is a directory", res.stderr)
+        self.assertNotIn("Traceback", res.stderr)
+        self.assertFalse(os.path.exists(os.path.join(self.src, "fssm")))
+        os.rmdir(idx_dir)
+
+        # Directory at fssm/shader_a.fssm fails cleanly with exit 2 and leaves fssm_index.json absent.
+        os.makedirs(os.path.join(self.src, "fssm", "shader_a.fssm"))
+        res2 = subprocess.run([sys.executable, "-I", TOOL, self.src], capture_output=True, text=True, errors="replace")
+        self.assertEqual(res2.returncode, 2, res2.stderr)
+        self.assertIn("cannot write", res2.stderr)
+        self.assertNotIn("Traceback", res2.stderr)
+        self.assertFalse(os.path.exists(idx_dir))
+        os.rmdir(os.path.join(self.src, "fssm", "shader_a.fssm"))
+
+        # OSError during index publish exits 2 cleanly without traceback.
+        err = PermissionError(errno.EACCES, "index locked")
+        with mock.patch.object(fssm_unpack, "replace_retry", side_effect=err), \
+                mock.patch.object(sys, "stderr", io.StringIO()) as stderr, \
+                mock.patch.object(sys, "stdout", io.StringIO()):
+            self.assertEqual(fssm_unpack.main([self.src]), 2)
+        self.assertIn("cannot write", stderr.getvalue())
+        self.assertIn("index locked", stderr.getvalue())
+
+    def test_symlinked_index_is_preserved_with_trailing_newline(self):
+        if os.name == "nt":
+            self.skipTest("symlink privileges vary on Windows")
+        with open(os.path.join(self.src, "shader_a.dxbc"), "wb") as f:
+            f.write(make_dxbc([(b"DXIL", make_xdat({0x0D: make_xbch(make_fssm())}))]))
+        with tempfile.TemporaryDirectory() as dest:
+            real_idx = os.path.join(dest, "real_index.json")
+            with open(real_idx, "w", encoding="utf-8", newline="\n") as f:
+                f.write("[]\n")
+            os.chmod(real_idx, 0o600)
+            link_idx = os.path.join(self.src, "fssm_index.json")
+            os.symlink(real_idx, link_idx)
+
+            res = subprocess.run([sys.executable, "-I", TOOL, self.src],
+                                 capture_output=True, text=True, errors="replace")
+            self.assertEqual(res.returncode, 0, res.stderr)
+            self.assertTrue(os.path.islink(link_idx))
+            self.assertEqual(os.stat(real_idx).st_mode & 0o777, 0o600)
+            with open(real_idx, "rb") as f:
+                raw = f.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertEqual([r["name"] for r in json.loads(raw)], ["shader_a"])
+
 
 if __name__ == "__main__":
     unittest.main()

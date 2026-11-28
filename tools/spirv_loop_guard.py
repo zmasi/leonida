@@ -9,18 +9,21 @@ import re
 
 DEFAULT_LIMIT = 65536
 _LINE = re.compile(r"(?m)^[ \t]*(?:(%[\w.]+)\s*=\s*)?(Op(?:Label|BranchConditional|Branch|Switch|"
-                   r"LoopMerge|SelectionMerge|Phi|Function|TypeInt|TypeBool|Constant))\b([^;\n]*)")
+                   r"LoopMerge|SelectionMerge|Phi|Function|TypeInt|TypeBool|Constant))\b([^;\r\n]*)")
 
 
 def parse_limit(text):
-    value = int(text)
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid loop limit: {text!r}") from None
     if not 0 <= value <= 0xffffffff:
         raise argparse.ArgumentTypeError("loop limit must be in 0..4294967295")
     return value
 
 
 def add_guards(text, limit=DEFAULT_LIMIT):
-    if not 0 <= limit <= 0xffffffff:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 0 <= limit <= 0xffffffff:
         raise ValueError("loop limit must fit an unsigned 32-bit word")
     if not limit or "OpLoopMerge" not in text:
         return text
@@ -41,7 +44,7 @@ def add_guards(text, limit=DEFAULT_LIMIT):
             uint = result
         elif op == "OpTypeBool":
             boolean = result
-        elif op == "OpConstant" and args[0] == uint:
+        elif op == "OpConstant" and len(args) >= 2 and args[0] == uint:
             constants[int(args[1], 0)] = result
         elif op == "OpLabel":
             block = result
@@ -119,6 +122,8 @@ def add_guards(text, limit=DEFAULT_LIMIT):
                 for match in re.finditer(r"(?<!\S)" + re.escape(back) + r"(?=\s|$)", text[line_start:at]):
                     edits.append((line_start + match.start(), line_start + match.end(), latch))
     if decls:
+        if first_function is None:
+            raise ValueError("cannot declare loop guard types/constants without OpFunction")
         edits.append((first_function, first_function, "\n".join(decls) + "\n"))
     chunks, previous = [], 0
     for start, end, replacement in sorted(edits, key=lambda e: (e[0], e[1])):

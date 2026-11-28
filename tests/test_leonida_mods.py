@@ -50,6 +50,10 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(leonida_mods.joaat("player_story000_00"), 0xE472B687)
         self.assertEqual(leonida_mods.joaat("cs_mandy"), 0xD7C0CDFF)
         self.assertEqual(leonida_mods.parse_model_id("0xD7C0CDFF"), 0xD7C0CDFF)
+        self.assertEqual(leonida_mods.parse_model_id("  player_story000_00 \t"), 0xE472B687)
+        self.assertEqual(leonida_mods.parse_model_id("\n0xD7C0CDFF "), 0xD7C0CDFF)
+        with self.assertRaises(ValueError):
+            leonida_mods.parse_model_id(" \t\n ")
         with self.assertRaises(ValueError):
             leonida_mods.parse_model_id("0x")
         with self.assertRaises(ValueError):
@@ -61,6 +65,12 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(mod.swaps[0].from_id, 0xE472B687)
         self.assertEqual(mod.swaps[0].to_id, 0xD7C0CDFF)
 
+        padded = dict(MANDY)
+        padded["archetype_swaps"] = [{"from": " player_story000_00 ", "to": " cs_mandy\t"}]
+        padded_mod = leonida_mods.validate_manifest(padded, "padded_names")
+        self.assertEqual(padded_mod.swaps[0].from_id, 0xE472B687)
+        self.assertEqual(padded_mod.swaps[0].to_id, 0xD7C0CDFF)
+
         def bad(data, needle):
             with self.assertRaises(leonida_mods.ModsError) as cm:
                 leonida_mods.validate_manifest(data, "bad")
@@ -71,7 +81,47 @@ class ManifestTests(unittest.TestCase):
             '"when" can only be "always"')
         bad({"archetype_swaps": [{"from": "cs_mandy", "to": "0xD7C0CDFF"}]}, "with itself")
         bad({"archetype_swaps": "all"}, '"archetype_swaps" must be a list')
+        bad({"archetype_swaps": None}, '"archetype_swaps" must be a list')
         bad([1, 2], "not a JSON object")
+
+    def test_camera_section_matches_runtime_rules(self):
+        # The cases of runtime/test/mods_test.cpp, "camera": the manager refuses what parse_mod refuses.
+        mod = leonida_mods.validate_manifest(
+            {"camera": {"view_mode": "first_person", "first_person_value": 4, "contexts": [0]}}, "fp")
+        self.assertEqual((mod.camera.view_mode, mod.camera.first_person_value, mod.camera.contexts),
+                         ("first_person", 4, [0]))
+        self.assertEqual(mod.warnings, [])     # a camera mod changes something without any swap
+        mod = leonida_mods.validate_manifest({"camera": {"view_mode": "default"}}, "d")
+        self.assertEqual((mod.camera.view_mode, mod.camera.first_person_value, mod.camera.contexts),
+                         ("default", 4, []))
+        mod = leonida_mods.validate_manifest(
+            {"camera": {"view_mode": "first_person", "first_person_value": 255.0,
+                        "contexts": [2147483647, 2147483648, 4294967295]}}, "wide")
+        self.assertEqual(mod.camera.first_person_value, 255)
+        self.assertEqual(mod.camera.contexts, [2147483647, 2147483648, 4294967295])
+        self.assertIsNone(leonida_mods.validate_manifest(MANDY, "mandy_prison_intro").camera)
+        self.assertEqual(leonida_mods.validate_manifest({}, "empty").warnings,
+                         ["no archetype_swaps; this mod currently changes nothing"])
+        self.assertEqual(leonida_mods.validate_manifest({"archetype_swaps": []}, "empty").warnings,
+                         ["archetype_swaps is empty; this mod currently changes nothing"])
+
+        def bad(camera, needle):
+            with self.assertRaises(leonida_mods.ModsError) as cm:
+                leonida_mods.validate_manifest({"archetype_swaps": MANDY["archetype_swaps"], "camera": camera},
+                                               "bad")
+            self.assertIn(needle, str(cm.exception))
+
+        bad("first_person", '"camera" must be an object')
+        bad(None, '"camera" must be an object')
+        bad({}, '"view_mode" must be "first_person" or "default"')
+        bad({"view_mode": "top_down"}, '"view_mode" must be "first_person" or "default"')
+        for value in (4.5, -1, 256, "4", True, None):
+            bad({"view_mode": "first_person", "first_person_value": value},
+                '"first_person_value" must be a whole number 0-255')
+        bad({"view_mode": "first_person", "contexts": "all"}, '"contexts" must be a list of numbers')
+        for value in (-1, 0.5, 4294967296, "0", False, None):
+            bad({"view_mode": "first_person", "contexts": [0, value]},
+                '"contexts" must be a list of whole numbers from 0 to 4294967295')
 
 
 class ManagerTests(unittest.TestCase):
@@ -145,6 +195,62 @@ class ManagerTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("skipped broken:", out)
             self.assertEqual(err, "")
+
+    def test_manifest_with_a_byte_order_mark_is_read_as_the_runtime_reads_it(self):
+        # docs/modding.md: a UTF-8 byte-order mark in front is accepted, a UTF-16 file is named as such.
+        with tempfile.TemporaryDirectory() as tmp:
+            mods = os.path.join(tmp, "mods")
+            manifest = Path(mods, "marked", "mod.json")
+            manifest.parent.mkdir(parents=True)
+            manifest.write_bytes(b"\xef\xbb\xbf" + json.dumps(MANDY).encode("utf-8"))
+            code, out, err = cli("--dir", mods, "check")
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("marked: Mandy in the prison intro [enabled; 1 swap", out)
+
+            code, out, err = cli("--dir", mods, "disable", "marked")
+            self.assertEqual((code, err), (0, ""))
+            self.assertEqual(read_json(manifest), {**MANDY, "enabled": False})
+
+            source = Path(tmp, "source", "from_notepad", "mod.json")
+            source.parent.mkdir(parents=True)
+            source.write_bytes(b"\xef\xbb\xbf" + json.dumps(MANDY).encode("utf-8"))
+            code, out, err = cli("--dir", mods, "install", str(source.parent))
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("installed from_notepad", out)
+
+            for name, encoding in (("le", "utf-16"), ("bare", "utf-16-le")):
+                Path(mods, name).mkdir()
+                Path(mods, name, "mod.json").write_bytes(json.dumps(MANDY).encode(encoding))
+            code, out, err = cli("--dir", mods, "check")
+            self.assertEqual((code, err), (1, ""))
+            self.assertIn("skipped le: mod.json is UTF-16; save it as UTF-8", out)
+            self.assertIn("skipped bare: mod.json is UTF-16; save it as UTF-8", out)
+
+    def test_list_and_check_report_the_camera_section(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mods = Path(tmp, "mods")
+            write_json(mods / "a_first" / "mod.json",
+                       {"camera": {"view_mode": "first_person", "first_person_value": 4, "contexts": [0, 2]}})
+            write_json(mods / "b_default" / "mod.json", {"camera": {"view_mode": "default"}})
+            code, out, err = cli("--dir", str(mods), "list")
+            self.assertEqual((code, err), (0, ""))
+            self.assertIn("a_first: a_first [enabled; 0 swaps, camera]", out)
+            self.assertIn("  camera first_person (value 4; contexts 0, 2)\n", out)
+            self.assertIn("  camera default (the game's own view)  (overrides a_first)\n", out)
+            self.assertNotIn("changes nothing", out)
+
+            code, out, err = cli("--dir", str(mods), "list", "--json")
+            self.assertEqual((code, err), (0, ""))
+            report = {m["folder"]: m for m in json.loads(out)["mods"]}
+            self.assertEqual(report["a_first"]["camera"],
+                             {"view_mode": "first_person", "first_person_value": 4, "contexts": [0, 2]})
+            self.assertEqual(report["a_first"]["warnings"], [])
+
+            # A section the runtime skips the mod for is an error here too, not a mod that "checks" clean.
+            write_json(mods / "c_broken" / "mod.json", {"camera": {"view_mode": "sideways"}})
+            code, out, err = cli("--dir", str(mods), "check")
+            self.assertEqual((code, err), (1, ""))
+            self.assertIn('skipped c_broken: "camera": "view_mode" must be "first_person" or "default"', out)
 
     def test_swap_conflicts_appear_in_json_text_and_strict_check(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -233,6 +339,11 @@ class SamplesAndGuiTests(unittest.TestCase):
         self.assertFalse(by_folder["mandy_to_monalisa"].enabled)
         active = leonida_mods.active_swaps(mods)
         self.assertEqual(active, {0xE472B687: by_folder["mandy_prison_intro"].swaps[0]})
+        # mods/first_person has a "camera" section and no swap: it is not a mod that "changes nothing".
+        first_person = by_folder["first_person"]
+        self.assertEqual((first_person.camera.view_mode, first_person.camera.first_person_value,
+                          first_person.camera.contexts), ("first_person", 4, [0]))
+        self.assertEqual(first_person.warnings, [])
 
     def test_gui_is_an_explicit_lazy_tkinter_entry_point(self):
         source = (ROOT / "tools" / "leonida_mods.py").read_text(encoding="utf-8")

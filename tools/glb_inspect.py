@@ -17,7 +17,9 @@ from __future__ import annotations
 import argparse
 from contextlib import suppress
 import errno
+import io
 import json
+import math
 import os
 import struct
 import sys
@@ -112,11 +114,15 @@ def _reject_json_constant(value: str) -> None:
 
 def parse_glb(data: bytes) -> dict:
     """Validate the GLB container and return the parsed JSON and chunk table."""
-    size = len(data)
-    if size < GLB_HEADER_SIZE:
-        raise GlbError(f"truncated GLB header: {size} bytes, need at least {GLB_HEADER_SIZE}")
+    return _parse_stream(io.BytesIO(data), len(data))
 
-    magic, version, declared_length = struct.unpack_from("<4sII", data, 0)
+
+def _parse_stream(stream, size: int) -> dict:
+    header = stream.read(GLB_HEADER_SIZE)
+    if len(header) < GLB_HEADER_SIZE:
+        raise GlbError(f"truncated GLB header: {len(header)} bytes, need at least {GLB_HEADER_SIZE}")
+
+    magic, version, declared_length = struct.unpack("<4sII", header)
     if magic != GLB_MAGIC:
         raise GlbError(f"bad GLB magic {magic!r}, expected {GLB_MAGIC!r}")
     if version != GLB_VERSION:
@@ -132,9 +138,10 @@ def parse_glb(data: bytes) -> dict:
     offset = GLB_HEADER_SIZE
     chunks: list[dict] = []
     while offset < size:
-        if offset + CHUNK_HEADER_SIZE > size:
+        chunk_header = stream.read(CHUNK_HEADER_SIZE)
+        if len(chunk_header) != CHUNK_HEADER_SIZE:
             raise GlbError(f"truncated chunk header at offset {offset}")
-        chunk_length, chunk_type = struct.unpack_from("<II", data, offset)
+        chunk_length, chunk_type = struct.unpack("<II", chunk_header)
         remaining = size - offset - CHUNK_HEADER_SIZE
         label = _chunk_type_name(chunk_type)
         if chunk_length > remaining:
@@ -146,13 +153,16 @@ def parse_glb(data: bytes) -> dict:
             raise GlbError(f"{label} chunk at offset {offset} has length {chunk_length}, not a multiple of 4")
         chunks.append({"type": chunk_type, "length": chunk_length})
         offset += CHUNK_HEADER_SIZE + chunk_length
+        stream.seek(offset)
 
     if not chunks or chunks[0]["type"] != CHUNK_TYPE_JSON:
         kind = _chunk_type_name(chunks[0]["type"]) if chunks else "none"
         raise GlbError(f"missing JSON chunk: first chunk is {kind}")
 
-    json_offset = GLB_HEADER_SIZE + CHUNK_HEADER_SIZE
-    json_payload = data[json_offset:json_offset + chunks[0]["length"]]
+    stream.seek(GLB_HEADER_SIZE + CHUNK_HEADER_SIZE)
+    json_payload = stream.read(chunks[0]["length"])
+    if len(json_payload) != chunks[0]["length"]:
+        raise GlbError("truncated JSON chunk")
     pad_start = len(json_payload.rstrip(b" \x00"))
     padding = len(json_payload) - pad_start
     nul_padding = json_payload[pad_start:].count(b"\x00")
@@ -369,11 +379,14 @@ def _bbox(accessor: dict | None) -> dict | None:
         return None
     lower = accessor.get("min")
     upper = accessor.get("max")
-    if not (isinstance(lower, list) and isinstance(upper, list) and len(lower) >= 3 and len(upper) >= 3):
+    if not (isinstance(lower, list) and isinstance(upper, list) and len(lower) == len(upper) == 3):
         return None
-    if not all(isinstance(value, (int, float)) and not isinstance(value, bool) for value in lower[:3] + upper[:3]):
+    for value in lower + upper:
+        if not (_is_int(value) or (isinstance(value, float) and math.isfinite(value))):
+            return None
+    if any(lo > hi for lo, hi in zip(lower, upper)):
         return None
-    return {"min": lower[:3], "max": upper[:3]}
+    return {"min": lower, "max": upper}
 
 
 def _merge_bbox(boxes: list[dict]) -> dict | None:
@@ -391,7 +404,7 @@ def _material_name(gltf: dict, index: object) -> str | None:
 
 
 def _texture_name(gltf: dict, texture_index: object) -> str | None:
-    """The baseColor texture's image name, falling back to its URI then the texture name."""
+    """The texture's image name, falling back to its URI then the texture name."""
     texture = _entry(gltf, "textures", texture_index)
     if texture is None:
         return None
@@ -417,7 +430,13 @@ def _material_report(gltf: dict, index: int, material: dict) -> dict:
     pbr = _object(material.get("pbrMetallicRoughness"))
     base_color_texture = _object(pbr.get("baseColorTexture"))
     texture_index = _index(base_color_texture.get("index"))
-    return {
+    additional = {}
+    for owner, role in ((pbr, "metallicRoughnessTexture"), (material, "normalTexture"),
+                        (material, "occlusionTexture"), (material, "emissiveTexture")):
+        if role in owner:
+            ref = _index(_object(owner[role]).get("index"))
+            additional[role] = {"index": ref, "name": _texture_name(gltf, ref)}
+    report = {
         "index": index,
         "name": _text(material.get("name")),
         "base_color_factor": pbr.get("baseColorFactor"),
@@ -426,6 +445,9 @@ def _material_report(gltf: dict, index: int, material: dict) -> dict:
         "alpha_mode": material.get("alphaMode"),
         "double_sided": material.get("doubleSided"),
     }
+    if additional:
+        report["additional_textures"] = additional
+    return report
 
 
 def _primitive_mode(primitive: dict) -> tuple[int | None, str | None, bool]:
@@ -494,6 +516,41 @@ def _mesh_report(gltf: dict, index: int, mesh: dict) -> dict:
     }
 
 
+def _skin_report(gltf: dict, index: int, skin: dict) -> dict:
+    joints = skin.get("joints")
+    joint_count = len(joints) if isinstance(joints, list) else None
+    report = {"index": index, "name": _text(skin.get("name")), "joint_count": joint_count}
+    issues = []
+    if not joint_count:
+        issues.append("joints must be a non-empty array")
+    seen = set()
+    for slot, joint in enumerate(_array(joints)):
+        if _entry(gltf, "nodes", joint) is None:
+            issues.append(f"joints[{slot}] does not reference a node")
+        elif joint in seen:
+            issues.append(f"joints[{slot}] repeats node {joint}")
+        else:
+            seen.add(joint)
+    if "skeleton" in skin and _entry(gltf, "nodes", skin["skeleton"]) is None:
+        issues.append("skeleton does not reference a node")
+    if "inverseBindMatrices" in skin:
+        accessor_index = skin["inverseBindMatrices"]
+        accessor = _accessor(gltf, accessor_index)
+        if accessor is None:
+            issues.append("inverseBindMatrices does not reference an accessor")
+        else:
+            if accessor.get("type") != "MAT4":
+                issues.append("inverseBindMatrices accessor must have type MAT4")
+            if accessor.get("componentType") != 5126:
+                issues.append("inverseBindMatrices accessor must have componentType FLOAT (5126)")
+            count = _accessor_count(gltf, accessor_index)
+            if joint_count and (count is None or count < joint_count):
+                issues.append(f"inverseBindMatrices needs at least {joint_count} matrices")
+    if issues:
+        report["issues"] = issues
+    return report
+
+
 def build_report(glb: dict, file_bytes: int) -> dict:
     """Turn the parsed GLB JSON into the inspection report."""
     gltf = glb["json"]
@@ -504,16 +561,8 @@ def build_report(glb: dict, file_bytes: int) -> dict:
     materials = [_material_report(gltf, i, material)
                   for i, material in enumerate(_array(gltf.get("materials")))
                   if isinstance(material, dict)]
-    skins = []
-    for i, skin in enumerate(_array(gltf.get("skins"))):
-        if not isinstance(skin, dict):
-            continue
-        joints = skin.get("joints")
-        skins.append({
-            "index": i,
-            "name": _text(skin.get("name")),
-            "joint_count": len(joints) if isinstance(joints, list) else None,
-        })
+    skins = [_skin_report(gltf, i, skin) for i, skin in enumerate(_array(gltf.get("skins")))
+             if isinstance(skin, dict)]
     animations = [_animation_report(gltf, i, animation)
                   for i, animation in enumerate(_array(gltf.get("animations")))
                   if isinstance(animation, dict)]
@@ -598,7 +647,7 @@ def format_report(report: dict) -> str:
         f"{chunk['type']} {chunk['byte_length']} bytes (padding {_padding_text(chunk.get('padding'))})"
         for chunk in report["chunks"]))
     bbox = report["position_bbox"]
-    suffix = (" (partial: some POSITION accessors have no min/max)"
+    suffix = (" (partial: some POSITION accessors have missing or invalid bounds)"
               if bbox is not None and not report["position_bbox_complete"] else "")
     lines.append(f"POSITION bbox: {_bbox_text(bbox)}{suffix}")
 
@@ -631,12 +680,16 @@ def format_report(report: dict) -> str:
             f"baseColorTexture={_show(material['base_color_texture'])} "
             f"(index {_show(material['base_color_texture_index'])}) "
             f"alphaMode={_show(material['alpha_mode'])} doubleSided={_show(material['double_sided'])}")
+        for role, texture in material.get("additional_textures", {}).items():
+            lines.append(f"    {role}={_show(texture['name'])} (index {_show(texture['index'])})")
 
     lines.append("skins:")
     if not report["skins"]:
         lines.append("  (none)")
     for skin in report["skins"]:
         lines.append(f"  [{skin['index']}] name={_show(skin['name'])} joints={_show(skin['joint_count'])}")
+        for issue in skin.get("issues", []):
+            lines.append(f"    issue: {issue}")
 
     lines.append("animations:")
     if not report["animations"]:
@@ -656,8 +709,12 @@ def format_report(report: dict) -> str:
 
 def inspect_file(path: str) -> dict:
     with open(path, "rb") as handle:
-        data = handle.read()
-    return build_report(parse_glb(data), len(data))
+        if not handle.seekable():
+            data = handle.read()
+            return build_report(parse_glb(data), len(data))
+        size = handle.seek(0, os.SEEK_END)
+        handle.seek(0)
+        return build_report(_parse_stream(handle, size), size)
 
 
 def main(argv: list[str] | None = None) -> int:

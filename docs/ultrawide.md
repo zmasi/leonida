@@ -4,6 +4,10 @@ How the output size goes from the window to the title and back to the screen, an
 change. **Measured** means a run, a test or the code shows it (file:line quoted, line numbers as of this note);
 **hypothesis** means nobody has checked it yet.
 
+> **Status on `main`:** The C++ `runtime/` changes described in the first two sections below were written against an
+> unmerged `runtime/` branch (`aspect_fit.h`, `display_mode.h`, `display_profile.h` are not in `runtime/` on `main`).
+> The Rust `d3d12/` implementation in [The D3D12 runtime (`d3d12/`)](#the-d3d12-runtime-d3d12) below is on `main`.
+
 ## Settings
 
 | variable | default | what it changes |
@@ -11,8 +15,8 @@ change. **Measured** means a run, a test or the code shows it (file:line quoted,
 | `LEONIDA_ASPECT` | unset | `21:9`, `32:9`, `43:18`, any `W:H` or decimal from 1 to 4, or `auto` (the primary monitor's shape). The display mode the console output reports is widened to that aspect at the same height, and so is the title's window. `off`, `none` or empty: unset. |
 | `LEONIDA_PRESENT_SCALE` | `stretch`, or `fit` with `LEONIDA_ASPECT` | `fit`: a frame whose shape is not the window's keeps its aspect, centred, with black bars beside it (pillarbox) or above and below (letterbox). A frame of the window's shape fills it. `stretch`: the frame fills the window, as before. |
 
-`scripts/play.ps1 -Aspect 21:9` (and `-PresentScale fit|stretch`) sets them. The arithmetic is in
-`runtime/src/aspect_fit.h` and `runtime/test/aspect_fit_test.cpp` tests it.
+On that unmerged `runtime/` branch, `scripts/play.ps1 -Aspect 21:9` (and `-PresentScale fit|stretch`) set them, with
+the arithmetic in `aspect_fit.h` and unit tests in `aspect_fit_test.cpp`.
 
 | `LEONIDA_DISPLAY_MODE` | `LEONIDA_ASPECT` | the title is told |
 |---|---|---|
@@ -26,13 +30,13 @@ change. **Measured** means a run, a test or the code shows it (file:line quoted,
 
 1. **The display mode the title is told.** `rt::d3d12::title_display_mode()` (`runtime/shims/xbox_display.cpp:324`)
    answers the console output's slot 21 (`output_modes`, `:230`), its `GetDesc` desktop coordinates (`:178`),
-   `GetDisplayModeList` (`:202`) and `FindClosestMatchingMode`. It reads `LEONIDA_DISPLAY_MODE` (default 3840x2160,
-   `runtime/src/display_mode.h`) and now widens the result with `LEONIDA_ASPECT` (`title_aspect_ratio()`, `:294`).
+   `GetDisplayModeList` (`:202`) and `FindClosestMatchingMode`. On that branch it read `LEONIDA_DISPLAY_MODE`
+   (default 3840x2160, `display_mode.h`) and widened the result with `LEONIDA_ASPECT` (`title_aspect_ratio()`, `:294`).
    Measured (docs/port_status.md, "The title makes its window at 3840x2160"): the 1.0.2.1 title calls slot 21 just
    before its first `SetFrameIntervalX`, but its window and back buffers stay 3840x2160 whatever slot 21 reports.
    1920x1080 was tried at 60 and 120 Hz.
 2. **The size the title renders at.** This size is compiled into the executable: the Series X SDR mode at RVA
-   `0x0615c100` (`runtime/src/display_profile.h:46`), the scanout reservation, the temporal scene scale and the
+   `0x0615c100` (`display_profile.h:46`), the scanout reservation, the temporal scene scale and the
    Settings viewport. `runtime/src/main.cpp:65-82` patches these when `LEONIDA_DISPLAY_MODE=2560x1440`. Every other
    output is refused (`display_profile.h:100`). Measured: with the SDR mode set to 1920x1080 the title still made
    2560x1440 buffers. `LEONIDA_ASPECT` does not change the executable.
@@ -123,9 +127,9 @@ Read from the 1.0.2.1 executable (offsets are RVAs; none of this is measured in 
   for 7:3 by whatever uses that function. The constant 16/9 at 0x615a1c0 is loaded by at least seven more
   instructions (0x73c7a7, 0x19148bc, 0x28c07bd, 0x3108ddd, 0x32be281, 0x3b6c5f5, 0x4163240), none of them read yet.
 
-`LEONIDA_OUTPUT=WIDTHxHEIGHT` (`hooks.rs`, EXPERIMENTAL) changes the first three together: the 3840x2160 row, the
-reservation that fits it and the Settings viewport pointed at the row, after VIctory's native 1440p profile
-(`runtime/src/display_profile.h`). `LEONIDA_OUTPUT_1440=1` is now the same with 2560x1440. A unit test checks the
+`LEONIDA_OUTPUT=WIDTHxHEIGHT` (`d3d12/crates/leonida-loader/src/hooks.rs`, EXPERIMENTAL) changes the first three
+together: the 3840x2160 row, the reservation that fits it and the Settings viewport pointed at the row, after
+VIctory's native 1440p profile. `LEONIDA_OUTPUT_1440=1` is now the same with 2560x1440. A unit test checks the
 bytes each place holds against the 1.0.2.1 executable (`LEONIDA_GAME_DIR`).
 
 What blocks calling it ultrawide, each needing a run:

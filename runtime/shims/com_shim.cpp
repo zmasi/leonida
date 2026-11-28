@@ -90,7 +90,13 @@ HRESULT WINAPI co_initialize_ex(LPVOID reserved, DWORD coinit) {
         created->requested_coinit = coinit;
         created->host_coinit = owned_mode;
         created->mismatch_absorbed = absorbed;
-        TlsSetValue(slot, created);
+        if (!TlsSetValue(slot, created)) {
+            // Not tracked, so no CoUninitialize would ever give the host reference back: undo it and fail.
+            const DWORD error = GetLastError();
+            delete created;
+            ::CoUninitialize();
+            return HRESULT_FROM_WIN32(error ? error : ERROR_NOT_ENOUGH_MEMORY);
+        }
         return S_OK;
     }
 
@@ -118,13 +124,20 @@ void WINAPI co_uninitialize() {
     if (!state || state->guest_depth == 0) return;
 
     --state->guest_depth;
-    if (state->guest_depth == 0) {
-        for (uint32_t i = 0; i < state->host_inits_owned; ++i) {
+    if (state->guest_depth != 0) {
+        // A nested init took its own host reference: give it back now, not at the outermost CoUninitialize, so balanced
+        // inner pairs do not pile up host references. The first init's reference stays until the guest balances.
+        if (state->host_inits_owned > 1) {
             ::CoUninitialize();
+            --state->host_inits_owned;
         }
-        TlsSetValue(slot, nullptr);
-        delete state;
+        return;
     }
+    for (uint32_t i = 0; i < state->host_inits_owned; ++i) {
+        ::CoUninitialize();
+    }
+    TlsSetValue(slot, nullptr);
+    delete state;
 }
 
 HRESULT WINAPI co_create_instance(REFCLSID rclsid, LPUNKNOWN outer, DWORD cls_context, REFIID riid, LPVOID* ppv) {

@@ -184,6 +184,144 @@ class ProbeCliTests(unittest.TestCase):
                 pr.main(["--modes", "game_i0_d3,not_a_mode"])
         self.assertEqual(caught.exception.code, 2)
 
+    def test_f32_scalar_bits_overflow_returns_signed_infinity(self):
+        self.assertEqual(pr.scalar_bits(1e40, "f32"), (0x7F800000, 0))
+        self.assertEqual(pr.scalar_bits(-1e40, "f32"), (0xFF800000, 0))
+        self.assertEqual(
+            pr.expected_words(pr.scalar_bits(3.0e38, "f32"), "mul:2", "f32", pr.MODES["game_i0_d3"]),
+            (0x7F800000, 0),
+        )
+
+    def test_malformed_oracle_results_unknown_arch_and_run_unavailable(self):
+        class StubOracle(FakeOracle):
+            def __init__(self, run_fn, *, arch="gfx1036"):
+                super().__init__(arch=arch)
+                self._run_fn = run_fn
+
+            def run(self, kernels):
+                return self._run_fn(kernels)
+
+        # Wrong batch count (too short and too long).
+        for bad_len in (0, len(pr.OPS) + 1):
+            o = StubOracle(lambda ks, n=bad_len: [[0] * 100 for _ in range(n)])
+            code, out, _ = run_main(["--modes", "game_i0_d3", "--waves", "32"], o)
+            self.assertEqual(code, 2, out)
+            self.assertIn("harness error", out)
+            self.assertTrue(o.closed)
+
+        # String kernel rejection from runner.run().
+        o = StubOracle(lambda ks: ["assembler rejected: bad opcode"] * len(ks))
+        code, out, _ = run_main(["--modes", "game_i0_d3", "--waves", "32"], o)
+        self.assertEqual(code, 2, out)
+        self.assertIn("assembler rejected: bad opcode", out)
+        self.assertTrue(o.closed)
+
+        # Truncated word list (used to crash with uncaught IndexError).
+        o = StubOracle(lambda ks: [[0] for _ in ks])
+        code, out, _ = run_main(["--modes", "game_i0_d3", "--waves", "32"], o)
+        self.assertEqual(code, 2, out)
+        self.assertIn("expected at least", out)
+        self.assertTrue(o.closed)
+
+        # Dict missing "words" and bool word element.
+        for payload in ({"other": []}, [True] * 200):
+            o = StubOracle(lambda ks, p=payload: [p for _ in ks])
+            code, out, _ = run_main(["--modes", "game_i0_d3", "--waves", "32"], o)
+            self.assertEqual(code, 2, out)
+            self.assertIn("harness error", out)
+            self.assertTrue(o.closed)
+
+        # Unknown arch family (ValueError from asm.family) exits 77 cleanly and closes oracle.
+        o = FakeOracle(arch="gfx900")
+        code, out, _ = run_main(["--modes", "game_i0_d3", "--waves", "32"], o)
+        self.assertEqual(code, 77, out)
+        self.assertIn("hardware oracle unavailable", out)
+        self.assertTrue(o.closed)
+
+        # runner.Unavailable raised inside oracle.run() exits 77 cleanly and closes oracle.
+        def raise_unavail(_ks):
+            raise runner.Unavailable("mode unsupported on device")
+
+        o = StubOracle(raise_unavail)
+        code, out, _ = run_main(["--modes", "game_i0_d3", "--waves", "32"], o)
+        self.assertEqual(code, 77, out)
+        self.assertIn("hardware oracle unavailable: mode unsupported on device", out)
+        self.assertTrue(o.closed)
+
+    def test_cli_validation_dedup_and_upfront_json_checks(self):
+        for argv in (
+            ["--modes", "game_i0_d3,"],
+            ["--modes", ",game_i0_d3"],
+            ["--waves", "32,"],
+            ["--waves", ",64"],
+            ["--hw-arch", ""],
+            ["--hw-arch", "   "],
+            ["--json", ""],
+            ["--json", "   "],
+        ):
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    pr.main(argv)
+                self.assertEqual(caught.exception.code, 2)
+
+        # Duplicate modes and waves are deduplicated so kernels are not run twice.
+        seen_kernel_counts = []
+        oracle = FakeOracle()
+        orig_run = oracle.run
+
+        def spy_run(kernels):
+            seen_kernel_counts.append(len(kernels))
+            return orig_run(kernels)
+
+        oracle.run = spy_run
+        code, out, err = run_main(["--modes", "game_i0_d3, game_i0_d3", "--waves", "32, 32"], oracle)
+        self.assertEqual((code, err), (0, ""), out)
+        self.assertEqual(seen_kernel_counts, [len(pr.OPS)])
+
+        # Blocked parent path fails fast before opening the hardware oracle.
+        with tempfile.TemporaryDirectory() as work:
+            blocker = os.path.join(work, "not_a_dir")
+            Path(blocker).write_bytes(b"keep me")
+            err_buf = io.StringIO()
+            with mock.patch.object(runner, "open_oracle", side_effect=AssertionError("oracle must not open")), \
+                    redirect_stderr(err_buf):
+                rc = pr.main(["--modes", "game_i0_d3", "--waves", "32", "--json", os.path.join(blocker, "out.json")])
+            self.assertEqual(rc, 2)
+            self.assertIn("cannot write", err_buf.getvalue())
+            self.assertEqual(Path(blocker).read_bytes(), b"keep me")
+
+    def test_write_report_creates_parent_atomic_symlink_mode_lf_devnull_and_nan(self):
+        with tempfile.TemporaryDirectory() as work:
+            nested = os.path.join(work, "sub", "dir", "probe.json")
+            code, out, err = run_main(["--modes", "game_i0_d3", "--waves", "32", "--json", nested], FakeOracle())
+            self.assertEqual((code, err), (0, ""), out)
+            raw = Path(nested).read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertEqual(json.loads(raw)["mismatches"], 0)
+
+            # Symlink target and permissions are preserved on atomic replace.
+            if os.name != "nt":
+                os.chmod(nested, 0o600)
+                link_path = os.path.join(work, "link.json")
+                os.symlink(nested, link_path)
+            else:
+                link_path = nested
+            self.assertTrue(pr.write_report(link_path, {"ok": 1}))
+            if os.name != "nt":
+                self.assertTrue(os.path.islink(link_path))
+                self.assertEqual(os.stat(nested).st_mode & 0o777, 0o600)
+            self.assertEqual(json.loads(Path(nested).read_text(encoding="utf-8")), {"ok": 1})
+
+            # Non-regular targets like /dev/null work cleanly.
+            self.assertTrue(pr.write_report(os.devnull, {"ok": 1}))
+
+            # Non-finite JSON values are rejected to stderr without overwriting existing file.
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                self.assertFalse(pr.write_report(nested, {"bad": float("nan")}))
+            self.assertIn("cannot write", err_buf.getvalue())
+            self.assertEqual(json.loads(Path(nested).read_text(encoding="utf-8")), {"ok": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,6 +35,19 @@ class ReadBeforeWriteTests(unittest.TestCase):
         self.assertEqual(read_s, {4, 5})
         self.assertEqual(read_v, {0, 2})
 
+    def test_short_form_carry_in_reads_its_scalar_src0(self):
+        # The assembler's short form v_add_co_ci_u32 vD, src0, src1 has an implicit VCC carry-out and carry-in:
+        # s3 (src0) is read before any write, not a carry-out destination, so the later read of s3 does not hide it.
+        for op in ("v_add_co_ci_u32", "v_sub_co_ci_u32", "v_subrev_co_ci_u32"):
+            with self.subTest(op=op):
+                insns = parse([
+                    f"\t{op}_e32 v1, s3, v2",
+                    "\ts_mov_b32 s9, s3",
+                ])
+                read_s, read_v = V.read_before_write(insns)
+                self.assertEqual(read_s, {3})
+                self.assertEqual(read_v, {2})
+
     def test_dual_dest_valu_ops_write_scalar_carry_or_scale(self):
         insns = parse([
             "\tv_mad_u64_u32 v[0:1], s[2:3], v4, v5, v[6:7]",

@@ -89,7 +89,12 @@ def load_names(archive, mount, use_cache=True):
     if use_cache:
         fd, name = tempfile.mkstemp(prefix="bink_names.", suffix=".part", dir=cache.parent)
         try:
-            with open(fd, "w", encoding="utf-8", newline="") as f:
+            try:
+                out = open(fd, "w", encoding="utf-8", newline="")
+            except BaseException:
+                os.close(fd)
+                raise
+            with out as f:
                 f.write("# " + key + "\n")
                 w = csv.writer(f, lineterminator="\n")
                 w.writerow(CACHE_FIELDS)
@@ -97,6 +102,10 @@ def load_names(archive, mount, use_cache=True):
                     w.writerow([r["path"], r["offset"], r["width"], r["height"], r["frames"]])
             os.replace(name, cache)
         finally:
+            try:
+                os.chmod(name, 0o600)
+            except OSError:
+                pass
             Path(name).unlink(missing_ok=True)
     return [(r["path"], int(r["offset"]), r["width"], r["height"], r["frames"]) for r in rows]
 
@@ -118,10 +127,11 @@ def pick(names, wanted):
 def find_exe(explicit):
     if explicit:
         return Path(explicit)
-    root = HERE.parent
-    for c in (root / "runtime" / "build" / "bink_play.exe", root / "runtime" / "build" / "Release" / "bink_play.exe"):
-        if c.is_file():
-            return c
+    build = HERE.parent / "runtime" / "build"
+    for config in ("", "Release", "RelWithDebInfo", "Debug", "MinSizeRel"):
+        player = build / config / "bink_play.exe"
+        if player.is_file():
+            return player
     raise SystemExit("bink_play.exe not found; build the runtime (runtime/build) or pass --exe")
 
 

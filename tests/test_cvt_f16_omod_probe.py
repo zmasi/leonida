@@ -271,6 +271,96 @@ class ProbeCliTests(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("unavailable", buf.getvalue())
 
+    def test_malformed_and_duplicate_modes_waves_and_empty_hw_arch(self):
+        # Trailing/empty comma tokens and empty --hw-arch must fail with SystemExit(2) before opening oracle.
+        for bad_args in (
+            ["--modes", "rne_d0_i0,"],
+            ["--modes", ",rne_d0_i0"],
+            ["--modes", "rne_d0_i0,,rtz_d0_i0"],
+            ["--waves", "32,"],
+            ["--waves", "32,,64"],
+            ["--hw-arch", ""],
+            ["--hw-arch", "   "],
+            ["--json", ""],
+            ["--json", "   "],
+        ):
+            with self.subTest(args=bad_args):
+                with mock.patch.object(runner, "open_oracle") as open_mock, redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as exc:
+                        pr.main(bad_args)
+                self.assertEqual(exc.exception.code, 2)
+                open_mock.assert_not_called()
+
+        # Duplicate modes/waves are deduplicated so kernels and total_cases are not double-counted.
+        oracle = FakeOracle()
+        with tempfile.TemporaryDirectory() as d:
+            report = os.path.join(d, "dedup.json")
+            rc, _, err = _run_main(
+                oracle, "--modes", "rne_d0_i0,rne_d0_i0", "--waves", "32,32", "--json", report
+            )
+            self.assertEqual(rc, 0, err)
+            doc = json.loads(Path(report).read_text(encoding="utf-8"))
+            self.assertEqual(doc["modes"], ["rne_d0_i0"])
+            self.assertEqual(doc["waves"], [32])
+            self.assertEqual(doc["total_cases"], len(pr.MODS) * len(pr.INPUTS))
+
+    def test_json_blocker_and_trailing_sep_fail_before_oracle(self):
+        with tempfile.TemporaryDirectory() as d:
+            blocker = os.path.join(d, "blocker")
+            Path(blocker).write_bytes(b"keep")
+            with mock.patch.object(runner, "open_oracle") as open_mock, redirect_stderr(io.StringIO()) as err:
+                rc = pr.main(["--modes", "rne_d0_i0", "--waves", "32", "--json", os.path.join(blocker, "r.json")])
+            self.assertEqual(rc, 2)
+            open_mock.assert_not_called()
+            self.assertIn("ERROR: cannot write", err.getvalue())
+            self.assertEqual(Path(blocker).read_bytes(), b"keep")
+
+            with mock.patch.object(runner, "open_oracle") as open_mock, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as exc:
+                    pr.main(["--modes", "rne_d0_i0", "--waves", "32", "--json", os.path.join(d, "sub") + os.sep])
+            self.assertEqual(exc.exception.code, 2)
+            open_mock.assert_not_called()
+
+    def test_write_report_atomic_symlink_nan_and_devnull(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "sub", "report.json")
+            self.assertTrue(pr.write_report(out, {"ok": 1}))
+            raw = Path(out).read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+
+            with redirect_stderr(io.StringIO()):
+                self.assertFalse(pr.write_report(out, {"bad": float("nan")}))
+            self.assertEqual(json.loads(Path(out).read_text(encoding="utf-8")), {"ok": 1})
+
+            if hasattr(os, "symlink"):
+                real = os.path.join(d, "real.json")
+                link = os.path.join(d, "link.json")
+                Path(real).write_text("old", encoding="utf-8")
+                try:
+                    os.symlink(real, link)
+                except OSError:
+                    link = None
+                if link is not None:
+                    self.assertTrue(pr.write_report(link, {"via": "link"}))
+                    self.assertTrue(os.path.islink(link))
+                    self.assertEqual(json.loads(Path(real).read_text(encoding="utf-8")), {"via": "link"})
+
+            if os.name == "posix" and os.path.exists("/dev/null"):
+                self.assertTrue(pr.write_report("/dev/null", {"ok": 1}))
+
+    def test_evaluate_results_count_mismatch_and_unknown_arch_family(self):
+        _, meta = pr.build_jobs(["rne_d0_i0"], [32])
+        rep = pr.evaluate_results(["rne_d0_i0"], [32], meta, [])
+        self.assertEqual(len(rep["harness_errors"]), 1)
+        self.assertIn("expected", rep["harness_errors"][0]["error"])
+
+        oracle = FakeOracle()
+        oracle.arch = "unknown_arch_999"
+        rc, out, _ = _run_main(oracle, "--modes", "rne_d0_i0", "--waves", "32")
+        self.assertEqual(rc, 77, out)
+        self.assertTrue(oracle.closed)
+
 
 if __name__ == "__main__":
     unittest.main()

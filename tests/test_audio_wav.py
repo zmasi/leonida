@@ -378,8 +378,21 @@ class GranuleTest(unittest.TestCase):
             path = Path(tmp, "sample.ogg")
             for name, first, last, expected in cases:
                 with self.subTest(name=name):
-                    path.write_bytes(first + last)
+                    tags = awc_opus.ogg_page(10, 1, 0, [b"OpusTags" + bytes(8)], 0)
+                    path.write_bytes(first + tags + last)
                     self.assertEqual(audio_wav.ogg_output_samples(path), expected)
+
+    def test_page_sequence_must_be_contiguous_for_explicit_trim(self):
+        head = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 312, 48000, 0, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp, "sample.ogg")
+            for seqs, frames in [((0, 1, 2), 960), ((0, 2, 3), 0), ((0, 1, 1), 0),
+                                 ((0xffffffff, 0, 1), 960)]:
+                with self.subTest(seqs=seqs):
+                    path.write_bytes(awc_opus.ogg_page(7, seqs[0], 0, [head], 2)
+                                     + awc_opus.ogg_page(7, seqs[1], 0, [b"OpusTags" + bytes(8)], 0)
+                                     + awc_opus.ogg_page(7, seqs[2], 1272, [b"x"], 4))
+                    self.assertEqual(audio_wav.ogg_output_samples(path), frames)
 
     def test_walk_rejects_same_serial_chaining_multiplexing_and_trailing_data(self):
         head = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 312, 48000, 0, 0)

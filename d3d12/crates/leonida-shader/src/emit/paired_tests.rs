@@ -702,3 +702,50 @@ fn the_paired_form_before_the_approximate_ones_when_asked() {
         v.validate(&mut copy).expect("DXIL validation failed");
     }
 }
+
+/// A program asked for by name ([`super::with_forms_for`], what `leonida-gpu`'s
+/// `LEONIDA_PAIRED_FOR` does): the water's tile program
+/// ([`super::water_tests::tile_program`]), which another exact form takes by default, takes the
+/// paired form before every other, as with [`PairedLanes::First`] for every program; the
+/// choice ends with the call. Asked for the wave-wide form instead, the form taken is the
+/// default's (an exact form came first). (No card: which form translates the program. What the
+/// paired form computes for it is `the_water_tile_program_in_the_paired_form_first`.)
+/// After edsuuu/VI-BR-PORT cf3394b.
+#[test]
+fn a_program_named_takes_the_paired_form_first() {
+    let native = super::water_tests::tile_program(0, false, true);
+    let p = crate::spill::build(&native).expect("build");
+    let st = structure::structure(&p).expect("structure");
+    let res =
+        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = dxbc::build(&[]);
+    let c = dxbc::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let emit = |mode: PairedLanes, forms: super::FormsFor| {
+        let was_mode = super::TEST_PAIRED_LANES.replace(Some(mode));
+        let taken = super::TEST_PAIRED_TAKEN.get();
+        let shader = super::with_forms_for(forms, || super::emit(&c, &native, &p, &st, &io, &res)).expect("emit");
+        super::TEST_PAIRED_LANES.set(was_mode);
+        (shader.dxil, super::TEST_PAIRED_TAKEN.get() - taken)
+    };
+    let none = super::FormsFor::default();
+    let named = super::FormsFor { paired_first: true, wide: false };
+    let wide = super::FormsFor { paired_first: false, wide: true };
+    let (default, taken) = emit(PairedLanes::BeforeWide, none);
+    assert_eq!(taken, 0);
+    let (first, taken) = emit(PairedLanes::First, none);
+    assert_eq!(taken, 1);
+    assert_ne!(first, default);
+    // named: the paired form, whatever the switch says
+    for mode in [PairedLanes::BeforeWide, PairedLanes::Off] {
+        let (by_name, taken) = emit(mode, named);
+        assert_eq!(taken, 1, "{mode:?}");
+        assert_eq!(by_name, first, "{mode:?}");
+    }
+    // the choice ended with the call
+    assert_eq!(emit(PairedLanes::BeforeWide, none), (default.clone(), 0));
+    // named for the wave-wide form: this program's exact form still comes first
+    assert_eq!(emit(PairedLanes::BeforeWide, wide), (default, 0));
+    lower::TEST_HOST_WAVE.set(was);
+}

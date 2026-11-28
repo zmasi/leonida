@@ -1,6 +1,8 @@
 """Fixed reference points for the synthetic guest's renderer and input trace (no GPU)."""
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import struct
@@ -100,6 +102,29 @@ class GuestSceneReferenceTest(unittest.TestCase):
             self.assertNotIn("Traceback", result.stderr)
             self.assertEqual(result.stdout, "")
             self.assertEqual(placeholder.read_bytes(), b"synthetic input")
+
+    def test_run_leaves_a_competing_runs_output_untouched(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            loader = root / "loader.txt"
+            loader.write_bytes(b"synthetic input")
+            shaders = root / "shaders"
+            shaders.mkdir()
+            args = argparse.Namespace(wine=None, loader=loader, guest=loader, shaders=shaders, play_audio=False)
+            out = root / "output"
+            logs = out / "logs"
+            # The other run claimed this directory after our argument check.
+            logs.mkdir(parents=True)
+            first_run_log = logs / "full.stdout.log"
+            first_run_log.write_bytes(b"first run")
+
+            stderr = io.StringIO()
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(stderr):
+                self.assertEqual(runner.execute(args, out, temporary=False), 1)
+
+            self.assertEqual(list(out.iterdir()), [logs])
+            self.assertEqual(first_run_log.read_bytes(), b"first run")
+            self.assertIn(f"could not create output directory {out}", stderr.getvalue())
 
     def test_launch_failure_preserves_run_record_and_logs(self):
         with tempfile.TemporaryDirectory() as temp:

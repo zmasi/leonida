@@ -554,10 +554,14 @@ def main(argv=None) -> int:
                 originals[dest] = None
         for tmp, dest in staged:
             os.replace(tmp, dest)
-    except OSError as error:
+    except BaseException as error:
         for dest, backup in originals.items():
             try:
                 if os.path.lexists(dest):
+                    try:
+                        os.chmod(dest, 0o600)
+                    except OSError:
+                        pass
                     os.remove(dest)
                 if backup is not None:
                     os.replace(backup, dest)
@@ -565,14 +569,24 @@ def main(argv=None) -> int:
                 pass
         for tmp, _ in staged:
             try:
+                try:
+                    os.chmod(tmp, 0o600)
+                except OSError:
+                    pass
                 os.remove(tmp)
             except OSError:
                 pass
-        print(f"text_tables: error: cannot write: {error}", file=sys.stderr)
-        return 2
+        if isinstance(error, OSError):
+            print(f"text_tables: error: cannot write: {error}", file=sys.stderr)
+            return 2
+        raise
     for backup in originals.values():
         if backup is not None:
             try:
+                try:
+                    os.chmod(backup, 0o600)
+                except OSError:
+                    pass
                 os.remove(backup)
             except OSError:
                 pass

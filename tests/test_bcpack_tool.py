@@ -5,12 +5,15 @@ Usage:
 """
 from __future__ import annotations
 
+import errno
 import io
+import json
 import os
 import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOLS = os.path.join(ROOT, "tools")
@@ -60,6 +63,16 @@ class TestBcpackTool(unittest.TestCase):
         for h in prof["histograms"]:
             self.assertGreaterEqual(h["unique_symbols"], 1)
             self.assertGreater(len(h["top_symbols"]), 0)
+
+    def test_profile_stream_decodes_lanes_once(self) -> None:
+        with mock.patch.object(
+            bcpack_tool.bcpack, "decode_lanes", wraps=bcpack_tool.bcpack.decode_lanes
+        ) as spy:
+            prof = bcpack_tool.profile_stream(
+                self.compressed_stream, codec=1, out_size=len(self.original_blocks)
+            )
+        self.assertEqual(spy.call_count, 1)
+        self.assertEqual(len(prof["histograms"]), 12)
 
     def test_decode_file_synthetic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -127,6 +140,136 @@ class TestBcpackTool(unittest.TestCase):
             self.assertIn(link_file, str(ctx.exception))
             with open(in_file, "rb") as f:
                 self.assertEqual(f.read(), self.compressed_stream)
+
+    def test_decode_refuses_history_file_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            hist_file = os.path.join(tmp_dir, "hist.json")
+            hist_body = json.dumps({"bc1": {"confirmed": {}}})
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            with open(hist_file, "w", encoding="utf-8", newline="\n") as f:
+                f.write(hist_body)
+            with self.assertRaises(ValueError) as ctx:
+                bcpack_tool.decode_file(
+                    in_file, hist_file, codec=1, out_size=len(self.original_blocks), history=hist_file
+                )
+            self.assertIn(hist_file, str(ctx.exception))
+            with open(hist_file, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), hist_body)
+
+    def test_decode_refuses_symlink_to_history_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            hist_file = os.path.join(tmp_dir, "hist.json")
+            link_file = os.path.join(tmp_dir, "hist_link.json")
+            hist_body = json.dumps({"bc1": {"confirmed": {}}})
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            with open(hist_file, "w", encoding="utf-8", newline="\n") as f:
+                f.write(hist_body)
+            try:
+                os.symlink(hist_file, link_file)
+            except (OSError, NotImplementedError, AttributeError) as e:
+                self.skipTest(f"symlinks unavailable: {e}")
+            with self.assertRaises(ValueError) as ctx:
+                bcpack_tool.decode_file(
+                    in_file, link_file, codec=1, out_size=len(self.original_blocks), history=hist_file
+                )
+            self.assertIn(link_file, str(ctx.exception))
+            with open(hist_file, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), hist_body)
+
+    def test_decode_refuses_history_dir_codec_file_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            hist_dir = os.path.join(tmp_dir, "hist_dir")
+            os.makedirs(hist_dir)
+            hist_file = os.path.join(hist_dir, "bc1.json")
+            hist_body = json.dumps({"codec": "bc1", "confirmed": {}})
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            with open(hist_file, "w", encoding="utf-8", newline="\n") as f:
+                f.write(hist_body)
+            with self.assertRaises(ValueError) as ctx:
+                bcpack_tool.decode_file(
+                    in_file, hist_file, codec=1, out_size=len(self.original_blocks), history=hist_dir
+                )
+            self.assertIn(hist_file, str(ctx.exception))
+            with open(hist_file, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), hist_body)
+
+    def test_decode_allows_dict_history_api(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            out_file = os.path.join(tmp_dir, "sample.raw")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            written = bcpack_tool.decode_file(
+                in_file,
+                out_file,
+                codec=1,
+                out_size=len(self.original_blocks),
+                history={"bc1": {"confirmed": {}}},
+            )
+            self.assertEqual(written, len(self.original_blocks))
+            with open(out_file, "rb") as f:
+                self.assertEqual(f.read(), self.original_blocks)
+
+    def test_decode_atomic_write_preserves_existing_output_on_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            out_file = os.path.join(tmp_dir, "out.raw")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            with open(out_file, "wb") as f:
+                f.write(b"EXISTING_BYTES")
+            with mock.patch.object(bcpack_tool.os, "replace", side_effect=OSError("simulated replace failure")):
+                with self.assertRaises(OSError):
+                    bcpack_tool.decode_file(
+                        in_file, out_file, codec=1, out_size=len(self.original_blocks)
+                    )
+            with open(out_file, "rb") as f:
+                self.assertEqual(f.read(), b"EXISTING_BYTES")
+            leftovers = [name for name in os.listdir(tmp_dir) if name.startswith(".bcpack_tool-")]
+            self.assertEqual(leftovers, [])
+
+    def test_decode_preserves_output_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            real_out = os.path.join(tmp_dir, "target.raw")
+            link_out = os.path.join(tmp_dir, "link.raw")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            try:
+                os.symlink(real_out, link_out)
+            except (OSError, NotImplementedError, AttributeError) as e:
+                self.skipTest(f"symlinks unavailable: {e}")
+            written = bcpack_tool.decode_file(
+                in_file, link_out, codec=1, out_size=len(self.original_blocks)
+            )
+            self.assertEqual(written, len(self.original_blocks))
+            self.assertTrue(os.path.islink(link_out))
+            with open(real_out, "rb") as f:
+                self.assertEqual(f.read(), self.original_blocks)
+
+    def test_decode_refuses_symlink_loop(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            loop_a = os.path.join(tmp_dir, "loop_a.raw")
+            loop_b = os.path.join(tmp_dir, "loop_b.raw")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            try:
+                os.symlink(loop_b, loop_a)
+                os.symlink(loop_a, loop_b)
+            except (OSError, NotImplementedError, AttributeError) as e:
+                self.skipTest(f"symlinks unavailable: {e}")
+            with self.assertRaises(OSError) as ctx:
+                bcpack_tool.decode_file(
+                    in_file, loop_a, codec=1, out_size=len(self.original_blocks)
+                )
+            self.assertEqual(ctx.exception.errno, errno.ELOOP)
 
     def test_cli_subcommands(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -286,6 +429,43 @@ class TestCliErrorPaths(unittest.TestCase):
                 tmp_dir, "decode_hist",
             )
             self._assert_one_error_line(rc, err, "hist.json")
+            self.assertFalse(os.path.exists(out_file))
+
+    def test_malformed_history_dir_with_trailing_slash_attributes_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            hist_dir = os.path.join(tmp_dir, "hist_dir")
+            os.makedirs(hist_dir)
+            with open(os.path.join(hist_dir, "bc1.json"), "w", encoding="utf-8", newline="\n") as f:
+                f.write("{not json")
+            out_file = os.path.join(tmp_dir, "out.raw")
+            rc, err, _ = self._cli(
+                ["decode", in_file, out_file, "--codec", "1", "--size", "32",
+                 "--history", hist_dir + os.sep],
+                tmp_dir, "decode_hist_dir",
+            )
+            self._assert_one_error_line(rc, err, "bc1.json")
+            self.assertIn("hist_dir", err)
+            self.assertFalse(os.path.exists(out_file))
+
+    def test_cli_unsupported_codec_exits_2_without_traceback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            in_file = os.path.join(tmp_dir, "sample.bcpack")
+            out_file = os.path.join(tmp_dir, "out.raw")
+            with open(in_file, "wb") as f:
+                f.write(self.compressed_stream)
+            with mock.patch.object(
+                bcpack_tool.bcpack,
+                "decode_with_info",
+                side_effect=bcpack_tool.bcpack.BcpackUnsupportedCodec("codec unsupported"),
+            ):
+                rc, err, _ = self._cli(
+                    ["decode", in_file, out_file, "--codec", "1", "--size", "32"],
+                    tmp_dir, "decode_unsupported",
+                )
+            self._assert_one_error_line(rc, err, "codec unsupported")
             self.assertFalse(os.path.exists(out_file))
 
     def test_decode_same_input_output_cli_exits_2(self) -> None:

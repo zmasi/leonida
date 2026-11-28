@@ -138,6 +138,20 @@ int main() {
     check(fitted_720.first == 1280 && fitted_720.second == 720, "1280x720 stays unchanged");
     const auto fitted_def = rt::lifecycle::fit_window_to_area(area, CW_USEDEFAULT, 0);
     check(fitted_def.first == CW_USEDEFAULT && fitted_def.second == 0, "CW_USEDEFAULT stays unchanged");
+    const RECT square{0, 0, 1000, 1000};
+    const auto fitted_wide = rt::lifecycle::fit_window_to_area(square, 4000, 2);
+    check(fitted_wide.first == 1000 && fitted_wide.second == 1,
+          "extreme wide aspect ratio clamps minor axis to at least 1 pixel");
+    const auto fitted_tall = rt::lifecycle::fit_window_to_area(square, 2, 4000);
+    check(fitted_tall.first == 1 && fitted_tall.second == 1000,
+          "extreme tall aspect ratio clamps minor axis to at least 1 pixel");
+    const RECT wide_span{-2000000000, 0, 2000000000, 1080};
+    const auto fitted_span = rt::lifecycle::fit_window_to_area(wide_span, 3840, 2160);
+    check(fitted_span.first == 1920 && fitted_span.second == 1080,
+          "work area span exceeding 32-bit signed int does not overflow");
+    const RECT empty_area{100, 100, 100, 500};
+    const auto fitted_empty = rt::lifecycle::fit_window_to_area(empty_area, 3840, 2160);
+    check(fitted_empty.first == 3840 && fitted_empty.second == 2160, "empty work area leaves dimensions unchanged");
 
     // 3. Subclassed window still forwards normal messages to its original window procedure.
     const HWND hwnd = create_w(0, L"STATIC", L"before", 0, 0, 0, 16, 16, nullptr, nullptr, nullptr, nullptr);

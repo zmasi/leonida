@@ -303,7 +303,10 @@ def value(tok, st):
         return st["s"][tok]
     if tok in INLINE_F:
         return INLINE_F[tok]
-    return int(tok, 0) & M32
+    try:
+        return int(tok, 0) & M32
+    except ValueError:
+        raise RefError(f"operand {tok!r}") from None
 
 
 def half(v, hi):
@@ -317,17 +320,31 @@ def reference(lines):
         op, _, rest = line.partition(" ")
         args, mods = parse(rest)
         if op == "s_mov_b32":
+            if len(args) != 2 or not re.fullmatch(r"s\d+", args[0]):
+                raise RefError(f"{op}: bad operands {args!r}")
             st["s"][args[0]] = value(args[1], st)
             continue
+        if not args or not re.fullmatch(r"v\d+", args[0]):
+            raise RefError(f"{op}: bad destination {args[0]!r}" if args else f"{op}: missing destination")
         d = int(args[0][1:])
         vals = [value(a, st) for a in args[1:]]
         if op == "v_mov_b32_e32":
+            if len(vals) != 1:
+                raise RefError(f"{op}: expected 1 source, got {len(vals)}")
             st["v"][d] = vals[0]
             continue
         if op in OPS_PK:
             n, fn, cl = OPS_PK[op]
+            if len(vals) != n:
+                raise RefError(f"{op}: expected {n} sources, got {len(vals)}")
+            if mods.get("clamp") and cl is None:
+                raise RefError(f"{op}: clamp is not modelled")
+            sel_lo = mods.get("op_sel", [0] * n)
+            sel_hi = mods.get("op_sel_hi", [1] * n)
+            if len(sel_lo) != n or len(sel_hi) != n:
+                raise RefError(f"{op}: expected {n} op_sel/op_sel_hi entries")
             out = 0
-            for k, sel in enumerate((mods.get("op_sel", [0] * n), mods.get("op_sel_hi", [1] * n))):
+            for k, sel in enumerate((sel_lo, sel_hi)):
                 r = fn(*[half(v, sel[i]) for i, v in enumerate(vals)])
                 if mods.get("clamp") and cl:
                     r = cl(r)
@@ -338,7 +355,15 @@ def reference(lines):
         if op not in OPS_16:
             raise RefError(f"{op} is not modelled")
         n, fn, cl = OPS_16[op]
+        if len(vals) != n:
+            raise RefError(f"{op}: expected {n} sources, got {len(vals)}")
+        if mods.get("clamp") and cl is None:
+            raise RefError(f"{op}: clamp is not modelled")
+        if "op_sel_hi" in mods:
+            raise RefError(f"{op}: op_sel_hi is only valid on packed VOP3P ops")
         sel = mods.get("op_sel", [0] * (n + 1))
+        if len(sel) != n + 1:
+            raise RefError(f"{op}: expected {n + 1} op_sel entries, got {len(sel)}")
         r = fn(*[half(v, sel[i]) for i, v in enumerate(vals)])
         if mods.get("clamp") and cl:
             r = cl(r)
@@ -389,9 +414,22 @@ def hw_kernel(lines, wave=32):
                       wave=wave, threads=1, words=4, raw=True)
 
 
+def hw_run(oracle, programs, wave=32):
+    if oracle is None:
+        raise RuntimeError("hardware oracle required for backend 'hw'")
+    res = oracle.run([hw_kernel(p, wave) for p in programs])
+    if not isinstance(res, (list, tuple)) or len(res) != len(programs):
+        got = len(res) if isinstance(res, (list, tuple)) else type(res).__name__
+        raise RuntimeError(f"hardware oracle returned {got} results for {len(programs)} programs")
+    return res
+
+
 # ---- comparison, shrinking, the run --------------------------------------------------------------------------
 
 def _diff(lines, want, got, label):
+    if not isinstance(got, (list, tuple)) or len(got) != 4:
+        got_desc = f"{len(got)} words" if isinstance(got, (list, tuple)) else type(got).__name__
+        raise RuntimeError(f"{label} returned {got_desc} (expected 4 words)")
     bad = [k for k in range(4) if want[k] != got[k]]
     if not bad:
         return None
@@ -456,7 +494,7 @@ def run_suite(programs, seed, max_ops, ops, backends=("translator",), oracle=Non
     failures = []
     rng = random.Random(seed)
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops) for _ in range(programs)]
-    hw = oracle.run([hw_kernel(p, wave) for p in progs]) if "hw" in backends else [None] * programs
+    hw = hw_run(oracle, progs, wave) if "hw" in backends else [None] * programs
     if "vk" in backends:
         import vk_fuzz_run
         counts["vk"], counts["vk_failures"] = vk_fuzz_run.judge(progs, hw, vk_fuzz_run.exact_verdict, wave=wave,
@@ -523,14 +561,23 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.programs < 1 or a.max_ops < 1:
         ap.error("--programs and --max-ops must be at least 1")
+    if a.hw_arch is not None:
+        a.hw_arch = a.hw_arch.strip()
+        if not a.hw_arch:
+            ap.error("--hw-arch must not be empty")
+    if a.build is not None:
+        a.build = a.build.strip()
+        if not a.build:
+            ap.error("--build must not be empty")
+    if a.work is not None:
+        a.work = a.work.strip()
+        if not a.work:
+            ap.error("--work must not be empty")
     backends = tuple(dict.fromkeys(t.strip() for t in a.oracle.split(",")))
     if not backends or any(t not in ("translator", "hw", "vk") for t in backends):
         ap.error("--oracle takes translator, hw, vk (with hw) or a comma-separated mix")
     if "vk" in backends and "hw" not in backends:
         ap.error("--oracle vk judges the translated programs against the hardware's words: use --oracle hw,vk")
-    global KNOWN, LITERALS
-    KNOWN = a.known or backends == ("hw",)
-    LITERALS = not a.no_literals
     if a.list_ops:
         for name in ALL_OPS:
             if name in OPS_PK:
@@ -561,6 +608,10 @@ def main(argv=None):
             print(f"hardware oracle unavailable: {e}")
             return 77
         print(f"hardware oracle: {oracle.device}")
+    global KNOWN, LITERALS
+    prev_known, prev_literals = KNOWN, LITERALS
+    KNOWN = a.known or backends == ("hw",)
+    LITERALS = not a.no_literals
     try:
         counts, failures = run_suite(a.programs, a.seed, a.max_ops, ops, backends, oracle, a.wave, a.build, a.work,
                                      a.vk_constants)
@@ -581,15 +632,20 @@ def main(argv=None):
         backends = tuple(b for b in backends if b != "vk")
 
         def check_fn(lines):
-            return check(lines, backends, (lambda l: oracle.run([hw_kernel(l, a.wave)])[0]) if oracle else None)
+            return check(lines, backends, (lambda l: hw_run(oracle, [l], a.wave)[0]) if oracle else None)
         for i, problem, lines in failures[: None if a.all_failures else 1]:
             small = shrink(lines, check_fn)
-            print(f"MISMATCH program {i}: {check_fn(small) or problem}")
+            try:
+                detail = check_fn(small) or problem
+            except Skip:
+                detail = problem
+            print(f"MISMATCH program {i}: {detail}")
             print("\n".join("\t" + line for line in small))
     except (RefError, RuntimeError) as e:
         print(f"harness error: {e}")
         return 2
     finally:
+        KNOWN, LITERALS = prev_known, prev_literals
         if oracle:
             oracle.close()
     if failures or vk_bad:

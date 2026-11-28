@@ -95,6 +95,14 @@ def disasm(code: bytes, mcpu: str, backend: str = "llvm-mc", wave32: bool = True
     the second (0xFA......) as an 8-byte EXP and the rest of the listing goes out of step (gfx1013 and gfx1030 alike).
     In 749 of the 2,684 library programs of 1.0.2.1 that refused 945 programs ('fall-through into undecodable
     words'). tools/rdna2_decode.py decodes them; such a program takes its listing when it has fewer invalid words."""
+    if backend == "auto":
+        asm, bad, err = disasm(code, mcpu, backend="llvm-mc", wave32=wave32)
+        if bad == 0 and asm.strip():
+            return asm, bad, err
+        py_asm, py_bad, _ = disasm(code, mcpu, backend="python", wave32=wave32)
+        if py_asm.strip() and (not asm.strip() or py_bad < bad):
+            return py_asm, py_bad, ""
+        return asm, bad, err
     if compute and backend != "python":
         asm, bad, err = disasm(code, mcpu, backend=backend, wave32=wave32)
         if bad:
@@ -346,8 +354,8 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--skip-existing", action="store_true", help="reuse complete listings from a matching run")
     ap.add_argument("--mcpu", default="gfx1013")
-    ap.add_argument("--backend", choices=("llvm-mc", "python"), default="llvm-mc",
-                    help="disassembler backend: llvm-mc (default) or pure-Python RDNA2 decoder (#1901)")
+    ap.add_argument("--backend", choices=("llvm-mc", "python", "auto"), default="llvm-mc",
+                    help="disassembler backend: llvm-mc (default), pure-Python RDNA2 decoder (#1901), or auto")
     ap.add_argument("--limit", type=positive_int)
     ap.add_argument("--jobs", type=positive_int, default=max(1, (os.cpu_count() or 2) // 2))
     a = ap.parse_args()
@@ -399,6 +407,11 @@ def main():
     if files:
         if a.backend == "llvm-mc":
             probe(a.mcpu)
+        elif a.backend == "auto":
+            try:
+                probe(a.mcpu)
+            except SystemExit:
+                a.backend = "python"
         with ThreadPoolExecutor(a.jobs) as ex:
             res.update(ex.map(lambda p: one(p, out, a.mcpu, backend=a.backend), files))
     print(f"{total} shaders -> {os.path.abspath(out)}: {dict(res)}")

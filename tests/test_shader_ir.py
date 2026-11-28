@@ -159,8 +159,20 @@ class OperandTests(unittest.TestCase):
 
     def test_llvm23_lit_is_the_constant(self):
         # LLVM 23 prints lit(V) for a literal it could also show as an inline constant (v_fma_mix* sources).
-        for text, plain in (("lit(0x42200000)", "0x42200000"), ("|lit(0x3f800000)|", "|0x3f800000|"),
-                            ("neg(lit(0x3f800000))", "neg(0x3f800000)"), ("-lit(0x3f800000)", "neg(0x3f800000)")):
+        for text, plain in (
+            ("lit(0x42200000)", "0x42200000"),
+            ("|lit(0x3f800000)|", "|0x3f800000|"),
+            ("neg(lit(0x3f800000))", "neg(0x3f800000)"),
+            ("-lit(0x3f800000)", "neg(0x3f800000)"),
+            ("lit(-1)", "-1"),
+            ("lit(-0x10)", "-0x10"),
+            ("lit(-1.5)", "-1.5"),
+            ("-lit(-1)", "neg(-1)"),
+            ("-lit(-1.5)", "neg(-1.5)"),
+            ("|lit(-1.5)|", "|-1.5|"),
+            ("-|lit(-1.5)|", "-|-1.5|"),
+            ("neg(lit(-1))", "neg(-1)"),
+        ):
             with self.subTest(text=text):
                 self.assertEqual(shader_ir.operand(text), shader_ir.operand(plain))
 

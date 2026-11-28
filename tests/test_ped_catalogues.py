@@ -7,6 +7,7 @@ no real asset names, and no retail hashes are used.
 """
 from __future__ import annotations
 
+import io
 import json
 import os
 import struct
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -798,6 +800,236 @@ class PedCataloguesTests(unittest.TestCase):
                 rep = json.load(fh)
             self.assertEqual(rep["catalogues"], 1)
             self.assertEqual(rep["presets"], 5)
+
+
+class PedCataloguesHardeningTests(unittest.TestCase):
+    """Regression tests for filter handling, BOM/UTF-8 safety, traversal guards, depth cap, bounds, and atomic JSON."""
+
+    @staticmethod
+    def _cli(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-I", os.path.join(TOOLS, "ped_catalogues.py"), *args],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+
+    def test_empty_names_file_and_blank_name_keep_filtering_active(self):
+        blocks, _ = build_rich_catalogue_blocks()
+        raw = build_synthetic_0drp(blocks)
+        with tempfile.TemporaryDirectory() as tmp:
+            cat_file = os.path.join(tmp, "sample.0drp")
+            with open(cat_file, "wb") as fh:
+                fh.write(raw)
+
+            empty_names = os.path.join(tmp, "empty_names.txt")
+            with open(empty_names, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write("# comment only\n   \n\n")
+
+            r1 = self._cli("resolve", cat_file, "--names-file", empty_names, "--json")
+            self.assertEqual(r1.returncode, 0, r1.stderr)
+            self.assertEqual(json.loads(r1.stdout)["matches"], 0)
+
+            r2 = self._cli("resolve", cat_file, "--name", "   ", "--json")
+            self.assertEqual(r2.returncode, 0, r2.stderr)
+            self.assertEqual(json.loads(r2.stdout)["matches"], 0)
+
+    def test_utf8_bom_and_invalid_utf8_in_names_file_and_carved_index(self):
+        blocks, _ = build_rich_catalogue_blocks()
+        raw = build_synthetic_0drp(blocks)
+        split = len(raw) // 2
+        with tempfile.TemporaryDirectory() as tmp:
+            cat_file = os.path.join(tmp, "sample.0drp")
+            with open(cat_file, "wb") as fh:
+                fh.write(raw)
+
+            # UTF-8 BOM on line 1 of --names-file must still match the first name
+            bom_names = os.path.join(tmp, "bom_names.txt")
+            with open(bom_names, "wb") as fh:
+                fh.write(b"\xef\xbb\xbfsynth_body_full_03\n")
+            r_bom = self._cli("resolve", cat_file, "--names-file", bom_names, "--json")
+            self.assertEqual(r_bom.returncode, 0, r_bom.stderr)
+            doc_bom = json.loads(r_bom.stdout)
+            self.assertEqual(doc_bom["matches"], 1)
+            self.assertEqual(doc_bom["bindings"][0]["matched_name"], "synth_body_full_03")
+
+            # Invalid UTF-8 in --names-file exits cleanly with code 2 (no traceback)
+            bad_names = os.path.join(tmp, "bad_names.txt")
+            with open(bad_names, "wb") as fh:
+                fh.write(b"\xff\xfeinvalid")
+            r_bad = self._cli("resolve", cat_file, "--names-file", bad_names)
+            self.assertEqual(r_bad.returncode, 2)
+            self.assertNotIn("Traceback", r_bad.stderr)
+            self.assertIn("ERROR:", r_bad.stderr)
+
+            # Carved index.json with UTF-8 BOM joins continuation streams cleanly
+            bom_dir = os.path.join(tmp, "bom_carve")
+            os.makedirs(bom_dir)
+            with open(os.path.join(bom_dir, "000000000100.bin"), "wb") as fh:
+                fh.write(raw[:split])
+            with open(os.path.join(bom_dir, "000000000300.bin"), "wb") as fh:
+                fh.write(raw[split:])
+            idx_payload = json.dumps({
+                "files": [
+                    {"offset": 0x100, "stored": 0x1F5, "file": "000000000100.bin"},
+                    {"offset": 0x300, "stored": 0x200, "file": "000000000300.bin"},
+                ]
+            }).encode("utf-8")
+            with open(os.path.join(bom_dir, "index.json"), "wb") as fh:
+                fh.write(b"\xef\xbb\xbf" + idx_payload)
+            self.assertEqual(len(list(pc.iter_catalogues_in_dir(bom_dir))), 1)
+
+            # Invalid UTF-8 index.json falls back to directory walk without crashing
+            bad_idx_dir = os.path.join(tmp, "bad_idx")
+            os.makedirs(bad_idx_dir)
+            with open(os.path.join(bad_idx_dir, "index.json"), "wb") as fh:
+                fh.write(b"\xff\xfe{not utf8}")
+            with open(os.path.join(bad_idx_dir, "good.0drp"), "wb") as fh:
+                fh.write(raw)
+            self.assertEqual(len(list(pc.iter_catalogues_in_dir(bad_idx_dir))), 1)
+
+    def test_carved_index_blocks_path_traversal(self):
+        blocks, _ = build_rich_catalogue_blocks()
+        raw = build_synthetic_0drp(blocks)
+        split = len(raw) // 2
+        with tempfile.TemporaryDirectory() as tmp:
+            outside = os.path.join(tmp, "outside.0drp")
+            with open(outside, "wb") as fh:
+                fh.write(raw)
+            outside_part1 = os.path.join(tmp, "outside_part1.bin")
+            with open(outside_part1, "wb") as fh:
+                fh.write(raw[split:])
+
+            carve_dir = os.path.join(tmp, "carved")
+            os.makedirs(carve_dir)
+            with open(os.path.join(carve_dir, "part0.bin"), "wb") as fh:
+                fh.write(raw[:split])
+            with open(os.path.join(carve_dir, "index.json"), "w", encoding="utf-8", newline="\n") as fh:
+                json.dump(
+                    {
+                        "files": [
+                            {"offset": 0x100, "stored": 0x100, "file": "../outside.0drp"},
+                            {"offset": 0x400, "stored": 0x1F5, "file": "part0.bin"},
+                            {"offset": 0x600, "stored": 0x200, "file": "../outside_part1.bin"},
+                        ]
+                    },
+                    fh,
+                )
+            self.assertEqual(list(pc.iter_catalogues_in_dir(carve_dir)), [])
+
+    def test_exact_max_parent_depth_chain_does_not_warn_and_max_depth_validation(self):
+        # Clean chain of exactly MAX_PARENT_DEPTH hops (last ancestor has parent_id=0): no cap warning.
+        exact_presets = bytearray()
+        for idx in range(pc.MAX_PARENT_DEPTH + 1):
+            pid = 0x1000 + idx
+            parent_id = (0x1000 + idx + 1) if idx < pc.MAX_PARENT_DEPTH else 0
+            exact_presets.extend(_pack_preset(preset_id=pid, parent_id=parent_id))
+        exact_blocks = [
+            (pc.CATALOG_ROOT_HASH, _pack_root(bucket0_count=pc.MAX_PARENT_DEPTH + 1, bucket0_ptr=_encode_ptr(2, 0))),
+            (pc.PRESET_STRUCT_HASH, bytes(exact_presets)),
+        ]
+        cat_exact = pc.parse_catalogue_strict(build_synthetic_0drp(exact_blocks), source="exact_depth.0drp")
+        self.assertEqual(cat_exact.stats["max_parent_depth"], pc.MAX_PARENT_DEPTH)
+        self.assertEqual(cat_exact.warnings, ())
+
+        # Chain of MAX_PARENT_DEPTH + 1 hops DOES trigger the cap warning.
+        over_presets = bytearray()
+        for idx in range(pc.MAX_PARENT_DEPTH + 2):
+            pid = 0x2000 + idx
+            parent_id = (0x2000 + idx + 1) if idx < pc.MAX_PARENT_DEPTH + 1 else 0
+            over_presets.extend(_pack_preset(preset_id=pid, parent_id=parent_id))
+        over_blocks = [
+            (pc.CATALOG_ROOT_HASH, _pack_root(bucket0_count=pc.MAX_PARENT_DEPTH + 2, bucket0_ptr=_encode_ptr(2, 0))),
+            (pc.PRESET_STRUCT_HASH, bytes(over_presets)),
+        ]
+        cat_over = pc.parse_catalogue_strict(build_synthetic_0drp(over_blocks), source="over_depth.0drp")
+        self.assertTrue(any("reached cap" in w for w in cat_over.warnings))
+
+        # Invalid max_depth rejected cleanly
+        root_preset = cat_exact.presets[0]
+        for bad_depth in (-1, True):
+            with self.assertRaises(ValueError):
+                pc.resolve_ancestor_tags(cat_exact, root_preset, max_depth=bad_depth)
+            with self.assertRaises(ValueError):
+                pc.resolve_effective_tags(cat_exact, root_preset, max_depth=bad_depth)
+            with self.assertRaises(ValueError):
+                pc.resolve_preset_bindings(cat_exact, max_depth=bad_depth)
+
+    def test_scan_bounds_and_inspect_max_inflate(self):
+        blocks, _ = build_rich_catalogue_blocks()
+        raw = build_synthetic_0drp(blocks)
+        rpf_bytes = build_synthetic_rpf([raw])
+        with tempfile.TemporaryDirectory() as tmp:
+            cat_file = os.path.join(tmp, "sample.0drp")
+            zcat_file = os.path.join(tmp, "sample.0drp.z")
+            rpf_path = os.path.join(tmp, "sample.rpf")
+            with open(cat_file, "wb") as fh:
+                fh.write(raw)
+            with open(zcat_file, "wb") as fh:
+                fh.write(zlib.compress(raw, 6))
+            with open(rpf_path, "wb") as fh:
+                fh.write(rpf_bytes)
+
+            for kwargs in (
+                {"limit": 0},
+                {"limit": -4},
+                {"limit": True},
+                {"start": -1},
+                {"start": True},
+                {"max_inflate": 0},
+                {"max_inflate": True},
+            ):
+                with self.subTest(rpf_kwargs=kwargs):
+                    with self.assertRaises(ValueError):
+                        list(pc.iter_catalogues_in_rpf(rpf_path, **kwargs))
+
+            with self.assertRaises(ValueError):
+                list(pc.iter_catalogues_in_file(cat_file, max_inflate=0))
+            with self.assertRaises(ValueError):
+                list(pc.iter_catalogues_in_dir(tmp, max_inflate=-1))
+
+            # inspect enforces --max-inflate on both raw and zlib-compressed inputs
+            r_raw = self._cli("inspect", cat_file, "--max-inflate", "64")
+            self.assertEqual(r_raw.returncode, 2)
+            self.assertIn("--max-inflate", r_raw.stderr)
+
+            r_z = self._cli("inspect", zcat_file, "--max-inflate", str(len(raw) - 1))
+            self.assertEqual(r_z.returncode, 2)
+            self.assertIn("--max-inflate", r_z.stderr)
+
+    def test_atomic_write_json_rejects_nan_and_cli_handles_write_oserror(self):
+        blocks, _ = build_rich_catalogue_blocks()
+        raw = build_synthetic_0drp(blocks)
+        with tempfile.TemporaryDirectory() as tmp:
+            out_path = os.path.join(tmp, "out.json")
+            sentinel = '{"keep": true}\n'
+            with open(out_path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(sentinel)
+
+            with self.assertRaises(ValueError):
+                pc._write_json(out_path, {"bad": float("nan")})
+            with open(out_path, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), sentinel)
+            self.assertEqual(os.listdir(tmp), ["out.json"])
+
+            cat_file = os.path.join(tmp, "sample.0drp")
+            with open(cat_file, "wb") as fh:
+                fh.write(raw)
+
+            for argv in (
+                ["census", cat_file, "--out", out_path],
+                ["inspect", cat_file, "--out", out_path],
+                ["resolve", cat_file, "--out", out_path],
+            ):
+                with self.subTest(argv=argv):
+                    err_buf = io.StringIO()
+                    with mock.patch.object(pc, "_write_json", side_effect=OSError("disk full")), mock.patch.object(
+                        sys, "stderr", err_buf
+                    ):
+                        rc = pc.main(argv)
+                    self.assertEqual(rc, 2)
+                    self.assertIn("ERROR:", err_buf.getvalue())
+                    self.assertIn("disk full", err_buf.getvalue())
 
 
 if __name__ == "__main__":

@@ -140,6 +140,66 @@ class FspxPrologueProbeTests(unittest.TestCase):
         self.assertIn("negative control failed", err_buf.getvalue())
         oracle.close.assert_called_once_with()
 
+    def test_tuple_outputs_malformed_results_runtime_error_and_empty_arch(self):
+        # Empty/whitespace --hw-arch is a CLI usage error.
+        for argv in (["--hw-arch", ""], ["--hw-arch", "   "]):
+            with self.subTest(argv=argv), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    probe.main(argv)
+                self.assertEqual(cm.exception.code, 2)
+
+        # Tuple rows pass cleanly instead of crashing with StopIteration.
+        good = self._passing_outputs()
+        tuple_good = tuple(tuple(row) for row in good)
+        oracle = self._mock_oracle(tuple_good)
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle), \
+                redirect_stdout(out_buf), redirect_stderr(err_buf):
+            rc = probe.main(["--oracle", "hw"])
+        self.assertEqual((rc, err_buf.getvalue()), (0, ""))
+        oracle.close.assert_called_once_with()
+
+        # Malformed batch and per-kernel payloads exit 2 (never false-pass or crash).
+        short_pos = [list(row) for row in good]
+        short_pos[0] = short_pos[0][:4]  # matching prefix, too short -> used to raise StopIteration
+        short_neg = [list(row) for row in good]
+        short_neg[-1] = [0, 1]           # short negative control -> used to raise IndexError
+        bool_row = [list(row) for row in good]
+        bool_row[0][0] = True
+        none_row = [list(row) for row in good]
+        none_row[0] = None
+
+        for label, bad_out in (
+            ("empty_batch", []),
+            ("short_batch", good[:-1]),
+            ("long_batch", good + [good[0]]),
+            ("none_batch", None),
+            ("short_positive", short_pos),
+            ("short_negative", short_neg),
+            ("bool_word", bool_row),
+            ("none_row", none_row),
+        ):
+            with self.subTest(case=label):
+                oracle = self._mock_oracle(bad_out)
+                out_buf, err_buf = io.StringIO(), io.StringIO()
+                with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle), \
+                        redirect_stdout(out_buf), redirect_stderr(err_buf):
+                    rc = probe.main(["--oracle", "hw"])
+                self.assertEqual(rc, 2, (out_buf.getvalue(), err_buf.getvalue()))
+                self.assertIn("harness error:", err_buf.getvalue())
+                oracle.close.assert_called_once_with()
+
+        # RuntimeError from oracle.run() exits 2 cleanly and closes oracle.
+        oracle = self._mock_oracle(None)
+        oracle.run.side_effect = RuntimeError("gpu hung")
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle), \
+                redirect_stdout(out_buf), redirect_stderr(err_buf):
+            rc = probe.main(["--oracle", "hw"])
+        self.assertEqual(rc, 2)
+        self.assertIn("harness error: gpu hung", err_buf.getvalue())
+        oracle.close.assert_called_once_with()
+
 
 if __name__ == "__main__":
     unittest.main()

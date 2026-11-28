@@ -265,6 +265,62 @@ int scripted_pad(CreateFn create) {
                   E_NOTIMPL &&
               reading_token == kInvalidCallbackToken,
           "script: reading callbacks still need SDL3");
+    // A blocking enumeration's callback still running on one thread while another unregisters it (kevincommits'
+    // Finding 19 in #1608, item 5): UnregisterCallback must wait for it to return, or the caller frees its context
+    // mid-call. And the callback may unregister itself without waiting on itself.
+    {
+        struct Held {
+            IGameInput* input;
+            HANDLE entered, release;
+            GameInputCallbackToken token;
+            bool self_unregistered;
+        };
+        static Held held{};
+        held = {input, CreateEventW(nullptr, TRUE, FALSE, nullptr), CreateEventW(nullptr, TRUE, FALSE, nullptr), 0, false};
+        HANDLE registrar = CreateThread(
+            nullptr, 0,
+            [](void*) -> DWORD {
+                GameInputCallbackToken t = 0;
+                held.input->RegisterDeviceCallback(
+                    nullptr, GameInputKindGamepad, GameInputDeviceConnected, GameInputBlockingEnumeration, &held,
+                    [](GameInputCallbackToken token, void* ctx, IGameInputDevice*, uint64_t, uint32_t, uint32_t) {
+                        auto* h = static_cast<Held*>(ctx);
+                        h->token = token;
+                        SetEvent(h->entered);
+                        WaitForSingleObject(h->release, 3000);
+                    },
+                    &t);
+                return 0;
+            },
+            nullptr, 0, nullptr);
+        check(WaitForSingleObject(held.entered, 3000) == WAIT_OBJECT_0, "script: the blocking callback is running");
+        HANDLE unregistrar = CreateThread(
+            nullptr, 0, [](void*) -> DWORD { return held.input->UnregisterCallback(held.token, 0) ? 1 : 0; }, nullptr,
+            0, nullptr);
+        check(WaitForSingleObject(unregistrar, 200) == WAIT_TIMEOUT,
+              "script: UnregisterCallback from another thread waits for the running blocking callback");
+        SetEvent(held.release);
+        DWORD unregistered = 0;
+        check(WaitForSingleObject(unregistrar, 3000) == WAIT_OBJECT_0 && GetExitCodeThread(unregistrar, &unregistered) &&
+                  unregistered == 1,
+              "script: and returns true once it has returned");
+        WaitForSingleObject(registrar, 3000);
+        CloseHandle(registrar);
+        CloseHandle(unregistrar);
+
+        GameInputCallbackToken self = 0;
+        check(input->RegisterDeviceCallback(
+                  nullptr, GameInputKindGamepad, GameInputDeviceConnected, GameInputBlockingEnumeration, &held,
+                  [](GameInputCallbackToken token, void* ctx, IGameInputDevice*, uint64_t, uint32_t, uint32_t) {
+                      auto* h = static_cast<Held*>(ctx);
+                      h->self_unregistered = h->input->UnregisterCallback(token, 0);
+                  },
+                  &self) == S_OK &&
+                  held.self_unregistered,
+              "script: a blocking callback can unregister itself");
+        CloseHandle(held.entered);
+        CloseHandle(held.release);
+    }
     void* second = nullptr;
     check(create(&second) == S_OK && second == input, "script: a second GameInputCreate returns the same instance");
     if (second) static_cast<IGameInput*>(second)->Release();

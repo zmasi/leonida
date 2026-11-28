@@ -75,6 +75,7 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
     // (Read back by the runs: these are made beside the others, not before.)
     let slow_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(dir.join("slow-pipelines.txt"))?);
     let bad_out = Mutex::new(std::fs::OpenOptions::new().create(true).append(true).open(&bad_file)?);
+    let done_all = done_all();
     std::thread::scope(|s| {
         for _ in 0..jobs.min(chunks.len()) {
             s.spawn(|| {
@@ -93,7 +94,9 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
                                 println!("{count} of {}, {:.0} s", all.len(), began.elapsed().as_secs_f64());
                             }
                             drop(state);
-                            let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
+                            if there || done_all {
+                                let _ = writeln!(lock(&done_out), "{fingerprint} {}", keys[n]);
+                            }
                         });
                         rest = &rest[made.min(rest.len())..];
                         match (ended, rest.split_first()) {
@@ -125,6 +128,23 @@ pub fn run(jobs: Option<usize>, limit: Option<usize>, again: bool, used: bool, t
         times.iter().sum::<f64>() / 1e3
     );
     Ok(())
+}
+
+/// Whether a pipeline that got no host pipeline in the warm's process is written to
+/// `warm-done.txt` all the same: `LEONIDA_WARM_DONE_ALL=1`, as before; unset or `0` (the
+/// default): only those that have one are done.
+///
+/// One left out by the warm's switches (a skip list, the ray-tracing resolves without the
+/// structure builder) or refused was written down as done, so a later warm under other
+/// switches passed it over for good and the run made it in play, with the driver's
+/// background compile behind it. Asking again costs no compile where it is refused again.
+///
+/// From trustno1-coder/VIctory-NVIDIA 5ed66db (Yorivel; there a cherry-pick of 4f2be38),
+/// GPL-3.0. Its numbers, on an RTX 4090 with ray tracing: about 670 pipelines "being made"
+/// in a run's first minutes and frames of 3 to 10 s while the D3D background threads
+/// compiled. Not measured here.
+fn done_all() -> bool {
+    std::env::var("LEONIDA_WARM_DONE_ALL").is_ok_and(|v| v.trim() == "1")
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

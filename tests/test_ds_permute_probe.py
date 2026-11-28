@@ -132,6 +132,46 @@ class DsPermuteProbeTests(unittest.TestCase):
             self.assertIn("error:", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
 
+    def test_oracle_closed_on_success_and_failure(self):
+        fake_probe = {"cases_total": 1, "cases_ok": 1, "cases": {}}
+        for exit_variant in ("success", "mismatch", "non_gfx10", "exception"):
+            with self.subTest(variant=exit_variant):
+                close_mock = mock.Mock()
+                oracle = types.SimpleNamespace(arch="gfx1030", close=close_mock)
+                if exit_variant == "non_gfx10":
+                    asm_mod = types.SimpleNamespace(family=lambda arch: "gfx9")
+                else:
+                    asm_mod = types.SimpleNamespace(family=lambda arch: "gfx10")
+                open_oracle = mock.Mock(return_value=oracle)
+                runner_mod = types.SimpleNamespace(Unavailable=_FakeUnavailable, open_oracle=open_oracle)
+                pkg = types.SimpleNamespace(asm=asm_mod, runner=runner_mod)
+
+                if exit_variant == "mismatch":
+                    probe_side_effect = lambda *a, **k: {"cases_total": 2, "cases_ok": 1, "cases": {}}
+                elif exit_variant == "exception":
+                    probe_side_effect = mock.Mock(side_effect=RuntimeError("probe failed"))
+                else:
+                    probe_side_effect = lambda *a, **k: fake_probe
+
+                with mock.patch.dict(sys.modules, {"hw_oracle": pkg, "hw_oracle.asm": asm_mod,
+                                                   "hw_oracle.runner": runner_mod}), \
+                     mock.patch.object(ds_permute_probe, "probe_wave", side_effect=probe_side_effect), \
+                     mock.patch.object(sys, "stdout", io.StringIO()), \
+                     mock.patch.object(sys, "stderr", io.StringIO()):
+                    if exit_variant == "exception":
+                        with self.assertRaises(RuntimeError):
+                            ds_permute_probe.main(["--waves", "32"])
+                    elif exit_variant == "non_gfx10":
+                        rc = ds_permute_probe.main(["--waves", "32"])
+                        self.assertEqual(rc, 77)
+                    elif exit_variant == "mismatch":
+                        rc = ds_permute_probe.main(["--waves", "32"])
+                        self.assertEqual(rc, 1)
+                    else:
+                        rc = ds_permute_probe.main(["--waves", "32"])
+                        self.assertEqual(rc, 0)
+                close_mock.assert_called_once()
+
 
 if __name__ == "__main__":
     unittest.main()

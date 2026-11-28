@@ -194,9 +194,11 @@ menu.
   way). Our hook is the one
   `call` of the cheat input function: it calls that function, then, if something was asked, gives the same queue
   a closure of its own. So our work runs exactly where a cheat of the title's would.
-- **Finding it again.** Ten places are named by patterns of 24 to 77 bytes (19 to 36 of them fixed, `??` for
-  what another build changes: short signatures, no longer than they must be), which give 19 things: 8 functions,
-  the hook's call, 9 globals and the place of the level in the wanted state. Each
+- **Finding it again.** Eleven places are named by patterns of 24 to 77 bytes (19 to 36 of them fixed, `??` for
+  what another build changes: short signatures, no longer than they must be), which give 20 things: 8 functions,
+  the hook's call, 10 globals and the place of the level in the wanted state (the eleventh place, the global of
+  the player's vehicle, is for the keyboard and mouse layout and is looked up without the game actions too:
+  `docs/gameinput.md`). Each
   pattern is in the 99.9 MB of code exactly once (`cargo test -p leonida-loader game_actions` with
   `LEONIDA_GAME_DIR` set checks it, and that functions lie in code and globals behind it). None contains a load
   of the thread's TLS array, which the loader rewrites. A place that is not found leaves its items saying so; the
@@ -396,7 +398,7 @@ interpreter is simply not found by these signatures, which is why the run-time s
   Skipped without a D3D12 device.
 - `cargo test -p leonida-hle --features diagnostics --lib -- gameinput clock`: the input shim with the kept keys in
   place, and the title's clock.
-- `cargo test -p leonida-loader --lib game_actions`: the ten places on made-up code (found wherever they lie,
+- `cargo test -p leonida-loader --lib game_actions`: the eleven places on made-up code (found wherever they lie,
   displacements and numbers read, a place missing, twice or pointing outside left out), the hook on made-up code
   that runs (the update step calls a function of ours and returns as before) and, with `LEONIDA_GAME_DIR` set to
   the package's folder, every place once in the retail executable, functions in code and globals behind it.

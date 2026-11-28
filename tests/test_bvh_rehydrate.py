@@ -283,6 +283,90 @@ class TestErrorsAndCli(unittest.TestCase):
                 self.assertEqual(R.main([paths["in.bin"], "--geom", geo, "--out", paths["out.bin"]]), 0)
             self.assertIn("rehydrated", text.getvalue())
 
+    def test_invalid_leaf_vertex_order_raises_value_error_and_cli_exits_2(self):
+        # Valid low nibbles are the 6 permutations of (0, 1, 2): a != b and a, b < 3.
+        for order in (0x01, 0x02, 0x04, 0x06, 0x08, 0x09):
+            src, _, _ = build([(0, 0x01, 0, None, order)])
+            self.assertEqual(len(R.rehydrate(src, [QUADS])), 0x300)
+
+        # Every other (a, b) pair used to crash with uncaught IndexError or TypeError.
+        invalid_orders = (0x00, 0x03, 0x05, 0x07, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F)
+        for order in invalid_orders:
+            with self.subTest(order=hex(order)):
+                src, _, _ = build([(0, 0x01, 0, None, order)])
+                with self.assertRaisesRegex(ValueError, "invalid vertex order"):
+                    R.rehydrate(src, [QUADS])
+
+        with tempfile.TemporaryDirectory() as d:
+            bad_src, _, _ = build([(0, 0x01, 0, None, 0x00)])
+            in_p = os.path.join(d, "bad.bin")
+            vb_p = os.path.join(d, "vb.bin")
+            ib_p = os.path.join(d, "ib.bin")
+            out_p = os.path.join(d, "out.bin")
+            with open(in_p, "wb") as f:
+                f.write(bad_src)
+            with open(vb_p, "wb") as f:
+                f.write(QUADS.vertices)
+            with open(ib_p, "wb") as f:
+                f.write(QUADS.indices)
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = R.main([in_p, "--geom", f"{vb_p},{ib_p}", "--out", out_p])
+            self.assertEqual(rc, 2)
+            self.assertIn("invalid vertex order", err.getvalue())
+            self.assertFalse(os.path.exists(out_p))
+
+    def test_box_node_with_more_than_four_children_raises_value_error(self):
+        for wide in (True, False):
+            with self.subTest(wide=wide):
+                src, _, _ = build([(0, 0x01, 0, None, 0x09)], root_wide=wide)
+                bad = bytearray(src)
+                # Node group starts at offset 0x200; top byte of word 0 is child count.
+                struct.pack_into("<I", bad, 0x200, 5 << 24)
+                with self.assertRaisesRegex(ValueError, "maximum 4"):
+                    R.rehydrate(bytes(bad), [QUADS])
+
+    def test_f32_overflow_saturates_to_signed_inf_and_transform_still_rejects_overflow(self):
+        self.assertEqual(R.f32(1e40), math.inf)
+        self.assertEqual(R.f32(-1e40), -math.inf)
+        # Scaling a large vertex via compressionParams exponent 0xFE (2^127) overflows float32 -> +-inf,
+        # which BOX16 clamps to HALF_POS_INF / HALF_NEG_INF instead of crashing with OverflowError.
+        scale_word = 0x80000000 | (0xFE << 16) | (0xFE << 8) | 0xFE
+        g = R.Geometry(struct.pack("<9f", 1e30, -1e30, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0))
+        src, _, _ = build([(0, 0x01, 0, None, 0x09)], root_wide=False, compression=scale_word)
+        out = R.rehydrate(src, [g])
+        self.assertEqual(floats(out, 0x100, 2), (math.inf, -math.inf))
+        h = struct.unpack_from("<6H", out, 0x200 + 16)
+        self.assertEqual(h[1], R.HALF_NEG_INF)
+        self.assertEqual(h[3], R.HALF_POS_INF)
+        # parse_transform must still reject values that overflow finite float32.
+        with self.assertRaisesRegex(ValueError, "finite float32"):
+            R.parse_transform("1e40,0,0,0,0,1,0,0,0,0,1,0")
+        with self.assertRaisesRegex(ValueError, "finite float32"):
+            R.parse_transform("-1e40,0,0,0,0,1,0,0,0,0,1,0")
+
+    def test_geom_rejects_extra_commas_and_empty_vb(self):
+        src, _, _ = build([(0, 0x01, 0, None, 0x09)])
+        with tempfile.TemporaryDirectory() as d:
+            in_p = os.path.join(d, "in.bin")
+            vb_p = os.path.join(d, "vb.bin")
+            ib_p = os.path.join(d, "ib.bin")
+            out_p = os.path.join(d, "out.bin")
+            with open(in_p, "wb") as f:
+                f.write(src)
+            with open(vb_p, "wb") as f:
+                f.write(QUADS.vertices)
+            with open(ib_p, "wb") as f:
+                f.write(QUADS.indices)
+            for bad_spec in (f"{vb_p},{ib_p},extra", f",{ib_p}"):
+                with self.subTest(spec=bad_spec):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err):
+                        rc = R.main([in_p, "--geom", bad_spec, "--out", out_p])
+                    self.assertEqual(rc, 2)
+                    self.assertIn("--geom expects VB[,IB]", err.getvalue())
+                    self.assertFalse(os.path.exists(out_p))
+
 
 if __name__ == "__main__":
     unittest.main()

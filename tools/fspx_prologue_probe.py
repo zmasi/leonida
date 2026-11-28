@@ -15,7 +15,7 @@ Usage:
 Exit codes:
     0   all prologue checks passed and all negative controls detected their clobbers
     1   a prologue modified state, failed to assemble/run, or a negative control went undetected
-    2   bad CLI arguments
+    2   bad CLI arguments or harness error
     77  hardware oracle unavailable on this machine
 """
 import argparse
@@ -250,6 +250,16 @@ def self_test():
     return 0
 
 
+def _extract_words(tag, got, nwords):
+    if isinstance(got, str):
+        return None, f"{tag}: {got}"
+    if (not isinstance(got, (list, tuple)) or len(got) < nwords
+            or any(isinstance(w, bool) or not isinstance(w, int) for w in got[:nwords])):
+        got_desc = len(got) if isinstance(got, (list, tuple)) else type(got).__name__
+        raise RuntimeError(f"{tag}: expected at least {nwords} int words, got {got_desc}")
+    return [w & 0xFFFFFFFF for w in got[:nwords]], None
+
+
 def run_hw(waves=(32, 64), arch=None):
     """Run all positive prologue checks and negative controls on the AMD GPU."""
     try:
@@ -265,23 +275,37 @@ def run_hw(waves=(32, 64), arch=None):
         reason = " ".join(str(e).splitlines())
         print(f"hardware oracle unavailable: {reason}", file=sys.stderr)
         return 77
+    except RuntimeError as e:
+        print(f"harness error: {e}", file=sys.stderr)
+        return 2
+
+    if not isinstance(raw_results, (list, tuple)) or len(raw_results) != len(all_kernels):
+        got_desc = len(raw_results) if isinstance(raw_results, (list, tuple)) else type(raw_results).__name__
+        print(f"harness error: oracle returned {got_desc} results for {len(all_kernels)} kernels", file=sys.stderr)
+        return 2
 
     pos_results = raw_results[:len(positives)]
     neg_results = raw_results[len(positives):]
 
     failures = []
-    for (tag, k, exp), got in zip(positives, pos_results):
-        if isinstance(got, str):
-            failures.append(f"{tag}: {got}")
-        elif got[:k.words] != exp:
-            failures.append(f"{tag}: mismatch (first diff at word "
-                            f"{next(i for i, (a, b) in enumerate(zip(got[:k.words], exp)) if a != b)})")
+    try:
+        for (tag, k, exp), got in zip(positives, pos_results):
+            words, rej = _extract_words(tag, got, k.words)
+            if rej is not None:
+                failures.append(rej)
+            elif words != exp:
+                failures.append(f"{tag}: mismatch (first diff at word "
+                                f"{next(i for i, (a, b) in enumerate(zip(words, exp)) if a != b)})")
 
-    for (tag, k, exp, check_diff), got in zip(negatives, neg_results):
-        if isinstance(got, str):
-            failures.append(f"{tag}: {got}")
-        elif not check_diff(got[:k.words], exp):
-            failures.append(f"{tag}: negative control failed to detect injected change")
+        for (tag, k, exp, check_diff), got in zip(negatives, neg_results):
+            words, rej = _extract_words(tag, got, k.words)
+            if rej is not None:
+                failures.append(rej)
+            elif not check_diff(words, exp):
+                failures.append(f"{tag}: negative control failed to detect injected change")
+    except RuntimeError as e:
+        print(f"harness error: {e}", file=sys.stderr)
+        return 2
 
     print(device)
     if failures:
@@ -304,6 +328,10 @@ def main(argv=None):
     ap.add_argument("--hw-arch", default=None, help="override GPU architecture for hw_oracle")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args(argv)
+    if args.hw_arch is not None:
+        args.hw_arch = args.hw_arch.strip()
+        if not args.hw_arch:
+            ap.error("--hw-arch must not be empty")
 
     if args.self_test:
         return self_test()

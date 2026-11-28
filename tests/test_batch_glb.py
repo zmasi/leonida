@@ -268,6 +268,31 @@ class TestBatchGlb(unittest.TestCase):
                                                      "matching primitives have no texture coordinates")]
                     self.assertEqual(stats["dropped_textures"], expected)
 
+    def test_preferred_png_and_same_stem_dds_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source, out, textures = root / "in", root / "out", root / "textures"
+            source.mkdir()
+            textures.mkdir()
+            (source / "car.obj").write_bytes(
+                b"v 0 0 0\nv 1 0 0\nv 0 1 0\nvt 0 0\nvt 1 0\nvt 0 1\n"
+                b"usemtl paint\nf 1/1 2/2 3/3\n")
+            dds = _create_minimal_bc1_dds()
+            fallback = dds_png.dds_to_png_bytes(dds)
+            preferred = dds_png.dds_to_png_bytes(_create_minimal_bc1_dds(0x001F))
+            (textures / "paint.dds").write_bytes(dds)
+            for label, png, expected, dropped in (
+                ("valid_png", preferred, preferred, []),
+                ("empty_png", b"", fallback, ["paint.png"]),
+                ("truncated_png", preferred[:24], fallback, ["paint.png"]),
+            ):
+                with self.subTest(case=label):
+                    (textures / "paint.png").write_bytes(png)
+                    stats = batch_glb.batch_convert(str(source), str(out), texture_dir=str(textures))
+                    self.assertEqual(stats["succeeded"], 1)
+                    self.assertIn(expected, (out / "car.glb").read_bytes())
+                    self.assertEqual([Path(p).name for _, p, _ in stats["dropped_textures"]], dropped)
+
     def test_batch_convert_with_dds_texture(self) -> None:
         with tempfile.TemporaryDirectory() as in_dir, \
              tempfile.TemporaryDirectory() as out_dir, \

@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
@@ -270,6 +271,97 @@ class TestCensus(unittest.TestCase):
                 lines = r.stderr.splitlines()
                 self.assertEqual(len(lines), 1, r.stderr)
                 self.assertTrue(lines[0].startswith(f"error: {state}: "), lines[0])
+
+    def test_json_refuses_input_files_and_preserves_their_bytes(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        manifest = os.path.join(self.tmp.name, "index.json")
+        with open(manifest, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write('{"programs": 1}\n')
+        disasm = os.path.join(self.tmp.name, "disasm")
+        os.makedirs(disasm, exist_ok=True)
+        listing = os.path.join(disasm, "sig.s")
+        with open(listing, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(asm("s_endpgm"))
+
+        targets = [
+            os.path.join(self.tmp.name, "sig.dxbc"),
+            os.path.join(self.tmp.name, ".", "fspx", "sig.json"),
+            manifest,
+            listing,
+        ]
+        snapshots = {}
+        for path in targets:
+            with open(path, "rb") as fh:
+                snapshots[path] = fh.read()
+
+        for path in targets:
+            with self.subTest(target=os.path.basename(path)):
+                r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--disasm", disasm, "--json", path],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("would overwrite an input file", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(r.stdout, "")
+                with open(path, "rb") as fh:
+                    self.assertEqual(fh.read(), snapshots[path])
+
+    def test_json_refuses_manifest_paths_before_either_file_exists(self):
+        disasm = os.path.join(self.tmp.name, "disasm")
+        os.mkdir(disasm)
+        for directory in (self.tmp.name, disasm):
+            with self.subTest(directory=directory):
+                target = os.path.join(directory, "index.json")
+                self.assertFalse(os.path.exists(target))
+                run = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--disasm", disasm, "--json", target],
+                                     capture_output=True, text=True)
+                self.assertEqual(run.returncode, 2, run.stderr)
+                self.assertIn("would overwrite an input file", run.stderr)
+                self.assertEqual(run.stdout, "")
+                self.assertFalse(os.path.exists(target))
+
+    def test_json_guard_delegates_to_shared_same_report_path(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        out = os.path.join(self.tmp.name, "ALIAS.JSON")
+        state = os.path.join(self.tmp.name, "fspx", "sig.json")
+        with mock.patch.object(R, "same_report_path", side_effect=lambda a, b: b == state) as guard:
+            with self.assertRaises(SystemExit) as cm:
+                R.main([self.tmp.name, "--json", out])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertTrue(guard.called)
+        self.assertFalse(os.path.exists(out))
+
+    def test_json_refuses_directories_before_scanning(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        disasm = os.path.join(self.tmp.name, "disasm")
+        other_dir = os.path.join(self.tmp.name, "reports")
+        os.makedirs(disasm, exist_ok=True)
+        os.makedirs(other_dir, exist_ok=True)
+        for target in (self.tmp.name, disasm, other_dir):
+            with self.subTest(target=os.path.basename(target)):
+                r = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--disasm", disasm, "--json", target],
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("folder", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                self.assertEqual(r.stdout, "")
+
+    def test_json_creates_nested_parent_and_reports_write_oserror_without_traceback(self):
+        self.write("sig", [(b"RTS0", rts0(params=[("cbv", 0)]))], user_sgprs=8)
+        nested = os.path.join(self.tmp.name, "nested", "out", "census.json")
+        r_ok = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", nested],
+                              capture_output=True, text=True)
+        self.assertEqual(r_ok.returncode, 0, r_ok.stderr)
+        self.assertTrue(os.path.isfile(nested))
+
+        blocker = os.path.join(self.tmp.name, "blocker")
+        with open(blocker, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("regular file\n")
+        blocked_out = os.path.join(blocker, "census.json")
+        r_err = subprocess.run([sys.executable, "-I", TOOL, self.tmp.name, "--json", blocked_out],
+                               capture_output=True, text=True)
+        self.assertEqual(r_err.returncode, 2, r_err.stderr)
+        self.assertIn(f"error: cannot write {blocked_out}:", r_err.stderr)
+        self.assertNotIn("Traceback", r_err.stderr)
 
 
 if __name__ == "__main__":

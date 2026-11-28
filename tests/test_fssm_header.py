@@ -421,5 +421,70 @@ class BindingCliTest(unittest.TestCase):
             self.assertEqual(doc["files"][0]["bindings"]["name"], "x")
 
 
+class FssmBomAndCaseTests(unittest.TestCase):
+    @staticmethod
+    def _mod():
+        tools_dir = os.path.dirname(TOOL)
+        if tools_dir not in sys.path:
+            sys.path.insert(0, tools_dir)
+        import fssm_header
+        return fssm_header
+
+    def test_stage_index_reads_utf8_bom_and_deduplicates_candidates(self):
+        from unittest import mock
+
+        fh = self._mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = os.path.join(tmp, "index.json")
+            with open(idx, "wb") as f:
+                f.write('\ufeff[{"file": "SHADER_A.fssm", "stage": "PS"}]\n'.encode("utf-8"))
+            self.assertEqual(fh.stage_index(tmp), {"SHADER_A": "PS"})
+
+            sub = os.path.join(tmp, "sub")
+            os.makedirs(sub)
+            bad_parent = os.path.join(tmp, "index.json")
+            bad_sub = os.path.join(sub, "index.json")
+            with open(bad_parent, "wb") as f:
+                f.write(b"{not-json")
+            with open(bad_sub, "wb") as f:
+                f.write(b"{not-json")
+            calls = []
+            orig_load = fh.json.load
+
+            def counting_load(stream):
+                calls.append(stream.name)
+                return orig_load(stream)
+
+            with mock.patch.object(fh.os.path, "realpath", return_value=bad_sub), \
+                    mock.patch.object(fh.json, "load", side_effect=counting_load):
+                self.assertEqual(fh.stage_index(sub), {})
+            self.assertEqual(len(calls), 1)
+
+    def test_files_of_matches_case_insensitive_fssm(self):
+        fh = self._mod()
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("a.fssm", "B.FSSM", "C.Fssm", "ignore.txt"):
+                with open(os.path.join(tmp, name), "wb") as f:
+                    f.write(b"")
+            os.makedirs(os.path.join(tmp, "dir.FSSM"))
+            got = [os.path.basename(p) for p in fh.files_of(tmp)]
+            self.assertEqual(got, ["B.FSSM", "C.Fssm", "a.fssm"])
+
+    def test_cli_handles_uppercase_fssm_and_bom_index(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fssm_dir = os.path.join(tmp, "fssm")
+            os.makedirs(fssm_dir)
+            with open(os.path.join(fssm_dir, "MYSHADER.FSSM"), "wb") as f:
+                f.write(tail_blob([(1, 2, 3, 4, 5)], b"MYSHADER"))
+            with open(os.path.join(fssm_dir, "index.json"), "wb") as f:
+                f.write('\ufeff[{"file": "MYSHADER.FSSM", "stage": "PS"}]\n'.encode("utf-8"))
+            p = subprocess.run([sys.executable, "-I", TOOL, fssm_dir, "--json"], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+            doc = json.loads(p.stdout)
+            self.assertEqual(doc["tally"]["files"], 1)
+            self.assertEqual(doc["files"][0]["name"], "MYSHADER.FSSM")
+            self.assertEqual(doc["files"][0]["stage"], "PS")
+
+
 if __name__ == "__main__":
     unittest.main()

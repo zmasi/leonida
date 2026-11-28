@@ -539,7 +539,29 @@ void check_run_time_load() {
                                   unregister_hint(n, late_hint, false) && unregister_port(n, late_port, false);
         while (XTaskQueueDispatch(manual, XTaskQueuePort::Completion, 0)) {}
         check(unregistered && late.calls == 0, "a registration ended before its queue is dispatched sends nothing");
-        XTaskQueueCloseHandle(manual);
+        // An initial notification whose callback unregisters itself, waiting, on the callback's own thread (kevincommits'
+        // Finding 19 in #1608, item 5): the wait was for its own return, so it never ended. Dispatched on a thread of
+        // its own so a hang is a failed check, not a stuck test.
+        static void* s_net = nullptr;
+        static Unregister s_unregister = nullptr;
+        static XTaskQueueRegistrationToken s_self{};
+        static bool s_self_result = false;
+        s_net = n;
+        s_unregister = unregister_port;
+        const PortCallback on_port_self = [](void*, uint16_t) { s_self_result = s_unregister(s_net, s_self, true); };
+        const bool self_registered = register_port(n, manual, nullptr, on_port_self, &s_self) == S_OK;
+        HANDLE dispatcher = CreateThread(
+            nullptr, 0,
+            [](void* q) -> DWORD {
+                while (XTaskQueueDispatch(static_cast<XTaskQueueHandle>(q), XTaskQueuePort::Completion, 0)) {}
+                return 0;
+            },
+            manual, 0, nullptr);
+        const bool returned = dispatcher && WaitForSingleObject(dispatcher, 3000) == WAIT_OBJECT_0;
+        check(self_registered && returned && s_self_result,
+              "a callback that unregisters itself with wait=true returns instead of waiting on itself");
+        if (dispatcher) CloseHandle(dispatcher);
+        if (returned) XTaskQueueCloseHandle(manual);
         uint16_t port = 7;
         using QueryPort = HRESULT(STDMETHODCALLTYPE*)(void*, uint16_t*);
         using NotImpl = HRESULT(STDMETHODCALLTYPE*)(void*);
@@ -822,26 +844,99 @@ void check_run_time_load() {
               "slot 26 (XPackageCloseMountHandle) closes the handle");
         SetEnvironmentVariableA("LEONIDA_CONTENT_PACKAGES", nullptr);
         using Stub = HRESULT(STDMETHODCALLTYPE*)(void*);
-        check(reinterpret_cast<Stub>(slot(pk, 20))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 40))(pk) == E_NOTIMPL &&
+        check(reinterpret_cast<Stub>(slot(pk, 20))(pk) == E_NOTIMPL && reinterpret_cast<Stub>(slot(pk, 30))(pk) == E_NOTIMPL &&
                   reinterpret_cast<Stub>(slot(pk, 41))(pk) == E_NOTIMPL,
-              "the slots without an offline answer (20, 40, 41) are E_NOTIMPL");
-        // Slot 39, XPackageEnumeratePackages(kind, scope, context, callback): the title enumerates content packages
-        // (kind 1); there are none offline, so S_OK and the callback never runs. No callback is E_INVALIDARG.
+              "the slots without an offline answer (20, 30, 41) are E_NOTIMPL");
+        // Slots 28/35/39, XPackageEnumeratePackages(kind, scope, context, callback): the title enumerates content
+        // packages (kind 1); there are none offline, so S_OK and the callback never runs. No callback is E_INVALIDARG.
         {
             using PackageCallback = bool(CALLBACK*)(void*, const void*);
             using EnumeratePackages = HRESULT(STDMETHODCALLTYPE*)(void*, uint32_t, uint32_t, void*, PackageCallback);
-            const auto enumerate_packages = reinterpret_cast<EnumeratePackages>(slot(pk, 39));
             int listed = 0;
             const PackageCallback count_package = [](void* ctx, const void*) -> bool {
                 ++*static_cast<int*>(ctx);
                 return true;
             };
-            check(enumerate_packages(pk, 1, 0, &listed, count_package) == S_OK &&
-                      enumerate_packages(pk, 1, 1, &listed, count_package) == S_OK &&
-                      enumerate_packages(pk, 0, 0, &listed, count_package) == S_OK && listed == 0 &&
-                      enumerate_packages(pk, 1, 0, &listed, nullptr) == E_INVALIDARG,
-                  "slot 39 (XPackageEnumeratePackages): S_OK and no callback (no content packages offline); "
+            bool all_ok = true;
+            for (const int s : {28, 35, 39}) {
+                const auto enumerate_packages = reinterpret_cast<EnumeratePackages>(slot(pk, s));
+                all_ok = all_ok && enumerate_packages(pk, 1, 0, &listed, count_package) == S_OK &&
+                         enumerate_packages(pk, 1, 1, &listed, count_package) == S_OK &&
+                         enumerate_packages(pk, 0, 0, &listed, count_package) == S_OK &&
+                         enumerate_packages(pk, 1, 0, &listed, nullptr) == E_INVALIDARG;
+            }
+            check(all_ok && listed == 0,
+                  "slots 28/35/39 (XPackageEnumeratePackages): S_OK and no callback (no content packages offline); "
                   "a null callback is E_INVALIDARG");
+        }
+        // Slots 29/36/40, XPackageRegisterPackageInstalled(queue, context, callback, token): returns S_OK and a fresh
+        // non-zero registration token accepted by slot 22; callback never runs offline.
+        {
+            using RegisterInstalled = HRESULT(STDMETHODCALLTYPE*)(void*, XTaskQueueHandle, void*, void*,
+                                                                  XTaskQueueRegistrationToken*);
+            using InstalledCallback = void(CALLBACK*)(void*, const void*);
+            static std::atomic<int> s_installed_calls{0};
+            const InstalledCallback on_installed = [](void*, const void*) { s_installed_calls.fetch_add(1); };
+            XTaskQueueRegistrationToken prev{0};
+            bool reg_ok = true;
+            for (const int s : {29, 36, 40}) {
+                const auto register_installed = reinterpret_cast<RegisterInstalled>(slot(pk, s));
+                XTaskQueueRegistrationToken tok{0};
+                reg_ok = reg_ok &&
+                         register_installed(pk, nullptr, nullptr, reinterpret_cast<void*>(on_installed), &tok) == S_OK &&
+                         tok.token != 0 && tok.token != prev.token &&
+                         register_installed(pk, nullptr, nullptr, nullptr, &tok) == E_INVALIDARG && tok.token == 0 &&
+                         register_installed(pk, nullptr, nullptr, reinterpret_cast<void*>(on_installed), nullptr) ==
+                             E_POINTER;
+                prev = tok;
+            }
+            check(reg_ok && s_installed_calls.load() == 0,
+                  "slots 29/36/40 (XPackageRegisterPackageInstalled): S_OK, distinct non-zero tokens, no callback");
+        }
+        // Flat C XPackage exports in xgameruntime.dll forward to the same offline implementation.
+        {
+            using FlatEnumFn = HRESULT(__stdcall*)(uint32_t, uint32_t, void*, void*);
+            using FlatCreateMonFn = HRESULT(__stdcall*)(const char*, uint32_t, const void*, uint32_t, XTaskQueueHandle,
+                                                        void**);
+            using FlatCloseMonFn = void(__stdcall*)(void*);
+            using FlatProgressFn = void(__stdcall*)(void*, void*);
+            using FlatUpdateFn = bool(__stdcall*)(void*);
+            using FlatRegProgFn = HRESULT(__stdcall*)(void*, void*, void*, XTaskQueueRegistrationToken*);
+            using FlatUnregProgFn = bool(__stdcall*)(void*, XTaskQueueRegistrationToken, bool);
+            using FlatRegInstFn = HRESULT(__stdcall*)(XTaskQueueHandle, void*, void*, XTaskQueueRegistrationToken*);
+            using FlatUnregInstFn = bool(__stdcall*)(XTaskQueueRegistrationToken, bool);
+            const auto find_xgr = [](const char* name) { return rt::shims::find("xgameruntime.dll", name); };
+            const auto flat_enum = reinterpret_cast<FlatEnumFn>(find_xgr("XPackageEnumeratePackages"));
+            const auto flat_create = reinterpret_cast<FlatCreateMonFn>(find_xgr("XPackageCreateInstallationMonitor"));
+            const auto flat_close = reinterpret_cast<FlatCloseMonFn>(find_xgr("XPackageCloseInstallationMonitorHandle"));
+            const auto flat_progress = reinterpret_cast<FlatProgressFn>(find_xgr("XPackageGetInstallationProgress"));
+            const auto flat_update = reinterpret_cast<FlatUpdateFn>(find_xgr("XPackageUpdateInstallationMonitor"));
+            const auto flat_reg_prog =
+                reinterpret_cast<FlatRegProgFn>(find_xgr("XPackageRegisterInstallationProgressChanged"));
+            const auto flat_unreg_prog =
+                reinterpret_cast<FlatUnregProgFn>(find_xgr("XPackageUnregisterInstallationProgressChanged"));
+            const auto flat_reg_inst = reinterpret_cast<FlatRegInstFn>(find_xgr("XPackageRegisterPackageInstalled"));
+            const auto flat_unreg_inst =
+                reinterpret_cast<FlatUnregInstFn>(find_xgr("XPackageUnregisterPackageInstalled"));
+            char own_id[64] = {};
+            reinterpret_cast<Ident>(slot(pk, 3))(pk, sizeof(own_id), own_id);
+            void* mon = nullptr;
+            struct FlatProg {
+                uint64_t total, installed, launch;
+                bool launchable, completed;
+            } fp{};
+            const auto dummy_cb = reinterpret_cast<void*>(+[](void*, const void*) -> bool { return true; });
+            XTaskQueueRegistrationToken tp{0}, ti{0};
+            check(flat_enum && flat_create && flat_close && flat_progress && flat_update && flat_reg_prog &&
+                      flat_unreg_prog && flat_reg_inst && flat_unreg_inst &&
+                      flat_enum(1, 0, nullptr, dummy_cb) == S_OK && flat_enum(1, 0, nullptr, nullptr) == E_INVALIDARG &&
+                      flat_create(own_id, 0, nullptr, 0, nullptr, &mon) == S_OK && mon != nullptr &&
+                      (flat_progress(mon, &fp), fp.completed && fp.launchable && fp.total != 0 && fp.installed == fp.total) &&
+                      !flat_update(mon) && flat_reg_prog(mon, nullptr, dummy_cb, &tp) == S_OK && tp.token != 0 &&
+                      flat_unreg_prog(mon, tp, true) && flat_reg_inst(nullptr, nullptr, dummy_cb, &ti) == S_OK &&
+                      ti.token != 0 && flat_unreg_inst(ti, true),
+                  "flat C XPackage enumeration, monitor, and install-registration exports resolve and work offline");
+            if (flat_close && mon) flat_close(mon);
         }
         struct Progress {
             uint64_t total, installed, launch;

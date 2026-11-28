@@ -242,6 +242,78 @@ class Cli(unittest.TestCase):
             self.assertIn("error:", err.getvalue())
             self.assertIn("No space left on device", err.getvalue())
 
+    def test_malformed_and_duplicate_selections_and_empty_hw_arch(self):
+        for bad_args in (
+            ["--ops", "v_exp_f16,"],
+            ["--ops", ",v_exp_f16"],
+            ["--modes", "keep16,"],
+            ["--modes", "keep16,,flush16"],
+            ["--waves", "32,"],
+            ["--waves", "32,,64"],
+            ["--hw-arch", ""],
+            ["--hw-arch", "   "],
+        ):
+            with self.subTest(args=bad_args), mock.patch.object(runner, "open_oracle") as open_mock:
+                with self.assertRaises(SystemExit) as raised, redirect_stderr(io.StringIO()):
+                    sw.main(bad_args)
+                self.assertEqual(raised.exception.code, 2)
+                open_mock.assert_not_called()
+
+        ref = [0] * 65536
+        fake_oracle = mock.MagicMock(device="fake-gpu", arch="gfx1030")
+        with mock.patch.object(runner, "open_oracle", return_value=fake_oracle), \
+                mock.patch.object(sw, "check_modes") as check_mock, \
+                mock.patch.object(sw, "reference", return_value=ref), \
+                mock.patch.object(sw, "sweep", return_value=list(ref)) as sweep_mock, \
+                redirect_stdout(io.StringIO()):
+            rc = sw.main(["--ops", "v_exp_f16,v_exp_f16", "--modes", "keep16,keep16", "--waves", "32,32"])
+        self.assertEqual(rc, 0)
+        check_mock.assert_called_once_with(fake_oracle, ["keep16"])
+        self.assertEqual(sweep_mock.call_count, 1)
+
+    def test_write_json_report_atomic_lf_nan_symlink_and_devnull(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "sub", "report.json")
+            self.assertIsNone(sw.write_json_report(out, {"ok": 1}))
+            raw = Path(out).read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+
+            self.assertIsNotNone(sw.write_json_report(out, {"bad": float("nan")}))
+            self.assertEqual(json.loads(Path(out).read_text(encoding="utf-8")), {"ok": 1})
+
+            if hasattr(os, "symlink"):
+                real = os.path.join(d, "real.json")
+                link = os.path.join(d, "link.json")
+                Path(real).write_text("old", encoding="utf-8")
+                try:
+                    os.symlink(real, link)
+                except OSError:
+                    link = None
+                if link is not None:
+                    self.assertIsNone(sw.write_json_report(link, {"via": "link"}))
+                    self.assertTrue(os.path.islink(link))
+                    self.assertEqual(json.loads(Path(real).read_text(encoding="utf-8")), {"via": "link"})
+
+            if os.name == "posix" and os.path.exists("/dev/null"):
+                self.assertIsNone(sw.write_json_report("/dev/null", {"ok": 1}))
+
+    def test_check_modes_and_sweep_guard_short_oracle_results(self):
+        short_oracle = mock.MagicMock(arch="gfx1030")
+        short_oracle.run.return_value = []
+        with self.assertRaisesRegex(RuntimeError, "expected 2 kernel results, got 0"):
+            sw.check_modes(short_oracle, ["keep16"])
+
+        empty_word_oracle = mock.MagicMock(arch="gfx1030")
+        empty_word_oracle.run.return_value = [[], []]
+        with self.assertRaisesRegex(RuntimeError, "MODE probe"):
+            sw.check_modes(empty_word_oracle, ["keep16"])
+
+        short_sweep_oracle = mock.MagicMock(arch="gfx1030")
+        short_sweep_oracle.run.return_value = [[0] * (sw.PER_KERNEL // 2)]
+        with self.assertRaisesRegex(RuntimeError, "expected .* kernel results, got 1"):
+            sw.sweep(short_sweep_oracle, "v_exp_f16", "keep16", 32)
+
 
 class OnHardware(unittest.TestCase):
     @classmethod

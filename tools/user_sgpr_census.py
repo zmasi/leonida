@@ -135,14 +135,14 @@ def load_index(path):
     return index
 
 
-# "<optional one-character prefix>VS_<technique>_<8 hex digits>_Wrapped" and the same with PS_: hash and suffix optional.
-TECHNIQUE_RE = re.compile(r"^.?(VS|PS)_(.+?)(?:_[0-9a-f]{8})?(?:_Wrapped)?$")
+# "<optional one-character prefix>(VS|PS|MS)_<technique>_<8 hex digits>_Wrapped": hash and suffix optional.
+TECHNIQUE_RE = re.compile(r"^.?(VS|PS|MS)_(.+?)(?:_[0-9a-f]{8})?(?:_Wrapped)?$")
 
 
 def technique(name, stage):
-    """The technique a VS or PS name belongs to, or None when the name doesn't carry the stage's token."""
+    """The technique a VS, PS, or MS name belongs to, or None when the name doesn't carry the stage's token."""
     m = TECHNIQUE_RE.match(name)
-    return m.group(2) if m and m.group(1).lower() == stage else None
+    return m.group(2) if m and m.group(1).lower() == stage.lower() else None
 
 
 def read_map(entry):
@@ -154,12 +154,13 @@ def read_map(entry):
     return out
 
 
-def pair_census(index):
-    """VS/PS of one technique (see the module docstring): agreement of the SGPRs both read, and the control."""
-    groups = defaultdict(lambda: {"vs": [], "ps": []})
-    stage_reads = {"vs": Counter(), "ps": Counter()}       # (sgpr, kind) -> shaders, for the control
+def pair_census(index, stages=("vs", "ps")):
+    """Stages s1/s2 of one technique (by default VS/PS, also MS/PS): agreement of the SGPRs both read, and the control."""
+    s1, s2 = stages[0].lower(), stages[1].lower()
+    groups = defaultdict(lambda: {s1: [], s2: []})
+    stage_reads = {s1: Counter(), s2: Counter()}       # (sgpr, kind) -> shaders, for the control
     for name, entry in index.items():
-        stage = entry.get("stage")
+        stage = (entry.get("stage") or "").lower()
         if stage not in stage_reads:
             continue
         m = read_map(entry)
@@ -168,11 +169,11 @@ def pair_census(index):
         t = technique(name, stage)
         if t is not None:
             groups[t][stage].append(m)
-    paired = {t: g for t, g in groups.items() if g["vs"] and g["ps"]}
+    paired = {t: g for t, g in groups.items() if g[s1] and g[s2]}
     c = Counter()
     for g in paired.values():
-        for v in g["vs"]:
-            for p in g["ps"]:
+        for v in g[s1]:
+            for p in g[s2]:
                 c["combinations"] += 1
                 shared = set(v) & set(p)
                 one_sided = set(v) ^ set(p)
@@ -187,20 +188,20 @@ def pair_census(index):
                     if any(k < s for k in one_sided):
                         c["above_one_sided_same_kind" if same else "above_one_sided_different_kind"] += 1
     control = Counter()
-    for (s, kv), nv in stage_reads["vs"].items():
-        for (s2, kp), np_ in stage_reads["ps"].items():
-            if s == s2:
+    for (s, kv), nv in stage_reads[s1].items():
+        for (s2_reg, kp), np_ in stage_reads[s2].items():
+            if s == s2_reg:
                 control["same_kind" if kv == kp else "different_kind"] += nv * np_
     keys = ("combinations", "combinations_sharing_an_sgpr", "identical_read_maps", "shared_same_kind",
             "shared_different_kind", "combinations_with_a_one_sided_sgpr_below_a_shared_one",
             "above_one_sided_same_kind", "above_one_sided_different_kind")
     return {
-        "techniques_with_vs_and_ps": len(paired),
-        "vs_in_pairs": sum(len(g["vs"]) for g in paired.values()),
-        "ps_in_pairs": sum(len(g["ps"]) for g in paired.values()),
+        f"techniques_with_{s1}_and_{s2}": len(paired),
+        f"{s1}_in_pairs": sum(len(g[s1]) for g in paired.values()),
+        f"{s2}_in_pairs": sum(len(g[s2]) for g in paired.values()),
         **{k: c[k] for k in keys},
-        "control_all_vs_ps": {"combinations": sum(1 for e in index.values() if e.get("stage") == "vs")
-                              * sum(1 for e in index.values() if e.get("stage") == "ps"),
+        f"control_all_{s1}_{s2}": {"combinations": sum(1 for e in index.values() if (e.get("stage") or "").lower() == s1)
+                              * sum(1 for e in index.values() if (e.get("stage") or "").lower() == s2),
                               "shared_same_kind": control["same_kind"],
                               "shared_different_kind": control["different_kind"]},
     }
@@ -245,7 +246,7 @@ def main(argv=None):
               + (f"; below base {s['below_base']}" if "below_base" in s else ""))
     report = summary
     if a.pairs:
-        pc = pair_census(index)
+        pc = pair_census(index, stages=("vs", "ps"))
         ctl = pc["control_all_vs_ps"]
         def share(same, diff):
             return f"{diff / (same + diff):.1%}" if same + diff else "-"
@@ -261,6 +262,22 @@ def main(argv=None):
               f"different kind {ctl['shared_different_kind']} "
               f"({share(ctl['shared_same_kind'], ctl['shared_different_kind'])} different)")
         report = {**summary, "vs_ps_pairs": pc}
+        has_ms = any((e.get("stage") or "").lower() == "ms" for e in index.values())
+        if has_ms:
+            ms_pc = pair_census(index, stages=("ms", "ps"))
+            ms_ctl = ms_pc["control_all_ms_ps"]
+            print(f"MS/PS pairs: {ms_pc['techniques_with_ms_and_ps']} techniques with both stages ({ms_pc['ms_in_pairs']} MS, "
+                  f"{ms_pc['ps_in_pairs']} PS), {ms_pc['combinations']} combinations, {ms_pc['combinations_sharing_an_sgpr']} "
+                  f"sharing an SGPR, {ms_pc['identical_read_maps']} with identical read maps")
+            print(f"  SGPRs both read: same kind {ms_pc['shared_same_kind']}, different kind {ms_pc['shared_different_kind']} "
+                  f"({share(ms_pc['shared_same_kind'], ms_pc['shared_different_kind'])} different)")
+            print(f"  above an SGPR only one stage reads ({ms_pc['combinations_with_a_one_sided_sgpr_below_a_shared_one']} "
+                  f"combinations): same kind {ms_pc['above_one_sided_same_kind']}, different kind "
+                  f"{ms_pc['above_one_sided_different_kind']}")
+            print(f"  control, all {ms_ctl['combinations']} MS x PS combinations: same kind {ms_ctl['shared_same_kind']}, "
+                  f"different kind {ms_ctl['shared_different_kind']} "
+                  f"({share(ms_ctl['shared_same_kind'], ms_ctl['shared_different_kind'])} different)")
+            report["ms_ps_pairs"] = ms_pc
     if a.json:
         try:
             with open(a.json, "w", encoding="utf-8", newline="\n") as f:

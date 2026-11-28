@@ -26,6 +26,7 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -72,11 +73,14 @@ inline std::vector<std::string> lines(const Sample& s, double age) {
     out.emplace_back(text);
     static const char* const now[submit_phases::kCount] = {"waiting for the GPU",   "fixing descriptors", "copying title memory",
                                                            "copying geometry",      "refreshing textures", "recording and submitting"};
-    if (s.phase >= 0 && s.phase < int(submit_phases::kCount))
-        std::snprintf(text, sizeof text, "now: %s%s", now[s.phase],
-                      s.phase_for >= 1 ? (" for " + std::to_string(int(s.phase_for)) + " s").c_str() : "");
-    else
+    if (s.phase >= 0 && s.phase < int(submit_phases::kCount)) {
+        if (std::isfinite(s.phase_for) && s.phase_for >= 1.0)
+            std::snprintf(text, sizeof text, "now: %s for %.0f s", now[s.phase], std::floor(s.phase_for));
+        else
+            std::snprintf(text, sizeof text, "now: %s", now[s.phase]);
+    } else {
         std::snprintf(text, sizeof text, "now: the title's own code");
+    }
     out.emplace_back(text);
     if (s.building)
         std::snprintf(text, sizeof text, "pipelines: %llu built, %u building (%.50s)",

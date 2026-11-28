@@ -20,12 +20,12 @@ TRANSLATOR = "rdna2spirv.py"
 # (label, file, old text, new text, test that must fail)
 MUTATIONS = [
     ("SDWA sext() ignored", TRANSLATOR,
-     'f = "OpBitFieldSExtract" if a.get("sext") else "OpBitFieldUExtract"',
-     'f = "OpBitFieldUExtract"',
+     'self.emit(f"{r} = OpShiftRightArithmetic %uint {up} {self.cu(32 - width)}")',
+     'self.emit(f"{r} = OpShiftRightLogical %uint {up} {self.cu(32 - width)}")',
      "test_ps_sdwa"),
     ("SDWA source field offset dropped", TRANSLATOR,
-     'self.emit(f"{r} = {f} %uint {v} {self.cu(off)} {self.cu(width)}")',
-     'self.emit(f"{r} = {f} %uint {v} {self.cu(0)} {self.cu(width)}")',
+     'self.emit(f"{r} = OpBitFieldUExtract %uint {v} {self.cu(off)} {self.cu(width)}")',
+     'self.emit(f"{r} = OpBitFieldUExtract %uint {v} {self.cu(0)} {self.cu(width)}")',
      "test_ps_sdwa"),
     ("v_min3/max3 min and max swapped", TRANSLATOR,
      'f = ("S" if op.endswith("i32") else "U") + ("Min" if "min" in op else "Max")',

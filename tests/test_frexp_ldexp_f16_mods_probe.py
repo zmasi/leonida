@@ -358,6 +358,80 @@ class ProbeCliTests(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("unavailable", buf.getvalue())
 
+    def test_malformed_comma_tokens_and_empty_args_rejected_before_oracle(self):
+        for bad_args in (
+            ["--ops", "v_frexp_mant_f16,"],
+            ["--ops", ",v_frexp_mant_f16"],
+            ["--ops", "v_frexp_mant_f16,,v_ldexp_f16"],
+            ["--waves", "32,"],
+            ["--waves", "32,,64"],
+            ["--hw-arch", ""],
+            ["--hw-arch", "   "],
+            ["--json", ""],
+            ["--json", "   "],
+        ):
+            with self.subTest(args=bad_args):
+                with mock.patch.object(runner, "open_oracle") as open_mock, redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        pr.main(bad_args)
+                self.assertEqual(cm.exception.code, 2)
+                open_mock.assert_not_called()
+
+    def test_json_blocker_trailing_sep_and_atomic_write_report(self):
+        with tempfile.TemporaryDirectory() as d:
+            blocker = os.path.join(d, "blocker")
+            Path(blocker).write_bytes(b"keep")
+            with mock.patch.object(runner, "open_oracle") as open_mock, redirect_stderr(io.StringIO()) as err:
+                rc = pr.main(["--ops", "v_frexp_mant_f16", "--waves", "32", "--json", os.path.join(blocker, "r.json")])
+            self.assertEqual(rc, 2)
+            open_mock.assert_not_called()
+            self.assertIn("ERROR: cannot write", err.getvalue())
+            self.assertEqual(Path(blocker).read_bytes(), b"keep")
+
+            with mock.patch.object(runner, "open_oracle") as open_mock, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    pr.main(["--ops", "v_frexp_mant_f16", "--waves", "32", "--json", os.path.join(d, "sub") + os.sep])
+            self.assertEqual(cm.exception.code, 2)
+            open_mock.assert_not_called()
+
+            out = os.path.join(d, "sub", "report.json")
+            self.assertTrue(pr.write_report(out, {"ok": 1}))
+            raw = Path(out).read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+
+            with redirect_stderr(io.StringIO()):
+                self.assertFalse(pr.write_report(out, {"bad": float("nan")}))
+            self.assertEqual(json.loads(Path(out).read_text(encoding="utf-8")), {"ok": 1})
+
+            if hasattr(os, "symlink"):
+                real = os.path.join(d, "real.json")
+                link = os.path.join(d, "link.json")
+                Path(real).write_text("old", encoding="utf-8")
+                try:
+                    os.symlink(real, link)
+                except OSError:
+                    link = None
+                if link is not None:
+                    self.assertTrue(pr.write_report(link, {"via": "link"}))
+                    self.assertTrue(os.path.islink(link))
+                    self.assertEqual(json.loads(Path(real).read_text(encoding="utf-8")), {"via": "link"})
+
+            if os.name == "posix" and os.path.exists("/dev/null"):
+                self.assertTrue(pr.write_report("/dev/null", {"ok": 1}))
+
+    def test_evaluate_results_count_mismatch_and_unknown_arch_family(self):
+        _, meta = pr.build_jobs(["v_frexp_mant_f16"], [32])
+        rep = pr.evaluate_results(["v_frexp_mant_f16"], [32], meta, [])
+        self.assertEqual(len(rep["harness_errors"]), 1)
+        self.assertIn("expected", rep["harness_errors"][0]["error"])
+
+        oracle = FakeOracle()
+        oracle.arch = "unknown_arch_999"
+        rc, out, _ = _run_main(oracle, "--ops", "v_frexp_mant_f16", "--waves", "32")
+        self.assertEqual(rc, 77, out)
+        self.assertTrue(oracle.closed)
+
 
 if __name__ == "__main__":
     unittest.main()

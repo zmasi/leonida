@@ -468,6 +468,58 @@ fn parse_paired_lanes(value: Option<&str>) -> PairedLanes {
     }
 }
 
+/// The forms asked for one program by name ([`with_forms_for`]), over what the switches say for
+/// every program. Both only matter for a console wave64 compute program on a host of 32-lane
+/// waves that does not translate as it is: any other program is left alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FormsFor {
+    /// The paired form ([`paired`]) before every other, the forms the chain counts as exact
+    /// included: as [`PairedLanes::First`] for this program.
+    pub paired_first: bool,
+    /// The wave-wide form ([`widen`]) before the approximate ones, as `LEONIDA_WAVE_WIDE=1` for
+    /// this program, and not the paired form in its place.
+    pub wide: bool,
+}
+
+thread_local! {
+    /// See [`with_forms_for`].
+    static FORMS_FOR: std::cell::Cell<FormsFor> =
+        const { std::cell::Cell::new(FormsFor { paired_first: false, wide: false }) };
+}
+
+/// Runs `f` (a translation, on this thread) with `forms` asked for its program.
+///
+/// For trying a form on one program, or finding by halves the program a form goes wrong for,
+/// without every other program changing with it: the forms the chain counts as exact may still be
+/// the wrong ones for a program. What the fork found with it, in its own chain of forms: the
+/// water's tile list (`CS_TransmissionVolumetrics_GenerateTiles`, `1aa247ed3653b616`) took a form
+/// counted as exact and whole tiles of the tiled water light were left unlit in a recorded
+/// frame, all of them lit with that one program in the paired form; the light clustering
+/// (`d3e5b737ea7cc150`, `55d2bce91ec9abcc`) is given half of the lights in each half of its cells
+/// by the approximate form; and wave-wide for every program lost the card as the world started.
+/// Which form this tree's chain takes for the tile and resolve programs of the transparent
+/// passes is in `docs/findings.md` ("Forms of the tile and resolve programs").
+///
+/// The caller names the programs and keys its cache by what it asks (`leonida-gpu`'s
+/// `shader_cache`: the lists `LEONIDA_PAIRED_FOR` and `LEONIDA_WAVE_WIDE_FOR`); the translator
+/// reads no switch for it, so the other programs' translations stay as they are.
+///
+/// After edsuuu/VI-BR-PORT 7318dee, 1fa0ed1 and cf3394b (edsuuu; `VICTORY_WAVE_WIDE_FOR`,
+/// `VICTORY_WAVE_PAIRED_FOR`), GPL-3.0. The paired form itself is this tree's
+/// ([`PairedLanes`]), not theirs.
+pub fn with_forms_for<R>(forms: FormsFor, f: impl FnOnce() -> R) -> R {
+    /// Puts the thread's choice back, also when `f` panics (a pipeline's build is caught and
+    /// its thread goes on to other programs).
+    struct Back(FormsFor);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            FORMS_FOR.set(self.0);
+        }
+    }
+    let _back = Back(FORMS_FOR.replace(forms));
+    f()
+}
+
 #[cfg(test)]
 thread_local! {
     /// A test's choice for [`paired_lanes`], for its thread only.
@@ -655,11 +707,13 @@ pub fn emit(
         };
         let done = |r: &Result<(HostShader, Option<u32>), ShaderError>| matches!(r, Ok((_, wave)) if *wave != Some(64));
         // The paired form (`paired`): with `LEONIDA_PAIRED_LANES=first` before every other form,
-        // else right before the wave-wide one.
-        let pairs = paired_lanes();
+        // else right before the wave-wide one. A program asked for by name ([`with_forms_for`])
+        // takes it first whatever the switch says.
+        let named = FORMS_FOR.get();
+        let pairs = if named.paired_first { PairedLanes::First } else { paired_lanes() };
         if pairs == PairedLanes::First {
             let again = paired(c, native, p, why);
-            report("paired lanes (first)", &again);
+            report(if named.paired_first { "paired lanes (first, named)" } else { "paired lanes (first)" }, &again);
             if done(&again) {
                 return again.map(|(shader, _)| shader);
             }
@@ -747,7 +801,8 @@ pub fn emit(
                 [0x58, 0x1d, 0xab, 0x2c, 0xd8, 0xbc, 0xf2, 0x2e, 0x5c, 0x96, 0x4b, 0x98, 0xe9, 0x03, 0x48, 0xd1]
                     | [0x24, 0x31, 0xbb, 0xe7, 0xdc, 0x15, 0x4a, 0xd7, 0x59, 0xd2, 0x0b, 0xc9, 0x54, 0x82, 0x9c, 0x1c]
             );
-        let wide_on = wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
+        // (or for this program alone: [`with_forms_for`])
+        let wide_on = named.wide || wide_option.as_ref().map_or(scene_kernel, |v| v == "1");
         // A single guest wave can iterate an active-lane loop until both host
         // halves have finished. The precise latch and convergence conditions
         // for the driver compute route are checked by widen().
@@ -787,7 +842,8 @@ pub fn emit(
                 // Still stopped where not every lane runs: the per-lane branches around
                 // those places taken as the console takes them, by the whole wave at once
                 // ([`widen`]), at two group barriers per such branch.
-                if wide_on && pairs == PairedLanes::BeforeWide {
+                // (not for a program named for the wave-wide form itself)
+                if wide_on && pairs == PairedLanes::BeforeWide && !named.wide {
                     let again = paired(c, native, p, why);
                     report("paired lanes", &again);
                     if done(&again) {
@@ -1187,8 +1243,140 @@ fn paired(
     r
 }
 
-/// The translated program, and the wave size it requires of the host.
+/// Which programs get the branches that close or leave their loops taken by each host wave
+/// together where cross-lane code depends on the wave ([`emit_program`]). `LEONIDA_LOOPS_WAVE`:
+/// - unset or `0`: none, as before;
+/// - `1`: console wave64 compute programs on a host of 32-lane waves;
+/// - `2`: every compute program.
+///
+/// Off until it has run in the game: the fork it is from has it on, for the water's tile
+/// list, on another set of forms (its host waves meet in pairs where this tree runs each on
+/// its own or pairs lanes in a thread), and here `1` is another translation for many
+/// programs. Counted offline for 32-lane waves over the title's compute programs but the
+/// 1,004 of the ray-tracing resolve (the 456 of them looked at are of console waves of 32,
+/// which `1` leaves alone): of 1,551 (1,043 of console wave64) 159 are translated with their
+/// loops' branches each host wave's, every one in the form it had; 45 more have such
+/// branches and keep their translation (the second one still needed 64 lanes or was
+/// refused); the same 1,529 translate either way. Among the 159: the depth of
+/// field's two boundary tile classifiers, the water's `GenerateTiles`, the scene's and the
+/// reflections' temporal resolves, instance culling, the depth pyramid with CPU occlusion.
+/// Part of the translation: the shader cache keys on it ([`translation_fingerprint`], by the
+/// switch's name).
+fn loops_wave(native: &NativeProgram) -> bool {
+    if native.stage != HwStage::Cs {
+        return false;
+    }
+    #[cfg(test)]
+    let asked = TEST_LOOPS_WAVE.get();
+    #[cfg(not(test))]
+    let asked: Option<u8> = None;
+    let mode = asked.unwrap_or_else(|| {
+        static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+        *MODE.get_or_init(|| match std::env::var("LEONIDA_LOOPS_WAVE").ok().as_deref().map(str::trim) {
+            Some("1") => 1,
+            Some("2") => 2,
+            _ => 0,
+        })
+    });
+    match mode {
+        1 => native.wave64 && lower::host_max_wave() == 32,
+        2 => true,
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice for [`loops_wave`] (`LEONIDA_LOOPS_WAVE`'s 0, 1 or 2), for its thread only.
+    pub(super) static TEST_LOOPS_WAVE: std::cell::Cell<Option<u8>> = const { std::cell::Cell::new(None) };
+}
+
+/// The translated program, and the wave size it requires of the host: [`emit_program_plain`];
+/// with [`loops_wave`], a program that comes out depending on the host's waves is translated
+/// once more with the per-lane branches that close or leave its loops taken by each host wave
+/// together ([`structure::structure_wide_host`]), and that translation is the one given if it
+/// needs no wider waves and the host runs it.
+///
+/// Why: the lowering turns the console's wave loops into loops each lane leaves on its own,
+/// and takes the code behind a loop as code the whole wave runs together. On NVIDIA the lanes
+/// that left a loop early run on as a wave of their own, so a ballot, a first-lane read, a
+/// reduction over the wave or an exchange between the halves of a console wave behind the
+/// loop sees a part of the wave. The fork saw it in the water's tile list
+/// (`water_shading:CS_TransmissionVolumetrics_GenerateTiles`: the tiles with local lights
+/// never counted themselves in, their list stayed empty and those tiles of the water kept no
+/// light). Of the title's tile classifiers the depth of field's
+/// `CS_TileClassificationNeighborhoodBoundary` (and its looking-glass variant) has that
+/// shape: a loop the lanes leave one by one on a comparison, and behind it reductions over
+/// the wave and lane reads. Translated offline for 32-lane waves it takes its form without
+/// early-outs either way, and with the switch its one loop branch is each host wave's.
+/// `CS_MaterialTilesInitial` has no loop and `CS_MaterialTiles` only loops on scalars:
+/// neither changes with this.
+///
+/// From trustno1-coder/VIctory-NVIDIA 64d4931 (trustno1-coder, GPL-3.0), which has it from
+/// readmet3xt-lab's foxhound 0.2.0-pre.3 (`VICTORY_LOOPS_WAVE`, on there). With the
+/// correction of voidopcode/vilocity 5ad1fd3 (voidopcode, GPL-3.0): a retranslation that
+/// still needs 64 lanes on a host of 32 is not taken, so that the first one's needs reach
+/// [`widen`]. Not taken from either: the pair meetings of host waves, the LDS set-up by the
+/// group's first thread (here: `lds_init`), LDS atomics in loops without a meeting, LDS
+/// bounds, and the kept skip around a loop that would not end.
 fn emit_program(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let first = emit_program_plain(c, native, p, st, io, res);
+    if !loops_wave(native) || !st.host_wide.is_empty() {
+        return first;
+    }
+    let Ok((_, Some(wave))) = &first else {
+        return first;
+    };
+    let loops = lower::loop_branches(p, st);
+    if loops.is_empty() {
+        return first;
+    }
+    let needs = lower::take_needs();
+    let again = structure::structure_wide_host(p, &st.wide, &loops).and_then(|st| {
+        let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+        emit_program_plain(c, native, p, &st, io, &res)
+    });
+    let why = std::env::var_os("LEONIDA_WAVE_WHY").is_some();
+    let runs = |w: u32| !(w == 64 && lower::host_max_wave() == 32);
+    match again {
+        Ok((shader, Some(w))) if w <= *wave && runs(w) => {
+            if why {
+                eprintln!("WAVE-LOOPS {} loop branches taken by each host wave together", loops.len());
+            }
+            lower::take_needs();
+            #[cfg(test)]
+            TEST_LOOPS_TAKEN.set(TEST_LOOPS_TAKEN.get() + 1);
+            Ok((shader, Some(w)))
+        }
+        other => {
+            if why {
+                let what = match &other {
+                    Ok((_, w)) => format!("wave {w:?}"),
+                    Err(e) => e.to_string(),
+                };
+                eprintln!("WAVE-LOOPS not taken ({} loop branches): {what}", loops.len());
+            }
+            lower::set_needs(needs);
+            first
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How many programs [`emit_program`] gave with their loops taken by each host wave
+    /// together, on this thread.
+    pub(super) static TEST_LOOPS_TAKEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+fn emit_program_plain(
     c: &Container,
     native: &NativeProgram,
     p: &ir::Program,

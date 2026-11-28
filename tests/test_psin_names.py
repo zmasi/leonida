@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "psin_names.py")
@@ -331,6 +332,81 @@ class TestCli(unittest.TestCase):
                 with open(paths[-1], "w", encoding="utf-8", newline="\n") as f:
                     json.dump(document, f)
             self.assertEqual(N.load_names(paths), {"prop_crate_01"})
+
+    def test_uppercase_json_extension_is_parsed_as_json(self):
+        with tempfile.TemporaryDirectory() as d:
+            upper = os.path.join(d, "NAMES.JSON")
+            with open(upper, "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"files": [{"names": ["prop_crate_01.#dr"]}]}, f)
+            self.assertEqual(N.load_names([upper]), {"prop_crate_01"})
+
+            bad = os.path.join(d, "BAD.JSON")
+            with open(bad, "wb") as f:
+                f.write(b"{not json")
+            r = self.run_tool(d, "--names", bad)
+            self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+            self.assertIn("not JSON:", r.stderr)
+
+    def test_refs_failure_preserves_previous_file_and_cleans_staging(self):
+        previous = "previous\trefs\n"
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "one.bin")
+            names = os.path.join(d, "names.txt")
+            refs = os.path.join(d, "refs.tsv")
+            with open(src, "wb") as f:
+                f.write(sample())
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                f.write("prop_crate_01\n")
+            with open(refs, "w", encoding="utf-8", newline="\n") as f:
+                f.write(previous)
+
+            with mock.patch.object(N, "scan", side_effect=OSError("disk error")), \
+                    mock.patch.object(sys, "argv", ["psin_names.py", src, "--names", names, "--refs", refs]):
+                rc = N.main()
+            self.assertEqual(rc, 2)
+            with open(refs, encoding="utf-8") as f:
+                self.assertEqual(f.read(), previous)
+            self.assertEqual([n for n in os.listdir(d) if n.startswith(".psin_names-")], [])
+
+            os.chmod(refs, 0o444)
+            try:
+                with mock.patch.object(os, "replace", side_effect=PermissionError("replace denied")), \
+                        mock.patch.object(sys, "argv", ["psin_names.py", src, "--names", names, "--refs", refs]):
+                    rc = N.main()
+                self.assertEqual(rc, 2)
+                with open(refs, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), previous)
+                self.assertEqual([n for n in os.listdir(d) if n.startswith(".psin_names-")], [])
+                if os.name == "nt":
+                    r = self.run_tool(src, "--names", names, "--refs", refs)
+                    self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                    self.assertNotIn("Traceback", r.stderr)
+                    with open(refs, encoding="utf-8") as f:
+                        self.assertEqual(f.read(), previous)
+                    self.assertEqual([n for n in os.listdir(d) if n.startswith(".psin_names-")], [])
+            finally:
+                for entry in os.listdir(d):
+                    try:
+                        os.chmod(os.path.join(d, entry), 0o600)
+                    except OSError:
+                        pass
+
+    def test_rejects_refs_case_variant_inside_src_dir(self):
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "Carved")
+            os.mkdir(src)
+            with open(os.path.join(src, "0001.bin"), "wb") as f:
+                f.write(sample())
+            names = os.path.join(d, "names.txt")
+            with open(names, "w", encoding="utf-8", newline="\n") as f:
+                f.write("prop_crate_01\n")
+            folded_refs = os.path.join(d, "carved", "out.tsv")
+            with mock.patch.object(N.os.path, "realpath", side_effect=os.path.abspath), \
+                    mock.patch.object(N.os.path, "normcase", side_effect=str.lower), \
+                    mock.patch.object(sys, "argv", ["psin_names.py", src, "--names", names, "--refs", folded_refs]):
+                with self.assertRaises(SystemExit) as cm:
+                    N.main()
+                self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":

@@ -329,23 +329,23 @@ def _fold_int_op(op: str, res_ty: str, args: list[str],
             if c2[1] == 1:
                 return a1
             if c2[1] == 0:
-                return a2
+                return int_const_by_val.get((res_ty, 0))
         if c1 is not None:
             if c1[1] == 1:
                 return a2
             if c1[1] == 0:
-                return a1
+                return int_const_by_val.get((res_ty, 0))
     elif op == "OpBitwiseAnd":
         if a1 == a2:
             return a1
         if c2 is not None:
             if c2[1] == 0:
-                return a2
+                return int_const_by_val.get((res_ty, 0))
             if dst_mask is not None and c2[1] == dst_mask:
                 return a1
         if c1 is not None:
             if c1[1] == 0:
-                return a1
+                return int_const_by_val.get((res_ty, 0))
             if dst_mask is not None and c1[1] == dst_mask:
                 return a2
     elif op == "OpBitwiseOr":
@@ -355,12 +355,12 @@ def _fold_int_op(op: str, res_ty: str, args: list[str],
             if c2[1] == 0:
                 return a1
             if dst_mask is not None and c2[1] == dst_mask:
-                return a2
+                return int_const_by_val.get((res_ty, dst_mask))
         if c1 is not None:
             if c1[1] == 0:
                 return a2
             if dst_mask is not None and c1[1] == dst_mask:
-                return a1
+                return int_const_by_val.get((res_ty, dst_mask))
     elif op == "OpBitwiseXor":
         if a1 == a2:
             return int_const_by_val.get((res_ty, 0))
@@ -372,7 +372,7 @@ def _fold_int_op(op: str, res_ty: str, args: list[str],
         if c2 is not None and c2[1] == 0:
             return a1
         if op != "OpShiftRightArithmetic" and c1 is not None and c1[1] == 0:
-            return a1
+            return int_const_by_val.get((res_ty, 0))
     elif op == "OpIEqual" and a1 == a2:
         return const_true_id
     elif op == "OpINotEqual" and a1 == a2:
@@ -386,7 +386,8 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                        int_const_by_val: dict[tuple[str, int], str],
                        int_type_info: dict[str, tuple[int, int]],
                        readonly_global_vars: set[str], glsl_sets: set[str],
-                       decorated_ids: set[str], max_passes: int = 4) -> tuple[list[str], set[str]]:
+                       decorated_ids: set[str], pinned_ids: set[str],
+                       max_passes: int = 4) -> tuple[list[str], set[str]]:
     """Optimize one OpFunction ... OpFunctionEnd slice. Returns (new_lines, deleted_ids)."""
     insts: list[list] = []
     for raw in body_lines:
@@ -752,12 +753,12 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                         if idx in dead_idx:
                             continue
 
-                    # Integer/bit constant folding & algebraic identities
+                    # Integer/bit constant folding & algebraic identities (must preserve Result Type)
                     folded = _fold_int_op(
                         op, args[0], args, const_int_val, int_const_by_val,
                         int_type_info, const_true_id, const_false_id,
                     )
-                    if folded is not None:
+                    if folded is not None and id_type.get(folded) == args[0]:
                         alias[res] = folded
                         dead_idx.add(idx)
                         deleted_ids.add(res)
@@ -811,7 +812,7 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                                     cached = entry_null_zero[root]
                                 elif root in static_null_zero and slot not in stored_slots:
                                     cached = static_null_zero[root]
-                            if cached is not None and res not in decorated_ids:
+                            if cached is not None and res not in decorated_ids and id_type.get(cached) == args[0]:
                                 alias[res] = cached
                                 dead_idx.add(idx)
                                 deleted_ids.add(res)
@@ -977,6 +978,8 @@ def _optimize_function(body_lines: list[str], const_ids: set[str], const_true: s
                     use_count[tok] = use_count.get(tok, 0) + 1
 
         def is_pure_dce_candidate(res: str, op: str, args: list[str]) -> bool:
+            if res in pinned_ids:
+                return False
             if op in _PURE_OPS or op == "OpPhi":
                 return True
             if op == "OpExtInst" and len(args) >= 3 and args[1] in glsl_sets and args[2] in _PURE_GLSL_EXT:
@@ -1035,6 +1038,7 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
     readonly_global_vars: set[str] = set()                  # PushConstant and Input OpVariables
     glsl_sets: set[str] = set()
     decorated_ids: set[str] = set()
+    pinned_ids: set[str] = set()
 
     func_ranges: list[tuple[int, int]] = []
     fn_start = None
@@ -1066,6 +1070,7 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
                 for tok in args[2:]:
                     if tok.startswith("%"):
                         decorated_ids.add(tok)
+                        pinned_ids.add(tok)
             elif op == "OpGroupDecorate" and len(args) >= 2:
                 for tok in args[1:]:
                     if tok.startswith("%"):
@@ -1108,6 +1113,10 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
                 const_ids.add(res)
                 const_type[res] = args[0]
                 const_null_type[res] = args[0]
+            elif op in ("OpUndef", "OpSpecConstant", "OpSpecConstantTrue",
+                        "OpSpecConstantFalse", "OpSpecConstantComposite",
+                        "OpSpecConstantOp") and res and args:
+                const_type[res] = args[0]
             elif op == "OpTypeArray" and res and args:
                 array_elem_type[res] = args[0]
             elif op == "OpVariable" and res and len(args) >= 2 and args[1] in ("PushConstant", "Input"):
@@ -1134,7 +1143,7 @@ def optimize(spvasm: str, max_passes: int = 4) -> str:
             lines[start:end], const_ids, const_true, const_false,
             const_null_elem_zero, const_type, const_int_val, int_const_by_val,
             int_type_info, readonly_global_vars, glsl_sets, decorated_ids,
-            max_passes=max_passes,
+            pinned_ids, max_passes=max_passes,
         )
         opt_funcs[start] = new_body
         all_deleted.update(deleted)

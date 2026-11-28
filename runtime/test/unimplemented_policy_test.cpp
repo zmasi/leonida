@@ -243,6 +243,17 @@ void test_classification() {
     check(cls("acphal.dll", "ApuFree") == ReturnClass::Other, "ApuFree is void");
     check(cls("acphal.dll", "ApuMapVirtualAddress") == ReturnClass::Other,
           "ApuMapVirtualAddress returns a 32-bit APU address");
+    check(cls("libHttpClient.GDK.dll", "HCInitialize") == ReturnClass::HResult, "HCInitialize is hresult");
+    check(cls("libhttpclient.gdk.dll", "HCCleanupAsync") == ReturnClass::HResult, "HCCleanupAsync is hresult");
+    check(cls("libhttpclient.gdk.dll", "HCHttpCallCreate") == ReturnClass::HResult, "HCHttpCallCreate is hresult");
+    check(cls("libhttpclient.gdk.dll", "HCHttpCallPerformAsync") == ReturnClass::HResult, "HCHttpCallPerformAsync is hresult");
+    check(cls("libhttpclient.gdk.dll", "HCHttpCallRequestSetUrl") == ReturnClass::HResult, "HCHttpCallRequest* is hresult");
+    check(cls("libhttpclient.gdk.dll", "HCHttpCallResponseGetStatusCode") == ReturnClass::HResult,
+          "HCHttpCallResponse* is hresult");
+    check(cls("libhttpclient.gdk.dll", "HCHttpCallDuplicateHandle") == ReturnClass::Other,
+          "HCHttpCallDuplicateHandle returns HCCallHandle, not hresult");
+    check(cls("libhttpclient.gdk.dll", "HCTraceImplMessage") == ReturnClass::Other,
+          "HCTraceImplMessage returns void");
     check(cls("xgameruntime.dll", "XGameRuntimeInitialize") == ReturnClass::HResult, "XGameRuntimeInitialize");
     check(cls("xgameruntime.dll", "XUserAddAsync") == ReturnClass::HResult, "XUser* is hresult");
     check(cls("xgameruntime.dll", "XTaskQueueCreate") == ReturnClass::HResult, "XTaskQueueCreate is hresult");

@@ -53,6 +53,61 @@ _INLINE_FLOAT_STR = {
     248: "0.15915494",
 }
 
+# Binary16 bit patterns for inline constants 240..248 on 16-bit integer operands
+# (AMD RDNA2 ISA + LLVM AMDGPUDisassembler::getInlineImmValF16 / printImmediateInt16).
+_INLINE_INT16 = {
+    240: 0x3800,  # 0.5
+    241: 0xB800,  # -0.5
+    242: 0x3C00,  # 1.0
+    243: 0xBC00,  # -1.0
+    244: 0x4000,  # 2.0
+    245: 0xC000,  # -2.0
+    246: 0x4400,  # 4.0
+    247: 0xC400,  # -4.0
+    248: 0x3118,  # 1 / (2 * pi)
+}
+
+# VOP1 / VOPC / VOP3 instructions whose source operands are scalar 16-bit integers
+# (OPERAND_REG_IMM_INT16 / OPERAND_REG_INLINE_C_INT16 in LLVM TableGen).
+_INT16_ALL_SRCS = frozenset({
+    "v_cvt_f16_i16",
+    "v_cvt_f16_u16",
+    "v_add_nc_i16",
+    "v_add_nc_u16",
+    "v_sub_nc_i16",
+    "v_sub_nc_u16",
+    "v_mul_lo_u16",
+    "v_lshlrev_b16",
+    "v_lshrrev_b16",
+    "v_ashrrev_i16",
+    "v_max_i16",
+    "v_max_u16",
+    "v_min_i16",
+    "v_min_u16",
+    "v_max3_i16",
+    "v_max3_u16",
+    "v_min3_i16",
+    "v_min3_u16",
+    "v_med3_i16",
+    "v_med3_u16",
+    "v_mad_i16",
+    "v_mad_u16",
+    *(f"{pfx}_{cc}_{ty}"
+      for pfx in ("v_cmp", "v_cmpx")
+      for cc in ("lt", "eq", "le", "gt", "ne", "ge")
+      for ty in ("i16", "u16")),
+})
+
+# Mixed-width VOP3 instructions where SRC0 and SRC1 are 16-bit integers, while SRC2 is 32-bit.
+_INT16_SRC01_ONLY = frozenset({
+    "v_mad_i32_i16",
+    "v_mad_u32_u16",
+})
+
+
+def _src_is_int16(name: str, src_idx: int) -> bool:
+    return name in _INT16_ALL_SRCS or (src_idx in (0, 1) and name in _INT16_SRC01_ONLY)
+
 # VOP2 instructions that always carry a trailing 32-bit literal constant.
 _VOP2_MANDATORY_LITERAL = frozenset({
     0x20,  # v_madmk_f32 (gfx1013)
@@ -203,7 +258,7 @@ def _vreg(reg: int, n: int = 1) -> dict:
     return {"k": "vgpr", "r": reg & 0xFF, "n": max(1, n), "neg": False, "abs": False}
 
 
-def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = False) -> dict:
+def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = False, int16: bool = False) -> dict:
     """Decode a 9-bit RDNA2 source operand (0..511)."""
     if code <= 127:
         op = _sreg(code, n)
@@ -212,7 +267,10 @@ def _src(code: int, n: int, lit: int | None, *, neg: bool = False, absm: bool = 
     elif 193 <= code <= 208:
         op = {"k": "imm", "v": -(code - 192)}
     elif code in _INLINE_FLOAT:
-        op = {"k": "fimm", "v": _INLINE_FLOAT[code], "abs": False}
+        if int16:
+            op = {"k": "imm", "v": _INLINE_INT16[code]}
+        else:
+            op = {"k": "fimm", "v": _INLINE_FLOAT[code], "abs": False}
     elif code == 251:
         op = {"k": "special", "t": "src_vccz", "neg": False, "abs": False}
     elif code == 252:
@@ -479,6 +537,8 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                     src0_neg = bool((w1 >> 20) & 1)
                     src0_abs = bool((w1 >> 21) & 1)
                     s0_is_sgpr = bool((w1 >> 23) & 1)
+                    # SDWA integer 16-bit ops (e.g. v_cvt_f16_u16_sdwa) take 32-bit f32 inline float bits on RDNA2
+                    # (hardware-verified in runtime/test/shaders/ps_sdwa_f16_const.asm) and stay fimm.
                     s0 = _src(src0_reg, 1, None) if s0_is_sgpr else _vreg(src0_reg, 1)
                     if src0_sext:
                         s0["sext"] = True
@@ -512,7 +572,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                 if fn == "VDST":
                     args.append(_sreg(vdst & 0x7F, 1) if name == "v_readfirstlane_b32" else _vreg(vdst, w))
                 elif fn == "SRC0":
-                    args.append(_src(src0, w, lit))
+                    args.append(_src(src0, w, lit, int16=_src_is_int16(name, 0)))
             return finish(op_name, args, mods, nbytes)
 
         if hi7 == 0x3E:  # VOPC
@@ -592,7 +652,7 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                     if not name.startswith("v_cmpx_"):
                         args.append(_vcc_operand(wave32))
                 elif fn == "SRC0":
-                    args.append(_src(src0, w, lit))
+                    args.append(_src(src0, w, lit, int16=_src_is_int16(name, 0)))
                 elif fn == "VSRC1":
                     args.append(_vreg(vsrc1, w))
             return finish(name + "_e32", args, mods, nbytes)
@@ -990,15 +1050,18 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
                     if opc in (0x342, 0x343, 0x35A) and ((src0 >> 8) & 1):
                         mods.append("high")
                 else:
-                    args.append(_src(src0, w, lit, neg=bool(neg & 1), absm=bool(abs_bits & 1)))
+                    args.append(_src(src0, w, lit, neg=bool(neg & 1), absm=bool(abs_bits & 1),
+                                     int16=_src_is_int16(name, 0)))
             elif fn == "SRC1":
                 if opc == 0x202:  # v_interp_mov_f32_e64: param selector p10/p20/p0
                     p = {0: "p10", 1: "p20", 2: "p0"}.get(src1 & 3, f"p{src1}")
                     args.append({"k": "interp", "t": p})
                 else:
-                    args.append(_src(src1, w, lit, neg=bool(neg & 2), absm=bool(abs_bits & 2)))
+                    args.append(_src(src1, w, lit, neg=bool(neg & 2), absm=bool(abs_bits & 2),
+                                     int16=_src_is_int16(name, 1)))
             elif fn == "SRC2":
-                args.append(_src(src2, w, lit, neg=bool(neg & 4), absm=bool(abs_bits & 4)))
+                args.append(_src(src2, w, lit, neg=bool(neg & 4), absm=bool(abs_bits & 4),
+                                 int16=_src_is_int16(name, 2)))
         if name in ("v_permlane16_b32", "v_permlanex16_b32"):
             # These two use op_sel bits 0 and 1 as FI and BOUND_CTRL, not as half selects. llvm-mc prints just that
             # pair, and nothing when both are 0, whatever bits 2 and 3 hold (LLVM 21.1.8, gfx1013).

@@ -6,8 +6,7 @@ counts, timings and settings only: no game data, no traces.
 
 Status in one line: on Linux/Proton and on native Windows the retail 1.0.2.1 package launches, shows its launch
 movie, first-run pages and landing prompt, runs the story load to its end with the loading slideshow drawing its
-artwork, and enters the world phase. A first world frame has not been verified yet on any of the three machines; what
-stops it is listed under [Where it stops](#where-it-stops).
+artwork, and enters the world phase. A first world frame has been verified on Linux/AMD (RX 7900 XTX, RADV, 2026-11-26; see [AMD on Linux: what got the world drawn](#amd-on-linux-what-got-the-world-drawn)); it has not been verified yet on any of the three machines in the table below, and what stops it there is listed under [Where it stops](#where-it-stops).
 
 ## Test machines
 

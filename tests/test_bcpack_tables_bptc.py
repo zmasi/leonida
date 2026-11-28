@@ -722,6 +722,43 @@ class TestSecurityAndEdgeValidation(unittest.TestCase):
             os.utime(hist, ns=(st.st_atime_ns, st.st_mtime_ns))
             self.assertEqual(bptc.load_bc6h(hist)[2][0], 2)
 
+    def test_strict_int_rejects_bool_float_and_duplicate_or_malformed_dict_keys(self) -> None:
+        for bad_key in (True, 1.5, " 0 ", "+0", "\u0660", "bad"):
+            with self.subTest(bad_key=bad_key):
+                with self.assertRaises(ValueError):
+                    list(bptc._iter_entries({bad_key: 0}))
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            list(bptc._iter_entries({"01": 1, "1": 2}))
+        with self.assertRaises(ValueError):
+            bptc.load_bc6h({"bc6h": {"endpointClass": {"0": True}}})
+        with self.assertRaises(ValueError):
+            bptc.load_bc6h({"bc6h": {"indexHistory": {"0": [1.5] + [0] * 15}}})
+        with self.assertRaises(ValueError):
+            bptc.load_bc7({"bc7": {"historyEndpointBits": {"0": [True] + [0] * 23}}})
+        with self.assertRaises(ValueError):
+            bptc.load_bc7({"bc7": {"historyEndpointLastResort": [[0, True]]}})
+        with self.assertRaises(ValueError):
+            bptc.load_bc_history(1, {"bc1": {"confirmed": {"0": [True, 0, 0, 0, 0, 0]}}})
+
+    def test_bc6h_class_and_bc7_bit_depth_bounds(self) -> None:
+        for key in ("endpointClass", "indexClass"):
+            for bad_cls in (-1, 4):
+                with self.subTest(key=key, bad_cls=bad_cls):
+                    with self.assertRaisesRegex(ValueError, "outside 0..3"):
+                        bptc.load_bc6h({"bc6h": {key: {"0": bad_cls}}})
+
+        for key, bad_vals in (
+            ("historyEndpointBits", (-1,)),
+            ("historyEndpointConfirmedBits", (-1, 9)),
+            ("historyIndexBits", (-1, 5)),
+            ("historyIndexConfirmedBits", (-1, 5)),
+        ):
+            width = 24 if "Endpoint" in key else 32
+            for bad in bad_vals:
+                with self.subTest(key=key, bad=bad):
+                    with self.assertRaisesRegex(ValueError, "out of bounds"):
+                        bptc.load_bc7({"bc7": {key: {"0": [bad] + [0] * (width - 1)}}})
+
 
 if __name__ == "__main__":
     unittest.main()

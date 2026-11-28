@@ -277,6 +277,76 @@ class Cli(unittest.TestCase):
             self.assertIn("error:", stderr.getvalue())
             self.assertNotIn("Traceback", stderr.getvalue())
 
+    def test_malformed_and_duplicate_dims_formats_and_empty_hw_arch(self):
+        for bad_args in (
+            ["--dims", "1d,"],
+            ["--dims", ",1d"],
+            ["--dims", "1d,,2d"],
+            ["--formats", "r32_uint,"],
+            ["--formats", "r32_uint,,r32_sint"],
+            ["--hw-arch", ""],
+            ["--hw-arch", "   "],
+        ):
+            with self.subTest(args=bad_args):
+                with mock.patch.object(runner, "open_oracle") as open_mock, \
+                     mock.patch.object(sys, "stderr", io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        pr.main(bad_args)
+                self.assertEqual(cm.exception.code, 2)
+                open_mock.assert_not_called()
+
+        oracle = FakeOracle()
+        with mock.patch.object(oracle, "run", wraps=oracle.run) as run_spy:
+            rc, out = run_main(oracle, "--dims", "1d, 1d", "--formats", "r32_uint, r32_uint")
+        self.assertEqual(rc, 0, out)
+        run_spy.assert_called_once()
+        self.assertEqual(len(run_spy.call_args.args[0]), 1)
+
+    def test_write_json_report_atomic_lf_nan_symlink_and_devnull(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "sub", "report.json")
+            self.assertIsNone(pr.write_json_report(out, {"ok": 1}))
+            raw = Path(out).read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+
+            err = pr.write_json_report(out, {"bad": float("nan")})
+            self.assertIsNotNone(err)
+            self.assertEqual(json.loads(Path(out).read_text(encoding="utf-8")), {"ok": 1})
+
+            if hasattr(os, "symlink"):
+                real = os.path.join(tmp, "real.json")
+                link = os.path.join(tmp, "link.json")
+                Path(real).write_text("old", encoding="utf-8")
+                try:
+                    os.symlink(real, link)
+                except OSError:
+                    link = None
+                if link is not None:
+                    self.assertIsNone(pr.write_json_report(link, {"via": "link"}))
+                    self.assertTrue(os.path.islink(link))
+                    self.assertEqual(json.loads(Path(real).read_text(encoding="utf-8")), {"via": "link"})
+
+            if os.name == "posix" and os.path.exists("/dev/null"):
+                self.assertIsNone(pr.write_json_report("/dev/null", {"ok": 1}))
+
+    def test_result_count_word_length_and_unknown_arch_family(self):
+        oracle = FakeOracle()
+        with mock.patch.object(oracle, "run", return_value=[]):
+            rc, out = run_main(oracle, "--dims", "1d", "--formats", "r32_uint")
+        self.assertEqual(rc, 2)
+        self.assertIn("expected 1 kernel results, got 0", out)
+
+        with mock.patch.object(oracle, "run", return_value=[[0, 1, 2]]):
+            rc2, out2 = run_main(oracle, "--dims", "1d", "--formats", "r32_uint")
+        self.assertEqual(rc2, 2)
+        self.assertIn("expected 256 words, got 3", out2)
+
+        bad_arch = FakeOracle()
+        bad_arch.arch = "unknown_arch_999"
+        rc3, out3 = run_main(bad_arch, "--dims", "1d", "--formats", "r32_uint")
+        self.assertEqual(rc3, 77, out3)
+
 
 class OnHardware(unittest.TestCase):
     @classmethod

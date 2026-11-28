@@ -734,16 +734,11 @@ triangle or accept that documented exception. This does not by itself explain th
 8-bit score above, whose per-block UV coverage was not measured here; the mixed-determinant vertex is one
 candidate.
 
-Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the bodies of the
-`RSC8` headers, the nested RPF9 payloads, and the whole `appdata0` data area. Across the 971
-core graphics blocks, final-slot widths remain unresolved (`0x21`, the last unread component type,
-is decoded above). The stride check
 Opaque: the encrypted RPF9 tables of contents, the Bink 2 bodies, the `LSNS` record contents, the nested RPF9
 payloads, and the whole `appdata0` data area. The bodies of the nine `RSC8` headers are decoded in
-[rsc8_audio.md](rsc8_audio.md): facial/lip-sync clips. Across the 971
-core graphics blocks, final-slot widths remain unresolved, and of the component types the non-normal
-bits of `0x21` (see above). The stride check
-also leaves 436 blocks unclassified, including 18 with a validated following meshlet group.
+[rsc8_audio.md](rsc8_audio.md): facial/lip-sync clips. Across the 971 core graphics blocks, final-slot widths remain
+unresolved (the recurring component types, including both the normal and tangent bits of `0x21`, are decoded above).
+The stride check also leaves 436 blocks unclassified, including 18 with a validated following meshlet group.
 "Unread" in the tables above is not a claim that those bytes are empty: in
 `story000_restofworld` the 9.33 MB unread gap contains 15 `ADAT` (AWC) banks (8,908,216 bytes), which hold the
 nine `RSC8` headers as tag `0x5c` clips, and nested RPF9 headers, and
@@ -933,11 +928,13 @@ streams found with `tools/restofworld_index.py`'s `find_rage_textures` / `is_pg_
    all 924 `core_restofworld` model resources (936 drawables across 926 system and 1,020 graphics streams)
    and the single `story000_restofworld` drawable dictionary (3 drawables) without the TOC. Archive path
    names and external texture-dictionary links still need the TOC or hash matching.
-7. A vertex decoder for `42 40 00 00` blocks. ASSET-57 measured recurring stream widths;
-   decoding vertex values still requires component types, final-stream widths and a way to
-   locate the owning geometry when only a graphics page is available. (Texture identification is
-   resolved above under **Textures (`ASSET-148`)**: embedded `0x980` descriptors in `zero-prefix`
-   CPU-segment streams plus the companion `ttdb/*.ttpf` pools.)
+7. A full vertex decoder for `42 40 00 00` blocks. ASSET-57 measured recurring stream widths,
+   `tools/vertex_types.py` decodes the recurring component types above (`0x42`, `0x28`, `0x27`,
+   `0x26`, `0x25`, `0x21`), and `tools/meshlet_page.py --draw-system` /
+   `tools/restofworld_model_join.py` resolve draw ownership when system metadata is available;
+   final-stream widths and locating the owning geometry from a graphics page alone remain open.
+   (Texture identification is resolved above under **Textures (`ASSET-148`)**: embedded `0x980`
+   descriptors in `zero-prefix` CPU-segment streams plus the companion `ttdb/*.ttpf` pools.)
 8. Runtime consumers for the XML content-definition records read by `tools/content_definitions.py`
    (see above). Their roots describe configuration, not UI layout; reference resolution and mapping
    to resources remain unimplemented.
@@ -974,6 +971,6 @@ decrypts the TOC.
 
 - [docs/rpf.md](rpf.md) - RPF9 carving and recovery tools.
 - [docs/design.md](design.md) - the model manifest and the archive-stage table.
-- `docs/story.md` - the `story000`/`shared_minigame000` archive family (pending story PR).
-- `docs/world.md` - map placement and the `0x7a` metadata resource (PR #117).
-- `docs/psin.md` - the `PSIN` container measured on `script.rpf` and `data.rpf` (PR #110).
+- [docs/story.md](story.md) - the `story000`/`shared_minigame000` archive family.
+- [docs/world.md](world.md) - map placement and the `0x7a` metadata resource (PR #117).
+- [docs/psin.md](psin.md) - the `PSIN` container measured on `script.rpf` and `data.rpf` (PR #110).

@@ -17,20 +17,39 @@ import unittest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BOLD_ID = re.compile(r"^\*\*[^*]+\*\*$")  # the whole first cell is bold
 SEPARATOR = re.compile(r"^\|\s*:?-{3}")
+FENCE_OPEN = re.compile(r"(`{3,})[^`]*$|(~{3,}).*$")
+
+
+def _update_fence(fence, line):
+    """Return (new_fence, is_fence_line) for CommonMark backtick or tilde fences."""
+    stripped = line.lstrip(" \t").rstrip("\r")
+    if fence is not None:
+        char, length = fence
+        run = len(stripped) - len(stripped.lstrip(char))
+        if run >= length and not stripped[run:].strip(" \t"):
+            return None, True
+        return fence, False
+    match = FENCE_OPEN.match(stripped)
+    if match:
+        run = match.group(1) or match.group(2)
+        return (run[0], len(run)), True
+    return None, False
 
 
 def repeated_ids(text):
     """[(line a, line b, id)] for two rows of one table whose first cells are the same bold ID."""
-    found, in_fence, seen, in_table = [], False, {}, False
+    found, fence, seen, in_table = [], None, {}, False
     for n, line in enumerate(text.split("\n"), 1):
-        if line.lstrip().startswith("```"):
-            in_fence = not in_fence
+        fence, is_fence_line = _update_fence(fence, line)
+        if is_fence_line:
             in_table = False
             continue
-        row = not in_fence and line.startswith("|") and not SEPARATOR.match(line)
+        if fence is not None:
+            continue
+        row = line.startswith("|") and not SEPARATOR.match(line)
         if row and not in_table:
             seen = {}
-        in_table = row or (not in_fence and SEPARATOR.match(line) is not None)
+        in_table = row or (SEPARATOR.match(line) is not None)
         if not row:
             continue
         cells = line.split("|")
@@ -65,6 +84,26 @@ class RepeatedTableIds(unittest.TestCase):
             "```", "| **M3** | in a fence |", "| **M3** | in a fence |", "```",
         ])
         self.assertEqual(repeated_ids(text), [(3, 5, "**M2**")])
+
+    def test_tilde_and_longer_fences_ignore_table_rows_inside(self):
+        text = "\n".join([
+            "~~~",
+            "| **M3** | in a tilde fence |",
+            "| **M3** | in a tilde fence |",
+            "```",
+            "~~~",
+            "| # | Scope |", "|---|---|",
+            "| **M4** | first |", "| **M4** | duplicate |",
+            "",
+            "````md",
+            "```",
+            "| **M5** | in a four-backtick fence |",
+            "| **M5** | in a four-backtick fence |",
+            "````",
+            "| # | Scope |", "|---|---|",
+            "| **M6** | first |", "| **M6** | duplicate |",
+        ])
+        self.assertEqual(repeated_ids(text), [(8, 9, "**M4**"), (18, 19, "**M6**")])
 
     def test_docs_have_no_repeated_table_ids(self):
         found = []

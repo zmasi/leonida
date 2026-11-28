@@ -111,15 +111,33 @@ class TestScan(unittest.TestCase):
             self.assertEqual(len(A.collect(tmp, join=True)), 1)
 
     def test_non_joined_scan_processes_each_blob_before_reading_the_next(self):
-        def parts(_src):
-            yield "first.bin", make_record(0x1000, 100_000)
+        def parts(src):
+            yield "first.bin", os.path.join(src, "00.bin")
             self.assertEqual(scan.call_count, 1)
-            yield "second.bin", make_record(0x1001, 200_000)
+            yield "second.bin", os.path.join(src, "01.bin")
 
-        with patch.object(A, "files_in", parts), patch.object(A, "scan", wraps=A.scan) as scan:
-            rows = A.collect("unused")
+        with tempfile.TemporaryDirectory() as tmp:
+            write_parts(tmp, [make_record(0x1000, 100_000), make_record(0x1001, 200_000)])
+            with patch.object(A, "paths_in", parts), patch.object(A, "scan_stream", wraps=A.scan_stream) as scan:
+                rows = A.collect(tmp)
         self.assertEqual([(row["file"], row["id"]) for row in rows],
                          [("first.bin", 0x1000), ("second.bin", 0x1001)])
+
+    def test_individual_files_use_bounded_reads(self):
+        from io import BytesIO
+
+        class SmallReads(BytesIO):
+            def read(self, size=-1):
+                if not 0 < size <= 7:
+                    raise AssertionError(f"unbounded read: {size}")
+                return super().read(size)
+
+        data = b"abc" + make_record(9, 120_000)
+        with patch.object(A, "paths_in", return_value=[("one.bin", "one.bin")]), \
+                patch.object(A, "open", return_value=SmallReads(data)), patch.object(A, "JOIN_BLOCK_BYTES", 7):
+            rows = A.collect("one.bin")
+        self.assertEqual(located(rows), [("one.bin", 7)])
+        self.assertEqual(without_location(rows), A.scan(data))
 
     def test_join_marker_at_stream_boundary_uses_the_file_containing_it(self):
         record = make_record(0x3000, 150_000)

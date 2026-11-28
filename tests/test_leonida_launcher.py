@@ -73,11 +73,34 @@ class CommandTests(unittest.TestCase):
                                        "-SmoothMotion", "-NoPrecompile", "-SeriesX", "-Quality",
                                        "-Resolution", "1440", "-Capture", "-Log"])
 
+    def test_the_newer_switches(self):
+        got = launcher.switch_args(settings(series_s=True, series_x=True, dlss_mode="balanced", frame_gen=3,
+                                            resolution="1080", aspect="21:9", present_scale="stretch",
+                                            adapter="5070"))
+        # Series S wins over Series X, and -Resolution is left out with a DLSS mode, as the script asks
+        self.assertEqual(got, ["-SeriesS", "-Dlss", "balanced", "-FrameGen", "3", "-Aspect", "21:9",
+                               "-PresentScale", "stretch", "-Adapter", "5070"])
+        self.assertEqual(launcher.switch_args(settings(dlss=False, dlss_mode="quality", resolution="1080")),
+                         ["-NoDlss", "-Resolution", "1080"])
+        self.assertEqual(launcher.switch_args(settings(present_scale="stretch")), [])   # only with -Aspect
+
+    def test_the_newer_settings_are_checked(self):
+        got = launcher.normalise({"frame_gen": False, "dlss_mode": "max", "aspect": "21:9; calc", "adapter": 'a"b',
+                                  "present_scale": "fill", "series_s": True, "series_x": True})
+        self.assertEqual((got["frame_gen"], got["dlss_mode"], got["aspect"], got["adapter"], got["present_scale"]),
+                         (0, "", "", "", ""))
+        self.assertEqual((got["series_s"], got["series_x"]), (True, False))
+        kept = launcher.normalise({"frame_gen": 4, "dlss_mode": "ultra", "aspect": " auto ", "adapter": "#1"})
+        self.assertEqual((kept["frame_gen"], kept["dlss_mode"], kept["aspect"], kept["adapter"]),
+                         (4, "ultra", "auto", "#1"))
+
     def test_switches_exist_in_the_script(self):
         text = (ROOT / "scripts" / "play-d3d12.ps1").read_text(encoding="utf-8")
         every = settings(dlss=False, ray_tracing=True, smooth_motion=True, precompile=False, series_x=True,
-                         quality=True, resolution="720", capture=True, log=True)
-        for arg in launcher.switch_args(every):
+                         quality=True, resolution="720", capture=True, log=True, aspect="32:9",
+                         present_scale="fit", adapter="#1", frame_gen=2)
+        newer = settings(series_s=True, dlss_mode="quality")
+        for arg in launcher.switch_args(every) + launcher.switch_args(newer):
             if arg.startswith("-") and arg[1:].isalpha():
                 self.assertIn("$" + arg[1:], text, arg)
         self.assertIn("$Game", text)

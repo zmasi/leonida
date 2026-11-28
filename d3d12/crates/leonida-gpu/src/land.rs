@@ -690,11 +690,16 @@ unsafe fn piece_at(
     let since = crate::watch::changes();
     let (mut pages, mut new_pages, mut blocks, mut dwords, mut missing) = (0, 0u64, 0, 0, 0);
     let mut span: Option<(usize, usize)> = None;
+    // The cells of each page that something was put into ([`new_cells`]).
+    let mut landed: Vec<(usize, crate::watch::Cells)> = Vec::new();
     for_pages(title, parts, |from, n| {
         pages += 1;
         if !differing[(title + from) / PAGE - base] {
             return;
         }
+        // (Before the merge makes the reference equal to the card's bytes.)
+        // SAFETY: the caller's: both are ours for the part's bytes.
+        let cells = unsafe { new_cells(title + from, now.add(from), held.add(from), n) };
         // SAFETY: the caller's; title memory, by an address that shows it
         // (`beside`) or the title's own.
         let merge = |take| unsafe { crate::safecopy::merge(into.wrapping_add(from) as *mut u8, now.add(from), held.add(from), n, take) };
@@ -719,6 +724,9 @@ unsafe fn piece_at(
         }
         blocks += done.new;
         dwords += done.dwords;
+        if done.dwords > 0 && cells != [0u64; 8] {
+            landed.push(((title + from) / PAGE, cells));
+        }
         missing += u64::from(!done.there);
         if done.new > 0 {
             new_pages += 1;
@@ -733,6 +741,7 @@ unsafe fn piece_at(
             }
         }
     });
+    crate::watch::landing_cells(&landed);
     if let Some((from, to)) = span {
         notes.spans.push((from, to - from));
         // Not through a copy that is not to be noted, if that is asked: the
@@ -749,6 +758,58 @@ unsafe fn piece_at(
     crate::shadow::PUT[0].fetch_add(u64::from(dwords > 0), Ordering::Relaxed);
     crate::shadow::PUT[2].fetch_add(dwords * 4, Ordering::Relaxed);
     dwords * 4
+}
+
+/// The cells of 8 bytes (`crate::watch::Cells`, by their place in the 4 KiB page) of the `n` bytes at title
+/// address `at` in which the card's bytes (`now`) differ from the reference (`held`): where the merge may put
+/// a shader's write into title memory. Where they are few (a kibibyte at most), those whose bytes title memory
+/// holds already are left out: a copy at its place in a list that title memory took when it was submitted
+/// (`crate::host::placed_is_titles`) is not a shader's write, and beside a real one in the same page it was
+/// noted as one with the page.
+///
+/// # Safety
+/// `now` and `held` are `n` bytes of ours; the stretch lies in one 4 KiB page of title memory.
+unsafe fn new_cells(at: usize, now: *const u8, held: *const u8, n: usize) -> crate::watch::Cells {
+    let mut cells = [0u64; 8];
+    let first = at % PAGE;
+    let mut i = 0;
+    while i < n {
+        let cell = (first + i) / 8;
+        // SAFETY: the caller's: inside the stretch.
+        let (differs, step) = unsafe {
+            if (first + i).is_multiple_of(8) && n - i >= 8 {
+                (now.add(i).cast::<u64>().read_unaligned() != held.add(i).cast::<u64>().read_unaligned(), 8)
+            } else {
+                (now.add(i).read() != held.add(i).read(), 1)
+            }
+        };
+        if differs {
+            cells[cell / 64] |= 1 << (cell % 64);
+        }
+        i += step;
+    }
+    let count: u32 = cells.iter().map(|c| c.count_ones()).sum();
+    if count == 0 || count > 128 {
+        return cells;
+    }
+    let mut there = [0u8; PAGE];
+    let there = &mut there[..n];
+    if !crate::host::read_into(at as *const u8, there) {
+        return cells;
+    }
+    for cell in first / 8..=(first + n - 1) / 8 {
+        if cells[cell / 64] & (1 << (cell % 64)) == 0 {
+            continue;
+        }
+        // The cell's bytes that lie in the stretch.
+        let (from, to) = ((cell * 8).max(first) - first, ((cell + 1) * 8).min(first + n) - first);
+        // SAFETY: the caller's: inside the stretch.
+        let card = unsafe { std::slice::from_raw_parts(now.add(from), to - from) };
+        if card == &there[from..to] {
+            cells[cell / 64] &= !(1 << (cell % 64));
+        }
+    }
+    cells
 }
 
 /// `parts` of a piece that begins at `title`, cut where 4 KiB pages of title

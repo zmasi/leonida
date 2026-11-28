@@ -38,6 +38,26 @@ Paths are placeholders: `<checkout>` is the repository, `<build>` the folder wit
   `<work>/shaders/spirv/library/index.json`), which drops their dispatches at play, and `LEONIDA_RT_AS=off`, which
   drops acceleration-structure builds. The picture then lacks what they draw.
 
+## Recommended variables (all platforms)
+
+Beyond the required platform settings above, these runtime variables (all documented in
+[runtime/README.md](../runtime/README.md)) are recommended for smoother start-up, faster pipeline compilation and
+better fault diagnostics on current `main`:
+
+| Setting | Default | Why |
+|---|---|---|
+| `LEONIDA_SUBMIT_ASYNC=4` | `0` | Moves command-list replay, before-submission refreshes and `vkQueueSubmit` off the title's submitting thread onto per-queue worker threads (up to 4 batches queued). |
+| `LEONIDA_ASYNC_PIPELINES=1` | `0` | Builds pipelines on the compile pool instead of blocking draws (pair with `LEONIDA_ASYNC_MIN_BYTES=2097152` and optionally `LEONIDA_ASYNC_MIN_BYTES_GRAPHICS=0` to keep small compute lighting/post passes synchronous while large ray-tracing or graphics pipelines build asynchronously; use `=0` when every pipeline is already pre-compiled and you want zero skipped draws). |
+| `LEONIDA_COMPILE_THREADS=16`, `LEONIDA_COMPILE_HEAVY_MAX=14` | half logical cores (2-8) / `threads-1` | Scales parallel pipeline compilation on high-core-count CPUs (adjust to available cores and RAM; pair with `LEONIDA_SERIAL_BIG_COMPILES=0`). |
+| `LEONIDA_COMPUTE_WARMUP_MAX_BYTES=8388608`, `LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES=131072` | `8388608` / unset | Bounds speculative warm-up module size and holds back large warm-ups while the title is actively submitting so warm-ups do not starve live frames. |
+| `LEONIDA_HEAVY_PIPELINE_CACHE_MS=0` | `0` | Keeps pipeline-cache lookups active for heavy modules instead of bypassing the cache after a threshold. |
+| `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1` | unset | Periodically saves pipeline-cache session checkpoints during boot so progress is preserved if a run stops early. |
+| `LEONIDA_ARENA_MB=4095`, `LEONIDA_TITLE_WINDOWS_MB=4096`, `LEONIDA_GEOMETRY_MB=6144` | smaller defaults | Room for the title's buffers in the world on 16-24 GB GPUs (reduce on 8 GB cards; with sparse binding the arena size is address range and memory is bound on demand). |
+| `LEONIDA_KEYBOARD_PAD=always`, `LEONIDA_RUMBLE=0` | unset / on | Exposes the keyboard as player 1 when no gamepad is attached and disables rumble/haptics overhead. |
+| `LEONIDA_DEVICE_FAULT=1`, `LEONIDA_DEVICE_MARKERS=1` | unset | Enables device-loss/stall reports and (on AMD / `VK_AMD_buffer_marker`) per-draw/dispatch GPU markers to pinpoint hangs. |
+| `LEONIDA_TITLE_HUD=1` or `LEONIDA_DEV_OVERLAY=1` | unset | Live frame rate, frame time, submission phases, pipeline-compile counts and VRAM/RAM usage on screen. |
+| `LEONIDA_GPU_LATENCY=1`, `LEONIDA_MEM_PROBE=30` | unset | Periodic per-queue GPU latency (every 10 s) and VRAM breakdown by consumer (every 30 s) in the runtime log. |
+
 ## Linux, Wine, AMD RX 7900 XTX (RADV)
 
 Measured by us on 2026-11-26: RX 7900 XTX, Ryzen 9 7950X3D, Linux 7.3, Mesa 26.3.1 (RADV), Wine. Details and the
@@ -59,19 +79,22 @@ reasons behind each step: [linux_proton.md](linux_proton.md#amd-on-linux-what-go
   | Setting | Why |
   |---|---|
   | `LEONIDA_D3D12=vulkan` | the Vulkan backend |
+  | `MESA_VK_DEVICE_SELECT=1002:744c!` | pins the discrete RX 7900 XTX on systems that also have an integrated GPU |
   | `LEONIDA_SHADERS=Z:<work>/shaders/spirv` | the native pack |
   | `LEONIDA_PIPELINE_CACHE_DIR=Z:<cache>/pso` | the journal the pre-compile filled |
   | `MESA_SHADER_CACHE_DIR=<cache>/mesa`, `MESA_SHADER_CACHE_MAX_SIZE=16G` | RADV's own cache, large enough for the pack |
   | `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1` | session cache snapshots during the boot |
-  | `LEONIDA_ASYNC_PIPELINES=0` | draws wait for their pipeline instead of being skipped |
-  | `LEONIDA_SERIAL_BIG_COMPILES=0`, `LEONIDA_COMPUTE_WARMUP_MAX_BYTES=8388608` | warm-up limits, as in the NVIDIA report below |
+  | `LEONIDA_SUBMIT_ASYNC=4` | offloads submission prep and `vkQueueSubmit` onto per-queue workers |
+  | `LEONIDA_ASYNC_PIPELINES=1` (or `=0`) | `=1` keeps first-run/streaming pipeline compiles off the draw thread (pair with `LEONIDA_COMPILE_THREADS=16`, `LEONIDA_COMPILE_HEAVY_MAX=14`); `=0` waits for every pipeline instead of skipping draws |
+  | `LEONIDA_SERIAL_BIG_COMPILES=0`, `LEONIDA_HEAVY_PIPELINE_CACHE_MS=0`, `LEONIDA_COMPUTE_WARMUP_MAX_BYTES=8388608`, `LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES=131072` | parallel big compiles with cache lookups kept active and live-frame warm-up throttling |
   | `LEONIDA_RT_AS=off`, `LEONIDA_SKIP_COMPUTE=<list>` | the large ray-tracing programs, left out at play as in our longest runs ([above](#settings-every-platform-needs)) |
   | `LEONIDA_TITLE_WATCHDOG=0`, `LEONIDA_TITLE_WATCHDOG_KICK=<trap RVA>,<kick RVA>` | the title's hang watchdog ([above](#settings-every-platform-needs)) |
   | `LEONIDA_DEVICE_TYPE=6`, `LEONIDA_MAP_READBACK=1`, `LEONIDA_FRAME_PACING=1`, `LEONIDA_PRESENT_NO_TEAR=1` | taken over from the NVIDIA report below; their effect on AMD was not measured one by one |
   | `LEONIDA_ARENA_MB=4095`, `LEONIDA_TITLE_WINDOWS_MB=4096`, `LEONIDA_GEOMETRY_MB=6144` | room for the title's buffers in the world |
   | `LEONIDA_SHADOW_ALIAS_MS=5000`, `LEONIDA_CONSOLE_FIX_US=0` | carried from earlier boot runs; their effect here was not measured one by one |
-  | `LEONIDA_DEVICE_FAULT=1` | a device-loss report if the GPU hangs |
-  | `LEONIDA_KEYBOARD_PAD=always` | the keyboard as the pad |
+  | `LEONIDA_DEVICE_FAULT=1`, `LEONIDA_DEVICE_MARKERS=1` | device-loss/stall report plus `VK_AMD_buffer_marker` draw/dispatch attribution if the GPU hangs |
+  | `LEONIDA_GPU_LATENCY=1`, `LEONIDA_MEM_PROBE=30`, `LEONIDA_TITLE_HUD=1`, `LEONIDA_DEV_OVERLAY=1` | optional live telemetry and overlays |
+  | `LEONIDA_KEYBOARD_PAD=always`, `LEONIDA_RUMBLE=0` | keyboard as player 1 without rumble overhead |
 
 - **Command:** from `<package>`, `wine <build>/gta6rt.exe --run Z:<exe> --game-dir Z:<package>`.
 - **What to expect:** menus at 30 frames/s with no in-game compiling; the world after the story load, over eight
@@ -157,7 +180,8 @@ TBD.
 
 ## Reporting
 
-Post a run in the coordination issue, with the fields of these sections: machine (OS, GPU, driver, RAM), the commit,
-how the shaders were made, the pipeline pre-compile, the OS and driver settings, every `LEONIDA_*` variable that
-differs from the defaults (never the watchdog's RVA values), and how far the run got with its frame rate. Keep logs,
-traces and screenshots on your machine ([linux_proton.md](linux_proton.md#reporting-a-result)).
+Post a `RUN` block ([agent_collaboration.md](agent_collaboration.md)) in the game-run tracking or coordination issue,
+with the fields of these sections: machine (OS, GPU, driver, RAM), the commit, how the shaders were made, the pipeline
+pre-compile, the OS and driver settings, every `LEONIDA_*` variable that differs from the defaults (never the
+watchdog's RVA values), and how far the run got with its frame rate. Keep logs, traces and screenshots on your machine
+([linux_proton.md](linux_proton.md#reporting-a-result)).

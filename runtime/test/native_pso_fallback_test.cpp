@@ -67,6 +67,76 @@ int main() {
         desc.NumRenderTargets = 1;  // the B4G4R4A4 format past the target count is not a target
         expect(!without_stand_in_blend(desc), "a format past NumRenderTargets is not looked at");
     }
+    {
+        // IndependentBlendEnable == FALSE with only RenderTarget[0] populated (normal D3D12 usage; RenderTarget[1..7]
+        // zeroed): B4G4R4A4 in slot 0 must replicate RenderTarget[0] before setting IndependentBlendEnable = TRUE so
+        // slot 1 keeps its blend state and RenderTargetWriteMask.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.NumRenderTargets = 2;
+        desc.RTVFormats[0] = DXGI_FORMAT_B4G4R4A4_UNORM;
+        desc.RTVFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.BlendState.IndependentBlendEnable = FALSE;
+        desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+        desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        desc.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        desc.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+        desc.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ONE;
+        desc.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ZERO;
+        desc.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        expect(without_stand_in_blend(desc), "shared blend with B4G4R4A4 in slot 0 triggers fallback");
+        expect(desc.BlendState.IndependentBlendEnable == TRUE, "fallback enables IndependentBlendEnable");
+        expect(!desc.BlendState.RenderTarget[0].BlendEnable &&
+                   desc.BlendState.RenderTarget[0].RenderTargetWriteMask == D3D12_COLOR_WRITE_ENABLE_ALL,
+               "slot 0 disables blend while keeping its write mask");
+        expect(desc.BlendState.RenderTarget[1].BlendEnable == TRUE &&
+                   desc.BlendState.RenderTarget[1].SrcBlend == D3D12_BLEND_SRC_ALPHA &&
+                   desc.BlendState.RenderTarget[1].RenderTargetWriteMask == D3D12_COLOR_WRITE_ENABLE_ALL,
+               "slot 1 inherits RenderTarget[0]'s blend state and write mask instead of staying zeroed");
+    }
+    {
+        // IndependentBlendEnable == FALSE with B4G4R4A4 in slot 1 and RenderTarget[1] zeroed: slot 1 is effectively
+        // blended through RenderTarget[0], so the fallback must trigger and disable blend only on slot 1.
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC desc{};
+        desc.NumRenderTargets = 2;
+        desc.RTVFormats[0] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.RTVFormats[1] = DXGI_FORMAT_B4G4R4A4_UNORM;
+        desc.BlendState.IndependentBlendEnable = FALSE;
+        desc.BlendState.RenderTarget[0].BlendEnable = TRUE;
+        desc.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        expect(without_stand_in_blend(desc), "shared blend with B4G4R4A4 in slot 1 triggers fallback");
+        expect(desc.BlendState.IndependentBlendEnable == TRUE, "slot 1 fallback enables IndependentBlendEnable");
+        expect(desc.BlendState.RenderTarget[0].BlendEnable == TRUE, "slot 0 keeps its blend");
+        expect(!desc.BlendState.RenderTarget[1].BlendEnable &&
+                   desc.BlendState.RenderTarget[1].RenderTargetWriteMask == D3D12_COLOR_WRITE_ENABLE_ALL,
+               "slot 1 disables blend and inherits RenderTarget[0]'s write mask");
+    }
+    {
+        // IndependentBlendEnable == FALSE with RenderTarget[0].BlendEnable == FALSE and stale RenderTarget[1].BlendEnable
+        // == TRUE: slot 1 is NOT effectively blended, so no fallback should trigger and desc must remain untouched.
+        auto before = two_targets(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B4G4R4A4_UNORM);
+        before.BlendState.IndependentBlendEnable = FALSE;
+        before.BlendState.RenderTarget[0].BlendEnable = FALSE;
+        before.BlendState.RenderTarget[1].BlendEnable = TRUE;  // ignored when IndependentBlendEnable == FALSE
+        auto desc = before;
+        expect(!without_stand_in_blend(desc), "stale RenderTarget[1].BlendEnable ignored when IndependentBlendEnable is FALSE");
+        expect(std::memcmp(&desc, &before, sizeof(desc)) == 0, "desc unchanged when effective blend is off");
+    }
+    {
+        // IndependentBlendEnable == TRUE preserves distinct per-target blend settings and write masks.
+        auto desc = two_targets(DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B4G4R4A4_UNORM);
+        desc.BlendState.IndependentBlendEnable = TRUE;
+        desc.BlendState.RenderTarget[0].RenderTargetWriteMask = 0x3;
+        desc.BlendState.RenderTarget[1].RenderTargetWriteMask = 0x5;
+        expect(without_stand_in_blend(desc), "independent blend with B4G4R4A4 in slot 1 triggers fallback");
+        expect(desc.BlendState.RenderTarget[0].BlendEnable == TRUE &&
+                   desc.BlendState.RenderTarget[0].RenderTargetWriteMask == 0x3,
+               "independent blend preserves slot 0");
+        expect(!desc.BlendState.RenderTarget[1].BlendEnable &&
+                   desc.BlendState.RenderTarget[1].RenderTargetWriteMask == 0x5,
+               "independent blend disables slot 1 blend without overwriting its write mask");
+    }
     if (failures) return 1;
     std::printf("native_pso_fallback: ok\n");
     return 0;

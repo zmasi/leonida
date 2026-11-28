@@ -66,6 +66,9 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     uint asked = 0;
     uint kind = 0;
     uint words = 0;
+    // As `super::SOURCE` notes them: a dispatch record that asks for more groups in x than run.
+    uint wide = 0;
+    uint wide_cut = 0;
     if (gi == 0) {
         largest_asked = 0;
         all_asked = 0;
@@ -92,6 +95,10 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
                 g = uint3(0, 0, 0);
             }
             cost = g.x * g.y * g.z * 64u;
+            if (record[0] > g.x && record[0] <= (1u << 24)) {
+                wide = record[0];
+                wide_cut = record[0] - g.x;
+            }
             record[0] = g.x;
             record[1] = g.y;
             record[2] = g.z;
@@ -175,6 +182,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
     }
     if (!active) {
         return;
+    }
+    if (wide > 0) {
+        uint was;
+        budget.InterlockedMax(20, wide, was);
+        budget.InterlockedAdd(24, wide_cut, was);
     }
     if (fits[gi] == 0) {
         record[0] = 0;
@@ -311,6 +323,20 @@ impl Table {
     }
 }
 
+/// What the pass waits for before it reads the records ([`record`]).
+pub(super) enum Wait<'a> {
+    /// Every earlier shader write: what the pass needs, and what a run records.
+    All,
+    /// Timing experiments (`LEONIDA_AB=<s>,LEONIDA_EXP_BATCH_NO_WAIT` and
+    /// `..._WAIT_SOURCES`): nothing, or only the unordered access to the buffers the
+    /// records are read from. They say what of a pass's cost is its wait for everything.
+    /// For timing only: a pass may then read records a shader has not finished writing.
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    None,
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    For(&'a [&'a ID3D12Resource]),
+}
+
 /// Records the pass over the table at `jobs` (a host address) into `dst`,
 /// which is in state `before` and left in `INDIRECT_ARGUMENT`: after every
 /// earlier shader write (the title's argument passes), before what reads
@@ -322,19 +348,33 @@ pub(super) fn record(
     budget: u64,
     sources: [u64; SOURCES],
     jobs: u64,
+    wait: Wait,
 ) {
     let after = transition(
         dst,
         D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
         D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
     );
+    let mut first = Vec::with_capacity(1 + SOURCES);
+    match wait {
+        Wait::All => first.push(uav_barrier()),
+        Wait::None => {}
+        Wait::For(buffers) => first.extend(buffers.iter().map(|b| D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    // SAFETY: a borrowed pointer the barrier never releases.
+                    pResource: unsafe { std::mem::transmute_copy(*b) },
+                }),
+            },
+        })),
+    }
+    first.push(transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS));
     // SAFETY: an open list; our root signature and pipeline; live buffers:
     // the sources and the table are read in the common state (promoted).
     unsafe {
-        l.ResourceBarrier(&[
-            uav_barrier(),
-            transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
-        ]);
+        l.ResourceBarrier(&first);
         l.SetComputeRootSignature(&c.root);
         l.SetPipelineState(&c.pso);
         for (i, source) in sources.into_iter().enumerate() {

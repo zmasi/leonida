@@ -6,11 +6,14 @@ Every byte here is built by the test: a minimal 0x7a resource with the four list
 two instances and one grass list with three. No game file, value or name is used.
 """
 import json
+import math
 import os
+import random
 import struct
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import zlib
 
@@ -326,6 +329,149 @@ class ArchiveTests(unittest.TestCase):
                     self.assertNotIn("<lambda>", r.stderr)
                     self.assertNotIn("Traceback", r.stderr)
                     self.assertEqual(r.stdout, "")
+
+
+def _oracle_grass(ib, io, n, isz, nx, ny, sc, sz, rot):
+    """The per-instance reading of a grass list, one record at a time."""
+    need = max(isz, nx + 1, ny + 1, sc + 1, sz + 1, rot + 1)
+    R = {"instances": n}
+    rmax = 0
+    for i in range(n):
+        o = io + i * isz
+        if min(nx, ny, sc, sz, rot) < 0 or o + need > len(ib):
+            R["instances_truncated"] = R.get("instances_truncated", 0) + 1
+            break
+        x, y = ib[o + nx] / 127.5 - 1, ib[o + ny] / 127.5 - 1
+        for k, v in (("normal_xy_inside_unit_disc", x * x + y * y <= 1.0 + 2 / 127.5),
+                     ("scale_zero", ib[o + sc] == 0), ("scalez_equals_scale", ib[o + sz] == ib[o + sc])):
+            R[k] = R.get(k, 0) + int(v)
+        rmax = max(rmax, ib[o + rot])
+    R["rotation_idx_max"] = rmax
+    return R
+
+
+def _oracle_prop(ib, io, n, isz, mat, box):
+    R = {"instances": n}
+    for i in range(n):
+        o = io + i * isz
+        if mat < 0 or o + max(48, mat + 48) > len(ib):
+            R["instances_truncated"] = R.get("instances_truncated", 0) + 1
+            break
+        m = struct.unpack_from("<12f", ib, o + mat)
+        cols = [(m[0], m[4], m[8]), (m[1], m[5], m[9]), (m[2], m[6], m[10])]
+        t = (m[3], m[7], m[11])
+        lens = [math.sqrt(sum(c * c for c in col)) for col in cols]
+        if min(lens) <= 1e-6 or not all(math.isfinite(x) for x in m):
+            R["matrix_degenerate"] = R.get("matrix_degenerate", 0) + 1
+            continue
+        u = [[c / l for c in col] for col, l in zip(cols, lens)]
+        ortho = max(abs(sum(u[a][k] * u[b][k] for k in range(3))) for a, b in ((0, 1), (0, 2), (1, 2)))
+        det = (u[0][0] * (u[1][1] * u[2][2] - u[1][2] * u[2][1]) - u[0][1] * (u[1][0] * u[2][2] - u[1][2] * u[2][0])
+               + u[0][2] * (u[1][0] * u[2][1] - u[1][1] * u[2][0]))
+        checks = [("matrix_orthonormal_axes", ortho < 0.01), ("matrix_right_handed", det > 0),
+                  ("matrix_uniform_scale", max(lens) - min(lens) < 0.01 * max(lens)),
+                  ("matrix_unit_scale", all(abs(x - 1) < 0.01 for x in lens))]
+        if box:
+            checks.append(("translation_in_aabb", all(box[0][k] - 0.01 <= t[k] <= box[1][k] + 0.01 for k in range(3))))
+        for k, v in checks:
+            R[k] = R.get(k, 0) + int(v)
+    return R
+
+
+def _random_matrices(rng, count, stride, at):
+    out = bytearray(count * stride)
+    for i in range(count):
+        kind = rng.random()
+        if kind < 0.05:
+            m = [0.0] * 12
+        elif kind < 0.08:
+            m = [float("nan")] + [1.0] * 11
+        elif kind < 0.5:
+            m = [rng.uniform(-3, 3) for _ in range(12)]
+        else:
+            th, s = rng.uniform(0, 6.28), rng.choice((1.0, 1.0, 2.0, 0.5))
+            c, sn = math.cos(th) * s, math.sin(th) * s
+            m = [c, -sn, 0, rng.uniform(-6, 16), sn, c, 0, rng.uniform(-6, 16), 0, 0, s * rng.choice((1, 1, -1)),
+                 rng.uniform(-6, 16)]
+        struct.pack_into("<12f", out, i * stride + at, *m)
+    return bytes(out)
+
+
+class ManyInstancesTests(unittest.TestCase):
+    """Lists of tens of thousands of instances: same counts as the one-record-at-a-time reading, much faster."""
+
+    GRASS = {il.GRASS_LIST: (0x1A0, {M["InstanceList"]: (0x178, 0x52)}),
+             il.GRASS_INST: (0x10, {M["NormalX"]: (6, 0x11), M["NormalY"]: (7, 0x11), M["Scale"]: (0xB, 0x11),
+                                    M["ScaleZ"]: (0xC, 0x11), M["RotationIdx"]: (0xD, 0x11)})}
+
+    def _grass(self, data, n, io=0):
+        gl = bytearray(0x1A0)
+        struct.pack_into("<QH", gl, 0x178, 1, n)
+        R = {}
+        blocks = [(il.GRASS_INST, len(data), 0x60000000)]
+        il.grass_list(bytes(gl), bytes(data), blocks, self.GRASS, bytes(gl), 0, R)
+        R.pop("lists"), R.pop("lodLevel")   # list-level fields, not instance counts
+        return R
+
+    def test_grass_counts_match_the_record_by_record_reading(self):
+        rng = random.Random(7)
+        data = bytes(rng.randrange(256) for _ in range(0x10 * 5000))
+        for n, cut in ((5000, 0), (5000, 37), (5000, 0x10 * 5000 - 3), (3, 0), (1, 0x10 * 5000 - 5)):
+            with self.subTest(n=n, cut=cut):
+                buf = data[:len(data) - cut] if cut else data
+                got = self._grass(buf, n)
+                self.assertEqual(got, _oracle_grass(buf, 0, n, 0x10, 6, 7, 0xB, 0xC, 0xD))
+
+    def test_prop_counts_match_the_record_by_record_reading(self):
+        rng = random.Random(11)
+        box = ((0.0,) * 3, (10.0,) * 3)
+        structs = {il.PROP_LIST: (0x170, {M["InstanceList"]: (0x90, 0x52), M["BatchAABB"]: (0xA0, 0x05)}),
+                   il.PROP_INST: (0x40, {M["InstMat"]: (0x4, 0x50)})}
+        data = _random_matrices(rng, 3000, 0x40, 4)
+        # The last record has 12 padding bytes after its matrix. Only cutting into
+        # the matrix itself makes that instance incomplete.
+        for n, cut in ((3000, 0), (3000, 1), (3000, 12), (3000, 13), (3000, 1000), (2, 0)):
+            with self.subTest(n=n, cut=cut):
+                pl = bytearray(0x170)
+                struct.pack_into("<QH", pl, 0x90, 1, n)
+                struct.pack_into("<4f4f", pl, 0xA0, *box[0], 0, *box[1], 0)
+                buf = data[:len(data) - cut]
+                R = {}
+                il.prop_list(bytes(pl), buf, [(il.PROP_INST, len(buf), 0x60000000)], structs, bytes(pl), 0, R)
+                R.pop("lists", None), R.pop("lodLevel", None), R.pop("aabb_valid", None)
+                self.assertEqual(R, _oracle_prop(buf, 0, n, 0x40, 4, box))
+
+    def test_prop_handedness_preserves_reference_rounding(self):
+        # Row three is three times row one. Rounding the column lengths differently
+        # can change the sign of the computed determinant at zero.
+        data = struct.pack("<12f", 6, 1, 1, 0, 3 * 2**26, 0, 2, 0, 18, 3, 3, 0)
+        header = struct.pack("<QH", 1, 1)
+        structs = {il.PROP_LIST: (len(header), {M["InstanceList"]: (0, 0x52)}),
+                   il.PROP_INST: (48, {})}
+        counts = {}
+        il.prop_list(header, data, [(il.PROP_INST, len(data), 0x60000000)], structs, header, 0, counts)
+        reference = _oracle_prop(data, 0, 1, 48, 0, None)
+        self.assertEqual(counts["matrix_right_handed"], reference["matrix_right_handed"])
+
+    def test_a_full_grass_list_is_read_much_faster_than_record_by_record(self):
+        rng = random.Random(3)
+        n = 60000
+        # Near-upright normals, as in real lists: a few distinct (NormalX, NormalY) pairs.
+        data = b"".join(bytes((0, 0, 0, 0, 0, 0, 120 + rng.randrange(16), 120 + rng.randrange(16),
+                               1, 2, 3, rng.randrange(256), rng.randrange(256), rng.randrange(73), 0, 0))
+                        for _ in range(n))
+
+        def best(fn):
+            times = []
+            for _ in range(3):
+                t0 = time.perf_counter()
+                fn()
+                times.append(time.perf_counter() - t0)
+            return min(times)
+
+        fast = best(lambda: self._grass(data, n))
+        slow = best(lambda: _oracle_grass(data, 0, n, 0x10, 6, 7, 0xB, 0xC, 0xD))
+        self.assertLess(fast * 4, slow, f"bulk {fast:.4f}s vs record-by-record {slow:.4f}s")
 
 
 if __name__ == "__main__":

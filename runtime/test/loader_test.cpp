@@ -990,6 +990,23 @@ void test_attach_reserved() {
     } catch (const std::exception& e) {
         failed("a run-time load's DllMain gets a NULL lpvReserved", e.what());
     }
+
+    // The same load through the wide path (LoadLibraryW / LoadLibraryExW). It had no RuntimeLoadScope, so its DllMain
+    // got the static load's non-NULL lpvReserved (RT-LOADER-RUNTIME-SCOPE-AND-TLS-SLOT, @kevincommits on #1608).
+    reset_notifications();
+    try {
+        write_image_as(make_lifecycle_image(), "attach_reserved_dynamic_w.dll");
+        rt::Loader loader(g_dir);
+        bool handled = false;
+        void* h = loader.load_runtime_module_w(L"attach_reserved_dynamic_w.dll", 0, handled);
+        const char* what = "a wide run-time load's DllMain gets a NULL lpvReserved";
+        if (!handled || !h) failed(what, "the run-time load failed");
+        else if (!g_attach_seen) failed(what, "DllMain was not called");
+        else if (g_attach_reserved) failed(what, "lpvReserved was non-NULL");
+        else pass(what);
+    } catch (const std::exception& e) {
+        failed("a wide run-time load's DllMain gets a NULL lpvReserved", e.what());
+    }
 }
 
 void test_process_detach_dependencies() {

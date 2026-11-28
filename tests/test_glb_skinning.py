@@ -445,11 +445,37 @@ class GlbSkinningTests(unittest.TestCase):
         self.assertIn("references node 5", proc.stderr)
         self.assertNotIn("Traceback", proc.stderr)
 
+    def test_surplus_inverse_bind_matrices_can_be_shared_by_two_skins(self):
+        doc, binary, _ = glb_skinning.parse_glb(make_glb(ibm_count=3))
+        skin = doc["skins"][0]
+        doc["skins"].append({"joints": [0], "inverseBindMatrices": skin["inverseBindMatrices"]})
+        path = self.write("shared.glb", build_glb(doc, binary))
+        output = self.dir / "shared.json"
+        proc = self.run_tool(path, "--json", output)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        report = json.loads(output.read_bytes())
+        self.assertTrue(report["ok"])
+        self.assertEqual([(s["joint_count"], s["inverse_bind_matrices"]["count"])
+                          for s in report["skins"]], [(2, 3), (1, 3)])
+
+    def test_surplus_inverse_bind_matrix_requires_affine_fourth_row(self):
+        doc, binary, _ = glb_skinning.parse_glb(make_glb(ibm_count=3))
+        accessor = doc["accessors"][doc["skins"][0]["inverseBindMatrices"]]
+        offset = doc["bufferViews"][accessor["bufferView"]]["byteOffset"]
+        payload = bytearray(binary)
+        struct.pack_into("<f", payload, offset + 2 * 64 + 3 * 4, 0.5)
+        report = glb_skinning.analyze_glb(build_glb(doc, payload))
+        self.assertFalse(report["ok"])
+        self.assertIn(
+            "inverseBindMatrices[2] fourth row must be [0, 0, 0, 1]",
+            "\n".join(report["errors"]),
+        )
+
     def test_inverse_bind_matrices_count_mismatch(self):
         report = glb_skinning.analyze_glb(make_glb(ibm_count=1))
         self.assertFalse(report["ok"])
         self.assertIn(
-            "inverseBindMatrices count 1 != joint count 2",
+            "inverseBindMatrices count 1 is below joint count 2",
             "\n".join(report["errors"]),
         )
         self.assertEqual(1, report["skins"][0]["inverse_bind_matrices"]["count"])
@@ -457,7 +483,7 @@ class GlbSkinningTests(unittest.TestCase):
         path = self.write("bad_ibm.glb", make_glb(ibm_count=1))
         proc = self.run_tool(path)
         self.assertNotEqual(0, proc.returncode)
-        self.assertIn("inverseBindMatrices count 1 != joint count 2", proc.stderr)
+        self.assertIn("inverseBindMatrices count 1 is below joint count 2", proc.stderr)
 
     def test_static_mesh_alongside_skinned_mesh_is_reported_not_failed(self):
         report = glb_skinning.analyze_glb(make_glb(add_static=True))
@@ -621,6 +647,35 @@ class GlbSkinningTests(unittest.TestCase):
                 self.assertNotEqual(0, proc.returncode)
                 self.assertIn("must not overwrite the input", proc.stderr)
                 self.assertEqual(before, path.read_bytes())
+
+    def test_analysis_does_not_copy_large_unused_payloads(self):
+        doc, binary, _ = glb_skinning.parse_glb(make_glb())
+        size = 4 * 1024 * 1024
+        doc["buffers"][0]["byteLength"] = size - 1
+        raw = build_glb(doc, binary.ljust(size - 1, b"\0"))
+        extension = struct.pack("<II", size, 0x12345678) + bytes(size)
+        raw = raw[:8] + struct.pack("<I", len(raw) + len(extension)) + raw[12:] + extension
+        path = self.write("padded.glb", raw)
+        measure = """
+import sys, tracemalloc
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import glb_skinning
+data = Path(sys.argv[2]).read_bytes()
+tracemalloc.start()
+report = glb_skinning.analyze_glb(data)
+assert report["ok"], report["errors"]
+print(tracemalloc.get_traced_memory()[1])
+"""
+        peak = subprocess.check_output([sys.executable, "-I", "-c", measure, str(TOOLS), str(path)], timeout=60)
+        self.assertLess(int(peak), size, "inspection allocated a full unused payload")
+
+    def test_accessor_cannot_read_the_bin_padding(self):
+        doc = {"buffers": [{"byteLength": 3}],
+               "bufferViews": [{"buffer": 0, "byteLength": 4}],
+               "accessors": [{"bufferView": 0, "componentType": 5121, "count": 1, "type": "VEC4"}]}
+        with self.assertRaisesRegex(glb_skinning.GlbSkinError, "exceeds buffer 0"):
+            glb_skinning._Reader(doc, bytes(4)).read(0, "JOINTS_0")
 
     def test_accessor_byte_stride_and_offset(self):
         joints = ((0, 0, 0, 0), (0, 1, 0, 0), (1, 1, 0, 0))

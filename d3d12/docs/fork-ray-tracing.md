@@ -159,6 +159,7 @@ fork's constant.
 | `LEONIDA_AMBIENT=constant:<level>` | the same light everywhere |
 | `LEONIDA_AMBIENT_SHADE=<strength>,<metres>` | the creases (1,0.6) |
 | `LEONIDA_AMBIENT_AIR=<multiple>` | what the air scatters is bounded by a multiple of the light around (off: the brown veil in the day room stays with it, light-14) |
+| `LEONIDA_AMBIENT_TRUE_DEPTH=1` | the resolve's depth is looked for at table offset 688 first (off: 464 alone). edsuuu/VI-BR-PORT 783b2e1 read off `CS_ScreenProbes_TemporalResolve_ReflectiveCaustics` (`34fb51b8a0312e82`) that 464 is its stencil plane and 688 its depth. Here a view that names the stencil plane as such gets no stand-in at all (the log says "missing depth SRV" once). Not tried in the game |
 
 It is off while the builder runs.
 

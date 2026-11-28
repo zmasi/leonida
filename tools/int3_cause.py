@@ -101,14 +101,31 @@ NAMES8 = ("al", "cl", "dl", "bl", "spl", "bpl", "sil", "dil") + tuple(f"r{n}b" f
 PREFIXES = frozenset((0x26, 0x2E, 0x36, 0x3E, 0x64, 0x65, 0x66, 0x67, 0xF0, 0xF2, 0xF3))
 
 # Instructions that leave the flags alone (opcode numbering as in gdk_runtime_calls.decode).
-_NEUTRAL = frozenset([0x63, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8D, 0x8F, 0x90, 0x98, 0x99, 0xA4, 0xA5, 0xAA,
-                      0xAB, 0xC6, 0xC7, *range(0x50, 0x60), *range(0xB0, 0xC0), *range(0x110, 0x118), 0x118, 0x11F,
-                      0x128, 0x129, *range(0x140, 0x150), *range(0x16E, 0x170), 0x17E, 0x17F,
-                      *range(0x190, 0x1A0), 0x1B6, 0x1B7, 0x1BE, 0x1BF, 0x1D6, 0x1E7])
+_NEUTRAL = frozenset([0x63, 0x68, 0x6A, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8B, 0x8D, 0x8F, *range(0x90, 0x9A),
+                      *range(0xA0, 0xA6), 0xAA, 0xAB, 0xC6, 0xC7, *range(0x50, 0x60), *range(0xB0, 0xC0),
+                      *range(0x110, 0x118), 0x118, 0x11F, 0x128, 0x129, *range(0x140, 0x150), *range(0x16E, 0x170),
+                      0x17E, 0x17F, *range(0x190, 0x1A0), 0x1B6, 0x1B7, 0x1BE, 0x1BF, *range(0x1C8, 0x1D0), 0x1D6,
+                      0x1E7])
 # VEX forms that set the flags: vucomis*/vcomis*, vtestp*, vptest, andn, blsr/blsmsk/blsi, bzhi, bextr.
 _VEX_FLAGS = frozenset((0x112E, 0x112F, 0x120E, 0x120F, 0x1217, 0x12F2, 0x12F3, 0x12F5, 0x12F7))
 COPY_OPS = frozenset((0x8A, 0x8B, 0x63, 0x1B6, 0x1B7, 0x1BE, 0x1BF))     # r <- r/m
 LOAD_OPS = COPY_OPS
+_BYTE_REG_OPS = frozenset((0x02, 0x0A, 0x12, 0x1A, 0x22, 0x2A, 0x32, 0x3A, 0x86, 0x8A, 0x1C0))
+_BYTE_RM_OPS = frozenset((0x00, 0x08, 0x10, 0x18, 0x20, 0x28, 0x30, 0x80, 0x86, 0x88, 0xC0, 0xC6,
+                          0xD0, 0xD2, 0xF6, 0xFE, 0x1C0, *range(0x190, 0x1A0)))
+
+
+def insn_writes(insn) -> list[int]:
+    """Like gdk_runtime_calls.writes, mapping 8-bit ModRM operands 4..7 without REX (ah..bh) to rax..rbx."""
+    regs = writes(insn)
+    if insn.rex or insn.mod is None or not regs:
+        return regs
+    out = list(regs)
+    if insn.op in _BYTE_REG_OPS and 4 <= insn.reg <= 7:
+        out = [r - 4 if r == insn.reg else r for r in out]
+    if insn.mod == 3 and insn.op in _BYTE_RM_OPS and 4 <= insn.rm <= 7:
+        out = [r - 4 if r == insn.rm else r for r in out]
+    return out
 
 
 class Image:
@@ -167,7 +184,11 @@ class Image:
     # same non-overlapping regex matches a scan sees; a pattern that is not really an instruction is dropped later,
     # when the caller checks that decoding the function lands on it.
 
-    def _lookup(self, index: array, target: int):
+    def _pack(self, entries: list[int]):
+        entries.sort()
+        return array("Q", entries) if 2 * self._shift - 2 <= 64 else entries
+
+    def _lookup(self, index, target: int):
         lo = bisect.bisect_left(index, target << self._shift)
         hi = bisect.bisect_left(index, (target + 1) << self._shift)
         return index[lo:hi]
@@ -186,7 +207,7 @@ class Image:
                     if 0 <= to < limit:
                         kind = {0xE8: 0, 0xE9: 1}.get(data[m.start()], 2)
                         entries.append(to << shift | (base + m.start()) << 2 | kind)
-            self._rel32 = array("Q", sorted(entries))
+            self._rel32 = self._pack(entries)
         mask = (1 << (self._shift - 2)) - 1
         return [(e >> 2 & mask, _REL32_KINDS[e & 3]) for e in self._lookup(self._rel32, target)]
 
@@ -196,17 +217,27 @@ class Image:
             limit, shift, entries = 1 << (self._shift - 2), self._shift, []
             for base, data in self.code.sections:
                 for m in _RIP_STORE.finditer(data):
-                    op = data[m.start()]
-                    if op in (0xC6, 0xC7) and data[m.start() + 1] != 0x05:
+                    pos = m.start()
+                    op = data[pos]
+                    if op in (0xC6, 0xC7) and data[pos + 1] != 0x05:
                         continue
                     at = m.end()
                     if at + 4 > len(data):
                         continue
-                    end = at + 4 + {0xC6: 1, 0xC7: 4}.get(op, 0)
-                    to = base + end + struct.unpack_from("<i", data, at)[0]
-                    if 0 <= to < limit:
-                        entries.append(to << shift | (base + m.start()))
-            self._stores = array("Q", sorted(entries))
+                    disp = struct.unpack_from("<i", data, at)[0]
+                    tails = {0xC6: (1,), 0xC7: (4,)}.get(op, (0,))
+                    if op == 0xC7 and (
+                        (pos >= 1 and data[pos - 1] == 0x66)
+                        or (pos >= 2 and data[pos - 2] == 0x66 and (data[pos - 1] & 0xF8) == 0x40)
+                    ):
+                        tails = (2, 4)
+                    for tail in tails:
+                        if at + 4 + tail > len(data):
+                            continue
+                        to = base + at + 4 + tail + disp
+                        if 0 <= to < limit:
+                            entries.append(to << shift | (base + pos))
+            self._stores = self._pack(entries)
         mask = (1 << self._shift) - 1
         return [e & mask for e in self._lookup(self._stores, target)]
 
@@ -232,7 +263,7 @@ class Image:
                 and insn.disp % 8 == 0):
             out = {"slot": insn.disp // 8}
             for prev in reversed(insns[max(0, k - 12):k]):
-                if RCX in writes(prev):
+                if RCX in insn_writes(prev):
                     if prev.op == 0x8B and prev.base == RIP:
                         out["this_global"] = prev.target
                     break
@@ -382,8 +413,8 @@ def read_test(insn, raw: bytes):
         if op == 0x1A3:
             right, more = reg()
             return {"form": "bit", "left": left, "right": right, "bits": bits, "registers": regs + more}
-        return {"form": "bit", "left": left, "right": immediate(raw, 1), "bits": bits, "registers": regs}
-    if op in (0xF6, 0xF7) and insn.reg & 7 == 0:
+        return {"form": "bit", "left": left, "right": raw[-1], "bits": bits, "registers": regs}
+    if op in (0xF6, 0xF7) and insn.reg & 7 in (0, 1):
         form = "mask"
         size = 1 if op == 0xF6 else (2 if bits == 16 else 4)
         left, regs = rm()
@@ -420,10 +451,21 @@ def flags_setter(insns, k):
         if insn.is_call() or insn.ends_flow():
             return None
         if is_jcc(insn) or insn.op in _NEUTRAL or (insn.op >= 0x1000 and insn.op not in _VEX_FLAGS) or (
-                insn.op in (0xF6, 0xF7) and insn.reg & 7 == 2):
+                insn.op in (0xF6, 0xF7) and insn.reg & 7 == 2) or (insn.op == 0xFF and insn.reg & 7 == 6):
             continue
         return j
     return None
+
+
+def load_bits(raw: bytes, insn) -> int:
+    """Memory operand width in bits for an instruction in LOAD_OPS."""
+    if insn.op in (0x8A, 0x1B6, 0x1BE):
+        return 8
+    if insn.op in (0x1B7, 0x1BF):
+        return 16
+    if insn.op == 0x63:
+        return 32
+    return width(raw, insn)
 
 
 def step(image: Image, func, i: int, reg: int, level: int):
@@ -438,18 +480,21 @@ def step(image: Image, func, i: int, reg: int, level: int):
         if reg in VOLATILE:
             return "result", {"value": "clobbered by a call", "at": insn.rva}, False
         return None
-    if reg not in writes(insn):
+    if reg not in insn_writes(insn):
         return None
     if insn.mod == 3 and insn.op in COPY_OPS:
-        return "follow", insn.rm, "copied" if insn.rm != reg else None
+        src = gpr(insn.rm, 8, insn.rex) if insn.op in (0x8A, 0x1B6, 0x1BE) else insn.rm
+        return "follow", src, "copied" if src != reg else None
     if insn.mod == 3 and insn.op in (0x88, 0x89):
-        return "follow", insn.reg, "copied" if insn.reg != reg else None
+        src = gpr(insn.reg, 8, insn.rex) if insn.op == 0x88 else insn.reg
+        return "follow", src, "copied" if src != reg else None
     if insn.op == 0x8D and insn.base not in (None, RIP) and insn.index is None:
         return "follow", insn.base, "derived"
     if insn.op in (0x81, 0x83) and insn.mod == 3 and insn.reg & 7 in (0, 5) and insn.rm == reg:
         return "follow", reg, "derived"
     if insn.op in LOAD_OPS and insn.mod != 3:
-        out = {"value": "loaded from memory", "at": insn.rva, "from": memory_name(insn, 64 if insn.wide else 32)}
+        bits = load_bits(image.raw(insn), insn)
+        out = {"value": "loaded from memory", "at": insn.rva, "from": memory_name(insn, bits)}
         if insn.base == RIP:
             out["global"] = insn.target
         elif insn.base == RSP:
@@ -488,7 +533,11 @@ def with_how(out, copied: bool, derived: bool):
 
 def falls_into(insns, i: int) -> bool:
     """Whether instruction i - 1 falls through to instruction i."""
-    return i > 0 and not (insns[i - 1].ends_flow() or insns[i - 1].op in (0xCC, 0x10B))
+    return i > 0 and not (insns[i - 1].ends_flow() or insns[i - 1].op in (0xCC, 0xCD, 0x10B))
+
+
+def _source_key(r):
+    return (r.get("at", r.get("call")), r.get("value", "call"), r.get("argument"))
 
 
 def trace(image: Image, func, k: int, reg: int, level: int = 0):
@@ -547,7 +596,7 @@ def trace_paths(image: Image, func, k: int, reg: int, budget: int = 4000, limit:
                 found.append(with_how(r[1], copied, derived) if r[2] else r[1])
     out, keys = [], set()
     for r in found:
-        key = (r.get("at", r.get("call")), r["value"] if "value" in r else "call")
+        key = _source_key(r)
         if key not in keys:
             keys.add(key)
             out.append(r)
@@ -590,23 +639,31 @@ def rel32_sources(image: Image, targets: set[int], skip):
 def global_writers(image: Image, target: int):
     """Each `mov [rip+x], r` / `mov [rip+x], imm` storing to the global at `target`, with what it stores."""
     found = []
+    seen_rvas = set()
     for at in image.stores_to(target):
         for back in (0, 1, 2):                 # the opcode, or a REX / 66 prefix before it
             rva = at - back
+            if rva in seen_rvas:
+                break
             func = image.function(rva)
-            if func is not None and image.lands_on(func, rva):
-                found.append((rva, func))
+            if func is None or not image.lands_on(func, rva):
+                continue
+            k = image.flow(func)[1][rva]
+            insn = image.flow(func)[0][k]
+            if (insn.op in (0x88, 0x89, 0xC6, 0xC7) and insn.base == RIP and insn.target == target
+                    and (insn.op not in (0xC6, 0xC7) or insn.reg & 7 == 0)):
+                seen_rvas.add(rva)
+                found.append((rva, func, k, insn))
                 break
     out = []
-    for rva, func in found[:MAX_STORES]:
-        k = image.flow(func)[1][rva]
-        insn = image.flow(func)[0][k]
+    for rva, func, k, insn in found[:MAX_STORES]:
         if insn.op in (0xC6, 0xC7):
             raw = image.raw(insn)
             value = immediate(raw, 1 if insn.op == 0xC6 else (2 if width(raw, insn) == 16 else 4))
             src = {"value": "a constant", "constant": value}
         else:
-            src = trace(image, func, k, insn.reg)
+            reg = gpr(insn.reg, 8, insn.rex) if insn.op == 0x88 else insn.reg
+            src = trace(image, func, k, reg)
         out.append({"at": rva, "function": list(func), "source": src})
     return {"global": target, "writers": out, "writers_not_read": max(0, len(found) - MAX_STORES)}
 
@@ -692,7 +749,7 @@ def returns(image: Image, rva: int):
         paths = trace_paths(image, func, k, RAX)
         complete = complete and paths["complete"]
         for x in paths["sources"]:
-            key = (x.get("at", x.get("call")), x.get("value", "call"))
+            key = _source_key(x)
             if key in keys:
                 continue
             keys.add(key)
@@ -705,7 +762,7 @@ def returns(image: Image, rva: int):
 
 
 def parse_address(text: str, image_base: int) -> int:
-    m = re.fullmatch(r"(?:[\w.\-]+\+)?(?:0x)?([0-9a-fA-F]+)", text.strip())
+    m = re.fullmatch(r"(?:[\w.\-]+\+)?(?:0[xX])?([0-9a-fA-F]+)", text.strip())
     if not m:
         raise ValueError(f"not an address: {text!r}")
     value = int(m.group(1), 16)

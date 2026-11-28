@@ -11,17 +11,21 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from contextlib import suppress
+import errno
 import json
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bcpack
+from file_mode import published_mode
 from report_paths import same_report_path
 
 
-def inspect_stream(raw: bytes, codec: int, out_size: int) -> dict:
-    """Analyze stream structure, compression ratio and per-lane statistics."""
+def _inspect_decoded_lanes(raw: bytes, codec: int, out_size: int) -> tuple[dict, list[list[int]]]:
+    """Decode lanes once and build the inspection report alongside the decoded lanes."""
     if codec not in bcpack.ALL_CODECS:
         raise ValueError(f"unsupported BCPack codec id: {codec}")
 
@@ -61,7 +65,7 @@ def inspect_stream(raw: bytes, codec: int, out_size: int) -> dict:
     trailing_bytes = len(raw) - used
     ratio = round(len(raw) / out_size, 4) if out_size else 0.0
 
-    return {
+    info = {
         "codec": bcpack.CODEC_NAMES[codec],
         "codec_id": codec,
         "compressed_bytes": len(raw),
@@ -73,12 +77,18 @@ def inspect_stream(raw: bytes, codec: int, out_size: int) -> dict:
         "total_symbols": total_symbols,
         "lanes": lane_reports,
     }
+    return info, lanes
+
+
+def inspect_stream(raw: bytes, codec: int, out_size: int) -> dict:
+    """Analyze stream structure, compression ratio and per-lane statistics."""
+    info, _ = _inspect_decoded_lanes(raw, codec, out_size)
+    return info
 
 
 def profile_stream(raw: bytes, codec: int, out_size: int) -> dict:
     """Generate symbol frequency distribution profile across all lanes."""
-    info = inspect_stream(raw, codec, out_size)
-    lanes, _ = bcpack.decode_lanes(raw, codec, out_size)
+    info, lanes = _inspect_decoded_lanes(raw, codec, out_size)
 
     histograms = []
     for idx, lane in enumerate(lanes):
@@ -96,6 +106,57 @@ def profile_stream(raw: bytes, codec: int, out_size: int) -> dict:
     return info
 
 
+def _history_paths(history: object, codec: int) -> tuple[str | None, list[str]]:
+    """Return `(display_path, protected_paths)` for an on-disk `history` argument, or `(None, [])`."""
+    if history is None or isinstance(history, dict):
+        return None, []
+    hist_path = os.fsdecode(os.fspath(history))
+    protected = [hist_path]
+    display = os.path.normpath(hist_path)
+    if os.path.isdir(hist_path):
+        codec_name = bcpack.CODEC_NAMES.get(codec)
+        if codec_name is not None:
+            candidate = os.path.join(display, f"{codec_name.lower()}.json")
+            if os.path.exists(candidate):
+                protected.append(candidate)
+                if os.path.isfile(candidate):
+                    display = candidate
+    return display, protected
+
+
+def _write_output_atomic(destination: str, data: bytes) -> None:
+    """Publish decoded bytes to `destination` without truncating an existing file on error."""
+    parent = os.path.dirname(os.path.abspath(destination))
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    # Special non-regular files (e.g. /dev/null or NUL) cannot be replaced by rename.
+    if os.path.exists(destination) and not os.path.isfile(destination):
+        with open(destination, "wb") as f:
+            f.write(data)
+        return
+
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=parent or ".",
+            prefix=".bcpack_tool-",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            staged = f.name
+            f.write(data)
+        os.chmod(staged, published_mode(destination))
+        os.replace(staged, destination)
+        staged = None
+    finally:
+        if staged is not None:
+            with suppress(OSError):
+                os.chmod(staged, 0o600)
+                os.unlink(staged)
+
+
 def decode_file(
     in_path: str,
     out_path: str,
@@ -111,6 +172,20 @@ def decode_file(
             f"refusing to overwrite it"
         )
 
+    hist_label, hist_protected = _history_paths(history, codec)
+    for target in hist_protected:
+        if same_report_path(target, out_path):
+            raise ValueError(
+                f"output path '{out_path}' names the history path '{target}'; "
+                f"refusing to overwrite it"
+            )
+
+    destination = os.path.realpath(out_path)
+    if os.path.islink(destination):
+        raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), out_path)
+    if os.path.isdir(destination):
+        raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), out_path)
+
     with open(in_path, "rb") as f:
         raw = f.read()
 
@@ -123,16 +198,13 @@ def decode_file(
     except ValueError as e:
         # json.JSONDecodeError from a --history file carries no filename; attribute it,
         # but do not double-prefix messages that already name the history path.
-        if history is not None and os.path.basename(str(history)) not in str(e):
-            raise ValueError(f"{history}: {e}") from e
+        if hist_label is not None:
+            base = os.path.basename(os.path.normpath(hist_label))
+            if not base or base not in str(e):
+                raise ValueError(f"{hist_label}: {e}") from e
         raise
 
-    parent = os.path.dirname(os.path.abspath(out_path))
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-
-    with open(out_path, "wb") as f:
-        f.write(data)
+    _write_output_atomic(destination, data)
 
     return len(data)
 
@@ -220,7 +292,7 @@ def main(argv: list[str] | None = None) -> int:
     src = args.in_file if args.command == "decode" else args.file
     try:
         return _run(args)
-    except (ValueError, OSError) as e:
+    except (ValueError, OSError, bcpack.BcpackUnsupportedCodec) as e:
         print(f"ERROR: {src}: {e}", file=sys.stderr)
         return 2
 
@@ -267,5 +339,8 @@ def _run(args: argparse.Namespace) -> int:
     return 1
 
 if __name__ == "__main__":
-    sys.stdout.reconfigure(errors="replace")
+    try:
+        sys.stdout.reconfigure(errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
     sys.exit(main())

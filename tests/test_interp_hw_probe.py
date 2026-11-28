@@ -263,6 +263,109 @@ class CliTest(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("no AMD GPU on this box", err.getvalue())
 
+    def test_empty_arch_nonpositive_kernels_malformed_and_deduped_seeds(self):
+        for argv in (
+            ["--arch", ""],
+            ["--arch", "   "],
+            ["--kernels", "0"],
+            ["--kernels", "-2"],
+            ["--seeds", ""],
+            ["--seeds", "1,"],
+            ["--seeds", ",2"],
+        ):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as ctx:
+                    ihp.main(argv)
+                self.assertEqual(ctx.exception.code, 2)
+
+        # Duplicate seeds are deduplicated so the same random kernel batch is not run twice.
+        calls = []
+
+        class CountingOracle:
+            closed = False
+
+            def run(self, kernels):
+                calls.append(len(kernels))
+                return [[0] * k.words for k in kernels]
+
+            def close(self):
+                self.closed = True
+
+        oracle = CountingOracle()
+        with mock.patch.object(ihp.runner, "open_oracle", return_value=oracle), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = ihp.main(["--seeds", "7, 7", "--kernels", "1"])
+        self.assertIn(rc, (0, 1))
+        self.assertEqual(calls, [1, 1])  # 1 unique seed batch + 1 tie kernel
+        self.assertTrue(oracle.closed)
+
+    def test_malformed_oracle_results_unavailable_and_runtime_error(self):
+        class StubOracle:
+            def __init__(self, run_fn):
+                self._run_fn = run_fn
+                self.closed = False
+
+            def run(self, kernels):
+                return self._run_fn(kernels)
+
+            def close(self):
+                self.closed = True
+
+        for label, bad_fn in (
+            ("empty_batch", lambda _ks: []),
+            ("none_batch", lambda _ks: None),
+            ("extra_batch", lambda ks: [[0] * ks[0].words, [0] * ks[0].words]),
+            ("short_words", lambda ks: [[0] * 4 for _ in ks]),
+            ("none_entry", lambda ks: [None for _ in ks]),
+            ("bool_words", lambda ks: [[True] * k.words for k in ks]),
+            ("rejected_str", lambda ks: ["assembler rejected" for _ in ks]),
+        ):
+            with self.subTest(case=label):
+                oracle = StubOracle(bad_fn)
+                err = io.StringIO()
+                with mock.patch.object(ihp.runner, "open_oracle", return_value=oracle), \
+                        contextlib.redirect_stderr(err):
+                    rc = ihp.main(["--seeds", "1", "--kernels", "1"])
+                self.assertEqual(rc, 2, err.getvalue())
+                self.assertTrue(oracle.closed)
+                self.assertIn("harness error:", err.getvalue())
+
+        # runner.Unavailable during oracle.run() exits 77 cleanly and closes oracle.
+        def raise_unavail(_ks):
+            raise ihp.runner.Unavailable("mode unsupported")
+
+        oracle = StubOracle(raise_unavail)
+        err = io.StringIO()
+        with mock.patch.object(ihp.runner, "open_oracle", return_value=oracle), \
+                contextlib.redirect_stderr(err):
+            rc = ihp.main(["--seeds", "1", "--kernels", "1"])
+        self.assertEqual(rc, 77, err.getvalue())
+        self.assertTrue(oracle.closed)
+        self.assertIn("hardware oracle unavailable: mode unsupported", err.getvalue())
+
+        # RuntimeError during oracle.run() exits 2 cleanly and closes oracle.
+        def raise_runtime(_ks):
+            raise RuntimeError("gpu hung")
+
+        oracle = StubOracle(raise_runtime)
+        err = io.StringIO()
+        with mock.patch.object(ihp.runner, "open_oracle", return_value=oracle), \
+                contextlib.redirect_stderr(err):
+            rc = ihp.main(["--seeds", "1", "--kernels", "1"])
+        self.assertEqual(rc, 2, err.getvalue())
+        self.assertTrue(oracle.closed)
+        self.assertIn("harness error: gpu hung", err.getvalue())
+
+        # check_random masks >32-bit values before verifying the 0xDEAD canary.
+        words = list(RandomCheckTest.WORDS)
+        words[5] |= 1 << 32
+        params = {(0, 0): (0x3F800000, 0x3F800000, 0x3F800000)}
+        kinds = {(0, 0): "f32"}
+        ij = [(ihp.f32w(1.0), ihp.f32w(1.0))]
+        tally, bad = {}, []
+        ihp.check_random(words, (params, kinds, ij, 4 * ihp.NOUT_PER), False, tally, bad)
+        self.assertEqual(tally[("f32", "p2_f16 high keeps vdst[31:16]")], [1, 0])
+
 
 if __name__ == "__main__":
     unittest.main()

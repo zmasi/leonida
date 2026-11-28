@@ -629,6 +629,87 @@ class OutputPathTest(unittest.TestCase):
             self.assertIn("--out is a directory", r.stderr)
             self.assertNotIn("Traceback", r.stderr)
 
+    def test_missing_input_with_pattern_reports_does_not_exist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = os.path.join(tmp, "no_such_dir")
+            out = os.path.join(tmp, "report.json")
+            r = subprocess.run([sys.executable, "-I", TOOL, missing, "--pattern", "*.bin", "--out", out],
+                               capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("does not exist", r.stderr)
+            self.assertNotIn("applies to a directory", r.stderr)
+            self.assertFalse(os.path.exists(out))
+
+    def test_unwritable_output_exits_cleanly_without_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = os.path.join(tmp, "carved")
+            os.makedirs(source)
+            with open(os.path.join(source, "p.bin"), "wb") as f:
+                f.write(page())
+            plain = os.path.join(tmp, "plain")
+            with open(plain, "wb") as f:
+                f.write(b"x")
+            r = subprocess.run([sys.executable, "-I", TOOL, source, "--out", os.path.join(plain, "out.json")],
+                               capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 2, r.stderr)
+            self.assertIn("ERROR:", r.stderr)
+            self.assertNotIn("Traceback", r.stderr)
+
+            if os.name == "nt":
+                ro = os.path.join(tmp, "ro.json")
+                previous = '{"previous": true}\n'
+                with open(ro, "w", encoding="utf-8", newline="\n") as f:
+                    f.write(previous)
+                os.chmod(ro, 0o444)
+                self.addCleanup(lambda: os.path.exists(ro) and os.chmod(ro, 0o600))
+                r = subprocess.run([sys.executable, "-I", TOOL, source, "--out", ro],
+                                   capture_output=True, text=True, timeout=120)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertIn("ERROR:", r.stderr)
+                self.assertNotIn("Traceback", r.stderr)
+                with open(ro, encoding="utf-8") as f:
+                    self.assertEqual(f.read(), previous)
+                self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".navmesh_index-")], [])
+
+    def test_cleanup_still_unlinks_temp_when_chmod_fails(self):
+        tool = load_tool_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = os.path.join(tmp, "report.json")
+            real_chmod = os.chmod
+
+            def fail_restore(path, mode, *args, **kwargs):
+                if isinstance(path, str) and os.path.basename(path).startswith(".navmesh_index-") and mode == 0o600:
+                    raise OSError("chmod failed")
+                return real_chmod(path, mode, *args, **kwargs)
+
+            with mock.patch.object(tool.os, "replace", side_effect=OSError("replace denied")), \
+                    mock.patch.object(tool.os, "chmod", side_effect=fail_restore):
+                with self.assertRaises(OSError):
+                    tool.write_outputs([], {"streams": 0}, dest, None)
+            self.assertEqual([n for n in os.listdir(tmp) if n.startswith(".navmesh_index-")], [])
+
+    def test_is_scanned_input_matches_slash_and_globstar_patterns(self):
+        tool = load_tool_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "carved")
+            sub = os.path.join(root, "sub")
+            os.makedirs(sub)
+            nested = os.path.join(sub, "0001.bin")
+            with open(nested, "wb") as f:
+                f.write(page())
+            other = os.path.join(sub, "ignore.txt")
+            with open(other, "wb") as f:
+                f.write(b"text")
+
+            self.assertTrue(tool.is_scanned_input(nested, root, "sub/*.bin"))
+            self.assertTrue(tool.is_scanned_input(nested, root, "**/sub/*.bin"))
+            self.assertFalse(tool.is_scanned_input(other, root, "sub/*.bin"))
+
+            # Simulate a case-variant / resolved path where the fallback glob does not see a match.
+            with mock.patch.object(tool.glob, "iglob", return_value=iter(())):
+                self.assertTrue(tool.is_scanned_input(nested, root, "sub/*.bin"))
+                self.assertTrue(tool.is_scanned_input(nested, root, "**/sub/*.bin"))
+
 
 if __name__ == "__main__":
     unittest.main()

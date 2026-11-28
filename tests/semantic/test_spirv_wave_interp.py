@@ -378,6 +378,56 @@ OpFunctionEnd
         self.assertEqual(mem[0], 32)
         self.assertEqual({mem[64 + 4 * i] for i in range(32)}, set(range(32)))
 
+    def test_physical_storage_buffer_load_and_store_readback(self):
+        mod = """OpCapability Shader
+OpCapability Int64
+OpCapability PhysicalStorageBufferAddresses
+OpMemoryModel PhysicalStorageBuffer64 GLSL450
+OpEntryPoint GLCompute %main "main" %out %l
+OpDecorate %out Location 0
+OpDecorate %l BuiltIn SubgroupLocalInvocationId
+OpDecorate %arr ArrayStride 4
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%ulong = OpTypeInt 64 0
+%v4uint = OpTypeVector %uint 4
+%arr = OpTypeRuntimeArray %uint
+%_ptr_Output = OpTypePointer Output %v4uint
+%_ptr_Builtin = OpTypePointer Input %uint
+%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %arr
+%_ptr_PSB_u = OpTypePointer PhysicalStorageBuffer %uint
+%out = OpVariable %_ptr_Output Output
+%l = OpVariable %_ptr_Builtin Input
+%c0 = OpConstant %uint 0
+%c10 = OpConstant %uint 10
+%c5_64 = OpConstant %ulong 5
+%c100_64 = OpConstant %ulong 100
+%c4_64 = OpConstant %ulong 4
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%lane = OpLoad %uint %l
+%pin = OpConvertUToPtr %_ptr_PSB_u %c5_64
+%vin = OpLoad %uint %pin Aligned 4
+%lane64 = OpUConvert %ulong %lane
+%off = OpIMul %ulong %lane64 %c4_64
+%addr = OpIAdd %ulong %c100_64 %off
+%base = OpConvertUToPtr %_ptr_PSB_arr %addr
+%slot = OpAccessChain %_ptr_PSB_u %base %c0
+%wval = OpIAdd %uint %lane %c10
+OpStore %slot %wval Aligned 4
+%rval = OpLoad %uint %slot Aligned 4
+%v = OpCompositeConstruct %v4uint %vin %rval %c0 %c0
+OpStore %out %v
+OpReturn
+OpFunctionEnd
+"""
+        mem = {5: 7}
+        res = run_wave(mod, wave=32, memory=mem)
+        for lane in range(32):
+            self.assertEqual(res["outputs"][lane]["%out"], (7, lane + 10, 0, 0))
+            self.assertEqual(mem[100 + 4 * lane], lane + 10)
+
     def test_quad_swap_and_broadcast(self):
         mod = """OpCapability Shader
 OpCapability GroupNonUniformQuad

@@ -24,12 +24,14 @@ using RemapFn = uint32_t (*)(uint32_t);
 // Executable memory within +-2 GiB of `close_to`, so a rel32 branch from the image reaches it. nullptr if none is free.
 inline uint8_t* alloc_near(const void* close_to, std::size_t size) {
     if (!close_to || size == 0) return nullptr;
-    SYSTEM_INFO si;
+    SYSTEM_INFO si{};
     GetSystemInfo(&si);
-    const uintptr_t gran = si.dwAllocationGranularity;
-    const uintptr_t center = reinterpret_cast<uintptr_t>(close_to) & ~(gran - 1);
+    const uintptr_t gran = si.dwAllocationGranularity ? static_cast<uintptr_t>(si.dwAllocationGranularity)
+                                                      : uintptr_t{0x10000};
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(close_to);
+    const uintptr_t center = addr - (addr % gran);
     const uintptr_t span = 0x70000000;  // stay well inside the rel32 range from anywhere in a large image
-    for (uintptr_t delta = gran; delta < span; delta += gran) {
+    for (uintptr_t delta = gran; delta < span;) {
         for (int side = 0; side < 2; ++side) {
             if (side == 0 && center < delta) continue;
             if (side == 1 && UINTPTR_MAX - center < delta) continue;
@@ -38,6 +40,8 @@ inline uint8_t* alloc_near(const void* close_to, std::size_t size) {
                                        PAGE_EXECUTE_READWRITE))
                 return static_cast<uint8_t*>(p);
         }
+        if (span - delta <= gran) break;
+        delta += gran;
     }
     return nullptr;
 }
@@ -53,6 +57,12 @@ constexpr DWORD kThunkFunctionOffset = 0x240;
 // RUNTIME_FUNCTION, makes the page executable and registers the function table. Frees the page and returns null on
 // failure.
 inline uint8_t* finish_thunk(uint8_t* t, std::size_t code_size, std::initializer_list<uint8_t> unwind) {
+    if (!t) return nullptr;
+    if (code_size == 0 || code_size > kThunkUnwindOffset ||
+        unwind.size() > kThunkFunctionOffset - kThunkUnwindOffset) {
+        VirtualFree(t, 0, MEM_RELEASE);
+        return nullptr;
+    }
     std::size_t i = 0;
     for (uint8_t b : unwind) t[kThunkUnwindOffset + i++] = b;
     auto* function = reinterpret_cast<RUNTIME_FUNCTION*>(t + kThunkFunctionOffset);
@@ -151,9 +161,17 @@ inline std::size_t redirect_direct_branches(uint8_t* begin, std::size_t size, co
         const uintptr_t next_addr = reinterpret_cast<uintptr_t>(next);
         const uintptr_t dst_addr = next_addr + static_cast<uintptr_t>(static_cast<intptr_t>(rel));
         if (dst_addr != reinterpret_cast<uintptr_t>(target)) continue;
-        const intptr_t to = static_cast<intptr_t>(reinterpret_cast<uintptr_t>(thunk) - next_addr);
-        if (to < INT32_MIN || to > INT32_MAX) continue;
-        const int32_t rel2 = static_cast<int32_t>(to);
+        const uintptr_t thunk_addr = reinterpret_cast<uintptr_t>(thunk);
+        int32_t rel2 = 0;
+        if (thunk_addr >= next_addr) {
+            const uintptr_t diff = thunk_addr - next_addr;
+            if (diff > static_cast<uintptr_t>(INT32_MAX)) continue;
+            rel2 = static_cast<int32_t>(diff);
+        } else {
+            const uintptr_t diff = next_addr - thunk_addr;
+            if (diff > static_cast<uintptr_t>(INT32_MAX) + 1u) continue;
+            rel2 = static_cast<int32_t>(-static_cast<int64_t>(diff));
+        }
         std::memcpy(begin + i + 1, &rel2, 4);
         ++n;
         i += 4;
@@ -179,6 +197,7 @@ inline HookResult redirect_image_calls(uint8_t* base, uint32_t target_rva, MakeT
     if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)))
         return r.error = "not a mapped PE image", r;
     const uint64_t lfanew = static_cast<uint64_t>(dos->e_lfanew);
+    if (lfanew > UINT32_MAX - sizeof(IMAGE_NT_HEADERS64)) return r.error = "not a mapped PE image", r;
     const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + lfanew);
     if (nt->Signature != IMAGE_NT_SIGNATURE ||
         nt->FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64) ||
@@ -228,6 +247,7 @@ inline HookResult redirect_image_calls(uint8_t* base, uint32_t target_rva, MakeT
         VirtualProtect(begin, size, old, &ignored);
         FlushInstructionCache(GetCurrentProcess(), begin, size);
     }
+    if (r.redirected == 0) free_thunk(thunk);
     r.ok = true;
     return r;
 }

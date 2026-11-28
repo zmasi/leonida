@@ -40,6 +40,13 @@ import struct
 
 PTR_BASE = 0x50000000
 GRAPHICS_BASE = 0x60000000
+GRAPHICS_LIMIT = 0x70000000
+
+
+def _require_int(value, name):
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer, got {type(value).__name__}")
+    return value
 
 
 class WalkError(Exception):
@@ -59,18 +66,21 @@ class ModelCountMismatchError(WalkError):
 
 
 def _u16(system, at):
+    _require_int(at, "offset")
     if not 0 <= at <= len(system) - 2:
         raise OutOfSegmentError(f"u16 field outside the segment: +0x{at:x}")
     return struct.unpack_from("<H", system, at)[0]
 
 
 def _u32(system, at):
+    _require_int(at, "offset")
     if not 0 <= at <= len(system) - 4:
         raise OutOfSegmentError(f"u32 field outside the segment: +0x{at:x}")
     return struct.unpack_from("<I", system, at)[0]
 
 
 def _u64(system, at):
+    _require_int(at, "offset")
     if not 0 <= at <= len(system) - 8:
         raise OutOfSegmentError(f"u64/pointer field outside the segment: +0x{at:x}")
     return struct.unpack_from("<Q", system, at)[0]
@@ -83,7 +93,7 @@ def _system_pointer(system, at, size, what):
     bytes of room left to the end of the segment.
     """
     raw = _u64(system, at)
-    if raw < PTR_BASE:
+    if not PTR_BASE <= raw < GRAPHICS_BASE:
         raise OutOfSegmentError(
             f"{what} pointer field +0x{at:x}: 0x{raw:016x} is not a 0x50000000-based system pointer")
     target = raw - PTR_BASE
@@ -114,6 +124,7 @@ def walk_chain(system, drawable_off):
     "models": [{"model": ..., "entries": ..., "geometries": [...]}, ...]}.
     A schema violation raises a WalkError subclass with the concrete reason.
     """
+    _require_int(drawable_off, "drawable offset")
     if not 0 <= drawable_off <= len(system) - 176:
         raise OutOfSegmentError(
             f"drawable +0x{drawable_off:x} falls outside the {len(system)}-byte system segment (176 B needed)")
@@ -151,12 +162,12 @@ def reverse_pointers(system):
     """Reverse pointer analysis: read a u64 at every 8-byte-aligned position.
 
     Every value that is 0x50000000-based and points into the segment
-    (0x50000000 <= value < 0x50000000 + len(system)) becomes an edge (source position ->
-    target offset). Graphics pointers (0x60000000-based) and zeroes give no edge.
+    (0x50000000 <= value < min(0x50000000 + len(system), 0x60000000)) becomes an edge
+    (source position -> target offset). Graphics pointers (0x60000000-based) and zeroes give no edge.
     Returns the reverse index: {target offset: [source positions, in ascending order]}.
     """
     index = {}
-    low, high = PTR_BASE, PTR_BASE + len(system)
+    low, high = PTR_BASE, min(PTR_BASE + len(system), GRAPHICS_BASE)
     unpack = struct.Struct("<Q").unpack_from
     for pos in range(0, len(system) - 7, 8):
         value = unpack(system, pos)[0]
@@ -166,11 +177,19 @@ def reverse_pointers(system):
 
 
 def _hexdump(system, at, nbytes=32):
-    """A hex dump of `nbytes` bytes from `at`, 16-byte rows with the address."""
+    """A hex dump of up to `nbytes` bytes from `at`, 16-byte rows with the address, stopping at EOF."""
+    _require_int(at, "hexdump offset")
+    _require_int(nbytes, "hexdump length")
+    if at < 0 or nbytes < 0:
+        raise ValueError(f"hexdump offset and length must be non-negative (got at={at}, nbytes={nbytes})")
     rows = []
+    limit = len(system)
     for row in range(0, nbytes, 16):
-        chunk = system[at + row:at + row + 16]
-        rows.append(f"+0x{at + row:06x}  {chunk.hex(' ')}")
+        pos = at + row
+        if pos >= limit:
+            break
+        chunk = bytes(system[pos:min(pos + 16, limit)])
+        rows.append(f"+0x{pos:06x}  {chunk.hex(' ')}")
     return "\n".join(rows)
 
 
@@ -189,10 +208,14 @@ def classify_parent(system, entries_table_off, index=None):
     builds one itself. Returns a list of {source, target, classification, ...} records,
     in ascending order of source position.
     """
+    _require_int(entries_table_off, "entries table offset")
     if index is None:
         index = reverse_pointers(system)
     out = []
     for src in index.get(entries_table_off, []):
+        _require_int(src, "source offset")
+        if not 0 <= src <= len(system) - 8:
+            raise OutOfSegmentError(f"reverse-index source +0x{src:x} falls outside the {len(system)}-byte segment")
         rec = {"source": src, "target": entries_table_off}
         model = src - 8
         if model >= 0 and model + 56 <= len(system):
@@ -226,6 +249,7 @@ def geometry_shape_check(system, geometry_off):
     their base (whether they are 0x60000000-based); the 0x4042 / group header magics
     cannot be checked without the graphics segment. A schema violation raises WalkError.
     """
+    _require_int(geometry_off, "geometry offset")
     if not 0 <= geometry_off <= len(system) - 160:
         raise OutOfSegmentError(
             f"geometry +0x{geometry_off:x} falls outside the {len(system)}-byte segment (160 B needed)")
@@ -234,9 +258,10 @@ def geometry_shape_check(system, geometry_off):
     descriptor = _system_pointer(system, geometry_off + 64, 16, "meshlet descriptor")
     ib = _system_pointer(system, descriptor, 64, "index-buffer record")
     for field_at, what in ((vb + 24, "vertex-buffer"), (ib + 24, "index-buffer")):
-        if struct.unpack_from("<Q", system, field_at)[0] < GRAPHICS_BASE:
+        raw = struct.unpack_from("<Q", system, field_at)[0]
+        if not GRAPHICS_BASE <= raw < GRAPHICS_LIMIT:
             raise WalkError(
-                f"{what} +0x{field_at - 24:x}: the +24 pointer is not a 0x60000000-based graphics pointer")
+                f"{what} +0x{field_at - 24:x}: the +24 pointer 0x{raw:016x} is not a 0x60000000-based graphics pointer")
     vcount, vstride = struct.unpack_from("<IH", system, vb + 8)
     if not vcount or not 1 <= vstride <= 32:
         raise WalkError(f"vertex-buffer +0x{vb:x}: invalid extent "

@@ -36,6 +36,11 @@ import struct
 import sys
 from collections import Counter
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+from report_paths import same_report_path  # noqa: E402
+
 KNOWN_VERSIONS = {1: "1.0", 2: "1.1", 3: "1.2"}
 TYPE_NAMES = {0: "table", 1: "constants", 2: "cbv", 3: "srv", 4: "uav"}
 # D3D12_SHADER_VISIBILITY. ALL is 0, so anything else is a stage-specific parameter; compute has no value of its own
@@ -289,22 +294,52 @@ def summarize(rows):
     }
 
 
+def _census_inputs(root, disasm=None):
+    """Manifest paths and existing inputs that `--json` must not overwrite."""
+    paths = [os.path.join(root, "index.json")]
+    with os.scandir(root) as entries:
+        for entry in entries:
+            if entry.name.lower().endswith(".dxbc") and entry.is_file():
+                paths.append(entry.path)
+    fspx_dir = os.path.join(root, "fspx")
+    if os.path.isdir(fspx_dir):
+        with os.scandir(fspx_dir) as entries:
+            for entry in entries:
+                if entry.name.lower().endswith(".json") and entry.is_file():
+                    paths.append(entry.path)
+    if disasm:
+        paths.append(os.path.join(disasm, "index.json"))
+        with os.scandir(disasm) as entries:
+            for entry in entries:
+                if entry.name.lower().endswith(".s") and entry.is_file():
+                    paths.append(entry.path)
+    return sorted(paths)
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("root", help="tools/fspx_unpack.py --out folder")
     ap.add_argument("--json", help="also write the rows and the summary here")
     ap.add_argument("--disasm", help="a tools/fspx_unpack.py --disasm folder; adds each program's reads")
     a = ap.parse_args(argv)
-    if a.json:
-        try:
-            if os.path.samefile(a.root, a.json):
-                ap.error("--json must not be the input folder")
-        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
-            pass
+    if a.json and same_report_path(a.root, a.json):
+        ap.error("--json must not be the input folder")
     if not os.path.isdir(a.root):
         ap.error(f"not a folder: {a.root}")
     if a.disasm and not os.path.isdir(a.disasm):
         ap.error(f"not a folder: {a.disasm}")
+    if a.json:
+        if a.disasm and same_report_path(a.disasm, a.json):
+            ap.error("--json must not be the --disasm folder")
+        if os.path.isdir(a.json):
+            ap.error(f"--json is a folder, not a file: {a.json}")
+        try:
+            protected = _census_inputs(a.root, a.disasm)
+        except OSError as e:
+            ap.error(f"cannot list {e.filename or a.root}: {e.strerror or e}")
+        for path in protected:
+            if same_report_path(a.json, path):
+                ap.error(f"--json would overwrite an input file: {path}")
     rows, errors = census(a.root, a.disasm)
     summary = summarize(rows)
     for row in rows:
@@ -329,9 +364,16 @@ def main(argv=None):
     for line in errors:
         print(f"error: {line}", file=sys.stderr)
     if a.json:
-        with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump({"rows": rows, "summary": summary}, fh, indent=1, sort_keys=True)
-            fh.write("\n")
+        try:
+            parent = os.path.dirname(os.path.abspath(a.json))
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            with open(a.json, "w", encoding="utf-8", newline="\n") as fh:
+                json.dump({"rows": rows, "summary": summary}, fh, indent=1, sort_keys=True)
+                fh.write("\n")
+        except OSError as e:
+            print(f"error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
+            return 2
     return 1 if errors else 0
 
 

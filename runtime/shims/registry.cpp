@@ -84,6 +84,12 @@ std::vector<Lookup> g_lookups;
 //  xcrdapi.dll               functions/dstoragegetfactory). dstorage_xs.dll is the console name; xcrdapi.dll is a
 //                            console module the title may import it from (docs/directstorage.md). dstorage.cpp serves
 //                            it; the class is kept for a build without that shim.
+//  libhttpclient.gdk.dll     GDK reference, gaming/gdk/docs/reference/system/httpclient/functions/<name>:
+//                            HCInitialize, HCCleanupAsync, HCSettingsGetTraceLevel, HCHttpCallCreate,
+//                            HCHttpCallCloseHandle, HCHttpCallPerformAsync, HCHttpCallGetRequestUrl,
+//                            HCHttpCallSetTracing, HCHttpCallRequest* and HCHttpCallResponse* return HRESULT.
+//                            HCHttpCallDuplicateHandle returns HCCallHandle (a pointer), and HCTraceImplMessage /
+//                            HCTraceSetEtwEnabled return void, so they stay Other.
 const char* const kNotHResult[] = {
     "XAsyncCancel", "XAsyncComplete",
     "XTaskQueueCloseHandle", "XTaskQueueDispatch", "XTaskQueueGetCurrentProcessTaskQueue",
@@ -137,6 +143,12 @@ ReturnClass classify(const std::string& dll, const std::string& name) {
         if (name == "DStorageGetFactory") return ReturnClass::HResult;
     } else if (is_audio_hal_hresult(dll, name)) {
         return ReturnClass::HResult;
+    } else if (dll == "libhttpclient.gdk.dll") {
+        if (name == "HCInitialize" || name == "HCCleanupAsync" || name == "HCSettingsGetTraceLevel" ||
+            name == "HCHttpCallCreate" || name == "HCHttpCallCloseHandle" || name == "HCHttpCallPerformAsync" ||
+            name == "HCHttpCallGetRequestUrl" || name == "HCHttpCallSetTracing" ||
+            starts_with(name, "HCHttpCallRequest") || starts_with(name, "HCHttpCallResponse"))
+            return ReturnClass::HResult;
     } else if (dll == "xgameruntime.dll") {
         if (name == "XGameRuntimeInitialize" || name == "XGameEventWrite") return ReturnClass::HResult;
         for (const char* n : kNotHResult)

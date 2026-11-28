@@ -68,6 +68,95 @@ class DrawableLookupTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 lookup.export_window(report, invalid)
 
+    def test_export_window_rejects_bool_float_and_non_int_budget(self):
+        report = {"archive": "one.rpf", "candidates": []}
+        for invalid in (True, False, 1.5, "10", None):
+            with self.subTest(budget=invalid):
+                with self.assertRaises(ValueError):
+                    lookup.export_window(report, invalid)
+
+    def test_invalid_hex_keys_counted_as_missing_or_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            h = world_names.joaat("prop")
+            bad_keys = ["-1", "+1", "1_2", "0x1", "10000000000000000", " 1 "]
+            placements = [
+                {"archetype": f"{h:x}", "key": bad, "position": [0, 0, 0],
+                 "rotation": [0, 0, 0, 1], "lod_level": 6}
+                for bad in bad_keys
+            ]
+            (root / "defs").write_text(
+                json.dumps({"archetypes": [{"name": h, "asset_name": h, "asset_type": 2}]}),
+                encoding="utf-8", newline="\n",
+            )
+            (root / "names").write_text(
+                json.dumps({"summary": {"archive": "test.rpf"}, "files": []}),
+                encoding="utf-8", newline="\n",
+            )
+            (root / "entities").write_text(
+                "\n".join(map(json.dumps, placements)), encoding="utf-8", newline="\n"
+            )
+            result = lookup.lookup(root / "entities", root / "defs", root / "names", [])
+            self.assertEqual(result["outcomes"], {"missing_or_invalid_key": len(bad_keys)})
+            self.assertEqual(result["candidates"], [])
+
+    def test_archetype_row_rejects_bool_and_non_u32_fields(self):
+        h = world_names.joaat("frag")
+        key = world_names.hash64("frag")
+        bad_rows = [
+            {"name": h, "asset_name": h, "asset_type": True},
+            {"name": [h], "asset_name": h, "asset_type": 2},
+            {"name": h, "asset_name": -1, "asset_type": 2},
+            {"name": 1 << 32, "asset_name": h, "asset_type": 2},
+        ]
+        for row in bad_rows:
+            with self.subTest(row=row), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "defs").write_text(json.dumps({"archetypes": [row]}), encoding="utf-8", newline="\n")
+                (root / "names").write_text(
+                    json.dumps({"summary": {"archive": "test.rpf"},
+                                "files": [{"offset": 16, "names": ["frag.#ft"]}]}),
+                    encoding="utf-8", newline="\n",
+                )
+                (root / "entities").write_text(
+                    json.dumps({"archetype": f"{h:x}", "key": f"{key:x}",
+                                "position": [0, 0, 0], "rotation": [0, 0, 0, 1], "lod_level": 6}),
+                    encoding="utf-8", newline="\n",
+                )
+                with self.assertRaises(ValueError):
+                    lookup.lookup(root / "entities", root / "defs", root / "names", [])
+
+    def test_whitespace_archive_and_deep_json_rejected(self):
+        import contextlib
+        import io
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "defs").write_text(json.dumps({"archetypes": []}), encoding="utf-8", newline="\n")
+            (root / "entities").write_text("", encoding="utf-8", newline="\n")
+            (root / "names").write_text(
+                json.dumps({"summary": {"archive": "   "}, "files": []}),
+                encoding="utf-8", newline="\n",
+            )
+            with self.assertRaises(ValueError):
+                lookup.lookup(root / "entities", root / "defs", root / "names", [])
+
+            deep = root / "deep.json"
+            deep.write_text("{}", encoding="utf-8", newline="\n")
+            with mock.patch.object(lookup.json, "load", side_effect=RecursionError("maximum recursion depth")):
+                with self.assertRaises(ValueError) as cm_val:
+                    lookup.report_rows(deep, "archetypes")
+                self.assertIn("nesting", str(cm_val.exception))
+                err = io.StringIO()
+                with (mock.patch.object(sys, "argv", ["world_drawable_lookup.py",
+                                                      str(root / "entities"), str(deep), str(root / "names")]),
+                      contextlib.redirect_stderr(err)):
+                    with self.assertRaises(SystemExit) as cm:
+                        lookup.main()
+                self.assertEqual(cm.exception.code, 1)
+                self.assertIn("nesting", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

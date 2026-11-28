@@ -80,6 +80,60 @@ class MetaToXmlPathsTest(unittest.TestCase):
                     self.assertTrue(failures[1].startswith(f"{archive_name}\\000000000008 pso : "), failures[1])
                     self.assertEqual(failures[2], f"{archive_name}\\000000000010 pso : synthetic parser failure")
 
+    def test_skips_bink2_null_head_rows_and_handles_uppercase_hex(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deps = root / "deps"
+            deps.mkdir()
+            build = subprocess.run(
+                [*POWERSHELL, "-Command", "-"], cwd=deps, input=BUILD_STUB + "\n",
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+
+            carve, out = root / "carve", root / "out"
+            archive = carve / "common"
+            archive.mkdir(parents=True)
+            (archive / "index.json").write_text(json.dumps({"files": [
+                {"type": "bink2", "off": 0, "size": 100},
+                {"head": None, "off": 4},
+                {"head": "5053494E00", "off": 16},
+            ]}), encoding="utf-8")
+            (archive / "000000000010.bin").write_bytes(b"PSIN\x00")
+
+            result = subprocess.run(
+                [*POWERSHELL, "-File", str(SCRIPT), "-Carve", str(carve),
+                 "-Out", str(out), "-CodeWalker", str(deps)],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("pso ok 1 failed 0; rbf ok 0 failed 0", result.stdout)
+            out_archive = out / "common"
+            self.assertEqual((out_archive / "000000000010.pso.xml").read_text(), "<synthetic />")
+            self.assertEqual([p.name for p in out_archive.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_negative_limit_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            deps = root / "deps"
+            deps.mkdir()
+            build = subprocess.run(
+                [*POWERSHELL, "-Command", "-"], cwd=deps, input=BUILD_STUB + "\n",
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(build.returncode, 0, build.stdout + build.stderr)
+
+            carve, out = root / "carve", root / "out"
+            carve.mkdir()
+            result = subprocess.run(
+                [*POWERSHELL, "-File", str(SCRIPT), "-Carve", str(carve),
+                 "-Out", str(out), "-CodeWalker", str(deps), "-Limit", "-1"],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("-Limit must be 0 or greater.", result.stderr)
+            self.assertFalse(out.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

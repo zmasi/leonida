@@ -420,6 +420,7 @@ def main(argv=None):
     if not os.path.exists(args.path):
         print(f"ERROR: {args.path} does not exist", file=sys.stderr)
         return 2
+    single_file = os.path.isfile(args.path)
     base = args.path if os.path.isdir(args.path) else os.path.dirname(args.path)
     stages = fssm_header.stage_index(base)
     try:
@@ -441,6 +442,9 @@ def main(argv=None):
             print(f"ERROR: cannot read {e.filename or path}: {e.strerror or e}", file=sys.stderr)
             return 2
         if row is None:
+            if single_file:
+                print(f"ERROR: {path}: no readable PSV0 chunk", file=sys.stderr)
+                return 2
             skipped["no psv0"] += 1
             continue
         row["stage"] = stages.get(stem)

@@ -63,6 +63,11 @@ class ClassifyTests(unittest.TestCase):
     def test_signature_must_be_at_the_start(self):
         self.assertEqual(carve.classify({"head": "ff" + RBF0_HEAD, "size": 1}), "other:ff524246")
 
+    def test_uppercase_hex_signatures_classify_the_same_as_lowercase(self):
+        self.assertEqual(carve.classify({"head": RBF0_HEAD.upper(), "size": 1}), "rbf0")
+        self.assertEqual(carve.classify({"head": RESPAGE_HEAD.upper(), "size": 1}), "respage")
+        self.assertEqual(carve.classify({"head": "DEADBEEFCAFEBABE", "size": 1}), "other:deadbeef")
+
 
 class BomIndexTests(unittest.TestCase):
     def test_utf8_bom_index_is_accepted(self):
@@ -431,6 +436,34 @@ class MainTests(unittest.TestCase):
                     os.unlink(temp)
                 except OSError:
                     pass
+
+    def test_main_accepts_explicit_argv_and_writes_trailing_lf_newline(self):
+        self.archive("a", [{"head": "DEADBEEFCAFEBABE", "size": 9}])
+        with contextlib.redirect_stdout(io.StringIO()):
+            rc = carve.main([self.root])
+        self.assertEqual(rc, 0)
+        with open(os.path.join(self.root, "types.json"), "rb") as f:
+            raw = f.read()
+        self.assertTrue(raw.endswith(b"\n"))
+        self.assertNotIn(b"\r\n", raw)
+        self.assertEqual(self.types()["overall"]["other:deadbeef"]["files"], 1)
+
+    def test_resolved_report_directory_or_non_dir_parent_stops_before_scanning(self):
+        self.archive("a", [{"head": RBF0_HEAD, "size": 1}])
+        existing_dir = os.path.join(self.root, "existing_dir")
+        existing_file = os.path.join(self.root, "existing_file")
+        os.mkdir(existing_dir)
+        with open(existing_file, "wb") as f:
+            f.write(b"x")
+        for resolved in (existing_dir, os.path.join(existing_file, "types.json")):
+            with self.subTest(resolved=os.path.basename(resolved)):
+                err = io.StringIO()
+                with mock.patch.object(carve.os.path, "realpath", return_value=resolved), \
+                        mock.patch.object(carve.os, "listdir", side_effect=AssertionError("scanned unexpectedly")), \
+                        contextlib.redirect_stderr(err):
+                    rc = carve.main([self.root])
+                self.assertEqual(rc, 2)
+                self.assertNotEqual(err.getvalue().strip(), "")
 
 
 if __name__ == "__main__":

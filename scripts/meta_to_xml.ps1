@@ -9,6 +9,9 @@ param(
     [int]$Limit = 0
 )
 $ErrorActionPreference = "Stop"
+if ($Limit -lt 0) {
+    throw "-Limit must be 0 or greater."
+}
 try { (Get-Process -Id $PID).PriorityClass = "BelowNormal" } catch {}
 Add-Type -Path "$CodeWalker\SharpDX.dll"; Add-Type -Path "$CodeWalker\SharpDX.Mathematics.dll"
 [void][Reflection.Assembly]::LoadFrom("$CodeWalker\CodeWalker.Core.dll")
@@ -21,7 +24,12 @@ foreach ($dir in Get-ChildItem -LiteralPath $Carve -Directory) {
     $idx = Join-Path $dir.FullName "index.json"
     if (-not (Test-Path -LiteralPath $idx)) { continue }
     $files = (Get-Content -LiteralPath $idx -Raw | ConvertFrom-Json).files |
-        Where-Object { $_.head.StartsWith("5053494e") -or $_.head.StartsWith("52424630") }
+        Where-Object {
+            $_.head -is [string] -and (
+                $_.head.StartsWith("5053494e", [StringComparison]::OrdinalIgnoreCase) -or
+                $_.head.StartsWith("52424630", [StringComparison]::OrdinalIgnoreCase)
+            )
+        }
     if (-not $files) { continue }
     $dest = Join-Path $Out $dir.Name
     New-Item -ItemType Directory -Force $dest | Out-Null
@@ -29,7 +37,7 @@ foreach ($dir in Get-ChildItem -LiteralPath $Carve -Directory) {
         if ($Limit -and $n -ge $Limit) { break }
         $n++
         $name = "{0:x12}" -f [int64]$r.off
-        $kind = if ($r.head.StartsWith("5053494e")) { "pso" } else { "rbf" }
+        $kind = if ($r.head.StartsWith("5053494e", [StringComparison]::OrdinalIgnoreCase)) { "pso" } else { "rbf" }
         try {
             $bytes = [IO.File]::ReadAllBytes((Join-Path $dir.FullName "$name.bin"))
             if ($kind -eq "pso") {
@@ -39,7 +47,16 @@ foreach ($dir in Get-ChildItem -LiteralPath $Carve -Directory) {
                 $f = New-Object CodeWalker.GameFiles.RbfFile; $f.Load($bytes)
                 $xml = [CodeWalker.GameFiles.RbfXml]::GetXml($f)
             }
-            [IO.File]::WriteAllText((Join-Path $dest "$name.$kind.xml"), $xml)
+            $xmlPath = Join-Path $dest "$name.$kind.xml"
+            $tmpXml = "$xmlPath.$PID.tmp"
+            try {
+                [IO.File]::WriteAllText($tmpXml, $xml)
+                Move-Item -LiteralPath $tmpXml -Destination $xmlPath -Force
+            } finally {
+                if (Test-Path -LiteralPath $tmpXml) {
+                    Remove-Item -LiteralPath $tmpXml -Force -ErrorAction SilentlyContinue
+                }
+            }
             $ok[$kind]++
         } catch {
             $bad[$kind]++

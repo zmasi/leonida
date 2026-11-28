@@ -288,6 +288,69 @@ class CharacterTextureTests(unittest.TestCase):
             self.assertNotIn("Traceback", proc.stderr)
             self.assertIn("ERROR: cannot write", proc.stderr)
 
+    def test_missing_texture_name_zero_material_name_and_unknown_slot_count(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = write_model(td, model([{
+                "Name": 0,
+                "Shader": "a1b2c3d4",
+                "Textures": [
+                    {"Param": "0xC8E8C282"},
+                    {"Name": "no_param_tex"},
+                ],
+            }]))
+            report_path = pathlib.Path(td) / "report.json"
+            result = run_tool(path, "--json", report_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            mat = report["models"][0]["materials"][0]
+            self.assertEqual(mat["name"], "0")
+            self.assertEqual(mat["bindings"][0]["texture"], "-")
+            self.assertEqual(mat["bindings"][1]["role"], "unknown")
+            self.assertEqual(report["summary"]["unknown_slots"], 1)
+
+    def test_dict_texture_bindings_preserve_explicit_lowercase_param(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = write_model(td, model([{
+                "Name": "head",
+                "Shader": "a1b2c3d4",
+                "Textures": {"slot_alias": {"param": "0xC8E8C282", "name": "face"}},
+            }]))
+            report_path = pathlib.Path(td) / "report.json"
+            result = run_tool(path, "--json", report_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            binding = json.loads(report_path.read_text(encoding="utf-8"))["models"][0]["materials"][0]["bindings"][0]
+            self.assertEqual((binding["slot"], binding["role"], binding["texture"]),
+                             ("0xC8E8C282", "diffusetex", "face"))
+
+    def test_empty_report_paths_and_atomic_write_preserve_existing_files(self):
+        import io
+        import importlib.util
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as td:
+            path = write_model(td, model([{"Name": "head", "Shader": "a1b2c3d4", "Textures": []}]))
+            for flag in ("--json", "--csv"):
+                for bad in ("", "   "):
+                    with self.subTest(flag=flag, bad=bad):
+                        result = run_tool(path, flag, bad)
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        self.assertIn("must not be empty", result.stderr)
+
+            spec = importlib.util.spec_from_file_location("ct_atomic_test", TOOL)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            for flag, name in (("--json", "out.json"), ("--csv", "out.csv")):
+                out = pathlib.Path(td) / name
+                out.write_text("keep-me\n", encoding="utf-8")
+                with mock.patch.object(mod.replace_retry, "replace", side_effect=OSError("disk full")), \
+                        mock.patch("sys.stdout", new_callable=io.StringIO), \
+                        mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                    rc = mod.main([str(path), flag, str(out)])
+                self.assertEqual(rc, 2)
+                self.assertIn("ERROR: cannot write", err.getvalue())
+                self.assertEqual(out.read_text(encoding="utf-8"), "keep-me\n")
+                self.assertEqual([p.name for p in pathlib.Path(td).glob("*.tmp")], [])
+
 
 if __name__ == "__main__":
     unittest.main()

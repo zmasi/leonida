@@ -61,6 +61,7 @@ sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import fssm_header  # noqa: E402
 import lane_masks  # noqa: E402
 import rdna2spirv  # noqa: E402  (stage_of, native_paths, base_op, BRANCHES)
+from report_paths import same_report_path  # noqa: E402
 from shader_ir import parse_file  # noqa: E402
 from wave64_graphics_scan import scanned_paths, wave64_rule  # noqa: E402
 
@@ -269,7 +270,7 @@ def main(argv=None) -> int:
             ap.error(f"{args.out} is a directory, not a JSON file")
         if not os.path.isdir(os.path.dirname(os.path.abspath(args.out))):
             ap.error(f"output directory does not exist: {os.path.dirname(os.path.abspath(args.out))}")
-        if os.path.exists(args.out) and any(os.path.samefile(args.out, p) for p in scanned_paths(args.src)):
+        if any(same_report_path(args.out, p) for p in scanned_paths(args.src)):
             ap.error("output must not overwrite a listing it scans")
     r = scan_directory(args.src)
     print("ps: %d shaders, %d wave32; %d with a lane-crossing or width-dependent instruction, %d with quad ops only"
@@ -278,8 +279,12 @@ def main(argv=None) -> int:
         only = " (%d with no other family)" % r["only_family"][fam] if fam in r["only_family"] else ""
         print("  %-12s %5d shaders, %6d instructions%s" % (fam, r["shaders"][fam], r["occurrences"][fam], only))
     if args.out:
-        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(r, f, indent=1)
+        try:
+            with open(args.out, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(r, f, indent=1)
+        except OSError as e:
+            print(f"ERROR: cannot write {args.out}: {e.strerror or e}", file=sys.stderr)
+            return 2
         print("wrote %s" % args.out)
     return 0
 

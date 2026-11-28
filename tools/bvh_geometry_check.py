@@ -48,17 +48,27 @@ def check_bounds(hdr, out):
     frame = R.LeafFrame(hdr)
     lo, hi = hdr.bounds[:3], hdr.bounds[3:]
     corners = [frame.apply((x, y, z)) for x in (lo[0], hi[0]) for y in (lo[1], hi[1]) for z in (lo[2], hi[2])]
+    if any(not math.isfinite(coord) for corner in corners for coord in corner):
+        return hdr.num_elements, math.inf if hdr.num_elements else 0.0
     box = [min(c[a] for c in corners) for a in range(3)] + [max(c[a] for c in corners) for a in range(3)]
     extent = max(max(box[a + 3] - box[a] for a in range(3)), 1e-30)
     union = [math.inf] * 3 + [-math.inf] * 3
     outside = 0
+    has_nonfinite = False
     for off in leaf_offsets(hdr):
         b = R.node_bounds(out, (off >> 6) << 3 | R.TRI0)
+        if any(not math.isfinite(v) for v in b):
+            outside += 1
+            has_nonfinite = True
+            continue
         if max([box[a] - b[a] for a in range(3)] + [b[a] - box[a] for a in range(3, 6)]) > OUTSIDE_TOLERANCE * extent:
             outside += 1
         for a in range(3):
             union[a], union[a + 3] = min(union[a], b[a]), max(union[a + 3], b[a + 3])
-    gap = max(abs(union[a] - box[a]) for a in range(6)) / extent if hdr.num_elements else 0.0
+    if has_nonfinite:
+        gap = math.inf
+    else:
+        gap = max(abs(union[a] - box[a]) for a in range(6)) / extent if hdr.num_elements else 0.0
     return outside, gap
 
 
@@ -89,15 +99,23 @@ def stored_overrides(src, hdr):
                                 yield children[bit // 6], bit % 6, value
 
 
+def _ulp_tol(value, ref):
+    if math.isfinite(value) and math.isfinite(ref):
+        return OVERRIDE_ULPS * 2.0 ** -23 * max(abs(value), abs(ref), 1e-30)
+    return 0.0
+
+
 def check_overrides(src, hdr, out):
     """(consistent, inconsistent) stored override components."""
     good = bad = 0
     for child, comp, value in stored_overrides(src, hdr):
         b = R.node_bounds(out, child)
         lo, hi = b[comp % 3], b[comp % 3 + 3]
-        tol = OVERRIDE_ULPS * 2.0 ** -23 * max(abs(value), abs(b[comp]), 1e-30) if math.isfinite(value) else 0.0
-        tighter = value >= b[comp] - tol if comp < 3 else value <= b[comp] + tol
-        if tighter and lo - tol <= value <= hi + tol:
+        tighter_tol = _ulp_tol(value, b[comp])
+        lo_tol = _ulp_tol(value, lo)
+        hi_tol = _ulp_tol(value, hi)
+        tighter = value >= b[comp] - tighter_tol if comp < 3 else value <= b[comp] + tighter_tol
+        if tighter and lo - lo_tol <= value <= hi + hi_tol:
             good += 1
         else:
             bad += 1
@@ -162,8 +180,14 @@ def main(argv=None):
     geom_paths = []
     for spec in a.geom:
         parts = spec.split(",")
+        if len(parts) > 2 or not parts[0]:
+            print("error: --geom expects VB[,IB]: %r" % spec, file=sys.stderr)
+            return 2
         geom_paths.append((parts[0], parts[1] if len(parts) > 1 else ""))
     if a.json:
+        if os.path.isdir(a.json):
+            print("error: --json is a directory: %s" % a.json, file=sys.stderr)
+            return 2
         if same_report_path(a.json, a.dehydrated):
             print("error: --json %s must not overwrite the dehydrated input" % a.json, file=sys.stderr)
             return 2
@@ -195,10 +219,14 @@ def main(argv=None):
     print("internal box area: %.6g" % report["internal_area"])
     print("consistent" if report["consistent"] else "NOT consistent")
     if a.json:
+        json_report = {
+            k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+            for k, v in report.items()
+        }
         try:
-            _publish(a.json, lambda f: json.dump(report, f, indent=1), "\n")
-        except OSError as e:
-            print("error: cannot write %s: %s" % (a.json, e.strerror or e), file=sys.stderr)
+            _publish(a.json, lambda f: json.dump(json_report, f, indent=1, allow_nan=False), "\n")
+        except (OSError, ValueError) as e:
+            print("error: cannot write %s: %s" % (a.json, getattr(e, "strerror", None) or e), file=sys.stderr)
             return 2
     return 0 if report["consistent"] else 1
 

@@ -3,14 +3,23 @@
 # Writes /opt/leonida/work/<agent>/boot-<n>.digest.txt and appends a line to /opt/leonida/work/boots.tsv.
 # Local only: digests quote trace lines, so they never go into commits or PRs.
 set -u
-AGENT=$1; N=$2; WORK=/opt/leonida/work/$AGENT; LOG=$WORK/boot-$N.log; RES=$WORK/boot-$N.resources.tsv
-META=$WORK/boot-$N.meta; OUT=$WORK/boot-$N.digest.txt; LEDGER=/opt/leonida/work/boots.tsv
+AGENT=${1:?agent}; N=${2:?n}
+if [ "$AGENT" = "." ] || [ "$AGENT" = ".." ] || ! [[ "$AGENT" =~ ^[A-Za-z0-9._-]+$ ]]; then
+  echo "boot-digest: invalid agent: $AGENT" >&2; exit 2
+fi
+if ! [[ "$N" =~ ^[0-9]+$ ]]; then
+  echo "boot-digest: invalid boot number: $N" >&2; exit 2
+fi
+ROOT=${LEONIDA_BOOT_ROOT:-/opt/leonida}
+WORK=$ROOT/work/$AGENT; LOG=$WORK/boot-$N.log; RES=$WORK/boot-$N.resources.tsv
+META=$WORK/boot-$N.meta; OUT=$WORK/boot-$N.digest.txt; LEDGER=$ROOT/work/boots.tsv
+mkdir -p "$WORK" "$(dirname "$LEDGER")"
 START=$(sed -n 's/^start_epoch=//p' "$META" 2>/dev/null); BOOT=$(sed -n 's/^boot_epoch=//p' "$META" 2>/dev/null)
 START=${START:-$(date +%s)}; BOOT=${BOOT:-$START}; END=$(date +%s)
 RESULT=${SERVICE_RESULT:-?}; ECODE=${EXIT_CODE:-?}; ESTAT=${EXIT_STATUS:-?}
 D3D=$(grep -o 'd3d12=[^ ]*' "$LOG" 2>/dev/null | tail -1 | cut -d= -f2)
 STDOUT=${D3D/d3d12-run-/stdout-run-}
-CAP=/opt/leonida/capture/$AGENT-$N
+CAP=$ROOT/capture/$AGENT-$N
 
 verdict=OK
 # systemd-oomd can kill the unit's processes without the unit ending in "oom-kill" (boot.sh then exits on its own).
@@ -39,15 +48,15 @@ cnt() { local c=0; [ -f "$D3D" ] && c=$(grep -a -c -E "$@" "$D3D"); echo "${c:-0
   grep -a 'present-probe: source frame .* via' "$D3D" 2>/dev/null | tail -1 | sed 's/.*via/source via/' | cut -c1-120
   echo
   echo "-- frames (swapchain; then the title's own backbuffer when LEONIDA_CAPTURE_SOURCE=1)"
-  [ -f "$CAP/index.txt" ] && { echo "$(wc -l < "$CAP/index.txt") captured; last: $(tail -1 "$CAP/index.txt" | cut -c1-110)"; awk '{m=$(NF-2)+$(NF-1)+$NF; if (m>0) n++} END{print n+0 " of " NR " frames non-black"}' "$CAP/index.txt"; } || echo "no capture index"
+  [ -s "$CAP/index.txt" ] && { echo "$(wc -l < "$CAP/index.txt") captured; last: $(tail -1 "$CAP/index.txt" | cut -c1-110)"; awk '{m=$(NF-2)+$(NF-1)+$NF; if (m>0) n++} END{print n+0 " of " NR " frames non-black"}' "$CAP/index.txt"; } || echo "no capture index"
   grep -a 'present-probe: source frame .* mean' "$D3D" 2>/dev/null | tail -2 | sed 's/.*source frame/source frame/' | cut -c1-140
   echo
   echo "-- resources (2 s samples)"
-  [ -s "$RES" ] && awk -F'\t' 'NR>1{ if(min==""||$2<min)min=$2; if($3>sw)sw=$3; if($4>um)um=$4; if($5>us)us=$5; if($6+0>gm)gm=$6 } END{printf "min RAM available %s MB, max swap used %s MB, game peak %s MB RAM + %s MB swap, VRAM peak %s MB\n",min,sw,um,us,gm}' "$RES" || echo "no samples"
+  [ -s "$RES" ] && awk -F'\t' 'NR>1{ c++; if(min==""||$2<min)min=$2; if($3>sw)sw=$3; if($4>um)um=$4; if($5>us)us=$5; if($6+0>gm)gm=$6 } END{ if(c>0) printf "min RAM available %s MB, max swap used %s MB, game peak %s MB RAM + %s MB swap, VRAM peak %s MB\n",min,sw,um,us,gm; else print "no samples" }' "$RES" || echo "no samples"
   journalctl --user -u "leonida-boot-$AGENT-$N" --since "@$START" -q --no-pager 2>/dev/null | grep -E 'Consumed|oom|Failed' | sed 's/^.*\]: //' | sort -u | cut -c1-200
   # Compare with other boots instead of guessing: on the console (Series S) path the title itself grows to ~20 GB of
   # RAM+swap by ~130 s (fsdraw-6: 9.9 GB + 11.2 GB), mostly zero pages that zram compresses well.
-  [ -s "$RES" ] && awk -F'\t' 'NR>1{t=$4+$5; if(t>m)m=t} END{printf "game peak RAM+swap %.1f GB (console-path baseline ~20 GB at 130 s; oomd kills when zram swap passes 98%%)\n", m/1024}' "$RES"
+  [ -s "$RES" ] && awk -F'\t' 'NR>1{ c++; t=$4+$5; if(t>m)m=t } END{ if(c>0) printf "game peak RAM+swap %.1f GB (console-path baseline ~20 GB at 130 s; oomd kills when zram swap passes 98%%)\n", m/1024 }' "$RES"
   echo
   echo "-- system events during the boot (OOM, GPU Xid, segfaults)"
   { journalctl --since "@$BOOT" -q --no-pager 2>/dev/null | grep -i -E 'systemd-oomd.*(Marked|killed)|oom-kill|out of memory|NVRM: Xid|segfault|gta6rt|wineserver.*crash' ; } | cut -c1-200 | tail -15
@@ -63,13 +72,13 @@ cnt() { local c=0; [ -f "$D3D" ] && c=$(grep -a -c -E "$@" "$D3D"); echo "${c:-0
   [ -f "$D3D" ] && tail -n 8 "$D3D" | cut -c1-200
 } > "$OUT" 2>&1
 
-frames=$( [ -f "$CAP/index.txt" ] && awk '{m=$(NF-2)+$(NF-1)+$NF; if (m>0) n++} END{print (n+0) "/" NR}' "$CAP/index.txt" || echo "-")
-peak=$( [ -s "$RES" ] && awk -F'\t' 'NR>1{if($4>u)u=$4} END{print u+0}' "$RES" || echo "-")
-exec 7>>"$LEDGER"; flock 7
+frames=$( [ -s "$CAP/index.txt" ] && awk '{m=$(NF-2)+$(NF-1)+$NF; if (m>0) n++} END{print (n+0) "/" NR}' "$CAP/index.txt" || echo "-")
+peak=$( [ -s "$RES" ] && awk -F'\t' 'NR>1{c++; if($4>u)u=$4} END{if(c>0) print u+0; else print "-"}' "$RES" || echo "-")
+exec 7>>"$LEDGER"; if command -v flock >/dev/null 2>&1; then flock 7; fi
 # Both the unit's ExecStopPost and the outer wrapper call this; the first one to finish records the boot.
-grep -q -P "^[^\t]*\t$AGENT\t$N\t" "$LEDGER" 2>/dev/null && exit 0
+awk -F'\t' -v a="$AGENT" -v n="$N" 'NR>1 && $2==a && $3==n {found=1; exit} END{exit !found}' "$LEDGER" 2>/dev/null && exit 0
 [ -s "$LEDGER" ] || printf 'end\tagent\tn\tresult\tran_s\tpresentx_ok\tpso_failed\tfspx_miss\tnonblack_frames\tpeak_mb\tgta6rt\n' >&7
 printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$(date '+%F %T')" "$AGENT" "$N" "$RESULT" "$((END-BOOT))" \
   "$(cnt 'XboxPresentation::PresentX ok')" "$(cnt 'CreatePipelineState failed')" "$(cnt 'no translated compute shader for FSPX')" \
-  "$frames" "$peak" "$(sed -n 's/^unit=.*gta6rt=\([^ ]*\).*/\1/p' "$META")" >&7
+  "$frames" "$peak" "$(sed -n 's/^unit=.*gta6rt=\([^ ]*\).*/\1/p' "$META" 2>/dev/null)" >&7
 exit 0

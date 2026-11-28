@@ -137,6 +137,108 @@ class BufferSwizzleProbeTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("WAVE_DIFF", out.getvalue())
 
+    def test_json_invalid_paths_fail_upfront_before_oracle(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "blocker"
+            blocker.write_bytes(b"keep")
+            bad_paths = [
+                "",
+                "   ",
+                tmp,
+                tmp + os.sep,
+                os.path.join(tmp, "nested") + os.sep,
+                str(blocker / "report.json"),
+            ]
+            for bad in bad_paths:
+                with self.subTest(json_path=bad):
+                    err = io.StringIO()
+                    with unittest.mock.patch.object(probe, "run_translator") as tr_mock, \
+                            unittest.mock.patch.object(probe, "run_hw") as hw_mock, \
+                            redirect_stderr(err):
+                        rc = probe.main(["--oracle", "both", "--group", "offset_wrap", "--json", bad])
+                    self.assertEqual(rc, 2)
+                    tr_mock.assert_not_called()
+                    hw_mock.assert_not_called()
+                    self.assertTrue(err.getvalue().strip())
+            self.assertEqual(blocker.read_bytes(), b"keep")
+
+    def test_write_json_report_atomic_symlink_nan_and_devnull(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            nested = os.path.join(tmp, "a", "b", "out.json")
+            self.assertIsNone(probe.write_json_report(nested, {"ok": True}))
+            raw = Path(nested).read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+            self.assertEqual(json.loads(raw.decode("utf-8")), {"ok": True})
+
+            # NaN must fail serialization without overwriting existing file.
+            err = probe.write_json_report(nested, {"bad": float("nan")})
+            self.assertIsNotNone(err)
+            self.assertEqual(json.loads(Path(nested).read_text(encoding="utf-8")), {"ok": True})
+
+            # Symlink target is updated in place without replacing the symlink itself.
+            if hasattr(os, "symlink"):
+                real_target = os.path.join(tmp, "real.json")
+                link_path = os.path.join(tmp, "link.json")
+                Path(real_target).write_text("old", encoding="utf-8")
+                try:
+                    os.symlink(real_target, link_path)
+                except OSError:
+                    link_path = None
+                if link_path is not None:
+                    self.assertIsNone(probe.write_json_report(link_path, {"via": "link"}))
+                    self.assertTrue(os.path.islink(link_path))
+                    self.assertEqual(json.loads(Path(real_target).read_text(encoding="utf-8")), {"via": "link"})
+
+            if os.name == "posix" and os.path.exists("/dev/null"):
+                self.assertIsNone(probe.write_json_report("/dev/null", {"discarded": 1}))
+
+    def test_empty_group_and_hw_arch_rejected_upfront(self):
+        for argv in (["--group", ""], ["--group", "   "], ["--hw-arch", ""], ["--hw-arch", "   "]):
+            with self.subTest(argv=argv):
+                err = io.StringIO()
+                with unittest.mock.patch.object(probe, "run_translator") as tr_mock, \
+                        redirect_stderr(err):
+                    rc = probe.main(argv)
+                self.assertEqual(rc, 2)
+                tr_mock.assert_not_called()
+                self.assertTrue(err.getvalue().strip())
+
+    def test_translator_only_wave_parity_and_error_precedence(self):
+        # Wave-invariant translator wave32 != wave64 must fail with WAVE_DIFF.
+        bad_tr_diff = {
+            32: {"voff_inst_wrap_and_soff_nowrap": [1, 2, 3, 4]},
+            64: {"voff_inst_wrap_and_soff_nowrap": [1, 2, 3, 5]},
+        }
+        out = io.StringIO()
+        with unittest.mock.patch.object(probe, "run_translator", return_value=bad_tr_diff), redirect_stdout(out):
+            rc = probe.main(["--oracle", "translator", "--group", "offset_wrap"])
+        self.assertEqual(rc, 1)
+        self.assertIn("WAVE_DIFF", out.getvalue())
+
+        # Wave-dependent translator wave32 == wave64 must fail with WAVE_SAME.
+        bad_tr_same = {
+            32: {"tid_wave32_vs_wave64": [0] * 64},
+            64: {"tid_wave32_vs_wave64": [0] * 64},
+        }
+        out2 = io.StringIO()
+        with unittest.mock.patch.object(probe, "run_translator", return_value=bad_tr_same), redirect_stdout(out2):
+            rc2 = probe.main(["--oracle", "translator", "--group", "add_tid_wave_lane"])
+        self.assertEqual(rc2, 1)
+        self.assertIn("WAVE_SAME", out2.getvalue())
+
+        # A string harness error in one wave must report ERROR, not WAVE_DIFF.
+        hw_err = ("device=mock", {
+            32: {"voff_inst_wrap_and_soff_nowrap": "compile failed"},
+            64: {"voff_inst_wrap_and_soff_nowrap": [1, 2, 3, 4]},
+        })
+        out3 = io.StringIO()
+        with unittest.mock.patch.object(probe, "run_hw", return_value=hw_err), redirect_stdout(out3):
+            rc3 = probe.main(["--oracle", "hw", "--group", "offset_wrap"])
+        self.assertEqual(rc3, 1)
+        self.assertIn("ERROR", out3.getvalue())
+        self.assertNotIn("WAVE_DIFF", out3.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

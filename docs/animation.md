@@ -30,9 +30,9 @@ The requested command (`python -I tools/rpf9_carve.py <package>/anim.rpf <work>/
 | Bink 2 | 0 streams |
 | elapsed | 141 s |
 
-`rpf9_carve.py` overreads its last stream: it advances a 1 MiB read cursor by 1 MiB even when the final mmap
-slice is shorter. That makes the last `PSIN` stream look 974,742 bytes stored instead of 1,766 and skips 21
-streams at the tail. `tools/anim_index.py` advances by the actual slice length. Its corrected walk finds:
+The earlier `rpf9_carve.py` run above overread its last stream: it used to advance a 1 MiB read cursor by 1 MiB even when the final mmap
+slice was shorter. That made the last `PSIN` stream look 974,742 bytes stored instead of 1,766 and skipped 21
+streams at the tail. Both `tools/rpf9_carve.py` and `tools/anim_index.py` now advance by the actual slice length (`len(chunk)`). The corrected walk finds:
 
 | Measure | corrected walk |
 |---|---:|
@@ -200,14 +200,8 @@ at the next 16-byte boundary after the first. In **1,781/1,781** pairs the u64 a
 In every pair the declared payload lengths fit within page two. The instance blocks referenced by the
 [`+0x38` instance block table](navmesh.md#schema-tables-q28-q30-q38-q40) fit wholly within page one. Schema tables also occupy page two after the auxiliary payloads,
 and none overlaps the auxiliary table or its payloads. The same framing is measured independently for
-[navigation resources](navmesh.md#schema-tables-q28-q30-q38-q40). The meaning of the individual payloads
+[navigation resources](navmesh.md#schema-tables-q28-q30-q38-q40). Entropy across the 1,781 streams is 4.03–7.79 bits/byte, and the meaning of the individual payloads
 in the animation archive remains open.
-The leading u32 is 2 or 3; the next four bytes are constant. Stored 18,168,950 bytes, inflated 32,691,776 bytes.
-1,767 distinct payloads (duplicates up to 10 copies). Entropy 4.03–7.79 bits/byte, so these are packed/quantized
-bitstreams rather than zlib streams. The 24-byte header has five small fields after the type; the measured
-version split and the track side are below. No keyframe values are claimed. Each of these streams is the second
-system page of a `0DRP` resource, the one right after its `0DRP` stream (see [Keyframe
-decoding](#keyframe-decoding)).
 
 ### Partial clip decode
 
@@ -965,8 +959,8 @@ the archetypes reference; the per-bone mapping onto each model's skeleton still 
    55 are referenced by one distinct asset name each. The remaining 104 are shared. Across their local
    animation packs, 63 dictionaries have nonzero rotation or translation bone hashes and 96 have none.
    All 63 fall below the 90% reference-skeleton threshold used above.
-measured. Still open in ASSET-20: the `0DRP` "2/3 packed clip streams" ([above](#packed-clip-streams)) and which
-model or skeleton each non-humanoid clip dictionary drives.
+
+Still open in ASSET-20: the meanings of the auxiliary payloads in the 1,781 `0DRP` second-page `clip-stream` entries ([above](#packed-clip-streams)) and the per-bone mapping onto each non-humanoid model's skeleton.
 
 ## `MoVE` state-machine containers
 

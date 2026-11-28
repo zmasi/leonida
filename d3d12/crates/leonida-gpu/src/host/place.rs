@@ -66,8 +66,24 @@ impl Placed {
     /// (`super::placed_is_titles`): the destination by what has landed there, and the source either not
     /// declared or the title's by the rule for fills (`super::fill_is_titles`).
     pub(super) fn titles(&self, written: &[(usize, usize)]) -> bool {
-        super::placed_is_titles(self.dst, self.len)
+        super::placed_is_titles(self.dst, self.len, touches(written, self.dst, self.dst + self.len))
             && (!touches(written, self.src, self.src + self.len) || super::fill_is_titles(self.src, self.len))
+    }
+
+    /// Diagnostics: why [`Placed::titles`] did not take the copy for the title's own, for the wait's name.
+    #[cfg(feature = "diagnostics")]
+    pub(super) fn why_waits(&self, written: &[(usize, usize)]) -> &'static str {
+        let source = touches(written, self.src, self.src + self.len);
+        let declared = touches(written, self.dst, self.dst + self.len);
+        let dst = super::placed_is_titles(self.dst, self.len, declared);
+        let src = !source || super::fill_is_titles(self.src, self.len);
+        match (dst, src, declared) {
+            (false, false, _) => "(a shader's write went into its destination lately, and into its source)",
+            (false, true, true) => "(a shader's write went into its destination, which flights declare, lately)",
+            (false, true, false) => "(a shader's write went into its destination, which no flight declares, lately)",
+            (true, false, _) => "(a shader's write went into its source lately, and the title did not write that since)",
+            (true, true, _) => "(taken for the title's own by now)",
+        }
     }
 
     /// Whether flights that write `written` are waited for.
@@ -127,30 +143,105 @@ pub(super) enum Waits {
     Yes,
 }
 
-/// Whether a step of `runs` reads one of `ranges` on the CPU.
-pub(super) fn read_by(runs: &[&HostList], ranges: Vec<(usize, usize)>) -> bool {
-    reader(runs, ranges).is_some()
+/// Whether only the steps behind a copy at its place in a list count as its readers (on unless
+/// `LEONIDA_PLACED_READERS=0`: every step of the submission that reads its destination, wherever it stands, as
+/// before; `LEONIDA_AB` can name it).
+///
+/// A copy whose bytes wait for flights ([`Waits::ForReaders`]) is left to the card: title memory does not hold
+/// what it writes until its submission has landed, so a step of the submission that reads its destination on the
+/// CPU stands until the flights have landed. That was asked of every such step. One ahead of the copy wants the
+/// bytes from before it, which title memory holds, and the steps are done in their order: it has nothing to
+/// wait for on the copy's account. (What flights declare of its own bytes stops it as before: `read_blocked`.)
+///
+/// From avatarmanz/VIctory-7900XTX 11511b81b ("... order-aware readers of copies at their place ...", author
+/// recorded as "local", 2026-11-25; GPL-3.0-or-later), where the switch is `VICTORY_PLACED_READERS` and the rule
+/// has been the default since; Belobug/VIctory-Belobug-AMD and TaynanGT/Vice-Tay have it from there. Not as in
+/// the source: the copies that wait are told apart by where they stand in their lists, not asked a second time
+/// whether they wait, and a diagnostics build counts the submissions the rule spared ([`AHEAD`]).
+pub(super) fn readers_in_order() -> bool {
+    crate::toggled!("LEONIDA_PLACED_READERS")
 }
 
-/// The first step of `runs` that reads one of `ranges` on the CPU: what kind of step, and the bytes it reads
-/// (address, length).
-pub(super) fn reader(runs: &[&HostList], mut ranges: Vec<(usize, usize)>) -> Option<(&'static str, usize, usize)> {
-    join_ranges(&mut ranges, []);
+/// Diagnostics, since the last frame-rate line: submissions that were not held for flights because every step
+/// that reads a waiting copy's destination on the CPU stands ahead of the copy ([`readers_in_order`]).
+#[cfg(feature = "diagnostics")]
+pub(super) static AHEAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The destinations of the copies at their place that wait for their readers ([`Waits::ForReaders`]), while
+/// the steps of a submission are walked in their order.
+pub(super) struct Waiting {
+    /// Those that count for the step the walk is at, in order, joined.
+    ranges: Vec<(usize, usize)>,
+    in_order: bool,
+}
+
+impl Waiting {
+    /// `all`: every such copy's destination. In order ([`readers_in_order`]) none counts before the walk has
+    /// come to its copy; else all do from the first step on.
+    pub(super) fn new(all: impl IntoIterator<Item = (usize, usize)>, in_order: bool) -> Self {
+        let mut ranges = Vec::new();
+        if !in_order {
+            join_ranges(&mut ranges, all);
+        }
+        Self { ranges, in_order }
+    }
+
+    /// The walk's next step: `reads` are the bytes it reads on the CPU (address, length), `copy` what it writes
+    /// if it is one of the waiting copies. Whether it reads what a waiting copy writes.
+    pub(super) fn step(&mut self, reads: Option<(usize, usize)>, copy: Option<(usize, usize)>) -> bool {
+        let read = reads.is_some_and(|(at, len)| touches(&self.ranges, at, at.saturating_add(len)));
+        // (After it was looked at as a reader: a copy does not read what it writes.)
+        if self.in_order
+            && let Some(dst) = copy
+        {
+            join_ranges(&mut self.ranges, [dst]);
+        }
+        read
+    }
+}
+
+/// The first step of `runs` that reads on the CPU what one of `placed` writes: what kind of step, and the bytes
+/// it reads (address, length). `placed`: the copies at their place that wait for their readers, each by its
+/// address in its list's steps and its destination (from, to). `in_order`: only steps behind the copy count
+/// ([`readers_in_order`]). `taken`: copies and fills that the CPU leaves out (their list, their place in it:
+/// `card_steps`).
+pub(super) fn reader(
+    runs: &[&HostList],
+    placed: &[(usize, usize, usize)],
+    in_order: bool,
+    taken: impl Fn(&HostList, usize) -> bool,
+) -> Option<(&'static str, usize, usize)> {
+    let mut waiting = Waiting::new(placed.iter().map(|p| (p.1, p.2)), in_order);
     runs.iter().find_map(|list| {
-        list.deferred().copies.iter().find_map(|step| {
-            let (kind, at, len) = match step {
-                &Step::Copy(_, src, len) => ("a buffer copy's source, written by a copy at its place in a list", src, len),
-                &Step::Fill(_, src, len, _) => ("a fill of upload memory from what a copy at its place in a list writes", src, len),
+        list.deferred().copies.iter().enumerate().find_map(|(i, step)| {
+            let read = match step {
+                &Step::Copy(_, src, len) if !taken(list, i) => {
+                    Some(("a buffer copy's source, written by a copy at its place in a list", src, len))
+                }
+                &Step::Fill(_, src, len, _) if !taken(list, i) => {
+                    Some(("a fill of upload memory from what a copy at its place in a list writes", src, len))
+                }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
-                    ("a texture over what a copy at its place in a list writes", at, len)
+                    Some(("a texture over what a copy at its place in a list writes", at, len))
                 }
-                &Step::Plane((at, len), _) => ("a movie plane over what a copy at its place in a list writes", at, len),
-                Step::Host(_, (from, to)) => ("a step of the host's that reads what a copy at its place in a list writes", *from, *to - *from),
-                Step::Placed(p) if p.from.is_some() => ("a copy at its place whose source another one at its place writes", p.src, p.len),
-                _ => return None,
+                &Step::Plane((at, len), _) => Some(("a movie plane over what a copy at its place in a list writes", at, len)),
+                Step::Host(_, (from, to)) => {
+                    Some(("a step of the host's that reads what a copy at its place in a list writes", *from, *to - *from))
+                }
+                Step::Placed(p) if p.from.is_some() => {
+                    Some(("a copy at its place whose source another one at its place writes", p.src, p.len))
+                }
+                _ => None,
             };
-            touches(&ranges, at, at.saturating_add(len)).then_some((kind, at, len))
+            let copy = match step {
+                Step::Placed(p) if placed.iter().any(|q| q.0 == std::ptr::from_ref::<Placed>(p) as usize) => {
+                    Some((p.dst, p.dst + p.len))
+                }
+                _ => None,
+            };
+            let reads = waiting.step(read.map(|(_, at, len)| (at, len)), copy);
+            read.filter(|_| reads)
         })
     })
 }
@@ -322,6 +413,59 @@ impl HostList {
 
 #[cfg(test)]
 mod tests {
+    use super::Waiting;
+
+    /// A step of a submission: what it reads on the CPU (address, length), and what it writes (from, to) if it
+    /// is a copy at its place that waits for its readers.
+    type Seen = (Option<(usize, usize)>, Option<(usize, usize)>);
+
+    fn fill(at: usize, len: usize) -> Seen {
+        (Some((at, len)), None)
+    }
+
+    /// Which of `steps` read what a waiting copy writes.
+    fn readers(steps: &[Seen], in_order: bool) -> Vec<usize> {
+        let mut waiting = Waiting::new(steps.iter().filter_map(|s| s.1), in_order);
+        (0..steps.len()).filter(|&i| waiting.step(steps[i].0, steps[i].1)).collect()
+    }
+
+    /// A step ahead of a waiting copy does not read what the copy writes, one behind it does; with every step
+    /// counted (`LEONIDA_PLACED_READERS=0`) both do, as before.
+    #[test]
+    fn waiting_copies_are_read_by_what_stands_behind_them() {
+        let copy: Seen = (None, Some((2000, 2288)));
+        // A fill of the copy's destination ahead of it, one behind it, and one of other bytes.
+        let steps = [fill(2000, 64), copy, fill(2100, 64), fill(5000, 64)];
+        assert_eq!(readers(&steps, true), [2]);
+        assert_eq!(readers(&steps, false), [0, 2]);
+        // Only ahead: nothing waits on the copy's account.
+        assert!(readers(&steps[..2], true).is_empty());
+        assert_eq!(readers(&steps[..2], false), [0]);
+        // Ends that touch are apart, and a read of no bytes reads nothing.
+        let steps = [copy, fill(1936, 64), fill(2288, 64), fill(2100, 0), fill(2287, 1)];
+        assert_eq!(readers(&steps, true), [4]);
+        assert_eq!(readers(&steps, false), [4]);
+    }
+
+    /// A waiting copy that takes its source on the CPU reads what a waiting copy ahead of it writes, not what
+    /// it writes itself; and each copy counts from its own place on.
+    #[test]
+    fn a_waiting_copy_reads_its_source_not_its_destination() {
+        let first: Seen = (None, Some((2000, 2064)));
+        // Out of the first one's destination.
+        let chained: Seen = (Some((2000, 64)), Some((3000, 3064)));
+        let onto_itself: Seen = (Some((3000, 64)), Some((3000, 3064)));
+        assert_eq!(readers(&[first, chained], true), [1]);
+        assert!(readers(&[chained, first], true).is_empty());
+        assert_eq!(readers(&[chained, first], false), [0]);
+        assert!(readers(&[onto_itself], true).is_empty());
+        // Two copies, a fill between them of the second one's destination and two behind both.
+        let second: Seen = (None, Some((3000, 3064)));
+        let steps = [first, fill(3000, 8), second, fill(3000, 8), fill(2000, 8)];
+        assert_eq!(readers(&steps, true), [3, 4]);
+        assert_eq!(readers(&steps, false), [1, 3, 4]);
+    }
+
     /// What copies with two sides cost to make (ignored: a measurement for
     /// `LEONIDA_CARD_ALL`): buffers of 64 KiB on the card and in the PC's
     /// memory.

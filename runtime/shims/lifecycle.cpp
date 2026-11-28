@@ -25,7 +25,9 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <mutex>
+#include <new>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -153,8 +155,14 @@ bool prepare_title_window(HWND parent, DWORD style, DWORD ex_style, int& x, int&
                  fitted_h);
     width = fitted_w;
     height = fitted_h;
-    x = area.left + ((area.right - area.left) - width) / 2;
-    y = area.top + ((area.bottom - area.top) - height) / 2;
+    const std::int64_t area_w = static_cast<std::int64_t>(area.right) - static_cast<std::int64_t>(area.left);
+    const std::int64_t area_h = static_cast<std::int64_t>(area.bottom) - static_cast<std::int64_t>(area.top);
+    const std::int64_t cx = static_cast<std::int64_t>(area.left) + (area_w - width) / 2;
+    const std::int64_t cy = static_cast<std::int64_t>(area.top) + (area_h - height) / 2;
+    x = static_cast<int>(
+        std::clamp<std::int64_t>(cx, std::numeric_limits<int>::min(), std::numeric_limits<int>::max()));
+    y = static_cast<int>(
+        std::clamp<std::int64_t>(cy, std::numeric_limits<int>::min(), std::numeric_limits<int>::max()));
     return true;
 }
 
@@ -167,10 +175,15 @@ void adopt_title_window(HWND hwnd, bool candidate) {
 
 ULONG WINAPI register_app_state_change(AppStateRoutine routine, PVOID context, PVOID* registration) {
     if (!routine || !registration) return ERROR_INVALID_PARAMETER;
-    const std::uintptr_t id = g_next_reg_id.fetch_add(1, std::memory_order_relaxed);
-    {
+    std::uintptr_t id = 0;
+    do {
+        id = g_next_reg_id.fetch_add(1, std::memory_order_relaxed);
+    } while (id == 0);
+    try {
         std::lock_guard lock(reg_mutex());
         reg_list().push_back({id, routine, context});
+    } catch (const std::bad_alloc&) {
+        return ERROR_NOT_ENOUGH_MEMORY;
     }
     *registration = reinterpret_cast<PVOID>(id);
     return ERROR_SUCCESS;
@@ -205,16 +218,22 @@ HWND WINAPI create_window_ex_a_shim(DWORD ex_style, LPCSTR class_name, LPCSTR wi
 }  // namespace
 
 std::pair<int, int> fit_window_to_area(const RECT& area, int width, int height) {
-    const int area_w = area.right - area.left;
-    const int area_h = area.bottom - area.top;
-    if (width <= 0 || height <= 0 || area_w <= 0 || area_h <= 0 || (width <= area_w && height <= area_h)) {
+    const std::int64_t area_w = static_cast<std::int64_t>(area.right) - static_cast<std::int64_t>(area.left);
+    const std::int64_t area_h = static_cast<std::int64_t>(area.bottom) - static_cast<std::int64_t>(area.top);
+    if (width <= 0 || height <= 0 || area_w <= 0 || area_h <= 0 ||
+        (static_cast<std::int64_t>(width) <= area_w && static_cast<std::int64_t>(height) <= area_h)) {
         return {width, height};
     }
+    const std::int64_t max_w = std::min<std::int64_t>(area_w, std::numeric_limits<int>::max());
+    const std::int64_t max_h = std::min<std::int64_t>(area_h, std::numeric_limits<int>::max());
     const double scale =
-        std::min(static_cast<double>(area_w) / static_cast<double>(width),
-                 static_cast<double>(area_h) / static_cast<double>(height));
-    return {static_cast<int>(static_cast<double>(width) * scale),
-            static_cast<int>(static_cast<double>(height) * scale)};
+        std::min(static_cast<double>(max_w) / static_cast<double>(width),
+                 static_cast<double>(max_h) / static_cast<double>(height));
+    const int fitted_w = static_cast<int>(
+        std::clamp<std::int64_t>(static_cast<std::int64_t>(static_cast<double>(width) * scale), 1, max_w));
+    const int fitted_h = static_cast<int>(
+        std::clamp<std::int64_t>(static_cast<std::int64_t>(static_cast<double>(height) * scale), 1, max_h));
+    return {fitted_w, fitted_h};
 }
 
 std::size_t registered_notification_count() {

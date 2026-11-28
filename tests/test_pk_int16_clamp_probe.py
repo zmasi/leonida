@@ -1,5 +1,5 @@
 """Unit and oracle-backed tests for tools/pk_int16_clamp_probe.py. Standard library only; no game files."""
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 import io
 import json
 import os
@@ -149,6 +149,102 @@ class PkInt16ClampProbeTests(unittest.TestCase):
             with unittest.mock.patch.object(sys, "stderr", io.StringIO()):
                 probe.main(["--ops", "v_not_an_op"])
         self.assertEqual(cm2.exception.code, 2)
+
+    def test_malformed_and_duplicate_ops_waves_and_empty_args(self):
+        for bad_args in (
+            ["--ops", "v_pk_mul_lo_u16,"],
+            ["--ops", ",v_pk_mul_lo_u16"],
+            ["--ops", "v_pk_mul_lo_u16,,v_pk_add_u16"],
+            ["--waves", "32,"],
+            ["--waves", "32,,64"],
+            ["--hw-arch", ""],
+            ["--hw-arch", "   "],
+            ["--json", ""],
+            ["--json", "   "],
+        ):
+            with self.subTest(args=bad_args):
+                with unittest.mock.patch.object(hw_runner, "open_oracle") as open_mock, redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        probe.main(bad_args)
+                self.assertEqual(cm.exception.code, 2)
+                open_mock.assert_not_called()
+
+        results = _expected_results_for(["v_pk_mul_lo_u16"], [32])
+        oracle = _mock_oracle(results)
+        with tempfile.TemporaryDirectory() as td:
+            jpath = os.path.join(td, "dedup.json")
+            with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=oracle), redirect_stdout(io.StringIO()):
+                rc = probe.main([
+                    "--ops", "v_pk_mul_lo_u16,v_pk_mul_lo_u16",
+                    "--waves", "32,32",
+                    "--json", jpath,
+                ])
+            self.assertEqual(rc, 0)
+            with open(jpath, encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(doc["ops"], ["v_pk_mul_lo_u16"])
+            self.assertEqual(doc["waves"], [32])
+            self.assertEqual(doc["total_cases"], 2 * len(probe.CASES))
+
+    def test_json_blocker_trailing_sep_and_atomic_write_report(self):
+        with tempfile.TemporaryDirectory() as td:
+            blocker = os.path.join(td, "blocker")
+            with open(blocker, "wb") as f:
+                f.write(b"keep")
+            with unittest.mock.patch.object(hw_runner, "open_oracle") as open_mock, redirect_stderr(io.StringIO()) as err:
+                rc = probe.main(["--ops", "v_pk_mul_lo_u16", "--waves", "32", "--json", os.path.join(blocker, "r.json")])
+            self.assertEqual(rc, 2)
+            open_mock.assert_not_called()
+            self.assertIn("ERROR: cannot write", err.getvalue())
+            with open(blocker, "rb") as f:
+                self.assertEqual(f.read(), b"keep")
+
+            with unittest.mock.patch.object(hw_runner, "open_oracle") as open_mock, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    probe.main(["--ops", "v_pk_mul_lo_u16", "--waves", "32", "--json", os.path.join(td, "sub") + os.sep])
+            self.assertEqual(cm.exception.code, 2)
+            open_mock.assert_not_called()
+
+            out = os.path.join(td, "sub", "report.json")
+            self.assertTrue(probe.write_report(out, {"ok": 1}))
+            with open(out, "rb") as f:
+                raw = f.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+
+            with redirect_stderr(io.StringIO()):
+                self.assertFalse(probe.write_report(out, {"bad": float("nan")}))
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(json.load(f), {"ok": 1})
+
+            if hasattr(os, "symlink"):
+                real = os.path.join(td, "real.json")
+                link = os.path.join(td, "link.json")
+                with open(real, "w", encoding="utf-8", newline="\n") as f:
+                    f.write("old")
+                try:
+                    os.symlink(real, link)
+                except OSError:
+                    link = None
+                if link is not None:
+                    self.assertTrue(probe.write_report(link, {"via": "link"}))
+                    self.assertTrue(os.path.islink(link))
+                    with open(real, encoding="utf-8") as f:
+                        self.assertEqual(json.load(f), {"via": "link"})
+
+            if os.name == "posix" and os.path.exists("/dev/null"):
+                self.assertTrue(probe.write_report("/dev/null", {"ok": 1}))
+
+    def test_evaluate_results_count_mismatch_and_unknown_arch_family(self):
+        _, meta = probe.build_jobs(["v_pk_mul_lo_u16"], [32])
+        rep = probe.evaluate_results(["v_pk_mul_lo_u16"], [32], meta, [])
+        self.assertEqual(len(rep["harness_errors"]), 1)
+        self.assertIn("expected", rep["harness_errors"][0]["error"])
+
+        bad_arch = _mock_oracle([], arch="unknown_arch_999", device="Unknown")
+        with unittest.mock.patch.object(hw_runner, "open_oracle", return_value=bad_arch), redirect_stdout(io.StringIO()):
+            self.assertEqual(probe.main(["--ops", "v_pk_mul_lo_u16", "--waves", "32"]), 77)
+        bad_arch.close.assert_called_once()
 
     def test_live_hw_oracle_when_configured(self):
         try:

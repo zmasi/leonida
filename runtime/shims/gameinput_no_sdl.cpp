@@ -674,8 +674,15 @@ public:
                          "[rt] gameinput: RegisterDeviceCallback kind=0x%08x filter=0x%08x enumeration=%d report=%d\n",
                          kind, status_filter, static_cast<int>(enumeration), report ? 1 : 0);
         if (token) *token = c.token;
-        // Blocking enumeration: the pad is reported before this returns, on the caller's thread.
-        if (report && enumeration == GameInputBlockingEnumeration) call_device(c, now_us());
+        // Blocking enumeration: the pad is reported before this returns, on the caller's thread. Under deliver_mu and
+        // marked as delivering, as deliver() runs callbacks, so an UnregisterCallback on another thread waits for it
+        // to return and one from inside it does not wait on itself.
+        if (report && enumeration == GameInputBlockingEnumeration) {
+            std::lock_guard dl(s.deliver_mu);
+            const DWORD outer = s.delivering_thread.exchange(GetCurrentThreadId());
+            call_device(c, now_us());
+            s.delivering_thread = outer;
+        }
         if (later) schedule_delivery();
         return S_OK;
     }

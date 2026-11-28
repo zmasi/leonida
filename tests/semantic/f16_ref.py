@@ -17,11 +17,14 @@ def f16_value(h):
 
 
 def is_nan(h):
+    h &= 0xFFFF
     return (h & 0x7C00) == 0x7C00 and (h & 0x03FF) != 0
 
 
 def same_f16(a, b):
     """Equal words, or both NaN."""
+    a &= 0xFFFF
+    b &= 0xFFFF
     return a == b or (is_nan(a) and is_nan(b))
 
 
@@ -58,6 +61,8 @@ def to_f16(v):
             return 0x7E00
         if math.isinf(v):
             return 0x7C00 if v > 0 else 0xFC00
+        if v == 0.0:
+            return 0x8000 if math.copysign(1.0, v) < 0 else 0
         v = Fraction(v)
     return round_f16(v)
 
@@ -67,6 +72,8 @@ def _special(*hs):
 
 
 def ref_add(a, b):
+    a &= 0xFFFF
+    b &= 0xFFFF
     if _special(a, b):
         return to_f16(f16_value(a) + f16_value(b))
     if a == 0x8000 and b == 0x8000:
@@ -75,10 +82,14 @@ def ref_add(a, b):
 
 
 def ref_sub(a, b):
+    a &= 0xFFFF
+    b &= 0xFFFF
     return ref_add(a, b ^ 0x8000) if not is_nan(b) else ref_add(a, b)
 
 
 def ref_mul(a, b):
+    a &= 0xFFFF
+    b &= 0xFFFF
     if _special(a, b):
         return to_f16(f16_value(a) * f16_value(b))
     r = round_f16(Fraction(f16_value(a)) * Fraction(f16_value(b)))
@@ -86,6 +97,9 @@ def ref_mul(a, b):
 
 
 def ref_fma(a, b, c):
+    a &= 0xFFFF
+    b &= 0xFFFF
+    c &= 0xFFFF
     if _special(a, b, c):
         return to_f16(f16_value(a) * f16_value(b) + f16_value(c))
     p = Fraction(f16_value(a)) * Fraction(f16_value(b))
@@ -96,7 +110,7 @@ def ref_fma(a, b, c):
 
 
 def neg(h):
-    return h ^ 0x8000
+    return (h & 0xFFFF) ^ 0x8000
 
 
 def fabs(h):
@@ -105,11 +119,13 @@ def fabs(h):
 
 def scale(h, factor):
     """h * factor for a power-of-two output modifier (inputs here stay in the normal range)."""
+    h &= 0xFFFF
     return to_f16(f16_value(h) * factor) if not is_nan(h) else h
 
 
 def clamp01(h):
     """clamp to [0, 1]; a NaN becomes +0."""
+    h &= 0xFFFF
     if is_nan(h):
         return 0
     v = f16_value(h)

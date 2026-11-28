@@ -500,6 +500,10 @@ def write_report(path, text):
     except BaseException:
         if tmp is not None:
             try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            try:
                 os.remove(tmp)
             except OSError:
                 pass

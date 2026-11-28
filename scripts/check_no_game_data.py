@@ -3,6 +3,10 @@
     python3 -I scripts/check_no_game_data.py            # every file `git ls-files` lists
     python3 -I scripts/check_no_game_data.py PATH...    # only these files
 
+Explicit PATH inputs must be regular files, not directories or symlinks. A missing, unreadable or non-regular
+explicit input is reported on stderr and causes exit 2 unless another input matches game data (exit 1).
+Default git enumeration still skips symlinks, submodules and files deleted from the working tree.
+
 The extension check in .github/workflows/no-game-data.yml misses a renamed file: a DDS saved as .bin, an executable
 as .txt. This reads the first bytes of each file and matches the magic numbers of the package's formats and the
 files the build extracts from it: RPF9 archives, TTPF texture pools, RAGE resources, XBCH/FSSM/DXBC shader
@@ -25,10 +29,12 @@ exits 1 if there is any. It exits 2 when a file cannot be read or git cannot lis
 repository, or git not installed). Standard library only, no game files.
 """
 import bz2
+import errno
 import gzip
 import io
 import lzma
 import os
+import stat
 import subprocess
 import sys
 import tarfile
@@ -274,15 +280,19 @@ def git_error(e):
     return e.strerror or str(e)
 
 
-def check(paths, unreadable=None):
+def check(paths, unreadable=None, *, explicit=False):
     """[(path, format)] for every regular file in `paths` that starts like game data.
 
-    A file that exists but cannot be opened or read is appended to `unreadable` (when given) as (path, error)."""
+    Files that cannot be opened or read are appended to `unreadable` (when given) as (path, error).
+    Explicit inputs also report missing paths and non-regular entries instead of silently skipping them."""
     found = []
     for path in paths:
-        if os.path.islink(path) or not os.path.isfile(path):
-            continue  # submodules, symlinks, files deleted in the working tree
         try:
+            if explicit:
+                if not stat.S_ISREG(os.lstat(path).st_mode):
+                    raise OSError(errno.EINVAL, "not a regular file", path)
+            elif os.path.islink(path) or not os.path.isfile(path):
+                continue  # submodules, symlinks, files deleted in the working tree
             name = classify_file(path)
         except OSError as e:
             if unreadable is not None:
@@ -311,7 +321,7 @@ def main(argv):
             print(f"check_no_game_data: cannot list the tracked files with git: {git_error(e)}", file=sys.stderr)
             return 2  # not 1: that is the 'game data found' code
     unreadable = []
-    found = check(paths, unreadable)
+    found = check(paths, unreadable, explicit=bool(argv))
     for path, name in found:
         print(f"{display(path)}: {name}")
     for path, e in unreadable:

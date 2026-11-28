@@ -29,6 +29,7 @@ except ImportError:   # run as a script, or imported by runner.py run as a scrip
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SOURCE = os.path.join(HERE, "hw_oracle_drm.c")
+SUBPROCESS_TIMEOUT = 120
 Unavailable = runner.Unavailable
 
 
@@ -50,9 +51,10 @@ def find_node(environ=None, sysfs="/sys/class/drm"):
     """The render node to use, or raise Unavailable."""
     environ = os.environ if environ is None else environ
     node = environ.get("LEONIDA_HW_DRM_NODE")
-    if not node:
+    if not node or not node.strip():
         raise Unavailable("set LEONIDA_HW_DRM_NODE to the render node of a GFX10, GFX11 or GFX12 AMD GPU that "
                           "drives no display (`ls -l /dev/dri/by-path` lists them)")
+    node = node.strip()
     if not os.path.exists(node):
         raise Unavailable(f"LEONIDA_HW_DRM_NODE={node} does not exist")
     displays = connected_displays(node, sysfs)
@@ -64,21 +66,39 @@ def find_node(environ=None, sysfs="/sys/class/drm"):
 
 def _symbols(elf):
     """([(section name, address, file offset, size)], [(symbol, section number, value)]) of a little-endian ELF64."""
-    if elf[:6] != b"\x7fELF\x02\x01":
+    if len(elf) < 0x40 or elf[:6] != b"\x7fELF\x02\x01":
         raise ValueError("not a little-endian ELF64 file")
     shoff, = struct.unpack_from("<Q", elf, 0x28)
     shentsize, shnum, shstrndx = struct.unpack_from("<HHH", elf, 0x3A)
+    if shentsize < 64 or shnum == 0 or shoff > len(elf) or shnum * shentsize > len(elf) - shoff:
+        raise ValueError("ELF64 section header table runs past ELF bounds")
+    if shstrndx >= shnum:
+        raise ValueError(f"ELF64 shstrndx {shstrndx} out of bounds for {shnum} section(s)")
     sections = [struct.unpack_from("<IIQQQQIIQQ", elf, shoff + i * shentsize) for i in range(shnum)]
 
     def string(table, at):
-        start = sections[table][4] + at
-        return elf[start:elf.index(b"\0", start)].decode("ascii", "replace")
+        if not 0 <= table < len(sections):
+            raise ValueError(f"ELF64 string table section index {table} out of bounds")
+        t_off, t_size = sections[table][4], sections[table][5]
+        if t_off > len(elf) or t_size > len(elf) - t_off:
+            raise ValueError("ELF64 string table runs past ELF bounds")
+        if not 0 <= at < t_size:
+            raise ValueError(f"ELF64 string offset {at} out of bounds for table size {t_size}")
+        start = t_off + at
+        end = t_off + t_size
+        nul = elf.find(b"\0", start, end)
+        if nul < 0:
+            raise ValueError("unterminated ELF64 string")
+        return elf[start:nul].decode("ascii", "replace")
 
     symbols = []
     for s in sections:
         if s[1] != 2:   # SHT_SYMTAB
             continue
-        for at in range(s[4], s[4] + s[5], 24):
+        if s[4] > len(elf) or s[5] > len(elf) - s[4] or not 0 <= s[6] < len(sections):
+            raise ValueError("ELF64 symbol table runs past ELF bounds")
+        sym_end = s[4] + (s[5] // 24) * 24
+        for at in range(s[4], sym_end, 24):
             name, _info, _other, shndx, value, _size = struct.unpack_from("<IBBHQQ", elf, at)
             if name and 0 < shndx < len(sections):
                 symbols.append((string(s[6], name), shndx, value))
@@ -93,6 +113,8 @@ def text_section(elf):
         raise ValueError("no .text section")
     text = names.index(".text")
     _name, address, offset, size = sections[text]
+    if offset > len(elf) or size > len(elf) - offset:
+        raise ValueError(".text section runs past ELF bounds")
     return elf[offset:offset + size], {name: value - address for name, shndx, value in symbols if shndx == text}
 
 
@@ -110,8 +132,10 @@ def kernel_registers(elf):
         if not name.endswith(".kd"):
             continue
         _section, address, offset, size = sections[shndx]
-        if value - address + 64 > size:
+        if value < address or value - address + 64 > size:
             raise ValueError(f"{name}: the kernel descriptor runs past its section")
+        if offset > len(elf) or (value - address) + 64 > len(elf) - offset:
+            raise ValueError(f"{name}: the kernel descriptor runs past ELF bounds")
         at = offset + value - address
         group, private = struct.unpack_from("<II", elf, at)
         rsrc3, rsrc1, rsrc2, properties = struct.unpack_from("<IIIH", elf, at + 44)
@@ -181,22 +205,42 @@ class DrmOracle(runner.Oracle):
             flags = ["-I/usr/include/libdrm", "-ldrm_amdgpu"]
             pkg_config = shutil.which("pkg-config")
             if pkg_config:
-                r = subprocess.run([pkg_config, "--cflags", "--libs", "libdrm_amdgpu"], capture_output=True, text=True)
-                if r.returncode == 0 and r.stdout.strip():
-                    flags = r.stdout.split()
-            tmp = exe + f".{os.getpid()}"
+                try:
+                    r = subprocess.run([pkg_config, "--cflags", "--libs", "libdrm_amdgpu"],
+                                       capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
+                    if r.returncode == 0 and r.stdout.strip():
+                        flags = r.stdout.split()
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
             kind, cc = runner.find_cc()
             if kind != "gcc":   # only an override named cl gives anything else on Linux
                 raise Unavailable(f"hw_oracle_drm.c needs gcc or a compiler that takes its options, not {cc}")
-            r = subprocess.run([cc, "-O1", SOURCE, "-o", tmp, *flags], capture_output=True, text=True)
-            if r.returncode:
-                raise Unavailable("hw_oracle_drm.c did not build (it needs the libdrm headers): " + r.stderr.strip()[:300])
-            os.replace(tmp, exe)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(exe), prefix=f".{os.path.basename(exe)}.", suffix=".tmp")
+            os.close(fd)
+            try:
+                try:
+                    r = subprocess.run([cc, "-O1", SOURCE, "-o", tmp, *flags],
+                                       capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    raise Unavailable(f"hw_oracle_drm.c did not build: {e}") from None
+                if r.returncode:
+                    raise Unavailable("hw_oracle_drm.c did not build (it needs the libdrm headers): " + r.stderr.strip()[:300])
+                os.replace(tmp, exe)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
         return exe
 
     def _device_arch(self):
         """What the launcher says the GPU is; it prints its device line before it reads any code."""
-        r = subprocess.run([self.exe, os.devnull, "4", self.node], input="", capture_output=True, text=True)
+        try:
+            r = subprocess.run([self.exe, os.devnull, "4", self.node],
+                               input="", capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise Unavailable(f"hw_oracle_drm probe failed: {e}") from None
         head = r.stdout.splitlines()[0] if r.stdout else ""
         if not head.startswith("#"):
             raise Unavailable((r.stderr.strip() or "the launcher printed no device line")[:300])
@@ -211,9 +255,12 @@ class DrmOracle(runner.Oracle):
         code = os.path.join(self.workdir, "k.bin")
         with open(s, "w", encoding="utf-8", newline="\n") as f:
             f.write(text)
-        r = subprocess.run([self.clang, "--target=amdgcn-amd-amdhsa", f"-mcpu={self.arch}",
-                            *(["-mwavefrontsize64"] if wave == 64 else []), "-c", s, "-o", o],
-                           capture_output=True, text=True)
+        try:
+            r = subprocess.run([self.clang, "--target=amdgcn-amd-amdhsa", f"-mcpu={self.arch}",
+                                *(["-mwavefrontsize64"] if wave == 64 else []), "-c", s, "-o", o],
+                               capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return None, str(e)
         if r.returncode:
             return None, r.stderr
         with open(o, "rb") as f:
@@ -225,7 +272,10 @@ class DrmOracle(runner.Oracle):
         return code, ""
 
     def _launch(self, code, tokens, words=4):
-        r = subprocess.run([self.exe, code, str(words), self.node],
-                           input="\n".join(launcher_tokens(tokens, self._offsets, self._registers)) + "\n",
-                           capture_output=True, text=True)
+        try:
+            r = subprocess.run([self.exe, code, str(words), self.node],
+                               input="\n".join(launcher_tokens(tokens, self._offsets, self._registers)) + "\n",
+                               capture_output=True, text=True, timeout=SUBPROCESS_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return -1, "", str(e)
         return r.returncode, r.stdout, r.stderr

@@ -227,9 +227,17 @@ def write_report(path: Path, doc):
             target.write("\n")
         os.chmod(temporary, published_mode(path))
         os.replace(temporary, path)
+        temporary = None
     finally:
         if temporary is not None:
-            temporary.unlink(missing_ok=True)
+            try:
+                os.chmod(temporary, 0o600)
+            except OSError:
+                pass
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def ensure_report_is_separate(output, inputs):

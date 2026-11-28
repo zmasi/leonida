@@ -34,6 +34,7 @@ import os
 import struct
 import sys
 import zlib
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import world_index as wi  # noqa: E402  (same 0x7a header, schema and stream helpers)
@@ -194,29 +195,64 @@ def prop_list(V, P, blocks, structs, buf, lo, R):
     isz = structs.get(PROP_INST, (0x40, {}))[0] or 0x40
     mat = member_or(structs, PROP_INST, "InstMat", 0)
     add(R, "instances", n)
-    for i in range(n):
-        o = io + i * isz
-        if mat < 0 or o + max(48, mat + 48) > len(ib):
-            add(R, "instances_truncated")
-            break
-        m = _f(ib, o + mat, 12)
-        cols = [(m[0], m[4], m[8]), (m[1], m[5], m[9]), (m[2], m[6], m[10])]
-        t = (m[3], m[7], m[11])
-        lens = [math.sqrt(sum(c * c for c in col)) for col in cols]
-        if min(lens) <= 1e-6 or not all(math.isfinite(x) for x in m):
-            add(R, "matrix_degenerate")
+    need = max(48, mat + 48)
+    fit = _fit(len(ib), io, isz, need, n) if mat >= 0 else 0
+    if fit < n:
+        add(R, "instances_truncated")
+    degenerate = ok = ortho_n = right_n = uniform_n = unit_n = in_box = 0
+    sqrt, isfinite = math.sqrt, math.isfinite
+    for m in _matrices(ib, io, fit, isz, mat):
+        # Three row-major rows of four floats; the axes are the columns of the 3x3 part.
+        # Keep the record-by-record sum() rounding at the classification boundaries.
+        l0 = sqrt(sum((m[0] * m[0], m[4] * m[4], m[8] * m[8])))
+        l1 = sqrt(sum((m[1] * m[1], m[5] * m[5], m[9] * m[9])))
+        l2 = sqrt(sum((m[2] * m[2], m[6] * m[6], m[10] * m[10])))
+        if not isfinite(l0 + l1 + l2 + m[3] + m[7] + m[11]) or min(l0, l1, l2) <= 1e-6:
+            degenerate += 1
             continue
-        u = [[c / l for c in col] for col, l in zip(cols, lens)]
-        ortho = max(abs(sum(u[a][k] * u[b][k] for k in range(3))) for a, b in ((0, 1), (0, 2), (1, 2)))
-        det = (u[0][0] * (u[1][1] * u[2][2] - u[1][2] * u[2][1]) - u[0][1] * (u[1][0] * u[2][2] - u[1][2] * u[2][0])
-               + u[0][2] * (u[1][0] * u[2][1] - u[1][1] * u[2][0]))
-        add(R, "matrix_orthonormal_axes", int(ortho < 0.01))
-        add(R, "matrix_right_handed", int(det > 0))
-        add(R, "matrix_uniform_scale", int(max(lens) - min(lens) < 0.01 * max(lens)))
-        add(R, "matrix_unit_scale", int(all(abs(x - 1) < 0.01 for x in lens)))
+        a = (m[0] / l0, m[4] / l0, m[8] / l0)
+        b = (m[1] / l1, m[5] / l1, m[9] / l1)
+        c = (m[2] / l2, m[6] / l2, m[10] / l2)
+        dab = abs(sum((a[0] * b[0], a[1] * b[1], a[2] * b[2])))
+        dac = abs(sum((a[0] * c[0], a[1] * c[1], a[2] * c[2])))
+        dbc = abs(sum((b[0] * c[0], b[1] * c[1], b[2] * c[2])))
+        det = (a[0] * (b[1] * c[2] - b[2] * c[1]) - a[1] * (b[0] * c[2] - b[2] * c[0])
+               + a[2] * (b[0] * c[1] - b[1] * c[0]))
+        ok += 1
+        ortho_n += max(dab, dac, dbc) < 0.01
+        right_n += det > 0
+        top = max(l0, l1, l2)
+        uniform_n += top - min(l0, l1, l2) < 0.01 * top
+        unit_n += abs(l0 - 1) < 0.01 and abs(l1 - 1) < 0.01 and abs(l2 - 1) < 0.01
         if box:
             mn, mx = box
-            add(R, "translation_in_aabb", int(all(mn[k] - 0.01 <= t[k] <= mx[k] + 0.01 for k in range(3))))
+            in_box += (mn[0] - 0.01 <= m[3] <= mx[0] + 0.01 and mn[1] - 0.01 <= m[7] <= mx[1] + 0.01
+                       and mn[2] - 0.01 <= m[11] <= mx[2] + 0.01)
+    if degenerate:
+        add(R, "matrix_degenerate", degenerate)
+    if ok:
+        add(R, "matrix_orthonormal_axes", ortho_n)
+        add(R, "matrix_right_handed", right_n)
+        add(R, "matrix_uniform_scale", uniform_n)
+        add(R, "matrix_unit_scale", unit_n)
+        if box:
+            add(R, "translation_in_aabb", in_box)
+
+
+def _fit(buf_len, io, isz, need, n):
+    """How many of the n records of size isz starting at io still hold need bytes inside the buffer."""
+    room = buf_len - io - need
+    return 0 if room < 0 else min(n, room // isz + 1)
+
+
+def _matrices(ib, io, fit, isz, mat):
+    """The 12 floats of each of the first fit records, read by one C-level pass when records do not overlap."""
+    if fit <= 0:
+        return ()
+    if isz >= mat + 48 and io + fit * isz <= len(ib):
+        rec = struct.Struct(f"<{mat}x12f{isz - mat - 48}x")
+        return rec.iter_unpack(memoryview(ib)[io:io + fit * isz])
+    return (struct.unpack_from("<12f", ib, io + i * isz + mat) for i in range(fit))
 
 
 def grass_list(V, P, blocks, structs, buf, lo, R):
@@ -243,17 +279,26 @@ def grass_list(V, P, blocks, structs, buf, lo, R):
     sc = member_or(structs, GRASS_INST, "Scale", 0xB)
     need = max(isz, nx + 1, ny + 1, sc + 1, sz + 1, rot + 1)
     add(R, "instances", n)
+    fit = _fit(len(ib), io, isz, need, n) if min(nx, ny, sc, sz, rot) >= 0 else 0
+    if fit < n:
+        add(R, "instances_truncated")
     rmax = 0
-    for i in range(n):
-        o = io + i * isz
-        if min(nx, ny, sc, sz, rot) < 0 or o + need > len(ib):
-            add(R, "instances_truncated")
-            break
-        x, y = ib[o + nx] / 127.5 - 1, ib[o + ny] / 127.5 - 1
-        add(R, "normal_xy_inside_unit_disc", int(x * x + y * y <= 1.0 + 2 / 127.5))
-        add(R, "scale_zero", int(ib[o + sc] == 0))
-        add(R, "scalez_equals_scale", int(ib[o + sz] == ib[o + sc]))
-        rmax = max(rmax, ib[o + rot])
+    if fit:
+        # One strided slice per byte field (the stride is the record size), then counts at C speed: a field
+        # pair is counted once per distinct value pair, and equality of two fields is one XOR of whole columns.
+        col = {f: ib[io + f:io + f + (fit - 1) * isz + 1:isz] for f in {nx, ny, sc, sz, rot}}
+        inside = 0
+        pairs = bytearray(2 * fit)
+        pairs[0::2], pairs[1::2] = col[nx], col[ny]
+        for pair, k in Counter(memoryview(pairs).cast("H")).items():
+            bx, by = pair.to_bytes(2, sys.byteorder)   # the two bytes in memory order, whatever the host
+            x, y = bx / 127.5 - 1, by / 127.5 - 1
+            inside += k * (x * x + y * y <= 1.0 + 2 / 127.5)
+        add(R, "normal_xy_inside_unit_disc", inside)
+        add(R, "scale_zero", col[sc].count(0))
+        diff = int.from_bytes(col[sc], "big") ^ int.from_bytes(col[sz], "big")
+        add(R, "scalez_equals_scale", diff.to_bytes(fit, "big").count(0))
+        rmax = max(col[rot])
     R["rotation_idx_max"] = max(R.get("rotation_idx_max", 0), rmax)
 
 

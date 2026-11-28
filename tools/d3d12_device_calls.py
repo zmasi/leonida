@@ -61,14 +61,17 @@ import os
 import re
 import struct
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+from file_mode import published_mode  # noqa: E402
 from gdk_runtime_calls import (  # noqa: E402
     ARG_INDEX, RAX, RCX, RDX, RIP, RSP, R9, VOLATILE, Code, branches, stack_argument, writes)
 from import_call_sites import import_slots  # noqa: E402
 from pe_inspect import PeFormatError, PeImage  # noqa: E402
+import replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 RBP = 5
@@ -545,12 +548,77 @@ def to_text(file: str, r: dict) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _check_out_dir_ancestors(out_dir: str) -> None:
+    """Fail before scanning when --out or any existing ancestor is not a directory."""
+    if not out_dir:
+        raise OSError("empty --out path")
+    cur = os.path.abspath(out_dir)
+    while True:
+        if os.path.exists(cur) or os.path.islink(cur):
+            if not os.path.isdir(cur):
+                raise OSError(f"{out_dir} is not a directory")
+            return
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            return
+        cur = parent
+
+
+def _write_reports(out_dir: str, reports: tuple[tuple[str, str], ...]) -> None:
+    """Ensure `out_dir` exists, stage all reports as UTF-8 LF temp files, then replace atomically."""
+    os.makedirs(out_dir, exist_ok=True)
+    if not os.path.isdir(out_dir):
+        raise OSError(f"{out_dir} is not a directory")
+    staged: list[tuple[str, str]] = []
+    try:
+        for dest, payload in reports:
+            if os.path.exists(dest) and os.path.isdir(dest):
+                raise OSError(f"{dest} is a directory")
+            with tempfile.NamedTemporaryFile(
+                "w",
+                dir=out_dir,
+                prefix="." + os.path.basename(dest) + ".",
+                suffix=".tmp",
+                encoding="utf-8",
+                newline="\n",
+                delete=False,
+            ) as f:
+                tmp_path = f.name
+                staged.append((tmp_path, dest))
+                f.write(payload)
+                f.flush()
+            os.chmod(tmp_path, published_mode(dest))
+        while staged:
+            tmp_path, dest = staged[0]
+            replace_retry.replace(tmp_path, dest)
+            staged.pop(0)
+    finally:
+        for tmp_path, _ in staged:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
     ap.add_argument("image")
     ap.add_argument("--out", required=True,
                     help="folder for <image>.device_calls.txt and .json (created if missing)")
     a = ap.parse_args(argv)
+    name = os.path.basename(a.image)
+    stem = os.path.join(a.out, name + ".device_calls")
+    report_files = (stem + ".json", stem + ".txt")
+    try:
+        _check_out_dir_ancestors(a.out)
+        for path in report_files:
+            if same_report_path(a.image, path):
+                raise OSError(f"{path} would overwrite the input")
+            if os.path.exists(path) and os.path.isdir(path):
+                raise OSError(f"{path} is a directory")
+    except OSError as e:
+        print(f"cannot write the report: {e.strerror or e}", file=sys.stderr)
+        return 1
     try:
         with open(a.image, "rb") as f:
             data = f.read()
@@ -558,21 +626,10 @@ def main(argv: list[str] | None = None) -> int:
     except (OSError, PeFormatError) as e:
         print(f"{a.image}: not a readable x86-64 PE image ({e})", file=sys.stderr)
         return 1
-    name = os.path.basename(a.image)
+    json_text = json.dumps({"file": name, **r}, indent=1) + "\n"
     text = to_text(name, r)
-    stem = os.path.join(a.out, name + ".device_calls")
     try:
-        if os.path.isfile(a.out):
-            raise OSError(f"{a.out} is a file, not a folder")
-        os.makedirs(a.out, exist_ok=True)
-        for path in (stem + ".json", stem + ".txt"):
-            if same_report_path(a.image, path):
-                raise OSError(f"{path} would overwrite the input")
-        with open(stem + ".json", "w", encoding="utf-8", newline="\n") as f:
-            json.dump({"file": name, **r}, f, indent=1)
-            f.write("\n")
-        with open(stem + ".txt", "w", encoding="utf-8", newline="\n") as f:
-            f.write(text)
+        _write_reports(a.out, ((report_files[0], json_text), (report_files[1], text)))
     except OSError as e:
         print(f"cannot write the report: {e.strerror or e}", file=sys.stderr)
         return 1

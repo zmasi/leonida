@@ -334,6 +334,104 @@ class Cli(unittest.TestCase):
         self.assertEqual(r.returncode, 77, r.stdout + r.stderr)
         self.assertIn("unavailable", r.stdout)
 
+    def test_main_restores_globals_and_rejects_empty_string_options(self):
+        self.assertFalse(d.KNOWN)
+        self.assertTrue(d.LITERALS)
+        rc, _ = self.main("--known", "--no-literals", "--list-ops")
+        self.assertEqual(rc, 0)
+        self.assertFalse(d.KNOWN)
+        self.assertTrue(d.LITERALS)
+
+        rc, _ = self.main("--known", "--no-literals", "--programs", "2", "--seed", "1", "--ops", "v_xor_b32")
+        self.assertEqual(rc, 0)
+        self.assertFalse(d.KNOWN)
+        self.assertTrue(d.LITERALS)
+
+        for flag in ("--hw-arch", "--build", "--work"):
+            for bad in ("", "   "):
+                with self.subTest(flag=flag, bad=bad):
+                    rc, _ = self.main(flag, bad, "--list-ops")
+                    self.assertEqual(rc, 2)
+
+    def test_hw_oracle_result_count_word_length_and_shrink_guards(self):
+        from unittest import mock
+        from hw_oracle import runner
+
+        with self.assertRaisesRegex(RuntimeError, "hardware oracle required"):
+            d.hw_run(None, [["v_mov_b32_e32 v1, 0"]])
+
+        class StubOracle:
+            device = "stub-rdna2"
+
+            def __init__(self, responses):
+                self._responses = list(responses)
+                self.closed = False
+
+            def run(self, kernels):
+                return self._responses.pop(0)
+
+            def close(self):
+                self.closed = True
+
+        stub_short = StubOracle([[[0, 0, 0, 0]]])
+        with mock.patch.object(runner, "open_oracle", return_value=stub_short):
+            rc, out = self.main("--oracle", "hw", "--programs", "2", "--ops", "v_xor_b32")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("harness error", out)
+        self.assertTrue(stub_short.closed)
+
+        stub_words = StubOracle([[[0, 1]]])
+        with mock.patch.object(runner, "open_oracle", return_value=stub_words):
+            rc, out = self.main("--oracle", "hw", "--programs", "1", "--ops", "v_xor_b32")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("expected 4 words", out)
+        self.assertTrue(stub_words.closed)
+
+        stub_shrink = StubOracle([[[0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF]], []])
+        with mock.patch.object(runner, "open_oracle", return_value=stub_shrink):
+            rc, out = self.main("--oracle", "hw", "--programs", "1", "--max-ops", "1", "--ops", "v_xor_b32")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("harness error", out)
+        self.assertTrue(stub_shrink.closed)
+
+    def test_shrink_final_recheck_skip_falls_back_to_original_problem(self):
+        from unittest import mock
+
+        calls = {"n": 0}
+
+        def flaky_translated(lines):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [w ^ 1 for w in d.reference(lines)]
+            raise d.Skip("transient skip during shrink recheck")
+
+        with mock.patch.object(d, "translated", flaky_translated):
+            rc, out = self.main("--programs", "1", "--seed", "1", "--max-ops", "1", "--ops", "v_xor_b32")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("MISMATCH program 0:", out)
+
+    def test_reference_rejects_bad_operands_compares_64bit_dst_and_op_sel(self):
+        bad_lines = (
+            "v_add3_u32 v1, v2, v3, v4 op_sel:[1,0,0,0]",
+            "v_mad_u32_u16 v1, v2, v3, v4 op_sel:[1,0]",
+            "v_mad_u32_u16 v1, v2, v3, v4 op_sel:[0,0,1,0]",
+            "v_cmp_bad_u32_e64 s20, v2, v3",
+            "v_cmp_eq_u32_e32 s20, v2, v3",
+            "v_cmp_eq_u32_e64 v1, v2, v3",
+            "v_cndmask_b32_e64 s4, 1, 2, s20",
+            "v_lshlrev_b64 v2, 1, v[4:5]",
+            "v_lshlrev_b64 v[2:4], 1, v[4:5]",
+            "v_lshlrev_b64 v[2:3], 1, v4",
+            "v_add3_u32 v1, bogus, v3, v4",
+            "v_add3_u32 s1, v2, v3, v4",
+            "v_add3_u32 v1, v2, v3",
+            "s_mov_b32 v1, 0",
+        )
+        for bad in bad_lines:
+            with self.subTest(line=bad):
+                with self.assertRaises(d.RefError):
+                    run(bad)
+
 
 if __name__ == "__main__":
     unittest.main()

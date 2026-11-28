@@ -92,8 +92,8 @@ def read_isa(path):
             continue
         groups = out.setdefault(name, [])
         for enc in ins.iterfind("InstructionEncodings/InstructionEncoding"):
-            g = encoding_group(enc.findtext("EncodingName", ""))
-            g = g or "OTHER:" + enc.findtext("EncodingName", "?")
+            raw_enc = (enc.findtext("EncodingName") or "").strip()
+            g = encoding_group(raw_enc) or ("OTHER:" + (raw_enc or "?"))
             if g not in groups:
                 groups.append(g)
     return {"architecture": arch, "schema": version, "license": licence, "instructions": out}
@@ -166,7 +166,7 @@ def _mnemonic_collection(node):
 
 def scan_translator(path):
     """Static scan of the translator source. Returns the sets described in the module docstring."""
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         tree = ast.parse(f.read(), path)
     exact = collections.defaultdict(set)      # name -> {source kind}
     prefixes = collections.defaultdict(set)   # prefix -> {line}
@@ -277,7 +277,7 @@ def classify(name, scan, handled_elsewhere):
 
 def accepted_names(path):
     """Names compared or tabled anywhere except inside a test whose body only raises Unsupported."""
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         tree = ast.parse(f.read(), path)
     skip = set()
     for node in ast.walk(tree):
@@ -308,7 +308,7 @@ def probe_llvm_mc(llvm_mc, names, mcpu="gfx1013"):
     for n in names:
         try:
             r = subprocess.run([llvm_mc, "-arch=amdgcn", f"-mcpu={mcpu}"], input=n + "\n", capture_output=True,
-                               text=True, timeout=PROBE_TIMEOUT)
+                               text=True, encoding="utf-8", errors="replace", timeout=PROBE_TIMEOUT)
         except OSError as e:
             return {"error": str(e)}
         except subprocess.TimeoutExpired:
@@ -374,7 +374,8 @@ def markdown(rep, list_unknown=False):
              f"Spec: {rep['architecture']}, schema {rep['schema']}, licence {rep['license']}. {n} instructions.", "",
              "| class | instructions | share |", "|---|---:|---:|"]
     for c in CLASSES:
-        lines.append(f"| {c} | {t[c]} | {100 * t[c] / n:.1f}% |")
+        pct = (100 * t[c] / n) if n else 0.0
+        lines.append(f"| {c} | {t[c]} | {pct:.1f}% |")
     lines += ["", "An instruction with several encodings is counted once in the table above and once per group "
               "below, so the group rows add up to more than the total.", "",
               "| encoding | total | handled-exact | handled-family | refused | unknown |",
@@ -441,6 +442,8 @@ def main(argv=None):
         ap.error(f"--translator {a.translator}: {e.strerror or e}")
     except UnicodeDecodeError as e:
         ap.error(f"--translator {a.translator}: not valid UTF-8 ({e.reason} at byte {e.start})")
+    except (SyntaxError, ValueError) as e:
+        ap.error(f"--translator {a.translator}: invalid Python ({e})")
     rep = build_report(isa, scan, accepted)
     if a.llvm_mc:
         probe = probe_llvm_mc(a.llvm_mc, [e["name"] for e in rep["not_in_rdna2"]])

@@ -182,8 +182,79 @@ fit plus everything after it go into a packed array reached through a 40-bit poi
 **`D3D12_ROOT_SIGNATURE_FLAGS`: not documented in the public GDK reference.** Both
 `d3d12/enums/d3d12_root_signature_flags_public.md` and `d3d12_xs/enums/d3d12_root_signature_flags_xs.md` return 404,
 although `D3D12_ROOT_SIGNATURE_DESC::Flags` is typed by it and the PC page links the Xbox name. The console flag
-values, including the high-byte bits this repository measures as `0x03000000`
-([d3d12_vulkan.md §8.2 item 19](d3d12_vulkan.md#82-unknown--open-questions)), have no public page.
+values have no public page, and §2.5 measures what the executable actually writes.
+
+### 2.5 Measured: the flag the real path serializes, and where `PRIV` sits
+
+The pages above stop at the shape. What the retail build does with it was measured statically in the executable
+(image VAs at the default base `0x140000000`; no file bytes are reproduced). This subsection is measurement, not
+documentation.
+
+The builder is `FUN_14247fc40`. Its only incoming reference is data, not a call: the entry table at `0x14acf1200`
+stores its RVA (`0x0247fc40`) at `0x14acf122c`, so a dispatcher reaches it by index. It fills a
+`D3D12_VERSIONED_ROOT_SIGNATURE_DESC` on the stack through `RCX = RSP+0x38` and then passes it to the import thunk of
+`D3D12SerializeVersionedRootSignature` (`0x145f3fdb0`, `JMP qword ptr [0x146793c10]`). The stores
+set every field:
+
+| offset from `RCX` | instruction | field |
+|---|---|---|
+| `+0x00` | `MOV dword ptr [RCX], 0x2` | `Version` = 2 = `D3D_ROOT_SIGNATURE_VERSION_1_1` |
+| `+0x08` | `MOV dword ptr [RCX+0x8], EAX` (`EAX` = 0) | `Desc_1_1.NumParameters` = 0 |
+| `+0x10` | `MOV qword ptr [RCX+0x10], RAX` | `Desc_1_1.pParameters` = null |
+| `+0x18` | `MOV dword ptr [RCX+0x18], EAX` | `Desc_1_1.NumStaticSamplers` = 0 |
+| `+0x20` | `MOV qword ptr [RCX+0x20], RAX` | `Desc_1_1.pStaticSamplers` = null |
+| `+0x28` | `MOV dword ptr [RCX+0x28], 0x80` | **`Desc_1_1.Flags` = `0x80`** |
+
+Two consequences are fixed by those immediates: this path never emits version 1.0, and it never emits `Flags` 0.
+Every signature it serializes carries `0x80`. The description holds no parameters and no samplers, so the only
+content it contributes to the blob is the version `1_1` and the flag `0x80`; the bindings come from the `PRIV` chunk
+below.
+
+`0x80` is `D3D12_ROOT_SIGNATURE_FLAG_LOCAL_ROOT_SIGNATURE`, the same name and value the PC header already
+defines; it is not an Xbox-only extension. What the console changes is *when* the bit is set: the local signature is
+a state-object subobject with its own `ID3D12RootSignature` (§2.1), so the builder sets the bit unconditionally,
+including on a description that names no bindings.
+
+The serializer's output goes to `FUN_140fa09f0`, which does not walk the description. It scans the DXBC container for
+the 8-byte chunk header `PRIV` (`0x56495250` at `+0..+3`, `uint32` payload length `N` at `+4..+7`), requires the
+two-byte marker `0xDC 0xE2` at `+8..+9`, reads the unaligned 32-bit dword at `+0xb` (bytes `1..4` of the compact
+stream) as the lookup key in its ordered map (`0x1475e7760`), and on a miss expands `[chunk + 0xa, chunk + 8 + N)` into
+a temporary `ID3DBlob` via `FUN_1455ac630` (`+0xa` begins with a 1-byte count, a `uint16` at `+0xb..+0xc`, and a second
+1-byte count at `+0xf`). It then passes the expanded blob's buffer and size with `IID_ID3D12RootSignature`
+(`0x1461e06c8`) to `ID3D12Device` vtable slot 16 (`+0x80`, `CreateRootSignature` at `0x140fa0b34` on `[0x148759d00]`),
+and releases the temporary `ID3DBlob` through its vtable slot 2 (`+0x10`, `IUnknown::Release` at `0x140fa0b45`). `PRIV`
+is therefore a compact root signature that is expanded on the way to the device, and the version/flags description
+above is only the envelope the serializer receives.
+
+`PRIV` is no fixed flag blob. The three `3VS_AlphaTransmissionFullScreenTri` containers in the carve (`_3a57a806`,
+`_4f16bf6c`, `_ab6941f7`) each declare one `PRIV` chunk of 484, 480 and 480 total bytes — a 10-byte prefix (4-byte
+`PRIV` id, 4-byte payload length, and the `0xDC 0xE2` marker) followed by 474, 470 and 470 bytes of compact stream
+(including the key dword at `+0xb`) — and those compact streams differ in their trailing tables while sharing the head.
+
+**`0x03000000` appears in neither place.** Over the first 4,000 files of the carve, which hold 3,997 valid
+`PRIV` blocks, a body scan for both byte orders (`03 00 00 00`, `00 00 00 03`) returns 0 hits. In the executable, a
+sweep of the whole `.text` block (image range `0x140001000`–`0x145f40966`) finds 1,514 raw `00 00 00 03` runs; 44 are
+instruction immediates — 37 `MOV r32,imm32`, 1 `MOV r/m32,imm32`, 1 `OR EAX,imm32`, 5 `ADD EAX,imm32` — and 190 more
+sit inside the 8-byte immediate of a `MOV RAX,imm64`. None falls inside `FUN_14247fc40`, `FUN_140fa09f0` or
+`FUN_1455ac630`; all the root-signature code uses `0x80`.
+
+The neighbouring value is easy to confuse with it: `0x30000000` (bytes `00 00 00 30`) *is* used widely, in 56
+`OR EAX, 0x30000000` sites, so a substring search for `0x3000000` returns those and never the `0x03000000` the
+citation means. The two values have nothing to do with each other here. The `OR` sites in `FUN_144da9c70` and
+`FUN_144dbda30` compose instruction-dword bits (`uVar3 = uVar10 | 0x30000000` for one encoding, `... | 0x20000000` /
+`... | 0x10000000` for the two neighbouring ones), and the single `MOV RAX, 0x300000050` at `0x142478499` packs two
+`WNDCLASSEX` dwords into one immediate (`cbSize` 0x50, `style` 0x3). Neither is a root-signature flag.
+
+`0x03000000` is instead a value of a different chunk, `RTS0`, the serialized-signature block that the FSR DLL and the
+BVH builder carry ([d3d12_vulkan.md §8.2 item 19](d3d12_vulkan.md#82-unknown--open-questions)); their flags word at
+body offset 20 is what `copy_rts0_blob_clear_xbox_flags` in `runtime/shims/d3d12_xs_rootsig.cpp` masks. No `RTS0`
+chunk occurs in the carve sample — the executable's own containers carry `PRIV` — and the mask is inert for `PRIV`
+anyway: `clear_high_byte()` masks `~0xFF000000`, so `0x80` survives it unchanged.
+
+That removes the last doubt about the shim: the layer's `D3D12SerializeVersionedRootSignature` shim forwards the
+description to the host serializer after clearing only bits 24–31 (`runtime/shims/d3d12_xs.cpp`), so `0x80` reaches
+the host validator as `0x80`, which is its own public value. Nothing has to be translated for this path; the mask the
+shim applies is there for `RTS0`, not for the `PRIV` path, and it leaves `0x80` alone.
 
 ## 3. State objects, DXIL libraries and hit groups
 
@@ -816,7 +887,7 @@ means the code is absent, not that the API is undocumented.
 
 | Area | Documented contract | State in this repository | Consequence |
 |---|---|---|---|
-| Root signature blobs | `D3D12_ROOT_SIGNATURE_DESC` 1.0/1.1, `D3D_ROOT_SIGNATURE_VERSION`, `CreateRootSignature` (§2.3) | `runtime/shims/d3d12_xs_rootsig.cpp` rewrites the measured `0x03000000` high byte and downgrades 1.2 to 1.1 before forwarding to the host serializer | Correct as a forwarding shim; the console flag semantics stay unknown because the flags enum is not published (§2.4) |
+| Root signature blobs | `D3D12_ROOT_SIGNATURE_DESC` 1.0/1.1, `D3D_ROOT_SIGNATURE_VERSION`, `CreateRootSignature` (§2.3) | The executable's `PRIV` root-signature builder (`FUN_14247fc40`) only ever serializes version 1.1 with `Flags = 0x80` (`LOCAL_ROOT_SIGNATURE`) and carries the bindings in a `PRIV` chunk that is expanded before `ID3D12Device::CreateRootSignature` (§2.5); `runtime/shims/d3d12_xs_rootsig.cpp` clears the `RTS0` high byte and downgrades 1.2 to 1.1 before forwarding | Correct as a forwarding shim, and `0x80` needs no translation; the `0x03000000` word is an `RTS0` value, not the word this path writes |
 | Console root parameters to `s0..s31` | Only `D3D12_ROOT_PARAMETER`'s three inline kinds are published; no user-data slot type (§2.4) | Measured model: inline from `s4`, spill array via a 40-bit pointer at `s[0:1]` ([d3d12_vulkan.md §8.2](d3d12_vulkan.md#82-unknown--open-questions)) | The layer cannot cite a document for the mapping; the shader-side check stays the only test |
 | State objects and RTPSOs | `CreateStateObject`, subobject enum, DXIL library, hit groups, shader/pipeline configs (§3) | No `CreateStateObject`, `DispatchRays` or `GetShaderIdentifier` in `runtime/shims/d3d12_vulkan_device.cpp` | Full DXR stays unimplemented; `RaytracingTier` is answered `NOT_SUPPORTED` and that answer is what the game reacts to |
 | DXIL library exports | Library target 6.3+, `NumExports == 0` means export all, `D3D12_EXPORT_FLAG_NONE` is the only flag (§3.2, §3.3) | Not reached: no state-object path | When a state object path is added, the export-set and rename rules are the part a translator must preserve to keep `GetShaderIdentifier` stable |

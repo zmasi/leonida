@@ -270,6 +270,18 @@ int main() {
     check(enqueue(apu, &activate, &total) == S_OK && dequeue(apu, &r) == S_OK && r.error == S_OK,
           "and it can be activated again");
     check(disconnect(apu, 0x20) == S_OK, "XApuDisconnect(handle, 0x20)");
+    // A handle that is not a live connection is refused, not freed or read (kevincommits' Finding 19 in #1608,
+    // item 5): a second disconnect used to free it again and close its event twice.
+    {
+        alignas(16) static uint8_t foreign[256] = {};
+        uint32_t ignored = 0;
+        check(disconnect(apu, 0x20) == E_INVALIDARG, "a second XApuDisconnect of the handle is E_INVALIDARG");
+        check(enqueue(apu, &activate, &ignored) == E_INVALIDARG && dequeue(apu, &r) == E_INVALIDARG &&
+                  count(apu, &ignored) == 0,
+              "a disconnected handle takes no command and has no results");
+        check(disconnect(foreign, 0x20) == E_INVALIDARG && enqueue(foreign, &activate, &ignored) == E_INVALIDARG,
+              "a handle XApuConnect never made is refused");
+    }
 
     // XDspConnectWithMaximumStreamLimit(buffer, u32, u32, 0x80, 1, handle*), success read as a return of 0.
     alignas(64) static uint8_t dsp_buffer[4096];

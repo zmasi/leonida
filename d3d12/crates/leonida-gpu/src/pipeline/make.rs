@@ -89,7 +89,44 @@ fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if skip_activate && named(shaders, b"CS_ScreenProbes_ActivateRays") {
         return Some("ray activation shader without BVH, left out");
     }
+    if skip_rt_shadow() && RT_SHADOW_NAMES.iter().any(|name| named(shaders, name)) {
+        return Some("traces shadows without BVH, left out (LEONIDA_SKIP_RT_SHADOW=1)");
+    }
     None
+}
+
+/// The entry points of the compute programs that trace the shadows of the
+/// screen tiles the title marks for rays (the edges of the cascades' shadows,
+/// hair): the sun's and the local lights'.
+const RT_SHADOW_NAMES: [&[u8]; 3] = [b"CS_GenerateShadowMasks_Raytraced", b"CS_RTShadowTrace", b"CS_RaytraceShadows"];
+
+/// Whether the traced shadow passes ([`RT_SHADOW_NAMES`]) are left out
+/// (`LEONIDA_SKIP_RT_SHADOW=1`; off by default: they run, as before). Never
+/// with the builder (`LEONIDA_BVH_BUILDER=1`), whose rays have something to
+/// hit.
+///
+/// With every ray a miss (`LEONIDA_BVH_MISS=1`) the tiles they trace come out
+/// lit: in the fork, stair-stepped sun patches on walls and clothes and hair
+/// glowing in the sun. Left out, those tiles keep what their targets held.
+/// The fork measured no frame rate from it (prison walk, RTX 4060 Ti, Series
+/// S: 21.9 fps against 22.6) and keeps it opt-in, so it is opt-in here: a
+/// switch for telling these passes' part in a picture fault from that of the
+/// 1,000 `CS_RaytracingResolve` programs, which `scripts/rt_off_hashes.txt`
+/// only leaves out together with them.
+///
+/// The names are 24 of the compute programs one run had made (its
+/// `known-shaders.bin`, 2026-11-27). That list holds 21 of them and 13 these
+/// names do not (the twelve `CS_RTDistantShadow*` and
+/// `CS_SetRTShadowsIndirectArgs`), and lacks `CS_GenerateShadowMasks_Raytraced`
+/// and the two `CS_RaytraceShadows_*`.
+///
+/// From edsuuu/VI-BR-PORT a04f601 (edsuuu), GPL-3.0.
+fn skip_rt_shadow() -> bool {
+    static SKIP: OnceLock<bool> = OnceLock::new();
+    *SKIP.get_or_init(|| {
+        std::env::var_os("LEONIDA_SKIP_RT_SHADOW").is_some_and(|v| v == "1")
+            && std::env::var_os("LEONIDA_BVH_BUILDER").is_none_or(|v| v != "1")
+    })
 }
 
 /// Confirmed first-scene producers. Prepare these at creation even on a cold

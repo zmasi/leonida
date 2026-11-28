@@ -180,7 +180,8 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   just before its first `SetFrameIntervalX`, but 1920x1080 (also at 120 Hz,
   also with `LEONIDA_DEVICE_TYPE=6`) leaves both at 3840x2160. The size is the
   executable's Series X SDR mode: VIctory upstream's native 1440p profile
-  (`native_1440p.rs`), ported as `runtime/src/display_profile.h`, patches it
+  (`native_1440p.rs`, ported on an unmerged `runtime/` branch as `display_profile.h`
+  and later into `d3d12/crates/leonida-loader/src/hooks.rs`) patches it
   and three related places in the mapped image, and with
   `LEONIDA_DISPLAY_MODE=2560x1440` the window and both back buffers are
   2560x1440 (`LEONIDA_RENDER_SCALE=0.75` renders 1080p into it). Other sizes
@@ -218,7 +219,7 @@ is on), so title GPU memory can live in VRAM and still be written by the CPU.
   writes when it gets there, the system timestamp the performance counter
   once the submission has run. The real title cannot exercise them yet: it
   stops at its render-target pool check before its first frame.
-- Time step (`port/frame-timing`, `runtime/src/frame_step.h`): the title's
+- Time step (unmerged `port/frame-timing` branch, `frame_step.h`): the title's
   timer (+0x22264d0, once a frame) steps its time sets by the measured
   QueryPerformanceCounter delta held to [1/30 s, 1/15 s]: the floor is
   1 / the target frame rate (+0x6849844, from the graphics settings), the cap a
@@ -379,8 +380,9 @@ scope instead. Measured in run 103:
 - draws stopped at about 180 s;
 - the write to 0 came at 211 s, from `game+0x2215c35` through the hook to `game+0x23cf683`.
 
-So the earlier runs that set that budget to delay "the device loss" were what caused it. The budget is now cut to 10 s
-(`kMaxWaitMs` in `runtime/src/pipeline_queue.h`), and runs use the default 500 ms. GPU-assisted validation (run 102,
+So the earlier runs that set that budget to delay "the device loss" were what caused it. The wait cap was later cut
+to 10 s (and the pipeline-wait coordination now lives in `runtime/src/pipeline_wait.h`), with runs using the default
+500 ms budget. GPU-assisted validation (run 102,
 30 minutes) reported nothing but the known sparse-bind message.
 
 Still unexplained in the same load:

@@ -5,36 +5,41 @@ factory opens files and creates queues, and a queue reads file or memory ranges 
 through status arrays, `ID3D12Fence` signals and events. `runtime/shims/dstorage.cpp` serves that API on the PC:
 files open through the runtime's `GAME:` mapping and write overlay, and a worker thread per queue does the reads
 and inflates zlib requests.
-This page records which DLL and ABI the console title is expected to use, how sure that is, and what the shim does.
+This page records which DLL and ABI the console title is measured to use, how sure the rest is, and what the shim does.
 
 ## Which DLL and which ABI: the evidence
 
-The game executable is not in the package available here, so its import table is unmeasured
-([runtime_imports.md](runtime_imports.md)). What is known:
+The executable is not in the package, but with a copy supplied its import table was measured
+([runtime_imports.md](runtime_imports.md), "The retail executable (RT-5)"): it imports `DStorageGetFactory` from
+`XCRDAPI.dll`, one import with one call site. [Below](#measured-factory-the-iid-and-the-vtable-slot) gives the call
+site, the interface id it passes and the vtable slot it then calls. What the package itself shows:
 
 | Evidence | Source | What it says |
 |---|---|---|
+| The executable imports `DStorageGetFactory` from `XCRDAPI.dll`, exactly once | [runtime_imports.md](runtime_imports.md) (RT-5 table), [audio_hal_exe_calls.md](audio_hal_exe_calls.md) | The serving module is measured, not only the name of a module. Neither `dstorage.dll` nor `dstorage_xs.dll` is imported by the executable |
+| The single call site asks for `{62959D11-D45F-4884-A0A3-F7862EA243AE}` and then calls **slot 8** of the returned object with `0x02000000` | [Measured factory](#measured-factory-the-iid-and-the-vtable-slot), this page | The console factory adds one console-only method (`SetCpuAffinity`) alongside the shared `SetDebugFlags` at slots 6–7 between `CreateStatusArray` (5) and `SetStagingBufferSize` (8); PC `dstorage.h` puts `SetDebugFlags` at 6 and `SetStagingBufferSize` at 7 |
 | None of the 16 shipped DLLs imports DirectStorage | [runtime_imports.md](runtime_imports.md) (6 Xbox-specific imports, all `xmem`/`d3d12_xs`), [textures.md](textures.md) "The shipped binaries" (no `DStorage` import, export or string) | DirectStorage, if used, is called by the executable itself |
 | The texture chunks carry the `DSTORAGE_BCPACK_MODE` values 1-7 and mix zlib and BCPack chunks | [textures.md](textures.md) "What BCPack is" | The data is laid out for console DirectStorage's decompression (DEFLATE, then BCPack, then swizzle) |
 | A sibling console layer's export inventory names `dstorage_xs.dll` as console DirectStorage | [d3d12_vulkan.md §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi) | The console module name, measured elsewhere, not here |
-| A retail title run by a sibling layer has `xcrdapi` in its console-only library set | [d3d12_vulkan.md §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi) | Only the name. Nothing in this repository says what `xcrdapi.dll` exports |
+| A retail title run by a sibling layer has `xcrdapi` in its console-only library set | [d3d12_vulkan.md §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi) | The name in a library list; the executable below narrows it to this one export |
 | The GDK reference: `DStorageGetFactory` is in header `dstorage_xs.h`, library `dstorage_xs.lib`; the interface pages give library `dstorage.lib`; all say "Xbox Series consoles" | [GDK DStorage reference](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/dstorage_members) | The console API has its own names (`IDStorageFactoryX`, `IDStorageQueueX`, `IDStorageFileX`, `IDStorageStatusArrayX`) and structures that differ from the PC API |
-| `registry.cpp` classified `dstorage.dll`/`dstorage_xs.dll` `DStorageGetFactory` as returning an HRESULT | `runtime/shims/registry.cpp` | It was an unimplemented import; `xcrdapi.dll` was not named |
+| `registry.cpp` classified `dstorage.dll`/`dstorage_xs.dll` `DStorageGetFactory` as returning an HRESULT | `runtime/shims/registry.cpp` | It was an unimplemented import; `xcrdapi.dll` was not named. The module is measured now and the registry serves all three names |
 
 **Chosen ABI: the console one** (the GDK's `IDStorageFactoryX2`/`IDStorageQueueX2`/`IDStorageFileX`/
 `IDStorageStatusArrayX` and its `DSTORAGE_REQUEST`), served as `DStorageGetFactory` under all three names:
 
 | Module | Confidence | Why |
 |---|---|---|
-| `dstorage_xs.dll` | medium | The reference's `dstorage_xs.lib` and the sibling inventory agree; not measured in this title |
-| `xcrdapi.dll` | low | Only a name in a library list. Owning the module also means a title's `LoadLibrary("xcrdapi.dll")` gets the shims' pseudo-handle, and `GetProcAddress` for any other name returns `NULL` (logged). Static imports of other `xcrdapi` names are unchanged |
-| `dstorage.dll` | low | The interface pages name `dstorage.lib`. Every caller of `gta6rt`'s import table is a console build, so this name serves the console ABI too, not the PC one |
+| `dstorage_xs.dll` | medium | The reference's `dstorage_xs.lib` and the sibling inventory agree. No shipped module and not the executable import it, so nothing in this title needs it; the name is served for a title that would |
+| `xcrdapi.dll` | **measured** | The executable's only DirectStorage import is `DStorageGetFactory` from this DLL and it is the only name it imports from it ([RT-5](runtime_imports.md), [the call site below](#measured-factory-the-iid-and-the-vtable-slot)). `XCRDAPI.dll` is not in the package, so the console OS supplies it. Owning the module also means a title's `LoadLibrary("xcrdapi.dll")` gets the shims' pseudo-handle, and `GetProcAddress` for any other name returns `NULL` (logged). Static imports of other `xcrdapi` names are unchanged |
+| `dstorage.dll` | low | The interface pages name `dstorage.lib`; the executable does not import it. Every caller of `gta6rt`'s import table is a console build, so this name serves the console ABI too, not the PC one |
 
 The PC DirectStorage ABI (`dstorage.h`: `IDStorageFactory` with `DSTORAGE_REQUEST` source and destination unions,
 `ID3D12Resource` destinations) is **not served**. A caller that asks for a PC interface id gets `E_NOINTERFACE` and a
-log line, never an object of the wrong shape. The one exception is `IDStorageStatusArray`, whose two methods are the
-console interface's in the same order (console D3D12 binaries reuse the PC SDK's ids), so a status array accepts its
-id.
+log line, never an object of the wrong shape. The console factory id is not one of those: it is the measured
+`{62959D11-D45F-4884-A0A3-F7862EA243AE}` and the factory accepts it (the shim also takes an id it has not seen and logs
+it). The other exception is `IDStorageStatusArray`, whose two methods are the console interface's in the same order
+(console D3D12 binaries reuse the PC SDK's ids), so a status array accepts its id.
 
 Owning a module has a run-time side: `LoadLibrary` of `xcrdapi.dll` or `dstorage.dll` (or `dstorage_xs.dll`) gets
 the shims' pseudo-handle even when the package ships its own copy of that DLL, so the shim shadows a packaged copy
@@ -45,22 +50,77 @@ of these, so nothing is shadowed today.
 
 | Unknown | Choice | Confidence | Where to change it |
 |---|---|---|---|
-| Vtable order of the console interfaces (the reference lists methods alphabetically) | The PC header's order for the methods both APIs have; console-only methods where the overview lists them: factory `CreateQueue, OpenFile, CreateStatusArray, SetCpuAffinity, SetDebugFlags, SetStagingBufferSize`, then `GetStats` (X1), `CreateQueue1` (X2); queue `EnqueueRequest, EnqueueStatus, EnqueueSignal, Submit, CancelRequestsWithTag, Close, GetErrorEvent, RetrieveErrorRecord, Query`, then `EnqueueSetEvent` (X1), `Query1` (X2); status array `IsComplete, GetHResult`; file `Close, GetHandle` | queue, status array: medium; file: medium; factory: low (the `SetCpuAffinity` slot is a guess) | `runtime/shims/dstorage_xs_abi.h`, one declaration per interface |
-| Interface ids of the X interfaces | A creating call (`DStorageGetFactory`, `CreateQueue*`, `OpenFile`, `CreateStatusArray`) accepts an id it has not seen for the kind of object it hands out and logs it once (`[rt] dstorage: ... asked for {...}: serving the ... interface`), so the first boot records them. It refuses an id seen for another kind, a PC DirectStorage id, and the system COM interfaces (the `{xxxxxxxx-0000-0000-C000-000000000046}` range with `IMarshal`, `IClientSecurity`, ..., and `IAgileObject`, `INoMarshal`, `IInspectable` and a few more). `QueryInterface` follows [d3d12_vulkan.md](d3d12_vulkan.md)'s rule (an unknown id is `E_NOINTERFACE`, logged): it accepts only `IUnknown`, the declared `IDStorageStatusArray` id for a status array, and the ids a creating call accepted for that kind of object | n/a (a policy, not a fact) | `IidPolicy` in `runtime/shims/dstorage.cpp` |
+| Vtable order of the console interfaces (the reference lists methods alphabetically) | The PC header's order for the methods both APIs have; console-only methods (`SetCpuAffinity`, `GetStats`, `CreateQueue1`, `GetHandle`, `Query1`) where the overview lists them: factory `CreateQueue, OpenFile, CreateStatusArray, SetCpuAffinity, SetDebugFlags, SetStagingBufferSize`, then `GetStats` (X1), `CreateQueue1` (X2); queue `EnqueueRequest, EnqueueStatus, EnqueueSignal, Submit, CancelRequestsWithTag, Close, GetErrorEvent, RetrieveErrorRecord, Query`, then `EnqueueSetEvent` (X1), `Query1` (X2); status array `IsComplete, GetHResult`; file `Close, GetHandle`. The factory order is now anchored: the one call site reaches `SetStagingBufferSize` at slot 8 (measured) where PC `dstorage.h` puts `SetDebugFlags` at 6 and `SetStagingBufferSize` at 7, confirming one console-only method (`SetCpuAffinity`) sits alongside `SetDebugFlags` at slots 6 and 7 before it. Which of `SetCpuAffinity` and `SetDebugFlags` is 6 and which is 7 is still unmeasured, as are the X1/X2 slots | queue, status array: medium; file: medium; factory: medium (slot 8 and the 6/7 pair count measured; the relative order of `SetCpuAffinity` and `SetDebugFlags` a guess) | `runtime/shims/dstorage_xs_abi.h`, one declaration per interface; `IDStorageFactoryX::SetStagingBufferSize` must keep slot 8 |
+| Interface ids of the X interfaces | The factory's id is measured: `{62959D11-D45F-4884-A0A3-F7862EA243AE}`, passed at the only `DStorageGetFactory` site ([below](#measured-factory-the-iid-and-the-vtable-slot)); bytes sit at `0x62FC7D8`/VA `0x1462FC7D8`. The others are not: a creating call (`DStorageGetFactory`, `CreateQueue*`, `OpenFile`, `CreateStatusArray`) accepts an id it has not seen for the kind of object it hands out and logs it once (`[rt] dstorage: ... asked for {...}: serving the ... interface`), so the first boot records them. It refuses an id seen for another kind, a PC DirectStorage id, and the system COM interfaces (the `{xxxxxxxx-0000-0000-C000-000000000046}` range with `IMarshal`, `IClientSecurity`, ..., and `IAgileObject`, `INoMarshal`, `IInspectable` and a few more). `QueryInterface` follows [d3d12_vulkan.md](d3d12_vulkan.md)'s rule (an unknown id is `E_NOINTERFACE`, logged): it accepts only `IUnknown`, the declared `IDStorageStatusArray` id for a status array, and the ids a creating call accepted for that kind of object | factory id: measured; the policy: n/a (a policy, not a fact) | `IidPolicy` in `runtime/shims/dstorage.cpp`; the factory id belongs beside `kStatusArrayIds` in `dstorage_xs_abi.h` (`dsx::kFactoryId`) and should be the first id `DStorageGetFactory` accepts |
 | `DSTORAGE_MIN_QUEUE_CAPACITY`, `DSTORAGE_MAX_QUEUE_CAPACITY`, `DSTORAGE_REQUEST_MAX_NAME` | The PC header's values: `0x80`, `0x2000`, 64 | medium | `dstorage_xs_abi.h` |
 | `E_DSTORAGE_*` values | The PC `dstorageerr.h` values (`FACILITY_GAME`, `0x8924xxxx`). That header also defines the console-only failures (zlib, BCPack, swizzle, XVD), so the space is shared. `E_DSTORAGE_DECOMPRESSION_ERROR` (`0x89240030`) is on the public constants page; `E_DSTORAGE_ZLIB_BAD_HEADER`, `_ZLIB_BAD_DATA` and `_ZLIB_PARITY_FAIL` (`0x89240031`-`33`) have no public description, and their names and values come from the header-generated bindings of the `direct-storage` crate (Sources). Which failure the console reports with each zlib code is inferred from the names | medium-high (values); medium (zlib codes' meaning) | `dstorage_xs_abi.h` |
 | Struct layouts | The compiler's x64 layout of the reference's declarations, pinned with `static_assert` (`DSTORAGE_REQUEST` 72 bytes, `DSTORAGE_QUEUE_DESC` 24, `DSTORAGE_QUEUE_DESC1` 32); `DSTORAGE_REQUEST_OPTIONS` is decoded from `AsUINT64` by explicit bit positions (zlib bit 0, BCPack 1-4, swizzle 5-20, destination pages 21, source type 22, source pages 23, reserved 24-63) | high for member order and types, medium for the bit allocation (MSVC allocates bit-fields from bit 0 up) | `dstorage_xs_abi.h` |
 
-The first boot with the executable settles most of this: the dry-run report shows which module it imports
-`DStorageGetFactory` from, and the log lines give the interface ids.
+The first boot with the executable still settles what the file does not: whether the boot reaches these calls at all (the
+dry run and a trace measured elsewhere stop earlier, in `D3D12ConfigureVirtualMemoryX`,
+[audio_hal_exe_calls.md](audio_hal_exe_calls.md)). The module and the factory's id no longer need a boot to find; the
+queue, file and status-array ids, and the relative order of `SetCpuAffinity` and `SetDebugFlags` at factory slots 6 and 7,
+still do.
+
+## Measured factory: the IID and the vtable slot
+
+Reproduce the call site count and the thunk from the file alone:
+
+```powershell
+python -I tools/import_call_sites.py game_scarlett_master.exe --import XCRDAPI.dll!DStorageGetFactory --json
+```
+
+It reports one `call` and one thunk, at RVA `0x1D8E4F0` / VA `0x141D8E4F0` and RVA `0x5F3FF80` / VA `0x145F3FF80`. The
+thunk is the ordinary `jmp qword [rip+…]` through the import's address-table slot (RVA `0x6793FB8`), and the slot holds
+the hint 0, name `DStorageGetFactory`. Capstone around the call site (`0x141D8E4DB`–`0x141D8E51C`), which is the one-time
+initializer of a factory singleton (a `-1`-sentinel one-time wrapper at `0x141D8E470`, itself called from six places,
+reaches it):
+
+```
+lea  rcx, [rip+0x456E2F6]      ; VA 0x1462FC7D8: the interface id, by address
+lea  rdx, [rip+0x5B6798F]      ; VA 0x1478F5E78: the out pointer
+mov  [rip+0x5B67990], rax      ; VA 0x1478F5E80: adjacent global stored before the call
+call 0x145F3FF80               ; DStorageGetFactory(REFIID, void**)
+mov  rcx, [rip+0x5B6797C]      ; VA 0x1478F5E78: the object the call wrote, tested for null
+test rcx, rcx                  ; je -> int3, then test eax, eax / je -> reload + vtable call (else int3)
+mov  rcx, [rip+0x5B6796B]      ; VA 0x1478F5E78: reload after the S_OK check
+mov  rax, [rcx]                ; its vtable
+mov  edx, 0x02000000           ; 32 MiB, the single argument
+call [rax+0x40]                ; slot 8
+test eax, eax                  ; jns, else int3
+```
+
+The id at `0x1462FC7D8` is 16 bytes, `11 9D 95 62 5F D4 84 48 A0 A3 F7 86 2E A2 43 AE`, read as Data1 little-endian
+`u32`, Data2/Data3 little-endian `u16`, then the eight Data4 bytes:
+
+**`{62959D11-D45F-4884-A0A3-F7862EA243AE}`**
+
+Two things follow.
+
+- **Slot 8.** `0x40 / 8 = 8`. `IUnknown` takes 0–2 and PC `dstorage.h` continues `CreateQueue` 3, `OpenFile` 4,
+  `CreateStatusArray` 5, `SetDebugFlags` 6, `SetStagingBufferSize` 7, so `SetStagingBufferSize` at 8 confirms one
+  console-only method (`SetCpuAffinity`) sits alongside the shared `SetDebugFlags` at slots 6 and 7 before it, matching
+  `runtime/shims/dstorage_xs_abi.h` (`SetStagingBufferSize` at slot 8). Both `SetDebugFlags(UINT32)` (`void`) and
+  `SetStagingBufferSize(UINT32)` (`HRESULT`) take one 32-bit argument; the `0x02000000` argument (32 MiB, the largest
+  staging size the shim accepts) and the `HRESULT` sign check (`test eax, eax` / `jns`) after `call [rax+0x40]` identify
+  `SetStagingBufferSize`. The call happens once, on first use, and the object is created before any queue or file exists,
+  which is the state the shim's `E_DSTORAGE_STAGING_BUFFER_LOCKED` rule expects.
+- **The id.** It is the console factory's, not a PC one (it is in none of `kPcInterfaceIds`), so a policy that learns the
+  id at boot would log it on the first call and serve the factory under the PC-open descriptor it guesses from. The shim
+  should accept it as the factory's declared id instead: `QueryInterface` of the factory for it succeeds, and the other
+  kinds refuse it. The queue, file and status-array ids are still unmeasured.
+
+What this does not show: which of `SetCpuAffinity` and `SetDebugFlags` sits at 6 vs 7, which of the factory's other slots
+the title reads (the object is one global, so it reads some), and whether `SetStagingBufferSize` needs anything of the
+shim beyond the size check it already does. The last one is behaviour the first run will show.
 
 ## What the shim does
 
 - **Factory**: one object for the process, never freed (its reference count does not drop below one).
   `SetDebugFlags` and `SetCpuAffinity` are stored only (a console core mask means nothing on the host).
-  `SetStagingBufferSize` accepts 0, 16, 20, 24, 28 and 32 MiB, fails with `E_DSTORAGE_INVALID_STAGING_BUFFER_SIZE`
-  otherwise and with `E_DSTORAGE_STAGING_BUFFER_LOCKED` while a queue or file exists. This records the
-  console setting. Host transform scratch is allocated on demand.
+  `SetStagingBufferSize` accepts 0, 16, 20, 24, 28 and 32 MiB (the title asks for 32 MiB once, at slot 8), fails with
+  `E_DSTORAGE_INVALID_STAGING_BUFFER_SIZE` otherwise and with `E_DSTORAGE_STAGING_BUFFER_LOCKED` while a queue or file
+  exists. This records the console setting. Host transform scratch is allocated on demand.
   `GetStats` reports the counts the shim keeps (queues per priority, requests, bytes, files, errors, zlib
   inflates: `TotalDecompressionRequestCount` grows when a zlib request's inflate starts, which is after its checks
   passed and its source was read, `PendingDecompressionRequestCount` is the inflates running, and
@@ -187,7 +247,17 @@ The first boot with the executable settles most of this: the dry-run report show
 - `runtime/src/bcpack.cpp` ports the interleaved rANS and strict block rebuilders from `tools/bcpack.py` for
   BC1, BC3, BC4, BC5, BC6H and BC7. The predictor window holds 256 blocks. The build generates the lookup
   tables from the existing codec modules. Damaged streams and missing predictors or inconsistent blocks
-  exceeding the reference tolerance give `E_DSTORAGE_DECOMPRESSION_ERROR`. BC2 has no reference decoder.
+  exceeding the tolerance give `E_DSTORAGE_DECOMPRESSION_ERROR`. BC2 has no reference decoder.
+  In fitted mode with a profile, a BC6H/BC7 request may have up to `max(2, blocks / 32)` **lost** blocks:
+  blocks whose endpoint or index predictor chain starts at a history entry the profile does not know. They
+  are rebuilt from the bits the profile has, so their colours can be wrong, and each such request is logged
+  (`[rt] dstorage: BC7 request approximated N of M blocks ...`; the first eight, then at powers of two).
+  `LEONIDA_DSTORAGE_LOST_DIVISOR=N` sets the divisor; 1024 is the reference decoder's limit
+  (`_loose_limit` in `tools/bcpack.py`), which refused such requests outright and left the whole destination
+  untouched. On the 1.0.2.1 package two BC7 requests in `data/ttdb/props/octa_imposters.ttpf` failed at every
+  boot this way (one unknown endpoint entry each, 5 of 1,536 and 15 of 768 blocks lost with a locally built
+  profile); with the default they are published. Inconsistent blocks (anchor or p-bit) keep the 1-in-1,024
+  limit, and strict mode (`LEONIDA_DSTORAGE_FITTED=0`) refuses any lost block as before.
   The runtime accepts the reference's fitted BC1/3/4/5 predictors for streamed art.
   `LEONIDA_DSTORAGE_FITTED=0` requires confirmed entries. Fitted blocks can differ from console output.
   The runtime stage of `make_game.py` generates `<work>/shaders/bcpack/history.bcph` locally.
@@ -263,3 +333,4 @@ a decode crossing two reversed pages, both CPU refill ranges, gather, and event/
 | [DirectStorage constants](https://learn.microsoft.com/en-us/windows/win32/dstorage/dstorage-constants) (Win32 reference) | `E_DSTORAGE_DECOMPRESSION_ERROR` = `0x89240030`; `E_DSTORAGE_INVALID_DESTINATION_SIZE`: equal to the length without decompression, larger with it; `E_DSTORAGE_INVALID_FILE_OFFSET` is the offset invalid for a decompression mode | [Microsoft Learn Terms of Use](https://learn.microsoft.com/en-us/legal/termsofuse); paraphrased |
 | [`direct-storage` crate](https://docs.rs/direct-storage/0.5.1/src/direct_storage/bindings.rs.html) 0.5.1 (bindings generated by `windows-bindgen` from the DirectStorage headers; 0.2.0's `errors.rs` has the same values) | `E_DSTORAGE_ZLIB_BAD_HEADER` `0x89240031`, `E_DSTORAGE_ZLIB_BAD_DATA` `0x89240032`, `E_DSTORAGE_ZLIB_PARITY_FAIL` `0x89240033` (names and values only) | MIT/Apache-2.0; two constants' names and values, no code copied |
 | [RFC 1950](https://www.rfc-editor.org/rfc/rfc1950) and [RFC 1951](https://www.rfc-editor.org/rfc/rfc1951) | The zlib stream and DEFLATE formats `zlib_inflate` decodes | Public specifications |
+| `game_scarlett_master.exe` (RT-5, supplied separately, not vendored) | The single `DStorageGetFactory` import, thunk, call site, the id it passes and the slot-8 call with 32 MiB; measured with `tools/import_call_sites.py` and Capstone 5.0.7 | Facts only, no bytes committed |
