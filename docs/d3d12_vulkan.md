@@ -4881,9 +4881,12 @@ A separate history of the last 16,384 dispatches names the likely hang when it h
 An idle queue (finished equals started) is not called hung: if it still has dispatches submitted, it was waiting
 on a semaphore or stuck in work that is not a dispatch (a draw, a copy). The values are what the GPU wrote before
 it stopped; after a loss and a ring reset they may be stale, so read them as a pointer, not a proof. The cost with
-the switch on is two marker writes per dispatch (a command-processor write and an end-of-pipe event, no wait) plus
-one entry in the history; with it off nothing is recorded. Without the extension, or without
-`LEONIDA_DEVICE_FAULT`, the runtime logs one `device-markers: unavailable` line and runs as before.
+the switch on is two marker writes per dispatch (a command-processor write and an end-of-pipe event), one
+transfer-write barrier over the queue's eight-byte slot before the pair, and one entry in the history. The barrier
+orders earlier writes to the same slot, including across submissions, without changing the marker stages or
+waiting on the host. It can affect transfer scheduling; with the switch off nothing is recorded. Without the
+extension, or without `LEONIDA_DEVICE_FAULT`, the runtime logs one `device-markers: unavailable` line and runs as
+before.
 
 For a local pre-submit inspection, also set `LEONIDA_COMPUTE_INPUTS` to comma-separated shader name fragments and
 `LEONIDA_COMPUTE_INPUT_SLOTS` to comma-separated decimal `root/slot` pairs. For example, `4/86,5/0,5/2,7/0` reads

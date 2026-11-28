@@ -228,6 +228,7 @@ struct CheckpointRecorder {
         if (submission.markers) {
             submission.marked.push_back({seq, submission.execute_call, submission.queue, submission.queue_kind,
                                          static_cast<std::uint32_t>(list), static_cast<std::uint32_t>(command), shader});
+            submission.markers.prepare_dispatch(buffer);
             submission.markers.started(buffer, seq);
             submission.open_marker = seq;
         }

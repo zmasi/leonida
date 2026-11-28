@@ -30,8 +30,16 @@ struct Write {
     std::uint64_t stage;
     VkDeviceSize offset;
     std::uint32_t marker;
+    bool synchronization2;
 };
 std::vector<Write> writes;
+struct Barrier {
+    VkCommandBuffer command_buffer;
+    VkDeviceSize offset;
+    std::size_t preceding_writes;
+    bool slot_dependency;
+};
+std::vector<Barrier> barriers;
 std::uint32_t words[2 * DeviceMarkers::max_queues];
 bool mapped = false, unmapped = false, freed = false;
 
@@ -62,11 +70,24 @@ VKAPI_ATTR void VKAPI_CALL destroy_buffer(VkDevice, VkBuffer, const VkAllocation
 VKAPI_ATTR void VKAPI_CALL free_memory(VkDevice, VkDeviceMemory, const VkAllocationCallbacks*) { freed = true; }
 VKAPI_ATTR void VKAPI_CALL write_marker2(VkCommandBuffer command_buffer, VkPipelineStageFlags2 stage, VkBuffer,
                                          VkDeviceSize offset, std::uint32_t marker) {
-    writes.push_back({command_buffer, stage, offset, marker});
+    writes.push_back({command_buffer, stage, offset, marker, true});
 }
-VKAPI_ATTR void VKAPI_CALL write_marker(VkCommandBuffer command_buffer, VkPipelineStageFlagBits stage, VkBuffer buffer,
+VKAPI_ATTR void VKAPI_CALL write_marker(VkCommandBuffer command_buffer, VkPipelineStageFlagBits stage, VkBuffer,
                                         VkDeviceSize offset, std::uint32_t marker) {
-    write_marker2(command_buffer, stage, buffer, offset, marker);
+    writes.push_back({command_buffer, stage, offset, marker, false});
+}
+
+VKAPI_ATTR void VKAPI_CALL pipeline_barrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst,
+                                           VkDependencyFlags flags, std::uint32_t memory_count, const VkMemoryBarrier*,
+                                           std::uint32_t buffer_count, const VkBufferMemoryBarrier* buffer,
+                                           std::uint32_t image_count, const VkImageMemoryBarrier*) {
+    const auto* slot = buffer_count == 1 ? buffer : nullptr;
+    const bool slot_dependency = src == VK_PIPELINE_STAGE_TRANSFER_BIT && dst == VK_PIPELINE_STAGE_TRANSFER_BIT &&
+        !flags && !memory_count && !image_count && slot && slot->srcAccessMask == VK_ACCESS_TRANSFER_WRITE_BIT &&
+        slot->dstAccessMask == VK_ACCESS_TRANSFER_WRITE_BIT && slot->srcQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED &&
+        slot->dstQueueFamilyIndex == VK_QUEUE_FAMILY_IGNORED && slot->buffer == fake_handle<VkBuffer>(0x100) &&
+        slot->size == 8;
+    barriers.push_back({cb, slot ? slot->offset : 0, writes.size(), slot_dependency});
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_proc(VkDevice, const char* name) {
@@ -81,6 +102,7 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_proc(VkDevice, const char* name) {
     LEONIDA_FAKE("vkFreeMemory", free_memory);
     LEONIDA_FAKE("vkCmdWriteBufferMarkerAMD", write_marker);
     LEONIDA_FAKE("vkCmdWriteBufferMarker2AMD", write_marker2);
+    LEONIDA_FAKE("vkCmdPipelineBarrier", pipeline_barrier);
 #undef LEONIDA_FAKE
     return nullptr;
 }
@@ -180,6 +202,7 @@ int pure_logic() {
 // Recording through CheckpointRecorder with the markers on, then the report's verdict for a stopped "GPU".
 int recorded(bool synchronization2) {
     writes.clear();
+    barriers.clear();
     mapped = unmapped = freed = false;
     const auto memory = memory_types();
     DeviceFaultExtensions enabled;
@@ -215,7 +238,8 @@ int recorded(bool synchronization2) {
             b.dispatched(cb);
         }
         EXPECT(writes.size() == 10);
-        // Each dispatch: started (top of pipe, slot +0) then finished (bottom of pipe, slot +4), with its seq.
+        EXPECT(barriers.size() == writes.size() / 2);
+        // Each dispatch: a slot dependency, then started (top of pipe, slot +0) and finished (bottom, slot +4).
         for (std::size_t i = 0; i < writes.size(); ++i) {
             const Write& w = writes[i];
             const std::uint32_t seq = std::uint32_t(i / 2 + 1);
@@ -226,7 +250,12 @@ int recorded(bool synchronization2) {
             const std::uint64_t bottom_stage = synchronization2 ? VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT
                                                                 : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT;
             EXPECT(w.marker == seq && w.command_buffer == cb && w.offset == slot + (top ? 0 : 4) &&
-                   w.stage == (top ? top_stage : bottom_stage));
+                   w.stage == (top ? top_stage : bottom_stage) && w.synchronization2 == synchronization2);
+            if (top) {
+                const Barrier& barrier = barriers[i / 2];
+                EXPECT(barrier.slot_dependency && barrier.preceding_writes == i &&
+                       barrier.command_buffer == w.command_buffer && barrier.offset == slot);
+            }
         }
         // The report's list numbers them the same way.
         EXPECT(first.dispatches.size() == 3 && first.dispatches[0].seq == 1 && first.dispatches[2].seq == 3);
@@ -280,10 +309,11 @@ int extension_request() {
     auto submission = diagnostics.begin_submission(diagnostics.next_execute_call(), VK_NULL_HANDLE, "compute", 1);
     EXPECT(!submission.markers);
     writes.clear();
+    barriers.clear();
     const CheckpointRecorder recorder{nullptr, submission, diagnostics.pipeline_names, 0};
     recorder.dispatch(VK_NULL_HANDLE, 0, VK_NULL_HANDLE, 0, {}, {1, 1, 1});
     recorder.dispatched(VK_NULL_HANDLE);
-    EXPECT(writes.empty() && submission.dispatches[0].seq == 1 && submission.marked.empty());
+    EXPECT(writes.empty() && barriers.empty() && submission.dispatches[0].seq == 1 && submission.marked.empty());
     EXPECT(diagnostics.report_markers(true).empty());
     return 0;
 }

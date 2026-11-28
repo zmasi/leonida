@@ -114,8 +114,23 @@ struct MarkerTarget {
     PFN_vkCmdWriteBufferMarker2AMD write2 = nullptr;  // with synchronization2
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceSize offset = 0;  // the slot: started at +0, finished at +4
+    PFN_vkCmdPipelineBarrier barrier = nullptr;
 
     explicit operator bool() const { return buffer != VK_NULL_HANDLE; }
+
+    // Before a dispatch's marker pair, outside rendering. The two writes touch disjoint words, so one
+    // dependency orders transfer accesses from previous pairs against both new writes, including across
+    // submits on this queue. The marker commands themselves order same-stage markers at TOP or BOTTOM.
+    void prepare_dispatch(VkCommandBuffer cb) const {
+        VkBufferMemoryBarrier memory{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+        memory.srcAccessMask = memory.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        memory.srcQueueFamilyIndex = memory.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        memory.buffer = buffer;
+        memory.offset = offset;
+        memory.size = 8;
+        barrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 0, nullptr, 1, &memory, 0, nullptr);
+    }
 
     void started(VkCommandBuffer command_buffer, std::uint64_t seq) const {
         if (write2)
@@ -157,15 +172,17 @@ public:
         LEONIDA_MARKER_LOAD(PFN_vkMapMemory, vkMapMemory);
         LEONIDA_MARKER_LOAD(PFN_vkCmdWriteBufferMarkerAMD, vkCmdWriteBufferMarkerAMD);
         LEONIDA_MARKER_LOAD(PFN_vkCmdWriteBufferMarker2AMD, vkCmdWriteBufferMarker2AMD);
+        LEONIDA_MARKER_LOAD(PFN_vkCmdPipelineBarrier, vkCmdPipelineBarrier);
 #undef LEONIDA_MARKER_LOAD
         destroy_buffer_ = reinterpret_cast<PFN_vkDestroyBuffer>(get(device, "vkDestroyBuffer"));
         free_memory_ = reinterpret_cast<PFN_vkFreeMemory>(get(device, "vkFreeMemory"));
         unmap_ = reinterpret_cast<PFN_vkUnmapMemory>(get(device, "vkUnmapMemory"));
         if (!vkCreateBuffer || !vkGetBufferMemoryRequirements || !vkAllocateMemory || !vkBindBufferMemory ||
-            !vkMapMemory || !destroy_buffer_ || !free_memory_ || !vkCmdWriteBufferMarkerAMD)
+            !vkMapMemory || !destroy_buffer_ || !free_memory_ || !vkCmdWriteBufferMarkerAMD || !vkCmdPipelineBarrier)
             return VK_ERROR_EXTENSION_NOT_PRESENT;
         write_ = vkCmdWriteBufferMarkerAMD;
         write2_ = synchronization2 ? vkCmdWriteBufferMarker2AMD : nullptr;
+        barrier_ = vkCmdPipelineBarrier;
         VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
         info.size = VkDeviceSize{8} * max_queues;
         info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -203,7 +220,7 @@ public:
 
     MarkerTarget target(VkQueue queue) const {
         for (std::uint32_t i = 0; i < count_; ++i)
-            if (queues_[i] == queue) return {write_, write2_, buffer_, VkDeviceSize{8} * i};
+            if (queues_[i] == queue) return {write_, write2_, buffer_, VkDeviceSize{8} * i, barrier_};
         return {};
     }
 
@@ -235,6 +252,7 @@ private:
     PFN_vkUnmapMemory unmap_ = nullptr;
     PFN_vkCmdWriteBufferMarkerAMD write_ = nullptr;
     PFN_vkCmdWriteBufferMarker2AMD write2_ = nullptr;
+    PFN_vkCmdPipelineBarrier barrier_ = nullptr;
     VkBuffer buffer_ = VK_NULL_HANDLE;
     VkDeviceMemory memory_ = VK_NULL_HANDLE;
     volatile std::uint32_t* words_ = nullptr;
