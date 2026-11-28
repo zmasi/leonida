@@ -74,7 +74,7 @@ VKAPI_ATTR void VKAPI_CALL write_marker2(VkCommandBuffer command_buffer, VkPipel
 }
 VKAPI_ATTR void VKAPI_CALL write_marker(VkCommandBuffer command_buffer, VkPipelineStageFlagBits stage, VkBuffer,
                                         VkDeviceSize offset, std::uint32_t marker) {
-    writes.push_back({command_buffer, stage, offset, marker, false});
+    writes.push_back({command_buffer, static_cast<std::uint64_t>(stage), offset, marker, false});
 }
 
 VKAPI_ATTR void VKAPI_CALL pipeline_barrier(VkCommandBuffer cb, VkPipelineStageFlags src, VkPipelineStageFlags dst,
