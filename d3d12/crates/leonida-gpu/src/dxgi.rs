@@ -248,41 +248,56 @@ fn display_size() -> (u32, u32) {
     })
 }
 
-/// The console's mode list: one 4K mode at 60 Hz (the title looks
-/// for a 120 Hz one to allow 120 Hz frame intervals).
+fn is_supported_display_format(format: u32) -> bool {
+    matches!(format, 10 | 24 | 28 | 29 | 87 | 91)
+}
+
+/// The console's mode list: one 4K mode at 60 Hz for supported scanout
+/// formats (the title looks for a 120 Hz one to allow 120 Hz frame intervals).
 /// shortcut: fixed mode, not the host display's; report the host's rates if
 /// a title paces by them.
 extern "system" fn modes(
     _: This,
-    _format: u32,
+    format: u32,
     _flags: u32,
     count: *mut u32,
     out: *mut Mode,
 ) -> HRESULT {
-    // SAFETY: the title passes its count (null is tolerated).
-    let Some(count) = (unsafe { count.as_mut() }) else {
+    if count.is_null() {
         return E_INVALIDARG;
-    };
-    if out.is_null() {
-        *count = 1;
+    }
+    if !is_supported_display_format(format) {
+        // SAFETY: `count` is non-null; `write_unaligned` tolerates unaligned callers.
+        unsafe { count.write_unaligned(0) };
         return S_OK;
     }
-    if *count < 1 {
+    if out.is_null() {
+        // SAFETY: as above.
+        unsafe { count.write_unaligned(1) };
+        return S_OK;
+    }
+    // SAFETY: `count` is non-null.
+    let asked = unsafe { count.read_unaligned() };
+    if asked < 1 {
+        // SAFETY: host DXGI writes the copied count (`0`) back on `MORE_DATA`.
+        unsafe { count.write_unaligned(0) };
         return MORE_DATA;
     }
-    *count = 1;
     let (width, height) = display_size();
     let mode = Mode {
         width,
         height,
         refresh: [60, 1],
-        format: 0,
+        format,
         scanlines: 1, // progressive
         scaling: 0,
         flags: 0,
     };
-    // SAFETY: checked non-null; room for `count` >= 1 modes.
-    unsafe { out.write(mode) };
+    // SAFETY: checked non-null; room for `asked` >= 1 modes.
+    unsafe {
+        out.write_unaligned(mode);
+        count.write_unaligned(1);
+    };
     S_OK
 }
 
@@ -358,6 +373,79 @@ mod tests {
             let mut out = object as This;
             assert_eq!(enumerate(object, 1, &mut out), NOT_FOUND, "{method}");
             assert!(out.is_null(), "{method} left a stale output pointer");
+        }
+    }
+
+    #[test]
+    fn display_modes_filter_unsupported_formats_and_echo_requested_format() {
+        type Modes = extern "system" fn(This, u32, u32, *mut u32, *mut Mode) -> HRESULT;
+        let get_modes = slot::<Modes>(&OUTPUT_OBJECT, 0xa8);
+
+        assert_eq!(
+            get_modes(&OUTPUT_OBJECT, 28, 0, std::ptr::null_mut(), std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+
+        // Unsupported formats (including DXGI_FORMAT_UNKNOWN = 0) report 0 modes with S_OK.
+        for bad_fmt in [0u32, 42, 61, 999] {
+            let mut count = 77u32;
+            assert_eq!(
+                get_modes(&OUTPUT_OBJECT, bad_fmt, 0, &mut count, std::ptr::null_mut()),
+                S_OK
+            );
+            assert_eq!(count, 0, "format {bad_fmt} null out");
+
+            let mut raw = [0xAAu8; size_of::<Mode>()];
+            for initial in [0u32, 4] {
+                let mut n = initial;
+                assert_eq!(
+                    get_modes(&OUTPUT_OBJECT, bad_fmt, 0, &mut n, raw.as_mut_ptr().cast()),
+                    S_OK
+                );
+                assert_eq!(n, 0, "format {bad_fmt} initial {initial}");
+                assert_eq!(raw, [0xAAu8; size_of::<Mode>()]);
+            }
+        }
+
+        // Supported scanout formats echo their format, handle MORE_DATA, and tolerate unaligned slots.
+        for fmt in [10u32, 24, 28, 29, 87, 91] {
+            let mut count = 0u32;
+            assert_eq!(
+                get_modes(&OUTPUT_OBJECT, fmt, 0, &mut count, std::ptr::null_mut()),
+                S_OK
+            );
+            assert_eq!(count, 1);
+
+            let mut untouched = [0xCCu8; size_of::<Mode>()];
+            let mut zero_cap = 0u32;
+            assert_eq!(
+                get_modes(
+                    &OUTPUT_OBJECT,
+                    fmt,
+                    0,
+                    &mut zero_cap,
+                    untouched.as_mut_ptr().cast(),
+                ),
+                MORE_DATA
+            );
+            assert_eq!(zero_cap, 0);
+            assert_eq!(untouched, [0xCCu8; size_of::<Mode>()]);
+
+            let mut unaligned_count = [0u8; 8];
+            let mut unaligned_mode = [0u8; size_of::<Mode>() + 4];
+            // SAFETY: offsets +1 lie inside our stack arrays and hold `u32` / `Mode` bytes.
+            unsafe {
+                let count_ptr = unaligned_count.as_mut_ptr().add(1).cast::<u32>();
+                let mode_ptr = unaligned_mode.as_mut_ptr().add(1).cast::<Mode>();
+                count_ptr.write_unaligned(4);
+                assert_eq!(get_modes(&OUTPUT_OBJECT, fmt, 0, count_ptr, mode_ptr), S_OK);
+                assert_eq!(count_ptr.read_unaligned(), 1);
+                let mode = mode_ptr.read_unaligned();
+                assert_eq!(mode.format, fmt);
+                assert!(mode.width >= 640 && mode.height >= 360);
+                assert_eq!(mode.refresh, [60, 1]);
+                assert_eq!(mode.scanlines, 1);
+            }
         }
     }
 }
