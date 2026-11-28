@@ -613,6 +613,72 @@ fn wave_atomic_pair_program(
     two_waves(&head, cmp, &region, &tail)
 }
 
+/// Same 128-thread lane-branch loop region, but containing only **one** DS atomic instruction
+/// executed across two loop iterations (`v20 = 0..2`): iteration 0 runs `v10 < 32` (`val_a`) and
+/// iteration 1 runs `v10 >= 32` (`val_b`).
+fn wave_single_atomic_loop_program(op: u32, val_a: u32, val_b: u32, seed: u32) -> NativeProgram {
+    const DS_READ2ST64_B32: u32 = 0x38;
+    let mut head = vec![
+        sop1(3, 22, k(0)),
+        vop1(1, 4, k(0)),
+        vop1(1, 5, 0xFF),
+        seed,
+        vop1(1, 6, 0xFF),
+        0xCAFE_BABD,
+    ];
+    head.extend(ds(DS_WRITE_B32, 0, 4, 5, 0, 0, 0));
+    head.extend(ds(DS_WRITE_B32, 0, 4, 6, 0, 256, 0));
+    head.extend([S_WAITCNT_LGKM0, S_BARRIER, vop2(0x1B, 5, k(1), 0)]);
+    let cmp = vopc(0xC5, k(0), 5);
+
+    let mut region = vec![
+        sop1(3, 22, k(1)),
+        sop1(4, 14, EXEC),
+        vop1(1, 20, k(0)), // v20 = 0 (iteration counter 0..2)
+        0xBF82_0001,
+        vop1(0, 0, 0),
+    ];
+    let top_at = 4usize;
+    region.extend(ds(DS_READ2ST64_B32, 8, 4, 0, 0, 1, 1));
+    region.extend(mbcnt(false, 13, K_M1, k(0)));
+    region.extend(mbcnt(true, 10, K_M1, V + 13)); // v10 = console lane 0..63
+    region.extend([
+        vop2(0x16, 15, k(5), 10), // v_lshrrev_b32 v15, 5, v10 (0 in wave0, 1 in wave1)
+        sop1(4, 18, EXEC),
+        vopc(0xD2, V + 20, 15),   // v_cmpx_eq_u32 exec, v20, v15 (active when iter == half_id)
+        vop1(1, 11, 0xFF),
+        val_a,
+    ]);
+    // Overwrite v11 with val_b when v15 == 1.
+    region.extend([
+        sop1(4, 16, EXEC),
+        vopc(0xD2, k(1), 15),
+        vop1(1, 11, 0xFF),
+        val_b,
+        sop1(4, EXEC, 16),
+    ]);
+    region.extend(ds(op, 0, 4, 11, 0, 0, 0)); // single DS atomic in the entire region!
+    region.extend([
+        sop1(4, EXEC, 18),
+        vop2(0x25, 20, k(1), 20), // v20 += 1
+        vopc(0xD4, k(2), 20),     // v_cmpx_gt_u32 exec, 2, v20 (v20 < 2)
+    ]);
+    let branch_at = region.len();
+    let offset = (top_at as i32 - (branch_at as i32 + 1)) as i16 as u16 as u32;
+    region.push(0xBF89_0000 | offset);
+
+    let mut tail = vec![S_WAITCNT_LGKM0, S_BARRIER, vop1(1, 4, k(0))];
+    tail.extend(ds(DS_READ_B32, 7, 4, 0, 0, 0, 0));
+    tail.extend([
+        S_WAITCNT_LGKM0,
+        vop2(0x25, 8, 22, 8),
+        vop2(0x1A, 12, k(3), 0),
+    ]);
+    tail.extend(store(7, 12, 0));
+    tail.extend(store(8, 12, 4));
+    two_waves(&head, cmp, &region, &tail)
+}
+
 #[test]
 fn exact_region_refuses_noncommuting_minmax_and_executes_same_type_minmax_on_gpu() {
     const DS_MIN_I32: u32 = 0x05;
@@ -632,11 +698,17 @@ fn exact_region_refuses_noncommuting_minmax_and_executes_same_type_minmax_on_gpu
         translated_for_32(&mixed_max, Some(true)).is_err(),
         "mixed signed/unsigned ds_max_i32 + ds_max_u32 must not elide cross-wave ordering"
     );
-    // 3. ds_min_f32(qNaN_1) vs ds_min_f32(qNaN_2) on qNaN_0 (last writer wins in Lower::lds_float_pick).
+    // 3. ds_min_f32(qNaN_1) vs ds_min_f32(qNaN_2) on qNaN_0 (last writer wins in Lower::lds_float_pick),
+    //    both as two instructions and as a single ds_min_f32 executed across two loop iterations.
     let float_min = wave_atomic_pair_program(DS_MIN_F32, 0x7FC0_0001, DS_MIN_F32, 0x7FC0_0002, 0x7FC0_0000);
     assert!(
         translated_for_32(&float_min, Some(true)).is_err(),
         "ds_min_f32 + ds_min_f32 must not elide cross-wave ordering due to NaN payload order"
+    );
+    let single_float_min = wave_single_atomic_loop_program(DS_MIN_F32, 0x7FC0_0001, 0x7FC0_0002, 0x7FC0_0000);
+    assert!(
+        translated_for_32(&single_float_min, Some(true)).is_err(),
+        "single ds_min_f32 in a loop across host waves must be rejected"
     );
 
     // Same-type integer min/max commute across the two 32-lane host waves: refused with
@@ -650,6 +722,10 @@ fn exact_region_refuses_noncommuting_minmax_and_executes_same_type_minmax_on_gpu
     let shader_u32 = translated_for_32(&same_u32, Some(true))
         .expect("same-type ds_min_u32 + ds_min_u32 translates via lds_exact");
 
+    let single_u32 = wave_single_atomic_loop_program(DS_MIN_U32, 3, 7, 20);
+    let shader_single_u32 = translated_for_32(&single_u32, Some(true))
+        .expect("single ds_min_u32 in a loop across host waves translates via lds_exact");
+
     let same_i32 = wave_atomic_pair_program(DS_MIN_I32, (-3i32) as u32, DS_MIN_I32, (-9i32) as u32, 5);
     let shader_i32 = translated_for_32(&same_i32, Some(true))
         .expect("same-type ds_min_i32 + ds_min_i32 translates via lds_exact");
@@ -661,6 +737,7 @@ fn exact_region_refuses_noncommuting_minmax_and_executes_same_type_minmax_on_gpu
     }
     for (shader, want_min, label) in [
         (&shader_u32, 3u32, "ds_min_u32"),
+        (&shader_single_u32, 3u32, "single_loop_ds_min_u32"),
         (&shader_i32, (-9i32) as u32, "ds_min_i32"),
     ] {
         let Some(out) = whole_uav(shader, [0, 0], 256) else {
