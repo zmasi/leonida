@@ -143,11 +143,99 @@ int check_stream_pool() {
     return 0;
 }
 
+// A request whose bytes run into the next mapping gets one mapping for all of them, not a zero-size view: the
+// extent made for it stops at that mapping (clip_title_pool_extent), and a view given less than its bytes would reach
+// past its copy. The cover takes the windows it reaches whole, in either view, and nothing else. Made-up addresses:
+// nothing is mapped here.
+int check_pool_cover() {
+    constexpr std::uint64_t cpu = 0x7ff612340000ull, gpu = 0x5612340000ull, pool = 4 * kMiB;
+    const auto window = [](std::uint64_t shader_va) { return shader_va >= 0x100000 && shader_va < 0x800000; };
+    leonida::TitleVaAliases table;
+    leonida::TitleWindowRange cover{}, unused{};
+    // An extent 512 KiB in, 256 KiB long, at both of the pair's addresses.
+    EXPECT(table.add_twin(cpu + 0x80000, gpu + 0x80000, 0x40000, 0x100000));
+    // A request 128 KiB before it for 192 KiB: from its own page, over the first extent, whole, in both views.
+    EXPECT(leonida::title_pool_cover(table, cpu, cpu + pool, cpu + 0x60000, gpu + 0x60000, cpu + 0x60000,
+                                     cpu + 0x90000, kAlign, kMiB, window, cover));
+    EXPECT(cover.start == cpu + 0x60000 && cover.size == 0x60000);
+    // A request that starts inside the first extent and ends past it: the same, from the extent's start, and an end
+    // that is not page-aligned is rounded up.
+    EXPECT(leonida::title_pool_cover(table, cpu, cpu + pool, cpu + 0xB0000, gpu + 0xB0000, cpu + 0xB0000,
+                                     cpu + 0xD0010, kAlign, kMiB, window, cover));
+    EXPECT(cover.start == cpu + 0x80000 && cover.size == 0x60000);
+    // add_twin refuses to enter it over the first extent; replace_twin replaces that one's ranges whole, and every
+    // byte they answered for is answered again.
+    EXPECT(!table.add_twin(cover.start, gpu + 0x80000, cover.size, 0x200000));
+    // A buffer the title places in the cover's span in either view after the plan (slot 133 takes no lock of the
+    // planner's) is not erased with the windows: replace_twin refuses and leaves every range as it was.
+    for (const std::uint64_t placed : {cpu + 0xC0000, gpu + 0xC8000}) {
+        leonida::TitleVaAliases raced;
+        EXPECT(raced.add_twin(cpu + 0x80000, gpu + 0x80000, 0x40000, 0x100000));
+        EXPECT(leonida::title_pool_cover(raced, cpu, cpu + pool, cpu + 0xB0000, gpu + 0xB0000, cpu + 0xB0000,
+                                         cpu + 0xD0010, kAlign, kMiB, window, cover));
+        EXPECT(raced.add(placed, 0x4000, 0x900000));
+        EXPECT(!raced.replace_twin(cover.start, gpu + 0x80000, cover.size, 0x200000, window));
+        EXPECT(raced.size() == 3 && raced.shader_va(placed + 0x10) == 0x900010);
+        EXPECT(raced.shader_va(cpu + 0x80000) == 0x100000 && raced.shader_va(gpu + 0xBFFFF) == 0x13FFFF);
+    }
+    EXPECT(table.replace_twin(cover.start, gpu + 0x80000, cover.size, 0x200000, window));
+    EXPECT(table.size() == 2);
+    EXPECT(table.shader_va(cpu + 0xBFFFF) == 0x23FFFF && table.shader_va(gpu + 0xD000F) == 0x25000F);
+    // Past `most`, or into a range that is not a window (a buffer placed in the GPU-only view), there is no cover.
+    EXPECT(!leonida::title_pool_cover(table, cpu, cpu + pool, cpu + 0x70000, gpu + 0x70000, cpu + 0x70000,
+                                      cpu + 0x90000, kAlign, 0x40000, window, unused));
+    EXPECT(table.add(gpu + 0xE0000, 0x8000, 0x900000));
+    EXPECT(!leonida::title_pool_cover(table, cpu, cpu + pool, cpu + 0xD8000, gpu + 0xD8000, cpu + 0xD8000,
+                                      cpu + 0xE4000, kAlign, kMiB, window, unused));
+    std::printf("stream pool: a request crossing into the next extent gets one 384 KiB mapping over it, whole; none "
+                "over a buffer or past the cap\n");
+    return 0;
+}
+
+// The twin view is bounded like the pool's own, and never computed modulo 2^64. Made-up addresses.
+int check_pool_cover_bounds() {
+    const auto window = [](std::uint64_t shader_va) { return shader_va >= 0x100000 && shader_va < 0x800000; };
+    leonida::TitleWindowRange cover{};
+    {
+        // Pool [0x100000, 0x500000), twin view [0x400000, 0x800000). A window at [0x200000, 0x440000) reaches the
+        // twin view from below it: covering it would erase it whole and leave [0x200000, 0x420000) unanswered.
+        leonida::TitleVaAliases table;
+        EXPECT(table.add(0x200000, 0x240000, 0x100000));
+        EXPECT(!leonida::title_pool_cover(table, 0x100000, 0x500000, 0x120000, 0x420000, 0x120000, 0x130000, kAlign,
+                                          kMiB, window, cover));
+        // And at the top: a window at [0x7F0000, 0x810000) runs past the twin view's end.
+        leonida::TitleVaAliases top;
+        EXPECT(top.add(0x7F0000, 0x20000, 0x100000));
+        EXPECT(!leonida::title_pool_cover(top, 0x100000, 0x500000, 0x4E0000, 0x7E0000, 0x4E0000, 0x4F8000, kAlign,
+                                          kMiB, window, cover));
+    }
+    {
+        // A twin view that would start below 0: the pool's first 3 MiB sit before address 0 there, so the request's
+        // span in it wraps. Refused, not looked up as an empty range past the window at [0, 0x20000).
+        leonida::TitleVaAliases table;
+        EXPECT(table.add(0, 0x20000, 0x100000));
+        EXPECT(!leonida::title_pool_cover(table, 0x10000000, 0x10400000, 0x10300000, 0x100000, 0x10000000,
+                                          0x10310000, kAlign, 4 * kMiB, window, cover));
+    }
+    {
+        // One that would end past 2^64: the request's span there wraps, and a buffer in it (not a window) was missed.
+        leonida::TitleVaAliases table;
+        constexpr std::uint64_t twin = 0xFFFFFFFFFFF00000ull;
+        EXPECT(table.add(twin + 0x80000, 0x10000, 0x900000));
+        EXPECT(!leonida::title_pool_cover(table, 0x100000, 0x500000, 0x100000, twin, 0x100000, 0x200000, kAlign, kMiB,
+                                          window, cover));
+    }
+    std::printf("stream pool: no cover over a mapping past the twin view, nor over a twin view past 64 bits\n");
+    return 0;
+}
+
 }  // namespace
 
 int main() {
     if (check_window_budget()) return 1;
     if (check_stream_pool()) return 1;
+    if (check_pool_cover()) return 1;
+    if (check_pool_cover_bounds()) return 1;
     std::printf("title_window_plan: a refused window gives no raw base, and a stream pool's two views share one "
                 "mapping\n");
     return 0;

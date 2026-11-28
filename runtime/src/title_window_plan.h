@@ -9,8 +9,11 @@
 //   - a stream pool (the title's CPU view paired with a GPU-only alias, gfxgeom section 3) is one reservation of
 //     16-24 GiB, so it cannot be one allocation: one mapping serves a page-aligned readable run of it, and every
 //     request inside that run reuses it instead of asking for a 128 KiB window each.
+#include "title_va_alias.h"
+
 #include <algorithm>
 #include <cstdint>
+#include <vector>
 
 namespace leonida {
 
@@ -60,6 +63,61 @@ inline bool title_pool_extent(std::uint64_t pool_lo, std::uint64_t pool_hi, std:
     end = (std::min)(end, pool_hi);
     if (end <= va || end <= start) return false;
     out = {start, end - start};
+    return true;
+}
+
+inline bool clip_title_pool_extent(TitleWindowRange& extent, std::uint64_t source, std::uint64_t twin,
+                                   std::uint64_t source_lo, std::uint64_t source_hi,
+                                   std::uint64_t twin_lo, std::uint64_t twin_hi) {
+    if (source < source_lo || source >= source_hi || twin < twin_lo || twin >= twin_hi ||
+        source < extent.start || source - extent.start >= extent.size)
+        return false;
+    const auto prefix = source - extent.start;
+    const auto before = std::min({prefix, source - source_lo, twin - twin_lo});
+    const auto after = std::min({extent.size - prefix, source_hi - source, twin_hi - twin});
+    extent = {source - before, before + after};
+    return true;
+}
+
+// The one mapping a stream-pool request [va, end) gets when what would serve it stops short: the extent clipped to
+// the free span (clip_title_pool_extent) ends at the next mapping, or `va` lies in a mapping that ends before `end`.
+// It starts at `start` (that extent's start, or `va`) and covers the request and, whole, every range the result
+// overlaps in either view (`twin`: va's byte in the pair's other view, `va` when there is none), page-aligned at its
+// end. A range entered over it replaces those ranges whole (TitleVaAliases::replace_twin), so none of their bytes is
+// left unanswered and no view reaches past the copy it was given. `owned(shader_va)` says the caller can retire the
+// copy a range answers from (a title window); any other range in the way (a slot-133 buffer, a geometry copy) makes
+// it false, as does a mapping past `most` bytes or outside [pool_lo, pool_hi) in its own view. The pool's other view
+// is [twin_lo, twin_hi), `twin` being va's byte there; one that would not fit in 64 bits makes it false too, so no
+// address is ever taken modulo 2^64. `out` is unchanged on false.
+template <class Owned>
+inline bool title_pool_cover(const TitleVaAliases& aliases, std::uint64_t pool_lo, std::uint64_t pool_hi,
+                             std::uint64_t va, std::uint64_t twin, std::uint64_t start, std::uint64_t end,
+                             std::uint64_t align, std::uint64_t most, Owned&& owned, TitleWindowRange& out) {
+    if (!align || (align & (align - 1)) != 0 || start > va || va >= end || start < pool_lo || end > pool_hi)
+        return false;
+    if (twin < va - pool_lo || pool_hi - va > UINT64_MAX - twin) return false;
+    const auto aligned_end = [&](std::uint64_t e) {
+        return e > pool_hi - (align - 1) ? pool_hi : (std::min)(pool_hi, (e + align - 1) & ~(align - 1));
+    };
+    // Each view's bounds: a range at x in the twin view is at x - twin_lo + pool_lo in va's.
+    const std::uint64_t base[2] = {pool_lo, twin - (va - pool_lo)}, top[2] = {pool_hi, twin + (pool_hi - va)};
+    std::uint64_t lo = start, hi = aligned_end(end);
+    std::vector<TitleVaAliases::Mapping> hits;
+    for (bool grew = true; grew;) {
+        grew = false;
+        for (int view = 0; view < (twin != va ? 2 : 1); ++view) {
+            aliases.overlapping(lo - pool_lo + base[view], hi - pool_lo + base[view], hits);
+            for (const TitleVaAliases::Mapping& m : hits) {
+                // Not ours, or not coverable: reaching past the pool in its own view.
+                if (!owned(m.shader_va) || m.title_va < base[view] || m.end > top[view]) return false;
+                const std::uint64_t b = m.title_va - base[view] + pool_lo, e = m.end - base[view] + pool_lo;
+                if (b < lo) lo = b, grew = true;
+                if (e > hi) hi = aligned_end(e), grew = true;
+            }
+        }
+        if (lo < pool_lo || hi > pool_hi || hi - lo > most) return false;
+    }
+    out = {lo, hi - lo};
     return true;
 }
 

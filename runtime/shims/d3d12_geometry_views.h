@@ -383,6 +383,18 @@ public:
         executing_.push_back(++execute_serial_);
         return execute_serial_;
     }
+    // The last replay begun, and the oldest still in progress (kAfterExecutes when none): what execute_end stamps by,
+    // for a copy the device retires the same way outside these views (a title window, DeviceState::retire_windows).
+    std::uint64_t execute_epoch() {
+        std::lock_guard lock(execute_mutex_);
+        return execute_serial_;
+    }
+    std::uint64_t oldest_execute() {
+        std::lock_guard lock(execute_mutex_);
+        std::uint64_t oldest = kAfterExecutes;
+        for (const auto s : executing_) oldest = (std::min)(oldest, s);
+        return oldest;
+    }
     // The replay that began with `serial` has recorded its submissions. Views retired while only replays now finished
     // were in progress get submitted() (the context's submitted_retire_ticket(), read here, after those replays
     // recorded theirs) as their retire ticket. Lock order: mutex_ -> execute_mutex_, as in retire_range.

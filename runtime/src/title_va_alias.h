@@ -23,10 +23,12 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <iterator>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -65,9 +67,72 @@ public:
     // The two addresses of one stream-pool extent (a GPU-only alias and the CPU view of the same pages, gfxgeom
     // section 3): both name the same shader VA, so a title view carrying either resolves to the one mapping.
     bool add_twin(std::uint64_t va, std::uint64_t twin, std::uint64_t bytes, std::uint64_t shader_va) {
-        if (va == twin) return add(va, bytes, shader_va);
-        const bool first = add(va, bytes, shader_va);
-        return add(twin, bytes, shader_va) && first;
+        if (!bytes || va > UINT64_MAX - bytes || twin > UINT64_MAX - bytes) return false;
+        if (va != twin && va < twin + bytes && twin < va + bytes) return false;
+        std::unique_lock lock(mutex_);
+        if (overlaps(va, va + bytes) || (va != twin && overlaps(twin, twin + bytes))) return false;
+        decltype(ranges_) pending;
+        pending.try_emplace(va, Range{va + bytes, shader_va});
+        pending.try_emplace(twin, Range{twin + bytes, shader_va});
+        publish_pool_ranges(pending);
+        return true;
+    }
+
+    // add_twin over live ranges: every range either address's bytes overlap is replaced whole (each is told as a
+    // removal), then both are entered under one lock. For a stream-pool request that runs into the windows next to it
+    // (title_pool_cover): the new range covers each of them whole, so none of their bytes is left unanswered.
+    // `replaces(shader_va)` names the ranges the caller planned to replace; one it does not (a slot-133 buffer
+    // entered since the plan, which takes no lock of the caller's) makes it false with nothing changed, checked
+    // under the same lock as the replacement.
+    template <class Replaces>
+    bool replace_twin(std::uint64_t va, std::uint64_t twin, std::uint64_t bytes, std::uint64_t shader_va,
+                      Replaces&& replaces) {
+        if (!bytes || va > UINT64_MAX - bytes || twin > UINT64_MAX - bytes) return false;
+        if (va != twin && va < twin + bytes && twin < va + bytes) return false;
+        std::unique_lock lock(mutex_);
+        const auto planned = [&](std::uint64_t begin, std::uint64_t end) {
+            auto it = ranges_.lower_bound(begin);
+            if (it != ranges_.begin() && std::prev(it)->second.end > begin) --it;
+            for (; it != ranges_.end() && it->first < end; ++it)
+                if (!replaces(it->second.shader_va)) return false;
+            return true;
+        };
+        if (!planned(va, va + bytes) || (va != twin && !planned(twin, twin + bytes))) return false;
+        erase_overlapping(va, va + bytes);
+        if (va != twin) erase_overlapping(twin, twin + bytes);
+        decltype(ranges_) pending;
+        pending.try_emplace(va, Range{va + bytes, shader_va});
+        pending.try_emplace(twin, Range{twin + bytes, shader_va});
+        publish_pool_ranges(pending);
+        return true;
+    }
+
+    bool reuse_pool_mapping(std::uint64_t va, std::uint64_t twin, std::uint64_t want, std::uint64_t max_size,
+                            std::uint64_t& shader_va) {
+        if (!want) return false;
+        std::unique_lock lock(mutex_);
+        const auto next = ranges_.upper_bound(va);
+        if (next != ranges_.begin()) {
+            const auto existing = std::prev(next);
+            if (va < existing->second.end) {
+                if (want > existing->second.end - va) return false;
+                shader_va = existing->second.shader_va + (va - existing->first);
+                return true;
+            }
+        }
+        const auto other_next = ranges_.upper_bound(twin);
+        if (other_next == ranges_.begin()) return false;
+        const auto other = std::prev(other_next);
+        if (twin >= other->second.end) return false;
+        const auto end = next == ranges_.end() ? UINT64_MAX : next->first;
+        const auto bytes = std::min({max_size, other->second.end - twin, end - va});
+        if (bytes < want) return false;
+        const auto shader = other->second.shader_va + (twin - other->first);
+        decltype(ranges_) pending;
+        pending.try_emplace(va, Range{va + bytes, shader});
+        publish_pool_ranges(pending);
+        shader_va = shader;
+        return true;
     }
 
     // Forgets the range that starts at title_va, if it still maps to shader_va (a newer range at the same VA keeps
@@ -92,6 +157,16 @@ public:
     void forget_copy(std::uint64_t title_va, std::uint64_t bytes, std::uint64_t shader_va) {
         if (!bytes) return;
         std::unique_lock lock(mutex_);
+        for (auto it = ranges_.lower_bound(title_va); it != ranges_.end() && it->first - title_va < bytes;) {
+            if (it->second.shader_va - shader_va != it->first - title_va) {
+                ++it;
+                continue;
+            }
+            by_shader_.erase(it->second.shader_va, it->first);
+            notify(Change::removed, it->first, it->second.end - it->first, it->second.shader_va);
+            it = ranges_.erase(it);
+        }
+        count_.store(ranges_.size(), std::memory_order_release);
         notify(Change::removed, title_va, bytes, shader_va);
         note_removed(shader_va, bytes);
         generation_.fetch_add(1, std::memory_order_release);
@@ -135,6 +210,16 @@ public:
         out.reserve(ranges_.size());
         for (const auto& [start, range] : ranges_) out.push_back({start, range.end, range.shader_va});
     }
+    // The ranges that overlap [begin, end), in title-VA order.
+    void overlapping(std::uint64_t begin, std::uint64_t end, std::vector<Mapping>& out) const {
+        out.clear();
+        if (begin >= end || !count_.load(std::memory_order_acquire)) return;
+        std::shared_lock lock(mutex_);
+        auto it = ranges_.lower_bound(begin);
+        if (it != ranges_.begin() && std::prev(it)->second.end > begin) --it;
+        for (; it != ranges_.end() && it->first < end; ++it)
+            out.push_back({it->first, it->second.end, it->second.shader_va});
+    }
 
     // Whether `shader_va` lies in the copy of a range added so far: an address the layer itself wrote for the title
     // (a window, a geometry copy, a slot-133 shadow or import), which a later scan of the same descriptor sees again.
@@ -144,6 +229,14 @@ public:
         std::shared_lock lock(mutex_);
         BufferVaIndex<std::uint64_t>::Hit hit{};
         return by_shader_.find(shader_va, hit);
+    }
+
+    // Whether any range still answers from inside [shader_va, shader_va + bytes): a copy (a title window) that some
+    // address still reaches. A range entered over a live one replaces it whole (add), so a copy can be left with none.
+    bool answers_into(std::uint64_t shader_va, std::uint64_t bytes) const {
+        if (!count_.load(std::memory_order_acquire)) return false;
+        std::shared_lock lock(mutex_);
+        return by_shader_.overlaps(shader_va, bytes);
     }
 
     // Debug-only inverse lookup. V#s retain 48 bits, so an import below heap_base wraps.
@@ -177,11 +270,12 @@ public:
     // read or write). Counted by kind: translated, or in the title's memory and left as it was.
     std::uint64_t resolve(std::uint64_t va, std::uint64_t bytes, Kind kind) {
         if (!va) return va;
-        std::uint64_t to = shader_va(va);
-        if (to != va) {
+        std::uint64_t mapped = va, available = 0;
+        const bool has_mapping = range_of(va, mapped, available) && mapped != va;
+        if (has_mapping && bytes <= available) {
             translated_[kind].fetch_add(1, std::memory_order_relaxed);
             note_reached(va, bytes);
-            return to;
+            return mapped;
         }
         Resolver resolver;
         void* context;
@@ -190,9 +284,13 @@ public:
             resolver = resolver_;
             context = hook_context_;
         }
-        if (!resolver || !resolver(context, va, bytes, to)) return va;
+        std::uint64_t to = va;
+        if (!resolver || !resolver(context, va, bytes, to)) {
+            if (!has_mapping) return va;
+            to = mapped;
+        }
         (to != va ? translated_ : untranslated_)[kind].fetch_add(1, std::memory_order_relaxed);
-        if (to != va) note_reached(va, bytes);
+        if (to && to != va) note_reached(va, bytes);
         return to;
     }
 
@@ -422,6 +520,25 @@ private:
         std::uint64_t end;        // exclusive
         std::uint64_t shader_va;  // what the range's first byte becomes
     };
+
+    void publish_pool_ranges(std::map<std::uint64_t, Range>& pending) {
+        try {
+            for (const auto& [base, range] : pending) by_shader_.insert(range.shader_va, range.end - base, base);
+        } catch (...) {
+            for (const auto& [base, range] : pending) by_shader_.erase(range.shader_va, base);
+            throw;
+        }
+        for (const auto& [base, range] : pending) notify(Change::added, base, range.end - base, range.shader_va);
+        ranges_.merge(pending);
+        count_.store(ranges_.size(), std::memory_order_release);
+        generation_.fetch_add(1, std::memory_order_release);
+    }
+
+    bool overlaps(std::uint64_t begin, std::uint64_t end) const {
+        const auto next = ranges_.lower_bound(begin);
+        return (next != ranges_.end() && next->first < end) ||
+               (next != ranges_.begin() && std::prev(next)->second.end > begin);
+    }
 
     void erase_overlapping(std::uint64_t begin, std::uint64_t end) {
         auto it = ranges_.lower_bound(begin);

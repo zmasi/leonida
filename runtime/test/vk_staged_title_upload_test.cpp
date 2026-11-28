@@ -278,7 +278,7 @@ void test_title_image_upload_ring() {
     bool nonzero = false, busy = true;
 
     // Initial unreferenced upload bypasses pending wait, submits transfer + consumer wait, and reports !busy.
-    const bool first_ok = uploader.write(dev, 201, binding, layout, tiled.data(), columns, true, nonzero, true, &busy);
+    const bool first_ok = uploader.write(dev, 201, binding, layout, tiled.data(), columns, true, nonzero, 0, true, &busy);
     expect(first_ok && !busy && nonzero, "initial unreferenced TitleImageUpload::write should succeed");
     expect(g_wait_calls == 0 && g_copy_calls == 1 && g_submit_calls == 2,
            "initial upload should submit primary + consumer queue without waiting");
@@ -286,7 +286,7 @@ void test_title_image_upload_ring() {
     // Six consecutive timed-out re-uploads (> 4 ring slots) report busy=true and rewind next_ cleanly.
     for (int attempt = 0; attempt < 6; ++attempt) {
         busy = false;
-        const bool ok = uploader.write(dev, 201, binding, layout, tiled.data(), columns, false, nonzero, false, &busy);
+        const bool ok = uploader.write(dev, 201, binding, layout, tiled.data(), columns, false, nonzero, 0, false, &busy);
         expect(!ok && busy, "timed-out re-upload should report busy=true rather than hard failure");
     }
     expect(g_wait_calls == 6 && g_submit_calls == 2, "timed-out re-uploads must not submit new transfers");
@@ -294,15 +294,38 @@ void test_title_image_upload_ring() {
     // Genuine Vulkan errors report busy=false so fill_failures still catches real faults.
     g_wait_result = VK_ERROR_OUT_OF_HOST_MEMORY;
     busy = true;
-    expect(!uploader.write(dev, 201, binding, layout, tiled.data(), columns, false, nonzero, false, &busy) && !busy,
+    expect(!uploader.write(dev, 201, binding, layout, tiled.data(), columns, false, nonzero, 0, false, &busy) && !busy,
            "hard Vulkan error must report busy=false");
 
     // Once pending queue work finishes, the queued refresh succeeds cleanly.
     g_wait_result = VK_SUCCESS;
     busy = true;
-    expect(uploader.write(dev, 201, binding, layout, tiled.data(), columns, false, nonzero, false, &busy) && !busy,
+    expect(uploader.write(dev, 201, binding, layout, tiled.data(), columns, false, nonzero, 0, false, &busy) && !busy,
            "retry after queue completion should succeed");
     expect(g_submit_calls == 4, "successful retry should submit transfer + consumer wait");
+
+    // Partial-mip initial upload (from = 1 of 2 mips) skips the wait while mip 1 is UNDEFINED, then waits when
+    // upgrading to full mips (from = 0) because mip 1 is already GENERAL.
+    {
+        std::lock_guard lock(ctx.submit_mutex());
+        ctx.record_submit_locked(pending_semaphore(), 2);
+    }
+    g_wait_result = VK_TIMEOUT;
+    rt::xg_xs::ResourceDesc mip_desc = desc;
+    mip_desc.mips = 2;
+    rt::xg_xs::Texture mip_layout{};
+    expect(rt::xg_xs::build_texture(mip_desc, mip_layout), "build_texture for 2-mip BC1 failed");
+    std::vector<std::uint8_t> mip_tiled(static_cast<std::size_t>(mip_layout.layout.size), 0x33);
+    auto mip_binding = make_image_binding(202, 16, 16);
+    mip_binding.mip_levels = 2;
+    ctx.add_resource(202, mip_binding, VK_IMAGE_LAYOUT_UNDEFINED);
+    const int waits_before = g_wait_calls;
+    expect(uploader.write(dev, 202, mip_binding, mip_layout, mip_tiled.data(), columns, false, nonzero, 1, true, &busy) &&
+               !busy && g_wait_calls == waits_before,
+           "partial-mip initial upload should skip waiting while mip tail is UNDEFINED");
+    expect(!uploader.write(dev, 202, mip_binding, mip_layout, mip_tiled.data(), columns, false, nonzero, 0, true, &busy) &&
+               busy && g_wait_calls == waits_before + 1,
+           "upgrading a partially filled texture must wait on pending work covering filled tail mips");
 
     uploader.release(dev);
 }

@@ -177,6 +177,7 @@ void start_title_peek(std::uint8_t* base) {
 }  // namespace
 
 #include "base_reservation.h"
+#include "compile_gate_policy.h"
 #include "code_hooks.h"
 #include "cpu_emulation.h"
 #include "host_cpu.h"
@@ -390,6 +391,9 @@ int wmain(int argc, wchar_t** argv) {
     if (argc > 1 && std::wstring(argv[1]) == L"--precompile-pipelines") return precompile_main(argc, argv);
     if (argc > 1 && std::wstring(argv[1]) == L"--compile-server") return compile_server_main(argc, argv);
 #endif
+    // The title's process (not a build host above): LEONIDA_COMPILE_GATE=auto may calibrate the driver when the device
+    // is made (src/compile_gate_policy.h).
+    leonida::compile_gate_policy::calibration_allowed = true;
     std::filesystem::path image, game_dir, overlay_dir, mods_dir;
     uint32_t archetype_lookup_rva = 0;  // --archetype-lookup RVA[,ARG]: the game's archetype lookup by hash
     int archetype_lookup_arg = 0;

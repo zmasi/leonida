@@ -236,14 +236,17 @@ class TestFormatDecoderBoundary(unittest.TestCase):
     def test_format_decode_call_builds_and_caches_function(self):
         words = ["%w0", "%w1", "%w2", "%w3"]
         self.assertIsNone(self.gen.fmt_fn)
-        comps1 = self.gen.format_decode_call("%fmt_var", words)
-        self.assertEqual(len(comps1), 4)
+        wvec = self.gen.format_decode_words(words)
         self.assertIsNotNone(self.gen.fmt_fn)
         first_fn = self.gen.fmt_fn
+        before = len(self.gen.body)
+        r = self.gen.format_decode_call("%fmt_var", wvec, "%k")
+        # One component, one call: the component index is the call's last argument.
+        self.assertEqual(self.gen.body[before:], [f"         {r} = OpFunctionCall %uint %fmt_dec %fmt_var {wvec} %k"])
 
-        # Subsequent call reuses the cached function
-        comps2 = self.gen.format_decode_call("%fmt_var2", words)
-        self.assertEqual(len(comps2), 4)
+        # Subsequent calls reuse the cached function
+        self.gen.format_decode_words(words)
+        self.gen.format_decode_call("%fmt_var2", wvec, "%k2")
         self.assertIs(self.gen.fmt_fn, first_fn)
 
     def test_encode_format_saturation_and_boundary(self):

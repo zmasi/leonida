@@ -880,6 +880,10 @@ struct ComputePipeline {
     bool large = false;        // PipelineCompiles limits how many of these compile at once
     bool skipped = false;      // never built on request (LEONIDA_SKIP_COMPUTE): its dispatches are dropped
     std::uint64_t estimate = 0;  // large: the bytes of memory its compile is expected to take
+    // Told at every dispatch that names this pipeline, built or not, with variant 0 (pipeline_order.h records the first
+    // one). Null: nobody is told. Called while a submission is prepared: it must never block or allocate (the only lock it may take is a non-blocking try_lock, on the first request of a pipeline and of a variant).
+    void (*requested)(void*, std::uint32_t variant) = nullptr;
+    void* request_context = nullptr;
 };
 
 // A graphics pipeline as replay needs it: the formats its attachments must have and which vertex-input slots it
@@ -910,6 +914,9 @@ struct GraphicsPipeline {
     // What `variant` would return when it is built already and nobody is building one, else null; builds nothing. See
     // ComputePipeline::built.
     std::function<VkPipeline(std::uint32_t flags)> built;
+    // As ComputePipeline::requested, at every draw that names this pipeline, with the variant flags it will use.
+    void (*requested)(void*, std::uint32_t variant) = nullptr;
+    void* request_context = nullptr;
     bool large = false;  // as ComputePipeline::large
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
     bool async_build = false;
@@ -2852,6 +2859,7 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
     for (std::size_t slot = 0; slot < p.colors.size(); ++slot)
         if (pipeline->color_formats[slot] != VK_FORMAT_UNDEFINED && !p.colors[slot].id) unbound |= 1u << slot;
     if (pipeline->depth_format != VK_FORMAT_UNDEFINED && !p.depth.id) unbound |= GraphicsPipeline::unbound_depth;
+    if (pipeline->requested) pipeline->requested(pipeline->request_context, unbound);
     if (unbound || !p.pipeline) {
         const bool indirect_rect_variant = arguments && (unbound & GraphicsPipeline::rectangle_stage);
         if (vk.compiles && pipeline->variant && pipeline->built && !pipeline->async_build && !indirect_rect_variant) {
@@ -2954,6 +2962,7 @@ ReplayResult prepare_draw(const Draw& draw, const IndirectDrawArgs* arguments, R
 // A compute pipeline that is built on first use: the one built already, the one vk.compiles will build with the
 // submission's others (true, with p.compile set and no pipeline yet), or the one built here.
 inline bool first_use(const ComputePipeline& pipeline, PipelineCompiles::User user, const ReplayFunctions& vk, Prepared& p) {
+    if (pipeline.requested) pipeline.requested(pipeline.request_context, 0);  // also for a handle that exists already
     if (p.pipeline.pipeline || !pipeline.build) return p.pipeline.pipeline != VK_NULL_HANDLE;
     if (vk.compiles && pipeline.built && !pipeline.async_build && !pipeline.skipped &&
         (!pipeline.bindless_set || vk.bind_descriptor_sets)) {

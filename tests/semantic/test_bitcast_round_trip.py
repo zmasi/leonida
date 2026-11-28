@@ -48,7 +48,7 @@ def bitcast_arguments(lines):
 class BitcastRoundTripTest(unittest.TestCase):
     def test_helpers_return_the_source(self):
         g = rdna2spirv.Gen.__new__(rdna2spirv.Gen)
-        g.body, g.n, g.bitcast_from, g.emulate = [], 0, {}, False
+        g.body, g.n, g.bitcast_from, g.emulate, g.fconst_of = [], 0, {}, False, {}
         f = g.tof("%t100")
         self.assertEqual(g.tou(f), "%t100")
         u = g.tou("%t200")

@@ -36,7 +36,7 @@ happens **on your PC, from your own copy of the game**.
 > from your game and stays on your PC. Never share those files.
 
 > [!NOTE]
-> **This is a continuation of [NotRexed's Leonida project](https://github.com/ItsNotRexed/Leonida).** The original
+> **This is a continuation of [NotRexed's Leonida project](https://github.com/ProjectLeonida/Leonida).** The original
 > author has left the project, and development continues here with its full commit history. Credit for the work up to
 > that point belongs to NotRexed and the contributors listed in the history.
 
@@ -44,12 +44,16 @@ Discord: https://discord.gg/ETf4qj5acN
 
 Telegram: https://t.me/mandyport
 
-Original author's Git Mirror: https://git.notrexed.dev/notrexed/Leonida
 <br>
 
 ## Project status
 
-**Early. Nothing is playable yet.** On `main`, the game boots from your own copy on native Windows and on Linux
+**Early, and playable in the world on one of its two runtimes.** The Direct3D 12 runtime in
+[`d3d12/`](d3d12/README.md) loads a save into the open world on Windows, where you control the character with the
+HUD, the map and the pause menu working, at a low frame rate (12 to 13 frames a second on the maintainer's PC; the
+measurements are at the end of this section). The rest of this section up to there is about the other runtime, the
+recompiled one with the D3D12 → Vulkan layer (`runtime/`), which is not playable yet. With that one, on `main`, the
+game boots from your own copy on native Windows and on Linux
 through Proton: it shows the launch movie, the first-run pages and the landing prompt, which respond to a pad or
 the keyboard pad, then runs the story load to its end and enters the world phase. A first world frame has not been
 verified yet on any test machine. On native Windows a scripted pad alone (`LEONIDA_INPUT_SCRIPT`, no keyboard or
@@ -57,6 +61,23 @@ controller) gets through every first-run page, including the legal-terms page wh
 the loading screen of the story load ([the route](docs/first_run_ui.md#through-the-first-run-pages-with-the-scripted-pad)).
 [First-run UI on Windows](docs/first_run_ui.md) has the build and launch steps;
 [the Linux/Proton report](docs/linux_proton.md) has the timings and where it stops.
+
+**The Direct3D 12 runtime, [`d3d12/`](d3d12/README.md) (Windows, NVIDIA and AMD), is playable in the world.**
+It is a separate program (`leonida.exe`) that grew from VIctory; what follows are this project's own measurements,
+taken by the maintainer on 2026-11-27, not figures quoted from another project. They are of the working branch of
+that day (commit `37426fd9f`, which has a fix for waits on the graphics card that is not on `main` yet); `main`
+itself measured about 10 frames a second at the same place earlier that day (median frame about 102 ms):
+
+- PC: Ryzen 5 7600X (6 cores), GeForce RTX 4060 Ti 16 GB (driver 616.64), 32 GB of RAM, Windows 11.
+- Series X profile, 2560x1440 picture, the title's own upscaler at render scale 1, no generated frames.
+- A save loads into the open world and you play from there: the character walks and drives with a pad (Xbox or
+  PlayStation, with matching button prompts) or with keyboard and mouse, with sound, the HUD, the map, the weapon
+  wheel and the pause menu. **12 to 13 frames a second** standing at the save point (median frame 75 to 82 ms in three runs of about
+  three minutes, about 7,100 draws a frame); the game uses about 5.6 of the 6 cores and the card is about 95% busy.
+- Known to be wrong in the picture: a stair-stepped part of the screen near the camera gets no indirect light at
+  that save point; ray-traced light is stood in for (every ray is a miss, the structure builder is off); the
+  transmission-volumetrics programs are left out, which darkens water.
+- Not measured: how far the story plays, and how long a session lasts.
 
 | What | Status |
 |---|---|
@@ -83,7 +104,8 @@ and the `D3D-` items), run `python -I tools/progress_dashboard.py --out <folder 
 
 ## Platforms
 
-Nothing is playable on any platform yet (see *Project status*). What runs where today:
+The Direct3D 12 runtime in `d3d12/` is playable in the world on Windows (see *Project status*); the recompiled runtime with the
+Vulkan layer is not playable on any platform yet. What runs where today, for the latter:
 
 | Platform | Today |
 |---|---|
@@ -101,7 +123,7 @@ The port isn't downloaded ready-made. It's built on your PC from your own copy.
 **The easy way:**
 
 1. Install the prerequisites below.
-2. Download this project **with its submodule**: `git clone --recursive https://github.com/ubiquitarianism/leonida`. A
+2. Download this project **with its submodule**: `git clone --recursive https://github.com/ProjectLeonida/mandy`. A
    "Download ZIP" from GitHub leaves out `third_party/rpf9-explorer`. The build fetches it if `git` is installed,
    and otherwise tells you what to do.
 3. Double-click **`Build.bat`**. On Linux or macOS, run **`./Build.sh`** from a terminal instead (see
@@ -284,6 +306,13 @@ These commands use the package in `game_path.txt`, the port's `overlay` for writ
 When the Vulkan backend is selected with `LEONIDA_D3D12=vulkan`, the packaged runtime finds the translated shaders
 in `<work>/shaders/spirv` using `shader_path.txt` beside `gta6rt.exe`. Set `LEONIDA_SHADERS` to use another directory.
 
+### Starting the game: the launcher
+
+Double-click **`Launcher.bat`** (Linux: `python3 tools/leonida_launcher.py`) for the Leonida Launcher: a window with a
+PLAY button, the game and data folders, the runtime's options (DLSS, ray tracing, Smooth Motion, and so on), the mod
+list and a few tools. PLAY runs `scripts\play-d3d12.ps1` for you. It needs only Python and Tkinter, and is described in
+[docs/launcher.md](docs/launcher.md).
+
 ## How it works
 
 | Piece | What it does | Where |
@@ -336,6 +365,12 @@ pull requests.
 - [LLVM](https://llvm.org/): AMDGPU disassembler.
 - Logo: ["Grand Theft Auto VI" icon by SlyDevil](https://www.steamgriddb.com/icon/122618) on SteamGridDB.
 - [SPIRV-Tools](https://github.com/KhronosGroup/SPIRV-Tools): assembly and validation.
+- Aki-Developer: `aki-gta6/aki-runtime` (GPL-3.0), a sister port shared with the project. Taken from it into the Rust
+  D3D12 runtime: the count of dropped draws by reason in the frame line, descriptor slots given back as soon as the
+  card has run a submission, pixel colours held to the console's HDR range, the composer's clamp that keeps a NaN from
+  coming out black, two planes composed into 10 bits under frame generation, the paired form of wave64 programs tried
+  before the approximate ones (`LEONIDA_PAIRED_LANES=exact`), a pipeline's kept skip answer, and four small fixes it
+  carried from fxceless/victory-fork. Each commit names the `aki-runtime` commit it is from.
 
 Grand Theft Auto and all related names are trademarks of their owners. This project is not affiliated with or
 endorsed by them.

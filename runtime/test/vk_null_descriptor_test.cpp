@@ -39,6 +39,9 @@
         }                                                                    \
     } while (0)
 
+// Everything but main needs the shader glslangValidator builds; without it CMake leaves the path undefined and
+// main reports the test unsupported, so none of this may name it.
+#ifdef LEONIDA_TEST_NULL_DESCRIPTORS_SPV
 namespace {
 
 using namespace leonida;
@@ -244,6 +247,7 @@ int check_common(const std::array<std::uint32_t, result_words>& r) {
 }
 
 }  // namespace
+#endif  // LEONIDA_TEST_NULL_DESCRIPTORS_SPV
 
 int main() {
 #ifndef LEONIDA_TEST_NULL_DESCRIPTORS_SPV

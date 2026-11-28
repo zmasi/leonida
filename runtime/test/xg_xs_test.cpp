@@ -81,6 +81,51 @@ void check_addresses(const Texture& t) {
     check(true, "every mip/array element has a distinct aligned address inside the resource");
 }
 
+// A fill of the smaller mips only (d3d12_vulkan_device.cpp, partial_mips) reads mip_chain_bytes(t, first) bytes from the
+// base: those hold every element of the mips from `first` on, and the next larger mip is not among them.
+void check_mip_prefix(uint32_t format, uint32_t layout, uint64_t width, uint32_t height, uint16_t mips) {
+    ResourceDesc d{};
+    d.dimension = kTexture2D;
+    d.width = width;
+    d.height = height;
+    d.depth_or_array = 1;
+    d.mips = mips;
+    d.format = format;
+    d.samples = 1;
+    d.layout = layout;
+    Texture t;
+    check(build_texture(d, t), "mip prefix case lays out");
+    const auto& plane = t.layout.plane[0];
+    std::vector<uint8_t> whole(size_t(t.layout.size));
+    for (size_t i = 0; i < whole.size(); ++i) whole[i] = uint8_t(i * 31 + (i >> 8) * 7);
+    std::vector<uint64_t> columns;
+    bool same = true, ordered = true, found = true;
+    for (unsigned first = 0; first < t.layout.mips; ++first) {
+        const uint64_t bytes = mip_chain_bytes(t, first);
+        // Exactly the prefix, so that a read past it is a heap error under a checked allocator and a difference here.
+        std::vector<uint8_t> part(whole.size(), 0xee);
+        std::copy_n(whole.begin(), size_t(bytes), part.begin());
+        for (unsigned level = first; level < t.layout.mips; ++level) {
+            const auto& mip = plane.mips[level];
+            const uint32_t pitch = mip.width_elements * t.format.bytes;
+            std::vector<uint8_t> a(size_t(pitch) * mip.height_elements), b(a.size());
+            copy_elements<false>(t, level, 0, whole.data(), a.data(), pitch, pitch * mip.height_elements, columns);
+            copy_elements<false>(t, level, 0, part.data(), b.data(), pitch, pitch * mip.height_elements, columns);
+            same &= a == b;
+        }
+        const bool in_tail = first > plane.standard_mips;
+        found &= first_mip_within(t, bytes) == (in_tail ? plane.standard_mips : first);
+        found &= first_mip_within(t, bytes - 1) == (first >= plane.standard_mips ? t.layout.mips
+                                                    : first + 1 < t.layout.mips  ? first + 1
+                                                                                 : t.layout.mips);
+        if (first && first <= plane.standard_mips) ordered &= bytes < mip_chain_bytes(t, first - 1);
+    }
+    check(same, "the prefix of a mip holds it and every smaller one");
+    check(ordered && mip_chain_bytes(t, 0) == t.layout.size, "a larger mip needs a longer prefix, mip 0 the whole texture");
+    check(found, "the first mip within a readable prefix is the largest one it holds");
+    check(first_mip_within(t, 0) == t.layout.mips, "nothing readable: no mip");
+}
+
 // copy_elements (row + column addressing) reads every element where offset() says it is.
 void check_detile(const Texture& t) {
     const ElementAddress address(t);
@@ -389,6 +434,19 @@ void test_models_agree() {
 }  // namespace
 
 int main() {
+    check_mip_prefix(DXGI_FORMAT_BC7_UNORM, 0x109, 1024, 1024, 11);   // 64 KiB blocks and a tail
+    check_mip_prefix(DXGI_FORMAT_BC1_UNORM, 0x105, 512, 256, 10);     // 4 KiB blocks and a tail
+    check_mip_prefix(DXGI_FORMAT_BC7_UNORM, 0x109, 300, 700, 10);     // extents that are no power of two
+    check_mip_prefix(DXGI_FORMAT_R8G8B8A8_UNORM, 0x10a, 256, 256, 1);  // one mip
+    check_mip_prefix(DXGI_FORMAT_R8G8B8A8_UNORM, 0x105, 512, 512, 2);  // a chain too short for a tail
+    check_mip_prefix(DXGI_FORMAT_R8G8B8A8_UNORM, 1, 256, 128, 9);     // linear
+    {
+        ResourceDesc d{kTexture2D, 0, 256, 256, 6, 9, DXGI_FORMAT_BC7_UNORM, 1, 0, 0x109, 0};
+        Texture cube;
+        check(build_texture(d, cube) && mip_chain_bytes(cube, 4) == cube.layout.size &&
+                  first_mip_within(cube, cube.layout.size - 1) == cube.layout.mips,
+              "an array is readable as a whole or not at all");
+    }
     {
         struct Entry { bool mapped, stale; int id; };
         Entry first{false, false, 1}, mapped{true, false, 2}, stale{false, true, 3};
@@ -594,6 +652,7 @@ int main() {
     DWORD previous = 0;
     if (!VirtualProtect(reservation, page, PAGE_READWRITE | PAGE_GUARD, &previous)) return 1;
     check(!leonida::texture_memory_readable(address, 2 * page), "guarded texture page remains untouched");
+    check(leonida::texture_memory_readable_bytes(address, 2 * page) == 0, "the readable prefix ends at a guarded first page");
     VirtualFree(reservation, page, MEM_DECOMMIT);
     check(!leonida::texture_memory_readable(address, page), "previously readable page is rechecked after decommit");
     VirtualFree(reservation, 0, MEM_RELEASE);

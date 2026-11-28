@@ -1,0 +1,42 @@
+[package]
+name = "leonida"
+description = "Command-line front end: inspect, census, convert, run."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+leonida-core.workspace = true
+leonida-pe.workspace = true
+leonida-loader.workspace = true
+leonida-hle.workspace = true
+leonida-gpu.workspace = true
+leonida-lua.workspace = true
+leonida-menu.workspace = true
+leonida-shader = { workspace = true, features = ["host"] }
+leonida-game.workspace = true
+anyhow.workspace = true
+blake3.workspace = true
+memchr.workspace = true
+clap.workspace = true
+walkdir.workspace = true
+
+[features]
+# NVIDIA DLSS for the title's upscale (LEONIDA_UPSCALE=dlss); needs LEONIDA_DLSS_SDK.
+dlss = ["leonida-gpu/dlss"]
+# Debug-level logs and the debugging switches (frame capture, stack dumps,
+# the host debug layer, scripted keys). Off in a plain release build.
+diagnostics = [
+    "leonida-core/diagnostics",
+    "leonida-hle/diagnostics",
+    "leonida-loader/diagnostics",
+    "leonida-shader/diagnostics",
+]
+
+# mimalloc as the process allocator (off by default: the system allocator).
+mimalloc = ["leonida-hle/mimalloc"]
+
+[lints]
+workspace = true

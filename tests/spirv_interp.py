@@ -15,6 +15,23 @@ import struct
 M32 = 0xFFFFFFFF
 
 
+def float_literal_bits(tok):
+    """The binary32 bits of an OpConstant %float literal as spirv-as reads it: a decimal, or a hex-float, where
+    exponent +128 is the SPIRV-Tools spelling of an infinity (0x1p+128) or a NaN with its payload (0x1.8p+128),
+    as tools/rdna2spirv.py's float_literal writes them. Raises ValueError for anything else."""
+    m = re.fullmatch(r"([+-]?)0[xX]([0-9a-fA-F]*)\.?([0-9a-fA-F]*)[pP]([+-]?\d+)", tok)
+    if m is None:
+        return struct.unpack("<I", struct.pack("<f", float(tok)))[0]
+    sign, ipart, fpart, exp = m.groups()
+    sig = int(ipart + fpart or "0", 16)
+    top = sig.bit_length() - 1
+    if sig and int(exp) - 4 * len(fpart) + top == 128:
+        frac = sig & ((1 << top) - 1)
+        mant = frac << (23 - top) if top <= 23 else frac >> (top - 23)
+        return (0x80000000 if sign == "-" else 0) | 0x7F800000 | mant
+    return struct.unpack("<I", struct.pack("<f", float.fromhex(tok)))[0]
+
+
 def f32(x):
     try:
         return struct.unpack("<f", struct.pack("<f", x))[0]
@@ -152,7 +169,8 @@ def run(spvasm):
         elif op == "OpConstant":
             t = types[args[0]][0]
             if t == "Float":
-                consts[res] = float(args[1]) if types[args[0]][1] == "64" else f32(float(args[1]))
+                consts[res] = float(args[1]) if types[args[0]][1] == "64" else (
+                    u2f(float_literal_bits(args[1])) if "x" in args[1].lower() else f32(float(args[1])))
             else:
                 consts[res] = int(args[1]) & M32
         elif op == "OpConstantTrue":

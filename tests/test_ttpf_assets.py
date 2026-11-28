@@ -221,14 +221,17 @@ class TextureAssets(unittest.TestCase):
         self.build()
         row = self.row_after_export()
         original = self.folder / row["File"]
-        self.assertEqual(original.read_bytes()[:4], b"DDS ")
+        original_bytes = original.read_bytes()
+        self.assertEqual(original_bytes[:4], b"DDS ")
         self.assertNotIn("BCPackLimitation", row)
         config["bc1"]["selectors"][0] = [mask ^ 1 for mask in config["bc1"]["selectors"][0]]
         profile.write_text(json.dumps(config), encoding="utf-8")
         self.build()
         updated = self.folder / self.row_after_export()["File"]
         self.assertNotEqual(updated, original)
-        self.assertNotEqual(updated.read_bytes(), original.read_bytes())
+        self.assertNotEqual(updated.read_bytes(), original_bytes)
+        # The row switched files, so the pass removes the one it replaced (remove_replaced).
+        self.assertFalse(original.exists())
 
     @unittest.skipUnless(os.environ.get("RPF9DUMP_DLL"), "requires the built rpf9dump")
     def test_new_base_and_pack_pools(self):

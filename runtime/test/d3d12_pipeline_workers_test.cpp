@@ -8,15 +8,22 @@
 //   - pipeline states released while a submission compiles: the ones it uses live on, and the release of any other waits
 //     until the submission has its pipelines;
 //   - a device whose last references go while its workers compile: the workers have ended before the pipeline cache is
-//     read for pipeline_cache.session.bin.
+//     read for pipeline_cache.session.bin;
+//   - the prewarm from a recorded order (LEONIDA_PIPELINE_PREWARM_ORDER, src/pipeline_prewarm.h) builds its graphics
+//     pipelines before the first bind for pipeline states made from a console stream (device slot 86), also when the
+//     stream is kept for its first bind (LEONIDA_PIPELINE_COMPILE=on-demand), and nothing without a plan.
 // With LEONIDA_LAZY_PIPELINES=0 and LEONIDA_LAZY_COMPUTE=0 the pipelines are compiled when they are created and only the
 // variants are left to the submission; the cases that need more than that are then left out.
 // The calls that create pipelines and read the cache are watched, and held back, through the device's vkGetDeviceProcAddr.
+// --async-graphics-zero and --async-graphics-unset: LEONIDA_ASYNC_PIPELINES=1 with LEONIDA_ASYNC_MIN_BYTES over every
+// module, and LEONIDA_ASYNC_MIN_BYTES_GRAPHICS 0 or unset, with the compile worker held (async_thresholds below).
 // Self-contained: builds its SPIR-V in memory. Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "test_temp_dir.h"
 #include "../shims/d3d12_com.h"
+#include "../shims/d3d12_xs_device.h"
+#include "../shims/d3d12_pipeline_compile.h"
 #include "../src/shader_library.h"
 
 #include <algorithm>
@@ -28,6 +35,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -40,6 +48,7 @@
 namespace {
 
 using namespace std::chrono_literals;
+using Clock = std::chrono::steady_clock;
 using d3d12test::Ref;
 using leonida::ReplayResult;
 using Words = std::vector<std::uint32_t>;
@@ -405,7 +414,7 @@ struct Setup {
     vktest::Device* vk;
     std::string library;
 
-    bool device(const char* threads, Ref<ID3D12Device>& out) const {
+    bool device(const char* threads, Ref<ID3D12Device>& out, bool prepare_on_bind = false) const {
         _putenv_s("LEONIDA_PIPELINE_THREADS", threads);
         rt::d3d12::VulkanDeviceInfo info{};
         info.get_instance_proc = instance_proc;
@@ -418,13 +427,34 @@ struct Setup {
         info.subgroup = vk->subgroup;
         info.features = vk->enabled;
         info.shader_dir = library;
+        info.prepare_on_bind = prepare_on_bind;  // LEONIDA_PIPELINE_COMPILE=on-demand
         CHECK(SUCCEEDED(rt::d3d12::create_vulkan_device(info, IID_PPV_ARGS(&out.p))));
         return true;
     }
 };
 
+// One pipeline state stream subobject as d3dx12.h declares it (CD3DX12_PIPELINE_STATE_STREAM_SUBOBJECT).
+template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Inner>
+struct alignas(void*) Subobject {
+    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type = Type;
+    Inner inner;
+};
+struct Stream {
+    std::vector<std::uint8_t> bytes;
+    template <D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type, typename Inner>
+    Stream& add(const Inner& inner) {
+        const Subobject<Type, Inner> subobject{Type, inner};
+        static_assert(sizeof(subobject) % sizeof(void*) == 0);
+        const std::size_t at = bytes.size();
+        bytes.resize(at + sizeof(subobject));
+        std::memcpy(bytes.data() + at, &subobject, sizeof(subobject));
+        return *this;
+    }
+};
+
 struct Pipelines {
     Ref<ID3D12RootSignature> root;
+    ID3D12Device* console = nullptr;  // set: graphics pipeline states through this console device's slot 86
     std::vector<ID3D12PipelineState*> states;  // kGraphics, then kCompute
     ~Pipelines() { release(); }
     void release() {
@@ -458,6 +488,44 @@ struct Pipelines {
         return SUCCEEDED(dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&out))) ? out : nullptr;
     }
 
+    // The same description as a stream, through the console device's CreatePipelineState (slot 86).
+    static ID3D12PipelineState* console_graphics(ID3D12Device* dev, ID3D12RootSignature* root, unsigned n) {
+        const auto vs = d3d12test::shader_container(program(0, 0)), ps = d3d12test::shader_container(program(1, n));
+        D3D12_BLEND_DESC blend{};
+        for (auto& rt : blend.RenderTarget) {
+            rt.SrcBlend = rt.SrcBlendAlpha = D3D12_BLEND_ONE;
+            rt.DestBlend = rt.DestBlendAlpha = D3D12_BLEND_ZERO;
+            rt.BlendOp = rt.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            rt.LogicOp = D3D12_LOGIC_OP_NOOP;
+            rt.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        }
+        D3D12_RASTERIZER_DESC raster{};
+        raster.FillMode = D3D12_FILL_MODE_SOLID;
+        raster.CullMode = D3D12_CULL_MODE_NONE;
+        raster.DepthClipEnable = TRUE;
+        D3D12_DEPTH_STENCIL_DESC depth{};
+        depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        D3D12_RT_FORMAT_ARRAY targets{};
+        targets.NumRenderTargets = n < kVariants ? 2 : 1;
+        for (UINT i = 0; i < targets.NumRenderTargets; ++i) targets.RTFormats[i] = DXGI_FORMAT_R8G8B8A8_UNORM;
+        Stream stream;
+        stream.add<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE>(root)
+            .add<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VS>(D3D12_SHADER_BYTECODE{vs.data(), vs.size()})
+            .add<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS>(D3D12_SHADER_BYTECODE{ps.data(), ps.size()})
+            .add<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND>(blend)
+            .add<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK>(UINT(UINT_MAX))
+            .add<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER>(raster)
+            .add<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL>(depth)
+            .add<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY>(D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE)
+            .add<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS>(targets)
+            .add<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC>(DXGI_SAMPLE_DESC{1, 0});
+        const D3D12_PIPELINE_STATE_STREAM_DESC desc{stream.bytes.size(), stream.bytes.data()};
+        using Create = HRESULT(WINAPI*)(ID3D12Device*, const D3D12_PIPELINE_STATE_STREAM_DESC*, REFIID, void**);
+        ID3D12PipelineState* out = nullptr;
+        const auto create = reinterpret_cast<Create>(d3d12test::slot(dev, 86));
+        return SUCCEEDED(create(dev, &desc, IID_PPV_ARGS(&out))) ? out : nullptr;
+    }
+
     bool create(ID3D12Device* dev) {
         D3D12_ROOT_PARAMETER params[2]{};
         params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
@@ -469,7 +537,7 @@ struct Pipelines {
         const auto blob = d3d12test::serialize_root_signature(desc);
         CHECK(SUCCEEDED(dev->CreateRootSignature(0, blob.data(), blob.size(), IID_PPV_ARGS(&root.p))));
         for (unsigned n = 0; n < kGraphics; ++n) {
-            auto* state = graphics(dev, root.p, n);
+            auto* state = console ? console_graphics(console, root.p, n) : graphics(dev, root.p, n);
             CHECK(state);
             states.push_back(state);
         }
@@ -812,15 +880,163 @@ bool device_destroyed(const Setup& setup) {
     return true;
 }
 
+// LEONIDA_PIPELINE_PREWARM_ORDER (src/pipeline_prewarm.h) with graphics pipeline states from console streams. A first
+// device records the order (LEONIDA_PIPELINE_ORDER_LOG=1); the next ones read it with an eight-entry cap and wait, before
+// recording any command, for the prewarm to build those eight. With the stream kept for its first bind (on-demand) the
+// parse is the prewarm's first job, so the eight are built before any bind there too. Without a plan nothing is built
+// before the submission.
+bool prewarm_from_recorded_order(const Setup& setup) {
+    const testfiles::ScratchDir dir("leonida_pipeline_prewarm_test");
+    const std::string log = (dir.path() / "pipeline_order.log").string();
+    _putenv_s("LEONIDA_PIPELINE_CACHE_DIR", dir.path().string().c_str());
+    const auto draw = [&](bool on_demand, int before_bind) {
+        Ref<ID3D12Device> inner, dev;
+        CHECK(setup.device("4", inner, on_demand));
+        // The console device (slot 86 is its CreatePipelineState), as the title sees it.
+        CHECK(SUCCEEDED(rt::d3d12_xs::create_device_proxy(inner.p, __uuidof(ID3D12Device),
+                                                          reinterpret_cast<void**>(&dev.p))));
+        rt::d3d12::set_device_outer(inner.p, dev.p);
+        ID3D12Device* const pc = inner.p;  // the rest is made through the PC device the proxy wraps
+        inner.p = nullptr;                 // the proxy owns that reference now
+        Pipelines pipelines;
+        pipelines.console = dev.p;
+        hooks.reset();
+        CHECK(pipelines.create(pc));
+        if (before_bind) {
+            std::unique_lock lock(hooks.mutex);
+            hooks.changed.wait_for(lock, 8s, [&] { return hooks.graphics >= before_bind; });
+        }
+        std::this_thread::sleep_for(200ms);  // nothing more comes
+        {
+            std::lock_guard lock(hooks.mutex);
+            if (hooks.graphics != before_bind)
+                std::fprintf(stderr, "prewarm (%s): %d graphics builds before the first bind, %d expected\n",
+                             on_demand ? "on-demand" : "console stream", hooks.graphics, before_bind);
+            CHECK(hooks.graphics == before_bind);
+        }
+        Frame frame;
+        CHECK(frame.create(pc, pipelines));
+        CHECK(frame.submit() == ReplayResult::success);
+        CHECK(frame.read() == reference);
+        CHECK(hooks.graphics == int(kGraphics));  // each built once, prewarmed or not
+        return true;
+    };
+    _putenv_s("LEONIDA_PIPELINE_ORDER_LOG", "1");
+    const bool recorded = draw(false, 0);  // no plan yet: nothing before the bind
+    _putenv_s("LEONIDA_PIPELINE_ORDER_LOG", "");
+    CHECK(recorded);
+    CHECK(std::filesystem::exists(log));
+    _putenv_s("LEONIDA_PIPELINE_PREWARM_ORDER", log.c_str());
+    _putenv_s("LEONIDA_PIPELINE_PREWARM_MAX_ENTRIES", "8");
+    const bool console = draw(false, 8);
+    const bool on_demand = draw(true, 8);
+    _putenv_s("LEONIDA_PIPELINE_PREWARM_ORDER", "");
+    _putenv_s("LEONIDA_PIPELINE_PREWARM_MAX_ENTRIES", "");
+    const bool no_plan = draw(true, 0);
+    _putenv_s("LEONIDA_PIPELINE_CACHE_DIR", "");
+    CHECK(console && on_demand && no_plan);
+    return true;
+}
+
+// ---- LEONIDA_ASYNC_MIN_BYTES_GRAPHICS (src/async_pipeline_size.h), with LEONIDA_ASYNC_PIPELINES=1. ----
+
+// --async-graphics-zero: LEONIDA_ASYNC_MIN_BYTES over every module and LEONIDA_ASYNC_MIN_BYTES_GRAPHICS=0, with every
+// job of the compile worker held. The first submission builds each compute pipeline where its dispatch needs it (every
+// buffer word is written) and no graphics one: their draws are skipped, so the image stays as cleared, and their
+// builds wait on the worker. Once the worker is let go, a later submission draws every cell.
+// --async-graphics-unset: the same with LEONIDA_ASYNC_MIN_BYTES_GRAPHICS unset. Graphics pipelines then take
+// LEONIDA_ASYNC_MIN_BYTES and are built in place too: the first submission draws everything and the worker gets nothing.
+bool async_thresholds(const Setup& setup, bool graphics_async) {
+    CHECK(first_use);  // lazy pipelines: nothing is built at creation
+    CHECK(rt::d3d12::async_replay_compile());
+    CHECK(rt::d3d12::async_min_bytes().compute == 1073741824);
+    CHECK(rt::d3d12::async_min_bytes().graphics == (graphics_async ? 0u : 1073741824u));
+    Ref<ID3D12Device> dev;
+    CHECK(setup.device("0", dev));
+    Pipelines pipelines;
+    Frame frame;
+    // Declared after the device and the pipelines, so it lets the worker go before they are released, also when a
+    // check fails.
+    std::atomic<unsigned> worker_jobs{0};
+    struct HeldWorker {
+        HANDLE release = nullptr;
+        void let_go() {
+            if (!release) return;
+            SetEvent(release);
+            rt::d3d12::PipelineCompiler::instance().set_job_probe(nullptr);
+        }
+        ~HeldWorker() {
+            let_go();
+            if (release) CloseHandle(release);
+        }
+    } held;
+    held.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    CHECK(held.release != nullptr);
+    rt::d3d12::PipelineCompiler::instance().set_job_probe([&worker_jobs, release = held.release](const void*) {
+        worker_jobs.fetch_add(1);
+        WaitForSingleObject(release, INFINITE);
+    });
+    hooks.reset();
+    CHECK(pipelines.create(dev.p) && frame.create(dev.p, pipelines));
+    CHECK(hooks.creates == 0);
+    CHECK(frame.submit() == ReplayResult::success);
+    std::vector<std::uint8_t> bytes = frame.read();
+    CHECK(bytes.size() == 4 * kExtent * kExtent + 4 * kCompute);
+    if (!graphics_async) {
+        CHECK(expected(bytes));
+        CHECK(hooks.graphics == int(kGraphics) && hooks.compute == int(kCompute));
+        CHECK(worker_jobs == 0);
+        return true;
+    }
+    // Every compute pipeline was built in place (the worker is held), no graphics one reached the driver.
+    for (unsigned n = 0; n < kCompute; ++n) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, &bytes[4 * kExtent * kExtent + 4 * n], 4);
+        CHECK(value == 1000 + n);
+    }
+    CHECK(std::all_of(bytes.begin(), bytes.begin() + 4 * kExtent * kExtent, [](std::uint8_t b) { return b == 0; }));
+    CHECK(hooks.compute == int(kCompute) && hooks.graphics == 0);
+    CHECK(worker_jobs >= 1);
+    // The worker let go: it builds the graphics pipelines (and variants), and a later submission draws them.
+    held.let_go();
+    const auto deadline = Clock::now() + 60s;
+    const auto drawn = [&] {
+        for (unsigned n = 0; n < kGraphics; ++n)
+            if (bytes[4 * ((n / 8 * 2) * kExtent + n % 8 * 2) + 3] != 255) return false;
+        return true;
+    };
+    do {
+        std::this_thread::sleep_for(20ms);
+        CHECK(frame.submit() == ReplayResult::success);
+        bytes = frame.read();
+    } while (!drawn() && Clock::now() < deadline);
+    CHECK(expected(bytes));
+    CHECK(hooks.graphics == int(kGraphics) && hooks.compute == int(kCompute));  // compute was not built again
+    return true;
+}
+
 bool run(const Setup& setup) {
     if (!same_image(setup)) return false;
     return !first_use || (refused_graphics(setup) && refused_compute(setup) && two_queues(setup) &&
-                          released_while_compiling(setup) && device_destroyed(setup));
+                          released_while_compiling(setup) && device_destroyed(setup) &&
+                          prewarm_from_recorded_order(setup));
 }
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool graphics_zero = argc == 2 && std::strcmp(argv[1], "--async-graphics-zero") == 0;
+    const bool graphics_unset = argc == 2 && std::strcmp(argv[1], "--async-graphics-unset") == 0;
+    if (argc != 1 && !graphics_zero && !graphics_unset) {
+        std::fprintf(stderr, "usage: d3d12_pipeline_workers_test [--async-graphics-zero | --async-graphics-unset]\n");
+        return 2;
+    }
+    if (graphics_zero || graphics_unset) {  // before the first pipeline state: the runtime reads these once
+        _putenv_s("LEONIDA_ASYNC_PIPELINES", "1");
+        _putenv_s("LEONIDA_STRICT_REPLAY", "0");
+        _putenv_s("LEONIDA_ASYNC_MIN_BYTES", "1073741824");  // 1 GiB: over any module
+        _putenv_s("LEONIDA_ASYNC_MIN_BYTES_GRAPHICS", graphics_zero ? "0" : "");  // "" removes it
+    }
     vktest::Device vk;
     vk.request_buffer_device_address = true;
     const auto status = vk.initialize();
@@ -841,7 +1057,8 @@ int main() {
     _putenv_s("LEONIDA_COMPUTE_WARMUP", "0");        // every compile is a submission's
     const testfiles::ScratchDir library("leonida_pipeline_workers_test");
     if (!write_library(library.path())) return 1;
-    if (!run({&vk, library.path().string()})) return 1;
+    const Setup setup{&vk, library.path().string()};
+    if (graphics_zero || graphics_unset ? !async_thresholds(setup, graphics_zero) : !run(setup)) return 1;
     if (vk.validation_errors()) {
         std::fprintf(stderr, "FAIL: %u validation errors\n", vk.validation_errors());
         return 1;
