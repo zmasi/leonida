@@ -62,12 +62,18 @@ struct State {
     pages: Vec<ModPage>,
     values: Vec<Vec<Value>>,
     events: std::collections::VecDeque<Event>,
+    /// Incremented on every [`set_pages`].
+    version: u64,
+    /// The `version` last handed to the menu by [`pages`].
+    shown: u64,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
     pages: Vec::new(),
     values: Vec::new(),
     events: std::collections::VecDeque::new(),
+    version: 0,
+    shown: 0,
 });
 static GENERATION: AtomicU64 = AtomicU64::new(0);
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -114,10 +120,14 @@ pub fn set_pages(mut pages: Vec<ModPage>) {
         })
         .collect();
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let version = state.version + 1;
+    let shown = state.shown;
     *state = State {
         pages,
         values,
         events: Default::default(),
+        version,
+        shown,
     };
     GENERATION.fetch_add(1, Ordering::AcqRel);
 }
@@ -129,16 +139,39 @@ fn cut(text: &str) -> String {
         .collect()
 }
 
+fn checked_value(kind: &ModKind, value: Value, allow_action: bool) -> Option<Value> {
+    match (kind, value) {
+        (ModKind::Toggle(_), Value::Bool(on)) => Some(Value::Bool(on)),
+        (ModKind::Number { min, max, .. }, Value::Number(v))
+            if v.is_finite() && min.is_finite() && max.is_finite() =>
+        {
+            let (lo, hi) = if min <= max { (*min, *max) } else { (*max, *min) };
+            Some(Value::Number(v.clamp(lo, hi)))
+        }
+        (ModKind::Action, Value::None) if allow_action => Some(Value::None),
+        _ => None,
+    }
+}
+
 /// Sets an item's value from the mods' side (no event is queued).
 pub fn set_value(page: usize, item: usize, value: Value) -> bool {
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-    match state.values.get_mut(page).and_then(|p| p.get_mut(item)) {
-        Some(slot) if !matches!(slot, Value::None) && !matches!(value, Value::None) => {
-            *slot = value;
-            true
-        }
-        _ => false,
-    }
+    let Some(kind) = state
+        .pages
+        .get(page)
+        .and_then(|p| p.items.get(item))
+        .map(|i| &i.kind)
+    else {
+        return false;
+    };
+    let Some(value) = checked_value(kind, value, false) else {
+        return false;
+    };
+    let Some(slot) = state.values.get_mut(page).and_then(|p| p.get_mut(item)) else {
+        return false;
+    };
+    *slot = value;
+    true
 }
 
 /// An item's value now.
@@ -197,7 +230,8 @@ pub const RELOAD_ID: Id = "mod.reload";
 /// The Mods page, then the mods' pages, to follow `first` pages already in
 /// the menu: the Mods page is page `first`, the mods' pages `first + 1`...
 pub fn pages(first: usize) -> Vec<Page> {
-    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    state.shown = state.version;
     let mut list = vec![Item::new(
         RELOAD_ID,
         "Reload Lua mods",
@@ -253,10 +287,19 @@ pub fn pages(first: usize) -> Vec<Page> {
 
 /// The value item `id` shows.
 pub fn value(id: &str) -> Value {
-    match parse(id) {
-        Some((p, i)) => value_of(p, i).unwrap_or(Value::None),
-        None => Value::None,
+    let Some((p, i)) = parse(id) else {
+        return Value::None;
+    };
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.shown != state.version {
+        return Value::None;
     }
+    state
+        .values
+        .get(p)
+        .and_then(|page| page.get(i))
+        .copied()
+        .unwrap_or(Value::None)
 }
 
 /// The menu set item `id` (a toggle flipped, a number moved, an action run).
@@ -267,6 +310,17 @@ pub fn apply(id: &str, value: Value) -> Result<Option<String>, String> {
     }
     let (p, i) = parse(id).ok_or_else(|| "Not a mod's item.".to_string())?;
     let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    if state.shown != state.version {
+        return Err("That mod item is gone (the mods were reloaded).".into());
+    }
+    let kind = state
+        .pages
+        .get(p)
+        .and_then(|page| page.items.get(i))
+        .map(|item| &item.kind)
+        .ok_or_else(|| "That mod item is gone (the mods were reloaded).".to_string())?;
+    let value = checked_value(kind, value, true)
+        .ok_or_else(|| "That mod item expects a different value.".to_string())?;
     let slot = state
         .values
         .get_mut(p)
@@ -360,12 +414,14 @@ mod tests {
         assert_eq!(value("mod.0.2"), Value::None);
         assert_eq!(value("mod.9.9"), Value::None);
         assert_eq!(counts()[&0], 3);
+        set_pages(vec![]);
     }
 
     #[test]
     fn what_the_menu_does_is_queued_for_the_mods_and_the_value_kept() {
         let _one = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_pages(sample());
+        pages(0);
         assert_eq!(apply("mod.0.0", Value::Bool(false)), Ok(None));
         assert_eq!(apply("mod.0.1", Value::Number(3.5)), Ok(None));
         assert_eq!(apply("mod.0.2", Value::None), Ok(None));
@@ -433,5 +489,68 @@ mod tests {
         assert_eq!(parse("mod.3.12"), Some((3, 12)));
         assert_eq!(parse("mod.x.1"), None);
         assert_eq!(parse("go.mods"), None);
+    }
+
+    #[test]
+    fn stale_pages_and_mismatched_values_are_refused() {
+        let _one = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        take_events();
+        set_pages(sample());
+        let shown = pages(13);
+        assert_eq!(shown[1].items[0].id, "mod.0.0");
+        assert_eq!(value("mod.0.0"), Value::Bool(true));
+
+        // A reload clears the old runtime's pages and publishes the new ones
+        // before the menu thread refreshes its own copy of the pages.
+        set_pages(vec![]);
+        set_pages(vec![ModPage {
+            title: "Reloaded".into(),
+            items: vec![ModItem {
+                label: "Speed".into(),
+                help: String::new(),
+                kind: ModKind::Number {
+                    value: 5.0,
+                    min: 0.0,
+                    max: 10.0,
+                    step: 1.0,
+                    decimals: 0,
+                    suffix: String::new(),
+                },
+            }],
+        }]);
+
+        // Until `pages` is called again, the menu's old `mod.0.0` toggle id
+        // must not read or overwrite the new number item at `(0, 0)`.
+        assert_eq!(value("mod.0.0"), Value::None);
+        assert!(apply("mod.0.0", Value::Bool(false)).is_err());
+        assert_eq!(value_of(0, 0), Some(Value::Number(5.0)));
+        assert!(take_events().is_empty());
+
+        // Once the menu takes the new pages in, valid updates work and wrong
+        // value types or non-finite numbers are still refused.
+        let refreshed = pages(13);
+        assert_eq!(refreshed[1].title, "Reloaded");
+        assert_eq!(value("mod.0.0"), Value::Number(5.0));
+        assert!(apply("mod.0.0", Value::Bool(false)).is_err());
+        assert!(apply("mod.0.0", Value::Number(f64::NAN)).is_err());
+        assert!(!set_value(0, 0, Value::Bool(false)));
+        assert!(!set_value(0, 0, Value::Number(f64::INFINITY)));
+        assert_eq!(value_of(0, 0), Some(Value::Number(5.0)));
+        assert!(take_events().is_empty());
+
+        assert_eq!(apply("mod.0.0", Value::Number(12.0)), Ok(None));
+        assert_eq!(value("mod.0.0"), Value::Number(10.0));
+        assert_eq!(
+            take_events(),
+            [Event {
+                page: 0,
+                item: 0,
+                value: Value::Number(10.0),
+            }]
+        );
+        assert!(set_value(0, 0, Value::Number(-3.0)));
+        assert_eq!(value_of(0, 0), Some(Value::Number(0.0)));
+
+        set_pages(vec![]);
     }
 }
