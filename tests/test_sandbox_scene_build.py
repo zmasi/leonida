@@ -116,6 +116,25 @@ class SceneBuildTests(unittest.TestCase):
         meshes, positions, _ = self.build_scene(rows, max_props=1, center=None)
         self.assertEqual((meshes, positions), (1, [(225.0, 25.0, 0.0)]))
 
+    def test_auto_center_does_not_keep_distant_placement_payloads(self):
+        placements = self.root / "rows.jsonl"
+        with placements.open("w", encoding="utf-8", newline="\n") as out:
+            for i in range(1200):
+                row = entity("synthetic_missing", 1000 + i, note="x" * 4096)
+                out.write(json.dumps(row) + "\n")
+            out.write(json.dumps(entity("synthetic_prop", 25, 25)) + "\n")
+        (self.models / "manifest.json").write_text(json.dumps({"Items": self.items}), encoding="utf-8", newline="\n")
+        args = SimpleNamespace(entities=placements, models=self.models, textures=[], center=None,
+                               radius=1, max_props=1, out=self.root / "scene.bin")
+        tracemalloc.start()
+        try:
+            stats = sandbox_scene.build(args)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertEqual((stats["center"], stats["placed"], stats["selected_rows"]), ([25, 25, 0], 1, 1201))
+        self.assertLess(peak, 4 * 1024 * 1024)
+
     def test_models_without_usable_geometry_do_not_consume_limit(self):
         self.add_model("synthetic_empty", "o empty\n")
         rows = [entity("synthetic_empty", i + 1) for i in range(4)]

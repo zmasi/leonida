@@ -503,16 +503,29 @@ def run_hw(arch=None, waves=(32, 64)):
             for c in CASES:
                 k = asm.Kernel(c.kernel_lines(), wave=wave, threads=1, words=5, raw=True, lds=65536, mode=c.mode)
                 batch = oracle.run([k] * 4, words=5)
+                if not isinstance(batch, (list, tuple)) or len(batch) != 4:
+                    got_desc = len(batch) if isinstance(batch, (list, tuple)) else type(batch).__name__
+                    raise RuntimeError(f"wave{wave} {c.name}: expected 4 oracle results, got {got_desc}")
                 picked = None
+                fallback = None
+                rejected = []
                 for r in batch:
-                    if not isinstance(r, list) or len(r) < 5:
+                    if isinstance(r, str):
+                        rejected.append(r)
                         continue
-                    if (r[4] & 0x100) == 0:
-                        picked = tuple(r[:4])
-                        break
+                    if (not isinstance(r, (list, tuple)) or len(r) < 5
+                            or any(isinstance(w, bool) or not isinstance(w, int) for w in r[:5])):
+                        raise RuntimeError(f"wave{wave} {c.name}: invalid oracle result {r!r}")
+                    words4 = tuple(w & 0xFFFFFFFF for w in r[:4])
+                    if fallback is None:
+                        fallback = words4
+                    if picked is None and (r[4] & 0x100) == 0:
+                        picked = words4
                 if picked is None:
-                    first = batch[0]
-                    picked = tuple(first[:4]) if isinstance(first, list) else first
+                    if fallback is not None:
+                        picked = fallback
+                    else:
+                        raise RuntimeError(f"wave{wave} {c.name}: kernel rejected: {rejected[0]}")
                 per_wave[wave][c.name] = picked
         return device, hw_arch, per_wave
     finally:
@@ -530,8 +543,16 @@ def main(argv=None):
     ap.add_argument("--oracle", choices=("translator", "hw", "both"), default="translator")
     ap.add_argument("--hw-arch", default=None, help="override GPU architecture for hw_oracle")
     args = ap.parse_args(argv)
+    if args.hw_arch is not None:
+        args.hw_arch = args.hw_arch.strip()
+        if not args.hw_arch:
+            ap.error("--hw-arch must not be empty")
 
-    got_mix, got_p1 = run_translator_checks()
+    try:
+        got_mix, got_p1 = run_translator_checks()
+    except (rdna2spirv.Unsupported, spirv_mini_interp.UnsupportedConstruct, RuntimeError, OSError) as e:
+        print(f"harness error: {e}")
+        return 2
     want_mix = (
         CASE_MIXED_F16_F32.expected_hw[0] & 0xFFFF,
         CASE_MIXED_F16_F32.expected_hw[1] & 0xFFFF,
@@ -556,12 +577,18 @@ def main(argv=None):
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
+    except RuntimeError as e:
+        print(f"harness error: {e}")
+        return 2
 
     print(f"hardware oracle: {device} ({hw_arch})")
     failures = 0
     for c in CASES:
         w32 = per_wave[32][c.name]
         w64 = per_wave[64][c.name]
+        if isinstance(w32, str) or isinstance(w64, str):
+            print(f"harness error: {c.name}: {w32 if isinstance(w32, str) else w64}")
+            return 2
         ok = (w32 == c.expected_hw) and (w64 == c.expected_hw)
         status = "ok" if ok else "MISMATCH"
         if not ok:

@@ -115,7 +115,11 @@ def _inside(value, comp, box, wide):
 
 
 def _root_equal(value, bound, comp, wide):
+    if math.isnan(value) or math.isnan(bound):
+        return False
     if wide:
+        if math.isinf(value) or math.isinf(bound):
+            return False
         return abs(value - bound) <= FLOAT_TOL * max(abs(bound), 1e-30)
     want = R.half_down(bound) if comp < 3 else R.half_up(bound)
     return R.float_to_half(value) == want
@@ -311,8 +315,11 @@ def check_stream(buf, at=0):
             got = comps.get(comp, [])
             if len(got) == kids and kids:
                 vals = [v for _, v in got]
-                union = min(vals) if comp < 3 else max(vals)
                 st["root_components_stored"] += 1
+                if any(math.isnan(v) for v in vals):
+                    res.fail("root_union_not_bounds")
+                    continue
+                union = min(vals) if comp < 3 else max(vals)
                 if _root_equal(union, box[comp], comp, wide):
                     st["root_components_equal"] += 1
                 else:
@@ -442,21 +449,33 @@ def scan_window(args):
                     tally.kinds[kind] += 1
                 if kind == "bvh4-chunk":
                     # Join the continuation streams that follow, up to the declared end.
-                    parts, have, q = [data], len(data), pos
+                    parts, have, prev_end, q, joined, saw_bad = [data], len(data), pos, pos, [], False
                     while have < row["declared_bytes"]:
-                        nxt = I.ZHDR.search(m, q, size)
-                        more = _inflate(m, nxt.start(), size) if nxt else None
+                        search_end = min(prev_end + 18, size) if saw_bad else size
+                        nxt = I.ZHDR.search(m, q, search_end)
+                        if not nxt or (saw_bad and nxt.start() > prev_end + 16):
+                            break
+                        more = _inflate(m, nxt.start(), size)
                         if more is None:
+                            if nxt.start() > prev_end + 16:
+                                break
+                            saw_bad = True
+                            q = nxt.start() + 1
+                            continue
+                        more_kind = I.classify(more[0][:I.HEAD], len(more[0]))["kind"]
+                        if more_kind != "raw":
                             break
                         parts.append(more[0])
                         have += len(more[0])
-                        tally.kinds["continuation"] += 1
-                        tally.consumed.add(nxt.start())
-                        q = nxt.start() + more[1]
+                        joined.append(nxt.start())
+                        prev_end = q = nxt.start() + more[1]
+                        saw_bad = False
                     data = b"".join(parts)
                     if have < row["declared_bytes"]:
                         tally.add(s, _short())
                         continue
+                    tally.kinds["continuation"] += len(joined)
+                    tally.consumed.update(joined)
                     tally.kinds["bvh4-chunk-joined"] += 1
                     pos = q
                     kind = "bvh4"

@@ -39,8 +39,8 @@ Auf keiner Plattform ist bisher etwas spielbar. Was heute wo läuft:
 - **AMD RDNA1 (RX 5000)**: ein unterstütztes Ziel, nah am RDNA2 der Konsole; seine 64 breiten Subgroups führen die
   Wave64-Shader nativ aus.
 
-GPU-Ergebnisse von allen Plattformen werden in [Issue #166](https://github.com/ItsNotRexed/Leonida/issues/166)
-gesammelt.
+GPU-Ergebnisse von allen Plattformen werden als Pull Requests eingereicht, die eine Datei zu
+[gpu-test-results/](../../../gpu-test-results) hinzufügen.
 
 ## Voraussetzungen
 
@@ -82,7 +82,7 @@ gesammelt.
 1. Installiere die Voraussetzungen oben.
 2. Klone das Repository **mit seinem Submodul**:
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/ubiquitarianism/leonida
    ```
    Ein „Download ZIP“ von GitHub lässt `third_party/rpf9-explorer` weg. Der Build holt es nach, wenn `git`
    installiert ist, und sagt dir sonst, was zu tun ist.
@@ -172,6 +172,6 @@ GPU der Runtime es kann, denn dieser Treiber kann bei emuliertem LDS-Code abstü
    [`CONTRIBUTING.md`](../../../CONTRIBUTING.md).
 
 Die [Anleitung zu den GPU-Tests](../../testing.md) zeigt, wie sie ohne Spieldateien laufen.
-Ergebnisse von GPU-Tests gehören in [Issue #166](https://github.com/ItsNotRexed/Leonida/issues/166).
+Ergebnisse von GPU-Tests gehören als Pull Request mit einer Datei in [gpu-test-results/](../../../gpu-test-results).
 
-[coord]: https://github.com/ItsNotRexed/Leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22
+[coord]: https://github.com/ubiquitarianism/leonida/issues?q=is%3Aissue%20is%3Aopen%20in%3Atitle%20%22Coordinating%20who%20works%20on%20what%22

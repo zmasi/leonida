@@ -81,6 +81,21 @@ int main() {
         check(cz::find(kShapeAWithRcx, sizeof kShapeAWithRcx).empty(), "a loop that compares against rcx is left alone");
         const uint8_t lone[] = {0x0F, 0x01, 0xFC, 0xC3};
         check(cz::find(lone, sizeof lone).empty(), "a CLZERO outside both loop shapes is left alone");
+        check(cz::find(nullptr, 64).empty(), "null code buffer returns no sites");
+        check(cz::stub_page(0x1000, 0x2000, 0) == nullptr, "stub_page rejects size 0");
+        check(cz::stub_page(0x2000, 0x1000, 0x10000) == nullptr, "stub_page rejects inverted [lo, hi)");
+        int32_t rel = 0;
+        check(cz::rel32_offset(0x100000000ull, 0x100000000ull + INT32_MAX, rel) && rel == INT32_MAX,
+              "rel32_offset accepts INT32_MAX");
+        check(!cz::rel32_offset(0x100000000ull, 0x100000000ull + uint64_t(INT32_MAX) + 1, rel),
+              "rel32_offset rejects INT32_MAX + 1");
+        check(cz::rel32_offset(0x180000000ull, 0x100000000ull, rel) && rel == INT32_MIN,
+              "rel32_offset accepts INT32_MIN");
+        check(!cz::rel32_offset(0x180000001ull, 0x100000000ull, rel),
+              "rel32_offset rejects INT32_MIN - 1");
+        const cz::Site site_a{6, 12, 0};
+        check(cz::stub(kShapeA + 6, site_a, 0x100000000ull, 0x500000000ull).empty(),
+              "stub refuses resume address beyond +/-2 GiB");
     }
 
     auto* code = static_cast<uint8_t*>(VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE));

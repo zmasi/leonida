@@ -121,12 +121,28 @@ def test_vertex_shader_text():
     assert "ClipDistance" not in plain and "CullDistance" not in plain
 
 
+def test_vertex_shader_text_pc_tail():
+    lay = dict(_vs_layout(clip=1, params=(0, 4)), push_constant_bytes=128,
+               address_dwords=None, pc_tail_address_dwords=[4, 5])
+    text = mesh_compute_vs.vs_spvasm(lay)
+    assert 'OpEntryPoint Vertex %main "main" %vertex_index %pc_tail %out_pos %out_clip %out0 %out4' in text
+    assert "OpDecorate %pc_tail DescriptorSet 1" in text and "OpDecorate %pc_tail Binding 0" in text
+    assert "OpMemberDecorate %PcTail 4 Offset 16" in text and "OpMemberDecorate %PcTail 5 Offset 20" in text
+    assert "PushConstant" not in text
+    assert "%alo_p = OpAccessChain %_ptr_Uniform_uint_tail %pc_tail %c4" in text
+    assert "%ahi_p = OpAccessChain %_ptr_Uniform_uint_tail %pc_tail %c5" in text
+
+
 @pytest.mark.skipif(not HAVE_SPIRV, reason="needs spirv-as and spirv-val")
+@pytest.mark.parametrize("pc_tail", [False, True], ids=["push-constant", "pc-tail-ubo"])
 @pytest.mark.parametrize("clip,cull,params", [(0, 0, ()), (0, 0, (0,)), (1, 0, (0, 1)), (5, 2, (0, 2, 7)),
                                               (0, 0, tuple(range(18)))])
-def test_vertex_shader_validates(tmp_path, clip, cull, params):
+def test_vertex_shader_validates(tmp_path, pc_tail, clip, cull, params):
+    lay = _vs_layout(clip, cull, params)
+    if pc_tail:
+        lay.update(push_constant_bytes=128, address_dwords=None, pc_tail_address_dwords=[4, 5])
     asm = tmp_path / "vs.spvasm"
-    asm.write_text(mesh_compute_vs.vs_spvasm(_vs_layout(clip, cull, params)), encoding="utf-8")
+    asm.write_text(mesh_compute_vs.vs_spvasm(lay), encoding="utf-8")
     spv = tmp_path / "vs.spv"
     for cmd in (["spirv-as", "--target-env", "vulkan1.2", str(asm), "-o", str(spv)],
                 ["spirv-val", "--target-env", "vulkan1.2", str(spv)]):

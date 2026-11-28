@@ -33,6 +33,19 @@ class ListTest(unittest.TestCase):
                     self.assertEqual(stdout.getvalue(), "Clips/Demo.bk2  640x480, 24 frames\n")
 
 
+class PlayerDiscoveryTest(unittest.TestCase):
+    def test_find_exe_in_cmake_configurations(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(bink_play, "HERE", Path(tmp) / "tools"):
+            build = Path(tmp) / "runtime" / "build"
+            for config in ("MinSizeRel", "Debug", "RelWithDebInfo", "Release", ""):
+                with self.subTest(config=config):
+                    exe = build / config / "bink_play.exe"
+                    exe.parent.mkdir(parents=True, exist_ok=True)
+                    exe.touch()
+                    self.assertEqual(bink_play.find_exe(None), exe)
+            self.assertEqual(bink_play.find_exe("my-player.exe"), Path("my-player.exe"))
+
+
 class PickTest(unittest.TestCase):
     def test_exact_path_wins_case_insensitively_and_with_backslashes(self):
         hit, _ = bink_play.pick(NAMES, "stinger\\intro_a.BK2")

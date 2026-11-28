@@ -6663,12 +6663,16 @@ class Gen:
             if key is not None:
                 self.x_mcache[key] = res
             return res
+        # The gather is stored to a variable of its own (eager, SHADER-529): a reader that writes a VGPR, v_mbcnt, is
+        # an OpSelect on the lane's EXEC, and SPIRV-Cross (MoltenVK) inlines a single-use gather into that ternary's
+        # taken arm. A lane that is off then never runs the subgroup op, and its bit is missing from the mask the
+        # other lanes count (SHADER-WAVEMASK-EAGER; Apple M5, MoltenVK 1.4.2, tools/crosslane_fuzz.py).
         if self.wave32_fragment:
             ballot = self.tmp()
             self.emit(f"{ballot} = OpGroupNonUniformBallot %v4uint_bal {self.cu(3)} {mine}")
             word = self.wave32_ballot_word(ballot)
             self.uses_ballot = True
-            return word, self.cu(0)
+            return self.eager("%uint", word), self.cu(0)
         self.uses_wave_bits = True
         lane = self.wave_lane()
         low, sh, bit, b, lo_in, hi_in, lo, hi = (self.tmp() for _ in range(8))
@@ -6680,7 +6684,7 @@ class Gen:
         self.emit(f"{hi_in} = OpSelect %uint {low} {self.cu(0)} {b}")
         self.emit(f"{lo} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {lo_in}")
         self.emit(f"{hi} = OpGroupNonUniformBitwiseOr %uint {self.cu(3)} Reduce {hi_in}")
-        return lo, hi
+        return self.eager("%uint", lo), self.eager("%uint", hi)
 
     def quad_any(self, v):
         """This lane's value after whole-quad mode: all ones if any of the 4 lanes of its quad (4n .. 4n+3 of the
@@ -7649,8 +7653,14 @@ class Gen:
         if off == 16 and width == 16:
             return self.as_uint(self.i16_half(v, 1)) if a.get("sext") else self.u16_half(v, 1)
         r = self.tmp()
-        f = "OpBitFieldSExtract" if a.get("sext") else "OpBitFieldUExtract"
-        self.emit(f"{r} = {f} %uint {v} {self.cu(off)} {self.cu(width)}")
+        if a.get("sext"):
+            # Sign-extend with two shifts, not OpBitFieldSExtract: an NVIDIA driver (RTX 4050 Laptop, 621.01) converts
+            # the extracted field as signed under v_cvt_f32_u32 (docs/design.md, "SDWA sext source"). Same value.
+            up = self.tmp()
+            self.emit(f"{up} = OpShiftLeftLogical %uint {v} {self.cu(32 - off - width)}")
+            self.emit(f"{r} = OpShiftRightArithmetic %uint {up} {self.cu(32 - width)}")
+            return r
+        self.emit(f"{r} = OpBitFieldUExtract %uint {v} {self.cu(off)} {self.cu(width)}")
         return r
 
     def sdwa_dst(self, d, val):
@@ -8753,9 +8763,12 @@ class Gen:
                 self.emit(f"{rel} = OpCopyObject %uint {lane}")
             else:
                 self.emit(f"{rel} = OpISub %uint {lane} {self.cu(32)}")
-            # bits below `rel`, clamped to [0, 32]
+            # bits below `rel`, clamped to [0, 32] (mask shift count to < 32 so OpShiftLeftLogical
+            # never executes SPIR-V UB on the discarded side of OpSelect).
+            rel_s = self.tmp()
             self.emit(f"{inrange} = OpULessThan %bool {rel} {self.cu(32)}")
-            self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {rel}")
+            self.emit(f"{rel_s} = OpBitwiseAnd %uint {rel} {self.cu(31)}")
+            self.emit(f"{one} = OpShiftLeftLogical %uint {self.cu(1)} {rel_s}")
             self.emit(f"{m1} = OpISub %uint {one} {self.cu(1)}")
             big = self.tmp()
             # lo: lanes >= 32 count all 32 bits; hi: lanes < 32 count none (rel wraps above 32).

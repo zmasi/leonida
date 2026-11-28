@@ -53,13 +53,16 @@ import os
 import re
 import struct
 import sys
+import tempfile
 import zlib
 from typing import Iterable, Iterator
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing sibling modules.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import file_mode  # noqa: E402
 import odrp_7a  # noqa: E402
 import psin_data  # noqa: E402
+import replace_retry  # noqa: E402
 from report_paths import same_report_path, path_key  # noqa: E402
 import world_names  # noqa: E402
 
@@ -641,10 +644,10 @@ def parse_catalogue_blocks(
                 break
             seen.add(cur)
             depth += 1
-            if depth >= MAX_PARENT_DEPTH:
+            cur = parent.parent_id
+            if cur and depth >= MAX_PARENT_DEPTH:
                 warnings.append(f"parent_id chain depth reached cap ({MAX_PARENT_DEPTH}) at preset 0x{rec.preset_id:08x}")
                 break
-            cur = parent.parent_id
         if depth > max_parent_depth:
             max_parent_depth = depth
 
@@ -729,6 +732,12 @@ def parse_catalogue(
 # ---------------------------------------------------------------- inheritance & resolution
 
 
+def _require_int_bound(value: object, name: str, *, minimum: int) -> int:
+    if type(value) is not int or value < minimum:
+        raise ValueError(f"{name} must be an integer >= {minimum}, got {value!r}")
+    return value
+
+
 def resolve_ancestor_tags(
     catalogue: CatalogueContainer,
     preset: PresetRecord,
@@ -740,6 +749,7 @@ def resolve_ancestor_tags(
 
     Returns `(matched_tags_subset, parent_chain_traversed, hit_cycle)`.
     """
+    _require_int_bound(max_depth, "max_depth", minimum=0)
     if not preset.parent_id:
         return {}, (), False
     visited = {preset.preset_id}
@@ -767,6 +777,7 @@ def resolve_effective_tags(
     max_depth: int = MAX_PARENT_DEPTH,
 ) -> tuple[dict[int, tuple[int, ...]], tuple[int, ...], bool]:
     """Merge tags along the `parent_id` chain (child keys override ancestor keys) with cycle guard."""
+    _require_int_bound(max_depth, "max_depth", minimum=0)
     visited = {preset.preset_id}
     ancestors: list[PresetRecord] = [preset]
     chain: list[int] = []
@@ -818,6 +829,7 @@ def resolve_preset_bindings(
     4. Direct state drawable `h0` (`murmur64`).
     5. Direct `cull_drawable` target (`murmur64`, when `h0 == 0` or matched by a `cull_drawable` query).
     """
+    _require_int_bound(max_depth, "max_depth", minimum=0)
     j32_names: dict[int, list[str]] = collections.defaultdict(list)
     m64_names: dict[int, list[str]] = collections.defaultdict(list)
     want_32: set[int] = set(filter_hashes_32 or ())
@@ -1060,6 +1072,7 @@ def _try_parse_candidate(
 
 def iter_catalogues_in_file(path: str, *, max_inflate: int = MAX_INFLATE) -> Iterator[CatalogueContainer]:
     """Yield a `0x8dcb4cf5` catalogue if `path` contains one (raw `0DRP`/`PSIN` or single zlib stream)."""
+    _require_int_bound(max_inflate, "max_inflate", minimum=1)
     if os.path.getsize(path) > max_inflate:
         return
     with open(path, "rb") as fh:
@@ -1084,12 +1097,13 @@ def _row_file_name(row: dict) -> str:
 
 def iter_catalogues_in_dir(path: str, *, max_inflate: int = MAX_INFLATE) -> Iterator[CatalogueContainer]:
     """Yield all `0x8dcb4cf5` catalogues in a carved directory (joining contiguous streams when `index.json` exists)."""
+    _require_int_bound(max_inflate, "max_inflate", minimum=1)
     manifest = os.path.join(path, "index.json")
     if os.path.isfile(manifest):
         try:
-            with open(manifest, encoding="utf-8") as fh:
+            with open(manifest, encoding="utf-8-sig") as fh:
                 doc = json.load(fh)
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
             doc = None
         if isinstance(doc, dict) and isinstance(doc.get("files"), list):
             rows = sorted(
@@ -1101,7 +1115,7 @@ def iter_catalogues_in_dir(path: str, *, max_inflate: int = MAX_INFLATE) -> Iter
                 row = rows[i]
                 fname = _row_file_name(row)
                 fpath = os.path.join(path, fname)
-                if not os.path.isfile(fpath) or os.path.getsize(fpath) > max_inflate:
+                if not _is_under_dir(fpath, path) or not os.path.isfile(fpath) or os.path.getsize(fpath) > max_inflate:
                     i += 1
                     continue
                 with open(fpath, "rb") as fh:
@@ -1126,7 +1140,7 @@ def iter_catalogues_in_dir(path: str, *, max_inflate: int = MAX_INFLATE) -> Iter
                         break
                     nname = _row_file_name(rows[j + 1])
                     npath = os.path.join(path, nname)
-                    if not os.path.isfile(npath):
+                    if not _is_under_dir(npath, path) or not os.path.isfile(npath):
                         break
                     with open(npath, "rb") as fh:
                         chunk = fh.read()
@@ -1164,6 +1178,11 @@ def iter_catalogues_in_rpf(
     Uses a 96-byte zlib header peek to skip non-`PSIN`/non-`0DRP` streams without inflating them,
     and joins contiguous continuation streams automatically when a catalogue spans multiple zlib blocks.
     """
+    _require_int_bound(max_inflate, "max_inflate", minimum=1)
+    if start is not None:
+        _require_int_bound(start, "start", minimum=0)
+    if limit is not None:
+        _require_int_bound(limit, "limit", minimum=1)
     file_size = os.path.getsize(path)
     if file_size == 0:
         raise ValueError("empty file")
@@ -1380,9 +1399,31 @@ def _check_out_path(out_path: str, inputs: list[str]) -> str | None:
 
 
 def _write_json(path: str, payload: object) -> None:
-    with open(path, "w", encoding="utf-8", newline="\n") as fh:
-        json.dump(payload, fh, indent=1)
-        fh.write("\n")
+    text = json.dumps(payload, indent=1, allow_nan=False) + "\n"
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path) or "."
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=parent,
+            prefix=f".{os.path.basename(abs_path)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as fh:
+            tmp_path = fh.name
+            fh.write(text)
+        os.chmod(tmp_path, file_mode.published_mode(abs_path))
+        replace_retry.replace(tmp_path, abs_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def _cmd_census(args: argparse.Namespace) -> int:
@@ -1403,7 +1444,11 @@ def _cmd_census(args: argparse.Namespace) -> int:
         print(f"ERROR: {args.source}: {exc}", file=sys.stderr)
         return 2
     if args.out:
-        _write_json(args.out, report)
+        try:
+            _write_json(args.out, report)
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: {args.out}: {exc}", file=sys.stderr)
+            return 2
     if args.json:
         json.dump(report, sys.stdout, indent=1)
         sys.stdout.write("\n")
@@ -1445,12 +1490,17 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
         print(f"ERROR: {args.file}: no such file", file=sys.stderr)
         return 2
     try:
+        max_inf = getattr(args, "max_inflate", MAX_INFLATE)
+        _require_int_bound(max_inf, "max_inflate", minimum=1)
+        if os.path.getsize(args.file) > max_inf:
+            raise ValueError(f"file size exceeds --max-inflate cap ({max_inf:,} bytes)")
         with open(args.file, "rb") as fh:
             data = fh.read()
         if len(data) >= 2 and data[0] == 0x78 and data[1] in (0x01, 0x5E, 0x9C, 0xDA):
-            inflated = _inflate_at(data, 0, len(data), MAX_INFLATE)
-            if inflated is not None:
-                data = inflated[0]
+            inflated = _inflate_at(data, 0, len(data), max_inf)
+            if inflated is None:
+                raise ValueError(f"zlib inflate failed or exceeded --max-inflate ({max_inf:,} bytes)")
+            data = inflated[0]
         cat = parse_catalogue_strict(data, source=args.file)
     except (OSError, ValueError) as exc:
         print(f"ERROR: {args.file}: {exc}", file=sys.stderr)
@@ -1460,7 +1510,11 @@ def _cmd_inspect(args: argparse.Namespace) -> int:
     if args.limit > 0:
         payload["presets"] = [p.to_dict() for p in cat.presets[:args.limit]]
     if args.out:
-        _write_json(args.out, payload)
+        try:
+            _write_json(args.out, payload)
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: {args.out}: {exc}", file=sys.stderr)
+            return 2
     if args.json:
         json.dump(payload, sys.stdout, indent=1)
         sys.stdout.write("\n")
@@ -1503,14 +1557,15 @@ def _cmd_resolve(args: argparse.Namespace) -> int:
     names: list[str] = list(args.name or ())
     if args.names_file:
         try:
-            with open(args.names_file, encoding="utf-8") as fh:
+            with open(args.names_file, encoding="utf-8-sig") as fh:
                 for line in fh:
                     s = line.strip()
                     if s and not s.startswith("#"):
                         names.append(s)
-        except OSError as exc:
+        except (OSError, UnicodeDecodeError) as exc:
             print(f"ERROR: {args.names_file}: {exc}", file=sys.stderr)
             return 2
+    has_name_filter = bool(args.name) or args.names_file is not None
 
     h32: set[int] = set()
     h64: set[int] = set()
@@ -1533,7 +1588,7 @@ def _cmd_resolve(args: argparse.Namespace) -> int:
             bindings.extend(
                 resolve_preset_bindings(
                     cat,
-                    drawable_names=names if names else None,
+                    drawable_names=names if has_name_filter else None,
                     filter_hashes_32=h32 or None,
                     filter_hashes_64=h64 or None,
                     require_textures=args.require_textures,
@@ -1551,7 +1606,11 @@ def _cmd_resolve(args: argparse.Namespace) -> int:
         "bindings": [b.to_dict() for b in bindings],
     }
     if args.out:
-        _write_json(args.out, payload)
+        try:
+            _write_json(args.out, payload)
+        except (OSError, ValueError) as exc:
+            print(f"ERROR: {args.out}: {exc}", file=sys.stderr)
+            return 2
     if args.json:
         json.dump(payload, sys.stdout, indent=1)
         sys.stdout.write("\n")
@@ -1590,6 +1649,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_ins.add_argument("--json", action="store_true", help="print inspection result as JSON")
     p_ins.add_argument("--out", help="write JSON result to FILE")
     p_ins.add_argument("--limit", type=_nonneg_int, default=10, help="number of presets to include (default 10, 0 for summary)")
+    p_ins.add_argument("--max-inflate", type=_pos_int, default=MAX_INFLATE, help="inflate/file size cap in bytes (default 64 MiB)")
     p_ins.set_defaults(func=_cmd_inspect)
 
     p_res = sub.add_parser("resolve", help="resolve preset inheritance, textures, and cull_drawable swaps")

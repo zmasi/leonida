@@ -6,12 +6,57 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
+#include <new>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
+
+namespace {
+
+// Thread-local allocation failure injector so only the thread calling run() hits injected OOMs without disturbing
+// worker threads or concurrent tests.
+thread_local int g_fail_alloc_after = -1;
+thread_local bool g_fail_all_allocs = false;
+
+struct OomScope {
+    explicit OomScope(int fail_after) {
+        g_fail_alloc_after = fail_after;
+        g_fail_all_allocs = false;
+    }
+    struct FailAll {};
+    explicit OomScope(FailAll) {
+        g_fail_alloc_after = -1;
+        g_fail_all_allocs = true;
+    }
+    ~OomScope() {
+        g_fail_alloc_after = -1;
+        g_fail_all_allocs = false;
+    }
+    OomScope(const OomScope&) = delete;
+    OomScope& operator=(const OomScope&) = delete;
+};
+
+}  // namespace
+
+void* operator new(std::size_t size) {
+    if (g_fail_all_allocs) throw std::bad_alloc();
+    if (g_fail_alloc_after == 0) {
+        g_fail_alloc_after = -1;
+        throw std::bad_alloc();
+    }
+    if (g_fail_alloc_after > 0) --g_fail_alloc_after;
+    if (void* p = std::malloc(size ? size : 1)) return p;
+    throw std::bad_alloc();
+}
+void* operator new[](std::size_t size) { return ::operator new(size); }
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 namespace {
 
@@ -257,6 +302,61 @@ void destroyed() {
     }
 }
 
+// OOM while growing the worker pool (start()) or pushing onto queue_ must never leave a dangling stack Batch*
+// in queue_ (stack use-after-free on the next worker wakeup) and must still complete every job.
+void oom_during_start_and_enqueue() {
+    // 1. Existing worker already running; next larger batch hits bad_alloc inside start() while growing threads_.
+    for (int fail_at = 0; fail_at < 6; ++fail_at) {
+        PipelineWorkers pool(4);
+        std::vector<std::atomic<int>> warmup(2);
+        pool.run(warmup.size(), [&](std::size_t i) { warmup[i].fetch_add(1); });
+        check(pool.stats().started == 1, "oom warmup started one worker");
+
+        std::vector<std::atomic<int>> calls(8);
+        const std::function<void(std::size_t)> job = [&calls](std::size_t i) { calls[i].fetch_add(1); };
+        bool threw = false;
+        try {
+            OomScope oom(fail_at);
+            pool.run(calls.size(), job);
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
+        check(!threw, "run() threw bad_alloc instead of completing on existing workers/caller");
+        for (auto& c : calls) check(c == 1, "oom batch lost or repeated a job");
+
+        // Follow-up batch wakes existing workers and scales to the full pool; a dangling Batch* in queue_ would UAF.
+        std::vector<std::atomic<int>> after(5);
+        pool.run(after.size(), [&](std::size_t i) { after[i].fetch_add(1); });
+        for (auto& c : after) check(c == 1, "post-oom batch lost or repeated a job");
+        check(pool.stats().started == 4 && pool.stats().running == 0, "pool recovered full worker count after oom");
+    }
+
+    // 2. Hard OOM on the very first batch (both start() and queue_.push_back() fail): falls back inline cleanly.
+    {
+        PipelineWorkers pool(4);
+        std::vector<std::atomic<int>> calls(6);
+        const std::function<void(std::size_t)> job = [&calls](std::size_t i) { calls[i].fetch_add(1); };
+        bool threw = false;
+        try {
+            OomScope oom(OomScope::FailAll{});
+            pool.run(calls.size(), job);
+        } catch (const std::bad_alloc&) {
+            threw = true;
+        }
+        check(!threw, "hard oom on first batch threw instead of running inline");
+        for (auto& c : calls) check(c == 1, "hard oom inline fallback lost or repeated a job");
+        const auto during = pool.stats();
+        check(during.started == 0 && during.batches == 0 && during.jobs == 0 && during.running == 0,
+              "hard oom inline fallback kept stats clean");
+
+        std::vector<std::atomic<int>> after(5);
+        pool.run(after.size(), [&](std::size_t i) { after[i].fetch_add(1); });
+        for (auto& c : after) check(c == 1, "batch after hard oom lost or repeated a job");
+        check(pool.stats().started == 4 && pool.stats().batches == 1 && pool.stats().running == 0,
+              "pool works normally once memory is available again");
+    }
+}
+
 void setting() {
     using leonida::pipeline_threads;
     check(pipeline_threads(nullptr, 16).count == 8 && pipeline_threads(nullptr, 16).valid, "unset on 16 processors");
@@ -285,6 +385,7 @@ int main() {
     nested();
     stopped_while_queued();
     destroyed();
+    oom_during_start_and_enqueue();
     setting();
     if (failures) return 1;
     std::printf("pipeline_workers_test: passed\n");

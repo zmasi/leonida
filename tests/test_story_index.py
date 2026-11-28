@@ -336,6 +336,39 @@ class ArchiveTest(unittest.TestCase):
             self.assertEqual(f.read(), prior)
         self.assertEqual(sorted(os.listdir(self.root)), before)
 
+    def test_failed_replace_of_read_only_report_makes_stage_deletable(self):
+        """A failed replace over a read-only report still cleans the stage: the staged file has the
+        read-only destination's bits, so the cleanup makes it deletable before deleting, and one
+        delete failure is swallowed instead of masking the replace error (Windows behavior)."""
+        out = os.path.join(self.root, "out.json")
+        with open(out, "w", encoding="utf-8") as f:
+            f.write('{"prior": true}')
+        with open(out, "rb") as f:
+            prior = f.read()
+        os.chmod(out, 0o444)
+        self.addCleanup(lambda: os.path.exists(out) and os.chmod(out, 0o600))
+        made_writable = []
+        real_chmod = os.chmod
+
+        def chmod(staged_path, mode, *args, **kwargs):
+            if isinstance(staged_path, str) and os.path.basename(staged_path).startswith("story_index") \
+                    and mode == 0o600:
+                made_writable.append(staged_path)
+            return real_chmod(staged_path, mode, *args, **kwargs)
+
+        with self.assertRaises(OSError) as raised:
+            with mock.patch.object(story_index.os, "replace", side_effect=OSError("replace denied")), \
+                    mock.patch.object(story_index.os, "chmod", chmod):
+                story_index.write_output(out, [{"offset": 0x100, "stored": 8, "size": 9,
+                                                "signature": "psin", "version": None, "count": 1,
+                                                "detail": ""}], {"files": 1})
+        self.assertIn("replace denied", str(raised.exception))
+        self.assertEqual(len(made_writable), 1)                     # the stage was made deletable
+        with open(out, "rb") as f:
+            self.assertEqual(f.read(), prior)                       # the prior report is untouched
+        self.assertEqual([n for n in os.listdir(self.root) if n.startswith("story_index")], [])
+        self.assertNotIn(".tmp", " ".join(os.listdir(self.root)))   # no staging directory stranded
+
     def test_cli(self):
         out = os.path.join(self.root, "cli.json")
         p = subprocess.run([sys.executable, "-I", TOOL, self.rpf, out, "--quiet"],

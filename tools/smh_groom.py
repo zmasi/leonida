@@ -37,6 +37,7 @@ from dataclasses import dataclass, field
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import glb_writer  # noqa: E402
+import report_paths  # noqa: E402
 
 SYS_BASE = 0x50000000
 GPU_BASE = 0x60000000
@@ -146,8 +147,34 @@ def _clean_zero(value: float) -> float:
     return 0.0 if value == 0.0 else value
 
 
-def inflate_stream(src: bytes | bytearray | memoryview | mmap.mmap, pos: int) -> tuple[bytes, int]:
+def _validate_strand_class(strand_class: int) -> int:
+    if isinstance(strand_class, bool) or not isinstance(strand_class, int) or strand_class not in (0, 1):
+        raise GroomError(f"unsupported strand class {strand_class!r} (expected 0 or 1)")
+    return strand_class
+
+
+def _validate_positive_float(name: str, value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise GroomError(f"{name} must be a finite positive number, got {value!r}")
+    val = float(value)
+    if not math.isfinite(val) or val <= 0.0:
+        raise GroomError(f"{name} must be a finite positive number, got {value!r}")
+    return val
+
+
+def inflate_stream(
+    src: bytes | bytearray | memoryview | mmap.mmap,
+    pos: int,
+    *,
+    max_bytes: int | None = None,
+) -> tuple[bytes, int]:
     """Inflate one zlib stream at ``pos`` -> ``(raw_bytes, next_16_aligned_offset)``."""
+    if isinstance(pos, bool) or not isinstance(pos, int) or pos < 0:
+        raise GroomError(f"zlib stream offset must be a non-negative integer, got {pos!r}")
+    if max_bytes is None:
+        max_bytes = MAX_INFLATE_BYTES
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes < 0:
+        raise GroomError(f"max_bytes must be a non-negative integer, got {max_bytes!r}")
     decoder = zlib.decompressobj()
     out = bytearray()
     size = len(src)
@@ -157,13 +184,14 @@ def inflate_stream(src: bytes | bytearray | memoryview | mmap.mmap, pos: int) ->
         chunk = src[pos:pos + 65536]
         if not chunk:
             raise GroomError("incomplete zlib resource stream")
+        remaining = max_bytes - len(out)
         try:
-            piece = decoder.decompress(chunk)
+            piece = decoder.decompress(chunk, remaining + 1)
         except zlib.error as exc:
             raise GroomError(f"zlib decompression failed at {pos:#x}: {exc}") from exc
         out.extend(piece)
-        if len(out) > MAX_INFLATE_BYTES:
-            raise GroomError(f"resource stream exceeds {MAX_INFLATE_BYTES} bytes")
+        if len(out) > max_bytes or decoder.unconsumed_tail:
+            raise GroomError(f"resource stream exceeds {max_bytes} bytes")
         pos += len(chunk) - len(decoder.unused_data)
     return bytes(out), (pos + 15) & -16
 
@@ -283,6 +311,8 @@ def parse_system_page(system: bytes | bytearray | memoryview) -> dict:
 
     box_min = struct.unpack_from("<3f", sys_bytes, 0x30)
     box_max = struct.unpack_from("<3f", sys_bytes, 0x40)
+    if not all(math.isfinite(v) for v in (*box_min, *box_max)):
+        raise GroomError("non-finite system page bounding box")
     box = (box_min, box_max)
 
     # Child rigs leave the +0x50..+0x6f secondary bounds floats (within +0x48..+0x70) unset
@@ -397,9 +427,8 @@ class Groom:
 
     def seed(self, strand_class: int = 0) -> int:
         """Per-class RNG seed word from the GPU buffer header."""
-        if strand_class not in (0, 1):
-            raise GroomError(f"unsupported strand class {strand_class} (expected 0 or 1)")
-        return self.header[STRAND_CLASS_SEED[strand_class] // 4]
+        cls = _validate_strand_class(strand_class)
+        return self.header[STRAND_CLASS_SEED[cls] // 4]
 
     def bone_weights(self) -> list[tuple[float, ...]]:
         """Sum-normalised 8-slot skin weights per guide."""
@@ -674,8 +703,8 @@ def read_resource(
     archive: str = "",
 ) -> Groom:
     """Read one groom LOD resource whose 16-byte zero prefix starts at ``offset``."""
-    if offset < 0 or offset + 17 > len(src):
-        raise GroomError(f"resource offset {offset:#x} out of range")
+    if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0 or offset + 17 > len(src):
+        raise GroomError(f"resource offset {offset!r} out of range")
     if bytes(src[offset:offset + 16]) != b"\x00" * 16:
         raise GroomError(f"expected 16-byte zero prefix at {offset:#x}")
     return _read_zlib_resource(src, offset + 16, archive=archive, resource_offset=offset)
@@ -694,11 +723,16 @@ def _read_zlib_resource(
         raise GroomError("not a groom LOD resource (system page signature mismatch)")
     desc = _sys_ptr(system, 0x70)
     size = struct.unpack_from("<I", system, desc + 8)[0] * 4
+    if size > MAX_INFLATE_BYTES:
+        raise GroomError(f"asset GPU buffer size {size} exceeds {MAX_INFLATE_BYTES} bytes")
     gpu = bytearray()
     while len(gpu) < size:
         if pos >= len(src) or src[pos:pos + 1] != b"x":
             raise GroomError("asset GPU buffer zlib stream missing or truncated")
-        chunk, pos = inflate_stream(src, pos)
+        prev_pos = pos
+        chunk, pos = inflate_stream(src, pos, max_bytes=MAX_INFLATE_BYTES - len(gpu))
+        if not chunk or pos <= prev_pos:
+            raise GroomError("asset GPU buffer zlib stream made no progress")
         gpu.extend(chunk)
     return parse(system, bytes(gpu[:size]), archive=archive, offset=resource_offset)
 
@@ -706,6 +740,8 @@ def _read_zlib_resource(
 def load_groom(path: str | os.PathLike, offset: int | None = None) -> Groom:
     """Load one groom from an RPF archive (at ``offset`` or first match) or a carved ``.smh`` file."""
     path_str = os.fspath(path)
+    if os.path.isdir(path_str):
+        raise GroomError(f"input path is a directory: {path_str}")
     size = os.path.getsize(path_str)
     if size == 0:
         raise GroomError(f"empty input file: {path_str}")
@@ -777,26 +813,39 @@ def scatter(
         Dict with keys ``tri`` (list[int]), ``culled`` (list[bool]),
         ``bary`` (list[tuple[float, float, float]]), and ``seed`` (list[int]).
     """
-    if strand_class not in (0, 1):
-        raise GroomError(f"unsupported strand class {strand_class} (expected 0 or 1)")
+    strand_class = _validate_strand_class(strand_class)
 
     per_tri = [c[strand_class] for c in groom.tri_count]
     if count is None:
         count = groom.strand_totals[strand_class] or sum(per_tri)
-    if count < 0:
-        raise GroomError(f"strand count must be non-negative, got {count}")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        raise GroomError(f"strand count must be a non-negative integer, got {count!r}")
+    if max_accepted is not None and (isinstance(max_accepted, bool) or not isinstance(max_accepted, int)):
+        raise GroomError(f"max_accepted must be an integer, got {max_accepted!r}")
+
+    if density_scale is not None:
+        if isinstance(density_scale, bool) or not isinstance(density_scale, (int, float)):
+            raise GroomError(f"density_scale must be a finite non-negative number, got {density_scale!r}")
+        ds_val = float(density_scale)
+        if not math.isfinite(ds_val) or ds_val < 0.0:
+            raise GroomError(f"density_scale must be a finite non-negative number, got {density_scale!r}")
+    else:
+        max_c = max(per_tri) if per_tri else 0
+        ds_val = 1.0 / max(float(max_c), 1.0)
 
     if max_accepted is not None and max_accepted <= 0:
         return {"tri": [], "culled": [], "bary": [], "seed": []}
     if count == 0:
         return {"tri": [], "culled": [], "bary": [], "seed": []}
 
-    if density_scale is None:
-        max_c = max(per_tri) if per_tri else 0
-        density_scale = 1.0 / max(float(max_c), 1.0)
-    ds32 = _f32(float(density_scale))
     # Precompute IEEE 754 float32 acceptance thresholds for every possible u8 triangle count (0..255).
-    thresh = [min(max(_f32(float(c) * ds32), 0.0), 1.0) for c in range(256)]
+    if ds_val == 0.0:
+        thresh = [0.0] * 256
+    elif ds_val >= 1.0:
+        thresh = [0.0] + [1.0] * 255
+    else:
+        ds32 = _f32(ds_val)
+        thresh = [min(max(_f32(float(c) * ds32), 0.0), 1.0) for c in range(256)]
 
     blocked = [False] * 256
     for rid in region_mask or ():
@@ -1081,6 +1130,28 @@ def _polyline_frames(
     return sides, ups
 
 
+def _validate_polylines(
+    polylines: list[list[tuple[float, float, float]]],
+    live: list[int] | None,
+) -> int:
+    k = len(polylines[0])
+    for idx, poly in enumerate(polylines):
+        if len(poly) != k:
+            raise GroomError(f"polyline {idx} has {len(poly)} nodes, expected uniform length {k}")
+    if live is not None and len(live) != len(polylines):
+        raise GroomError(f"live length {len(live)} does not match polyline count {len(polylines)}")
+    return k
+
+
+def _validate_nonneg_float(name: str, value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise GroomError(f"{name} must be a finite non-negative number, got {value!r}")
+    val = float(value)
+    if not math.isfinite(val) or val < 0.0:
+        raise GroomError(f"{name} must be a finite non-negative number, got {value!r}")
+    return val
+
+
 def build_tubes(
     polylines: list[list[tuple[float, float, float]]],
     live: list[int] | None = None,
@@ -1090,9 +1161,13 @@ def build_tubes(
     sides: int = 3,
 ) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]], list[int]]:
     """Build tapered N-sided triangle tubes around polylines -> ``(verts, normals, indices)``."""
+    radius = _validate_nonneg_float("radius", radius)
+    tip = _validate_nonneg_float("tip", tip)
+    if isinstance(sides, bool) or not isinstance(sides, int):
+        raise GroomError(f"sides must be an integer, got {sides!r}")
     if not polylines or sides < 3:
         return [], [], []
-    k = len(polylines[0])
+    k = _validate_polylines(polylines, live)
     if k < 2:
         return [], [], []
 
@@ -1150,9 +1225,11 @@ def build_ribbons(
     tip: float = 0.25,
 ) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]], list[int]]:
     """Build flat tapered quad-strip ribbons around polylines -> ``(verts, normals, indices)``."""
+    width = _validate_nonneg_float("width", width)
+    tip = _validate_nonneg_float("tip", tip)
     if not polylines:
         return [], [], []
-    k = len(polylines[0])
+    k = _validate_polylines(polylines, live)
     if k < 2:
         return [], [], []
 
@@ -1198,7 +1275,7 @@ def build_lines(
     """Flatten polylines for glTF ``LINES`` (mode 1) -> ``(verts, paired_indices)``."""
     if not polylines:
         return [], []
-    k = len(polylines[0])
+    k = _validate_polylines(polylines, live)
     verts: list[tuple[float, float, float]] = []
     indices: list[int] = []
     v_extend = verts.extend
@@ -1281,13 +1358,23 @@ def to_glb(
         geometry = "curves"
     if geometry not in GEOMETRY_MODES:
         raise GroomError(f"unsupported geometry mode {geometry!r} (expected one of {GEOMETRY_MODES})")
+    if not isinstance(up_axis, str):
+        raise GroomError(f"unsupported up_axis {up_axis!r} (expected 'z' or 'y')")
     up = up_axis.lower()
     if up not in ("z", "y"):
         raise GroomError(f"unsupported up_axis {up_axis!r} (expected 'z' or 'y')")
-    cls_tuple = tuple(classes)
-    for cls in cls_tuple:
-        if cls not in (0, 1):
-            raise GroomError(f"unsupported strand class {cls} (expected 0 or 1)")
+    if isinstance(max_strands, bool) or not isinstance(max_strands, int) or max_strands < 0:
+        raise GroomError(f"max_strands must be a non-negative integer, got {max_strands!r}")
+    if isinstance(vertex_budget, bool) or not isinstance(vertex_budget, int) or vertex_budget <= 0:
+        raise GroomError(f"vertex_budget must be a positive integer, got {vertex_budget!r}")
+    guide_radius = _validate_positive_float("guide_radius", guide_radius)
+    strand_radius = _validate_positive_float("strand_radius", strand_radius)
+    cls_list: list[int] = []
+    for cls in classes:
+        c = _validate_strand_class(cls)
+        if c not in cls_list:
+            cls_list.append(c)
+    cls_tuple = tuple(cls_list)
 
     bin_buf = bytearray()
     buffer_views: list[dict] = []
@@ -1611,6 +1698,9 @@ def _collect_census_targets(paths: Iterable[str]) -> list[str]:
 
 def run_census(paths: Iterable[str], *, limit: int | None = None) -> dict:
     """Scan archives or carved ``.smh`` files and return aggregate corpus census statistics."""
+    if limit is not None:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
+            raise GroomError(f"census limit must be an integer >= 1, got {limit!r}")
     targets = _collect_census_targets(paths)
     per_source: list[dict] = []
     total_lods = 0
@@ -1681,7 +1771,7 @@ def run_census(paths: Iterable[str], *, limit: int | None = None) -> dict:
                         try:
                             g = read_resource(mm, off, archive=target)
                             rows.append(_row_from_groom(g, off))
-                        except (GroomError, ValueError, IndexError) as exc:
+                        except (GroomError, ValueError, IndexError, struct.error, OverflowError) as exc:
                             rows.append({"offset": off, "error": str(exc)})
                 else:
                     if remaining is not None:
@@ -1689,7 +1779,7 @@ def run_census(paths: Iterable[str], *, limit: int | None = None) -> dict:
                     try:
                         g = load_groom(target)
                         rows.append(_row_from_groom(g, 0))
-                    except (GroomError, ValueError, IndexError) as exc:
+                    except (GroomError, ValueError, IndexError, struct.error, OverflowError) as exc:
                         rows.append({"offset": 0, "error": str(exc)})
 
         ok_rows = [r for r in rows if not r["error"]]
@@ -1798,12 +1888,26 @@ def _parse_limit(text: str) -> int:
     return value
 
 
+def _parse_positive_float(text: str) -> float:
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid float: {text!r}") from None
+    if not math.isfinite(value) or value <= 0.0:
+        raise argparse.ArgumentTypeError(f"must be a finite positive number, got {text!r}")
+    return value
+
+
 def _parse_classes(text: str) -> tuple[int, ...]:
     if not text.strip():
         return ()
     out: list[int] = []
     for part in text.split(","):
-        val = int(part.strip())
+        tok = part.strip()
+        try:
+            val = int(tok)
+        except ValueError:
+            raise argparse.ArgumentTypeError(f"invalid strand class: {tok!r}") from None
         if val not in (0, 1):
             raise argparse.ArgumentTypeError(f"strand class must be 0 or 1, got {val}")
         if val not in out:
@@ -1902,8 +2006,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_glb.add_argument("--no-scalp", action="store_true", help="Omit scalp triangle mesh")
     p_glb.add_argument("--no-guides", action="store_true", help="Omit guide curves/tubes")
-    p_glb.add_argument("--guide-radius", type=float, default=0.0006, help="Display tube/ribbon radius for guides (m)")
-    p_glb.add_argument("--strand-radius", type=float, default=0.00035, help="Display tube/ribbon radius for strands (m)")
+    p_glb.add_argument("--guide-radius", type=_parse_positive_float, default=0.0006, help="Display tube/ribbon radius for guides (m)")
+    p_glb.add_argument("--strand-radius", type=_parse_positive_float, default=0.00035, help="Display tube/ribbon radius for strands (m)")
     p_glb.add_argument("--up", choices=("z", "y"), default="z", help="Source up axis (default z -> glTF Y-up)")
 
     return parser
@@ -1916,7 +2020,7 @@ def main(argv: list[str] | None = None) -> int:
             groom = load_groom(args.path, offset=args.offset)
             summary = groom.summary()
             if args.json:
-                print(json.dumps(summary, indent=2))
+                print(json.dumps(summary, indent=2, allow_nan=False))
             else:
                 print(_format_inspect_text(summary))
             return 0
@@ -1924,14 +2028,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "census":
             report = run_census(args.paths, limit=args.limit)
             if args.json:
-                print(json.dumps(report, indent=2))
+                print(json.dumps(report, indent=2, allow_nan=False))
             else:
                 print(_format_census_text(report))
             return 0
 
         if args.command == "export-glb":
-            if os.path.exists(args.output) and os.path.exists(args.path) and os.path.samefile(args.path, args.output):
+            if report_paths.same_report_path(args.path, args.output):
                 raise GroomError(f"output must not overwrite the input file: {args.path}")
+            if os.path.isdir(args.output):
+                raise GroomError(f"output path is a directory: {args.output}")
             groom = load_groom(args.path, offset=args.offset)
             meta = write_glb(
                 args.output,
@@ -1952,7 +2058,7 @@ def main(argv: list[str] | None = None) -> int:
                 "geometry": meta["geometry"],
                 "strandTotals": meta["strandTotals"],
                 "strandsShown": meta["strandsShown"],
-            }))
+            }, allow_nan=False))
             return 0
     except (GroomError, glb_writer.GlbError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

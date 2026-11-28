@@ -12,6 +12,8 @@ def _load_native(ctypes):
     if name is None:
         return None
     path = Path(__file__).resolve().parent / "shader_carve_native" / "target" / "release" / name
+    if not path.is_file():
+        return None
     scan = ctypes.CDLL(str(path)).leonida_shader_carve_find_v1
     scan.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
     scan.restype = ctypes.c_size_t
@@ -46,17 +48,22 @@ def entry_search(mapping, pattern):
     def reference(pos):
         return pattern.search(mapping, pos)
 
-    if (os.environ.get("LEONIDA_SHADER_CARVE_NATIVE") == "0"
+    if (os.environ.get("LEONIDA_SHADER_CARVE_NATIVE", "").strip().lower() in ("0", "false", "off", "no")
             or sys.implementation.name != "cpython" or sys.version_info < (3, 11)):
         yield reference
         return
 
+    view = release = None
     try:
         import ctypes
 
         scan = _load_native(ctypes)
         if scan is not None:
             view, release = _acquire_buffer(ctypes, mapping)
+            if not view.readonly or view.len <= 0 or not view.buf:
+                release(ctypes.byref(view))
+                release = None
+                scan = None
     except (ImportError, OSError, AttributeError, BufferError, TypeError, ValueError):
         scan = None
 
@@ -64,9 +71,17 @@ def entry_search(mapping, pattern):
         yield reference
         return
 
+    released = False
+
     def search(pos):
         nonlocal scan
-        if scan is not None and view.readonly and 0 <= pos < view.len:
+        if (
+            scan is not None
+            and view.readonly
+            and isinstance(pos, int)
+            and not isinstance(pos, bool)
+            and 0 <= pos < view.len
+        ):
             if (match := pattern.match(mapping, pos)) is not None:
                 return match
             try:
@@ -75,7 +90,7 @@ def entry_search(mapping, pattern):
                     return None
                 if pos <= offset < view.len and (match := pattern.match(mapping, offset)) is not None:
                     return match
-            except (OSError, ValueError, ctypes.ArgumentError):
+            except (OSError, ValueError, TypeError, OverflowError, ctypes.ArgumentError):
                 pass
             scan = None
         return reference(pos)
@@ -84,4 +99,6 @@ def entry_search(mapping, pattern):
         yield search
     finally:
         scan = None
-        release(ctypes.byref(view))
+        if not released and release is not None and view is not None:
+            released = True
+            release(ctypes.byref(view))

@@ -2215,53 +2215,6 @@ and w dwords). Limits: one draw of one triangle, mrt0 only; the vertex
 stage is the template's, compiled by the driver; the SPI behaviour comes from the driver's metadata, so a `--set`
 the hardware does not support is not refused here.
 
-### Packed 16-bit integer operations on RDNA2 (SHADER-302)
-
-*Measured on an RDNA2 iGPU (gfx1036), Windows 11, AMD Windows driver 32.0.21045.29003, HIP backend (`amdhip64_6.dll`), AMD clang 23.0.0git (`rocm-sdk-core 10.0.0`).*
-
-380 raw compute kernels covering all 11 packed 16-bit integer instructions (`v_pk_add_u16`, `v_pk_sub_u16`, `v_pk_add_i16`, `v_pk_sub_i16`, `v_pk_mul_lo_u16`, `v_pk_mad_u16`, `v_pk_mad_i16`, `v_pk_max_u16`, `v_pk_min_u16`, `v_pk_max_i16`, `v_pk_min_i16`), tested in both wave32 and wave64:
-
-- **Constant operands under `op_sel` / `op_sel_hi`:** Integer constants under VOP3P are uniformly treated as 32-bit dwords `C`. When `op_sel[i] == 0`, bits `[15:0]` are selected; when `op_sel[i] == 1`, bits `[31:16]` are selected. Positive inline constants zero-extend (`5` → `0x00000005`: lo=`0x0005`, hi=`0x0000`; `64` → `0x00000040`: lo=`0x0040`, hi=`0x0000`). Negative inline constants sign-extend (`-1` → `0xFFFFFFFF`: lo=`0xFFFF`, hi=`0xFFFF`; `-16` → `0xFFFFFFF0`: lo=`0xFFF0`, hi=`0xFFFF`). 32-bit literals preserve their full dword (`0x12345678`: lo=`0x5678`, hi=`0x1234`; `0x80017fff`: lo=`0x7fff`, hi=`0x8001`). Float inline tokens (`0.5`, `1.0`, `-2.0`, `4.0`) assemble as their 32-bit IEEE 754 bit patterns (`1.0` → `0x3f800000`: lo=`0x0000`, hi=`0x3f80`).
-- **`clamp` saturation:** Unsigned add/mad saturate to `0xFFFF`; unsigned sub saturates underflow to `0x0000`; signed add/sub/mad saturate to `[-32768, 32767]`.
-- **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
-### Pixel-shader ISA on the hardware (`tools/ps_oracle.py`, EGEN-TOOL-PS-ORACLE)
-
-`tools/hw_oracle` only launches compute kernels, so what only a pixel shader has (`v_interp_*` and the parameter
-words the SPI writes into LDS, the barycentric VGPRs, exports and their formats, helper lanes) could not be
-measured there. `tools/ps_oracle.py` runs hand-written RDNA2 pixel-shader ISA in a real draw on an AMD GPU, through
-Vulkan's `VK_KHR_pipeline_binary`:
-
-1. `vk_harness` builds a pipeline from a template vertex + pixel shader and writes its binary (`VKH_BINARY_OUT`).
-   On the AMD Windows driver that is one PAL ELF: `.text` with `_amdgpu_gs_main` (the vertex stage) and
-   `_amdgpu_ps_main`, and a `.note` with the PAL metadata in msgpack, from which the driver programs the register
-   counts and the SPI setup (`spi_ps_input_ena/addr`, `spi_ps_input_cntl` per parameter, `spi_shader_col_format`).
-2. The code under test is assembled with AMD clang (`LEONIDA_AMD_CLANG`, as for hw_oracle) and replaces
-   `_amdgpu_ps_main`; `.text` grows if needed and the pixel stage's VGPR/SGPR counts are raised to the registers
-   the code names. `--set PATH=JSON` changes a metadata entry as well, e.g.
-   `.graphics_registers/.spi_ps_input_cntl/0/.fp16_interp_mode=true`.
-3. `vk_harness` builds the pipeline from the patched binary (`VKH_BINARY_IN`), draws one full-screen triangle into
-   an RGBA32F target and reads every pixel's four mrt0 dwords back bit for bit.
-
-The template sets what the code finds when it starts, so `--show-template` prints the template's own ISA and SPI
-metadata to copy the conventions from. With the built-in `interp2` template on gfx1036 the pixel stage is wave64,
-the perspective I/J barycentrics are in v0/v1, M0 comes from s2 (`s_mov_b32 m0, s2`), and parameters 0 and 1 are
-the vertex shader's locations 0 = (u, v, 0, 1) and 1 = (u, v, 0, 0), u and v going 0..2 across the screen.
-
-```powershell
-$env:LEONIDA_VK_DEVICE = "radeon"
-python -I tools/ps_oracle.py --build <runtime build> --template interp2 --show-template
-python -I tools/ps_oracle.py --build <runtime build> --template interp2 --asm body.s --size 4 1 [--json out.json]
-```
-
-Checked on an AMD Radeon iGPU (gfx1036, Windows driver 26.10.1): the driver accepts a patched binary (there is no
-check over the code), the patched code runs as the pixel shader, and `v_interp_p1/p2_f32` of `attr0.x` at the four
-pixel centres of a 4 x 1 target gives u = 0.125, 0.375, 0.625, 0.875, with `v_interp_mov_f32` reading the
-parameter words P0 = 0 and P10 = 2.0 (`tests/test_ps_oracle.py`, which runs it on hardware when
-`LEONIDA_PS_ORACLE_BUILD` names a runtime build). On other drivers the binary is not a single PAL ELF (the NVIDIA
-driver returns two blobs) and the tool exits 77. Limits: one draw of one triangle, mrt0 as RGBA32F only; the vertex
-stage is the template's, compiled by the driver; the SPI behaviour comes from the driver's metadata, so a `--set`
-the hardware does not support is not refused here.
-
 **On Linux (RADV).** Mesa's RADV returns the pipeline as one binary per stage, as `radv_shader_serialize` writes it
 (Mesa 26.3 `radv_pipeline_cache.c`, structs in `radv_shader.h`): a type word, `struct ac_shader_config` (`num_sgprs`,
 `num_vgprs`, ..., `rsrc1`), `struct radv_shader_info`, `total_size`, then `code_size`, `exec_size` and the other
@@ -2276,7 +2229,6 @@ limits: `--set` is refused (RADV keeps the SPI setup in its own structs, so a te
 needs), and only GFX10 (RDNA1/RDNA2) devices are taken, from the chip name RADV puts in the device name; GFX11 and
 later interpolate with `lds_param_load` instead of `v_interp_*`, so e.g. an RX 9070 XT (`RADV GFX1201`) gets
 `unsupported architecture` and exit 77.
-### Packed 16-bit integer operations on RDNA2 (SHADER-302)
 
 Mesa optimises varyings across stages, so a template's parameter layout can differ from the Windows driver's:
 RADV moves `interp2`'s `in0 + in1` into the vertex shader and the pixel shader reads one parameter, attr0 =
@@ -2291,9 +2243,6 @@ the Windows check's `attr0.x` code (with `v40`, past the template's 8 VGPRs) giv
 P0 = 0 and P10 = 4.0 for the single parameter, and a second patch with another constant changes the result (nothing
 is cached).
 
-- **Constant operands under `op_sel` / `op_sel_hi`:** Integer constants under VOP3P are uniformly treated as 32-bit dwords `C`. When `op_sel[i] == 0`, bits `[15:0]` are selected; when `op_sel[i] == 1`, bits `[31:16]` are selected. Positive inline constants zero-extend (`5` → `0x00000005`: lo=`0x0005`, hi=`0x0000`; `64` → `0x00000040`: lo=`0x0040`, hi=`0x0000`). Negative inline constants sign-extend (`-1` → `0xFFFFFFFF`: lo=`0xFFFF`, hi=`0xFFFF`; `-16` → `0xFFFFFFF0`: lo=`0xFFF0`, hi=`0xFFFF`). 32-bit literals preserve their full dword (`0x12345678`: lo=`0x5678`, hi=`0x1234`; `0x80017fff`: lo=`0x7fff`, hi=`0x8001`). Float inline tokens (`0.5`, `1.0`, `-2.0`, `4.0`) assemble as their 32-bit IEEE 754 bit patterns (`1.0` → `0x3f800000`: lo=`0x0000`, hi=`0x3f80`).
-- **`clamp` saturation:** Unsigned add/mad saturate to `0xFFFF`; unsigned sub saturates underflow to `0x0000`; signed add/sub/mad saturate to `[-32768, 32767]`.
-- **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
 #### Helper lanes at a triangle edge (`tools/ps_helper_probe.py`, SHADER-681)
 
 What a pixel wave does with the helper lanes of a partly covered 2x2 quad, which the translator's EXEC model and
@@ -2327,16 +2276,6 @@ unwritten helper register:
 The last row is what the driver's own code relies on: RADV compiles the template as `s_wqm_b64 exec, exec` at entry,
 then the interpolation and an `exp mrt0 ... done vm` with the helpers still on. The programs are wave64; a wave32
 pixel stage (`RADV_PERFTEST=pswave32`) and GFX11+ exit 77. Not measured: wave32, RDNA1/gfx1013 and the Windows driver.
-
-### Packed 16-bit integer operations on RDNA2 (SHADER-302)
-
-*Measured on an RDNA2 iGPU (gfx1036), Windows 11, AMD Windows driver 32.0.21045.29003, HIP backend (`amdhip64_6.dll`), AMD clang 23.0.0git (`rocm-sdk-core 10.0.0`).*
-
-380 raw compute kernels covering all 11 packed 16-bit integer instructions (`v_pk_add_u16`, `v_pk_sub_u16`, `v_pk_add_i16`, `v_pk_sub_i16`, `v_pk_mul_lo_u16`, `v_pk_mad_u16`, `v_pk_mad_i16`, `v_pk_max_u16`, `v_pk_min_u16`, `v_pk_max_i16`, `v_pk_min_i16`), tested in both wave32 and wave64:
-
-- **Constant operands under `op_sel` / `op_sel_hi`:** Integer constants under VOP3P are uniformly treated as 32-bit dwords `C`. When `op_sel[i] == 0`, bits `[15:0]` are selected; when `op_sel[i] == 1`, bits `[31:16]` are selected. Positive inline constants zero-extend (`5` → `0x00000005`: lo=`0x0005`, hi=`0x0000`; `64` → `0x00000040`: lo=`0x0040`, hi=`0x0000`). Negative inline constants sign-extend (`-1` → `0xFFFFFFFF`: lo=`0xFFFF`, hi=`0xFFFF`; `-16` → `0xFFFFFFF0`: lo=`0xFFF0`, hi=`0xFFFF`). 32-bit literals preserve their full dword (`0x12345678`: lo=`0x5678`, hi=`0x1234`; `0x80017fff`: lo=`0x7fff`, hi=`0x8001`). Float inline tokens (`0.5`, `1.0`, `-2.0`, `4.0`) assemble as their 32-bit IEEE 754 bit patterns (`1.0` → `0x3f800000`: lo=`0x0000`, hi=`0x3f80`).
-- **`clamp` saturation:** Unsigned add/mad saturate to `0xFFFF`; unsigned sub saturates underflow to `0x0000`; signed add/sub/mad saturate to `[-32768, 32767]`.
-- **Silicon vs Translator parity:** 380 of 380 kernels match bit-for-bit between native hardware and `tools/rdna2spirv.py` lowered to SPIR-V (0 mismatches, 0 wave32/wave64 differences).
 
 
 ### Real pixel shaders on two GPUs (`tools/ps_sweep.py`, `runtime/test/vk_ps_sweep.cpp`)

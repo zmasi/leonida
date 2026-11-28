@@ -25,13 +25,18 @@ import argparse
 import json
 import math
 import os
+import stat
 import struct
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 
 MODES = {
     # The mode the translator emits and the game runs with: scaling ignored, clamp applied.
@@ -142,7 +147,10 @@ def scalar_bits(value, kind):
         bits = _f64_bits(value)
         return (bits & 0xFFFFFFFF, (bits >> 32) & 0xFFFFFFFF)
     if kind == "f32":
-        return (struct.unpack("<I", struct.pack("<f", value))[0], 0)
+        try:
+            return (struct.unpack("<I", struct.pack("<f", value))[0], 0)
+        except OverflowError:
+            return ((0x80000000 if math.copysign(1.0, value) < 0 else 0) | 0x7F800000, 0)
     return (_f16_bits(value), 0)
 
 
@@ -173,12 +181,30 @@ def expected_words(plain, mod, kind, descriptor):
 
 
 def evaluate(modes, waves, meta, raw_results):
+    if not isinstance(raw_results, (list, tuple)) or len(raw_results) != len(meta):
+        got_desc = len(raw_results) if isinstance(raw_results, (list, tuple)) else type(raw_results).__name__
+        raise RuntimeError(f"oracle returned {got_desc} results for {len(meta)} kernels")
     measured = {}
     for (wave, mode_name, op, kind, cases), result in zip(meta, raw_results):
-        words = [w & 0xFFFFFFFF for w in (result["words"] if isinstance(result, dict) else result)]
+        if isinstance(result, str):
+            raise RuntimeError(f"wave{wave} {mode_name} {op}: {result}")
+        if isinstance(result, dict):
+            if "words" not in result:
+                raise RuntimeError(f"wave{wave} {mode_name} {op}: oracle result dict missing 'words'")
+            raw_words = result["words"]
+        else:
+            raw_words = result
+        if not isinstance(raw_words, (list, tuple)) or any(
+                not isinstance(w, int) or isinstance(w, bool) for w in raw_words):
+            raise RuntimeError(f"wave{wave} {mode_name} {op}: invalid word payload from oracle")
+        step = word_count(kind)
+        expected_len = len(cases) * len(MODS) * step
+        if len(raw_words) < expected_len:
+            raise RuntimeError(
+                f"wave{wave} {mode_name} {op}: expected at least {expected_len} words, got {len(raw_words)}")
+        words = [w & 0xFFFFFFFF for w in raw_words]
         # A 16-bit destination writes only bits [15:0]; the rest of the register is untouched residue.
         mask = 0xFFFF if kind == "f16" else 0xFFFFFFFF
-        step = word_count(kind)
         per_mod = {mod: [] for mod in MODS}
         index = 0
         for _ in cases:
@@ -263,13 +289,65 @@ def self_test():
     return 0
 
 
+def _resolve_report_target(path):
+    return os.path.realpath(path) if os.path.islink(path) else os.path.abspath(path)
+
+
+def validate_report_path(path):
+    """Fail fast before running the GPU sweep when an existing ancestor blocks --json creation."""
+    target = _resolve_report_target(path)
+    if os.path.isdir(target):
+        print(f"cannot write {path}: destination is a directory", file=sys.stderr)
+        return False
+    parent = os.path.dirname(target)
+    probe = parent
+    while probe and not os.path.exists(probe):
+        next_probe = os.path.dirname(probe)
+        if next_probe == probe:
+            break
+        probe = next_probe
+    if probe and os.path.exists(probe) and not os.path.isdir(probe):
+        print(f"cannot write {path}: parent {probe} is not a directory", file=sys.stderr)
+        return False
+    return True
+
+
 def write_report(path, report):
     try:
-        with open(path, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(report, fh, ensure_ascii=False, indent=1)
+        payload = json.dumps(report, ensure_ascii=False, indent=1, allow_nan=False) + "\n"
+        target = _resolve_report_target(path)
+        if os.path.exists(target):
+            st = os.stat(target)
+            if stat.S_ISDIR(st.st_mode):
+                raise IsADirectoryError(f"{path} is a directory")
+            if not stat.S_ISREG(st.st_mode):
+                with open(target, "w", encoding="utf-8", newline="\n") as fh:
+                    fh.write(payload)
+                return True
+        parent = os.path.dirname(target) or "."
+        os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".f64-omod-probe-", suffix=".tmp")
+        try:
+            try:
+                fh = open(fd, "w", encoding="utf-8", newline="\n")
+            except BaseException:
+                os.close(fd)
+                raise
+            with fh:
+                fh.write(payload)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp_path, published_mode(target))
+            replace_retry(tmp_path, target)
+        except BaseException:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         return True
-    except OSError as exc:
-        print(f"cannot write {path}: {exc}")
+    except (OSError, ValueError) as exc:
+        print(f"cannot write {path}: {exc}", file=sys.stderr)
         return False
 
 
@@ -284,14 +362,28 @@ def main(argv=None) -> int:
     if args.self_test:
         return self_test()
 
-    modes = [m.strip() for m in args.modes.split(",") if m.strip()]
-    wave_tokens = [w.strip() for w in args.waves.split(",") if w.strip()]
+    if args.hw_arch is not None:
+        args.hw_arch = args.hw_arch.strip()
+        if not args.hw_arch:
+            ap.error("--hw-arch must not be empty")
+    mode_tokens = [m.strip() for m in args.modes.split(",")]
+    wave_tokens = [w.strip() for w in args.waves.split(",")]
+    if not any(mode_tokens) or any(not m for m in mode_tokens):
+        ap.error("--modes must be a comma-separated list of mode names")
+    if not any(wave_tokens) or any(not w for w in wave_tokens):
+        ap.error("--waves must be a comma-separated list of 32 and/or 64")
+    modes = list(dict.fromkeys(mode_tokens))
     bad = [m for m in modes if m not in MODES] + [w for w in wave_tokens if w not in ("32", "64")]
-    if bad or not modes or not wave_tokens:
-        ap.error("unknown or empty --modes/--waves entry: " + ", ".join(bad or ["--modes/--waves"]))
-    waves = [int(w) for w in wave_tokens]
-    if args.json and os.path.isdir(args.json):
-        ap.error(f"--json {args.json} is a folder, not a file")
+    if bad:
+        ap.error("unknown or empty --modes/--waves entry: " + ", ".join(bad))
+    waves = list(dict.fromkeys(int(w) for w in wave_tokens))
+    if args.json is not None:
+        if not args.json.strip():
+            ap.error("--json must not be empty")
+        if os.path.isdir(args.json):
+            ap.error(f"--json {args.json} is a folder, not a file")
+        if not validate_report_path(args.json):
+            return 2
 
     from hw_oracle import asm, runner
 
@@ -301,12 +393,20 @@ def main(argv=None) -> int:
         print(f"hardware oracle unavailable: {exc}")
         return 77
     try:
-        if asm.family(oracle.arch) != "gfx10":
+        try:
+            fam = asm.family(oracle.arch)
+        except ValueError as exc:
+            print(f"hardware oracle unavailable: {exc}")
+            return 77
+        if fam != "gfx10":
             print(f"hardware oracle unavailable: {oracle.arch} is not GFX10")
             return 77
         print(f"hardware oracle: {oracle.device} ({oracle.arch})")
         kernels, meta = build_kernels(asm, modes, waves)
         summary = evaluate(modes, waves, meta, oracle.run(kernels))
+    except runner.Unavailable as exc:
+        print(f"hardware oracle unavailable: {exc}")
+        return 77
     except (RuntimeError, KeyError, TypeError) as exc:
         print(f"harness error: {exc}")
         return 2

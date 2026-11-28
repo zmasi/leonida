@@ -273,6 +273,83 @@ class FixtureTests(unittest.TestCase):
             self.assertEqual(ic.main(["--isa", self.xml, "--translator", self.src, "--json"]), 0)
         self.assertEqual(json.loads(out.getvalue())["instructions"], 15)
 
+    def test_utf8_bom_translator_is_scanned(self):
+        f = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False, encoding="utf-8-sig", newline="\n")
+        f.write(FIXTURE_SRC)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        scan = ic.scan_translator(f.name)
+        accepted = ic.accepted_names(f.name)
+        self.assertIn("s_mov_b32", scan["exact"])
+        self.assertIn("s_mov_b32", accepted)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = ic.main(["--isa", self.xml, "--translator", f.name, "--json"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out.getvalue())["instructions"], 15)
+
+    def test_syntax_error_or_nul_in_translator_is_usage_error(self):
+        for bad in ("def broken(:\n", "x = 1\x00\n"):
+            with self.subTest(bad=bad):
+                src = _fixture(bad, ".py")
+                self.addCleanup(os.unlink, src)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                    ic.main(["--isa", self.xml, "--translator", src])
+                self.assertEqual(cm.exception.code, 2)
+                self.assertIn("invalid Python", err.getvalue())
+
+    def test_markdown_handles_zero_instructions_without_zerodivision(self):
+        empty_rep = {
+            "architecture": "AMD RDNA 2",
+            "schema": "1.1.1",
+            "license": "MIT",
+            "instructions": 0,
+            "totals": {c: 0 for c in ic.CLASSES},
+            "groups": {},
+            "class": {},
+            "unknown_by_group": {},
+            "refused": [],
+            "partial": [],
+            "not_in_rdna2": [],
+            "prefixes": {},
+            "prefixes_without_rdna2_match": [],
+            "suffixes": {},
+        }
+        md = ic.markdown(empty_rep)
+        self.assertIn("| unknown | 0 | 0.0% |", md)
+
+    def test_empty_or_whitespace_encoding_name_maps_to_other_question(self):
+        xml_text = (
+            "<Spec><Document><License>MIT</License><SchemaVersion>1.1.1</SchemaVersion></Document>"
+            "<ISA><Architecture><ArchitectureName>AMD RDNA 2</ArchitectureName></Architecture><Instructions>"
+            "<Instruction><InstructionName>S_EMPTY_ENC</InstructionName>"
+            "<InstructionEncodings><InstructionEncoding><EncodingName/></InstructionEncoding></InstructionEncodings>"
+            "</Instruction>"
+            "<Instruction><InstructionName>S_WS_ENC</InstructionName>"
+            "<InstructionEncodings><InstructionEncoding><EncodingName>   </EncodingName></InstructionEncoding></InstructionEncodings>"
+            "</Instruction>"
+            "</Instructions></ISA></Spec>"
+        )
+        xml = _fixture(xml_text, ".xml")
+        self.addCleanup(os.unlink, xml)
+        ins = ic.read_isa(xml)["instructions"]
+        self.assertEqual(ins["s_empty_enc"], ["OTHER:?"])
+        self.assertEqual(ins["s_ws_enc"], ["OTHER:?"])
+
+    def test_probe_llvm_mc_uses_utf8_replace_encoding(self):
+        seen_kwargs = []
+
+        def fake_run(*_args, **kwargs):
+            seen_kwargs.append(kwargs)
+            return subprocess.CompletedProcess(["llvm-mc"], 0, "", "")
+
+        with patch.object(ic.subprocess, "run", side_effect=fake_run):
+            out = ic.probe_llvm_mc("llvm-mc", ["s_endpgm"])
+        self.assertEqual(out, {"s_endpgm": "LLVM: valid on gfx1013"})
+        self.assertEqual(seen_kwargs[0].get("encoding"), "utf-8")
+        self.assertEqual(seen_kwargs[0].get("errors"), "replace")
+
 
 class TranslatorScanTests(unittest.TestCase):
     """The real translator: facts that must keep holding for the scan to mean anything. No XML needed."""

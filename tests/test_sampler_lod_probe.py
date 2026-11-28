@@ -238,6 +238,79 @@ class OracleLifecycleTest(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("no device", buf.getvalue())
 
+    def test_hw_closes_on_malformed_results_non_finite_calib_and_run_errors(self):
+        import struct
+        import runner
+
+        table = p.rows()
+        n = len(table)
+        level_start = [float(100 * k) for k in range(p.LEVELS)]
+        good_words = [struct.unpack("<I", struct.pack("<f", level_start[p.rdna2_level(*r[1:])]))[0] for r in table]
+
+        class StubOracle:
+            device = "fake-gpu"
+            arch = "gfx1036"
+
+            def __init__(self, run_fn):
+                self._run_fn = run_fn
+                self.closed = False
+
+            def run(self, kernels):
+                return self._run_fn(kernels)
+
+            def close(self):
+                self.closed = True
+
+        bad_cases = [
+            ("empty_batch", [], "expected 1"),
+            ("none_batch", None, "NoneType"),
+            ("str_batch", "bad", "str"),
+            ("extra_batch", [list(good_words), list(good_words)], "got 2"),
+            ("none_words", [None], "NoneType"),
+            ("short_words", [[0] * 3], f"expected {n} words, got 3"),
+            ("overlong_words", [[0] * (n + 1)], f"expected {n} words, got {n + 1}"),
+            ("bool_word", [[True] * n], "bool"),
+            ("none_word", [[None] * n], "NoneType"),
+        ]
+        for label, bad_ret, hint in bad_cases:
+            for fail_wave in (32, 64):
+                with self.subTest(case=label, wave=fail_wave):
+                    fake = StubOracle(lambda ks, fw=fail_wave, br=bad_ret: br if ks[0].wave == fw else [list(good_words)])
+                    rc, out = self._run_hw(fake)
+                    self.assertEqual(rc, 2, out)
+                    self.assertTrue(fake.closed)
+                    self.assertIn(f"wave{fail_wave}:", out)
+                    self.assertIn(hint, out)
+
+        # Non-finite calibration start (+inf) is rejected even when wave32 and wave64 agree and starts are distinct.
+        inf_words = list(good_words)
+        inf_words[0] = 0x7F800000
+        fake = StubOracle(lambda _ks: [list(inf_words)])
+        rc, out = self._run_hw(fake)
+        self.assertEqual(rc, 2, out)
+        self.assertTrue(fake.closed)
+        self.assertIn("calibration:", out)
+
+        # runner.Unavailable during oracle.run() exits 77 cleanly and closes oracle.
+        def raise_unavail(_ks):
+            raise runner.Unavailable("mode unsupported")
+
+        fake = StubOracle(raise_unavail)
+        rc, out = self._run_hw(fake)
+        self.assertEqual(rc, 77, out)
+        self.assertTrue(fake.closed)
+        self.assertIn("hardware oracle unavailable: mode unsupported", out)
+
+        # RuntimeError during oracle.run() exits 2 cleanly and closes oracle.
+        def raise_runtime(_ks):
+            raise RuntimeError("gpu hung")
+
+        fake = StubOracle(raise_runtime)
+        rc, out = self._run_hw(fake)
+        self.assertEqual(rc, 2, out)
+        self.assertTrue(fake.closed)
+        self.assertIn("harness error: gpu hung", out)
+
 
 if __name__ == "__main__":
     unittest.main()

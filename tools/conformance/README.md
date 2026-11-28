@@ -1,12 +1,13 @@
 # Conformance harness: does the Vulkan-backed D3D12 device render what D3D12 renders?
 
-The shim in `runtime/` reimplements D3D12 on Vulkan. Its device, resource, view, sampler,
-copy, clear and barrier paths are covered by `runtime/test/`, but nothing today checks the
-thing that matters most: **that a draw produces the same pixels as the host's D3D12.**
+The shim in `runtime/` reimplements D3D12 on Vulkan. Its own CTest suite in `runtime/test/`
+already covers draws on SPIR-V shaders (including `d3d12_draw` and `d3d12_first_light`),
+while this directory defines a small set of deterministic scenes designed to **diff the
+shim's rendered pixels directly against native D3D12 on the same machine.**
 
-This harness defines a small set of deterministic scenes, renders them with native D3D12 on
-the same machine, and checks every pixel that the scene claims. When the shim's draw path
-lands, the same scenes go through it and the two image sets are diffed.
+This harness renders those scenes with native D3D12 (`native/`), verifies every pixel each
+scene claims, and provides `compare.py` to diff two renderer manifests once a Vulkan-shim
+driver is wired into `tools/conformance/`.
 
 ## Layout
 
@@ -21,7 +22,7 @@ tools/conformance/
 
 ## The scenes
 
-Seven scenes, each chosen to make one failure visible at an exact coordinate:
+Six scenes, each chosen to make one failure visible at an exact coordinate:
 
 | scene | proves |
 |---|---|
@@ -58,23 +59,25 @@ Microsoft Basic Render Driver as well as on hardware.
 
 ## Status today
 
-Against the shim as of `2e5c0f2`, the driver in the pull request reports:
+The Vulkan-backed D3D12 shim in `runtime/` has moved past the early `2e5c0f2` baseline where
+`ID3D12Device::CreateRootSignature` returned `E_NOTIMPL` and blocked the five drawn scenes:
 
-```
-clear          OK       3/3 pixel checks matched (row pitch 1024, readback 262144 bytes)
-fullscreen     BLOCKED  ID3D12Device::CreateRootSignature (E_NOTIMPL 0x80004001)
-depth_order    BLOCKED  ID3D12Device::CreateRootSignature (E_NOTIMPL 0x80004001)
-scissor        BLOCKED  ID3D12Device::CreateRootSignature (E_NOTIMPL 0x80004001)
-blend          BLOCKED  ID3D12Device::CreateRootSignature (E_NOTIMPL 0x80004001)
-indexed        BLOCKED  ID3D12Device::CreateRootSignature (E_NOTIMPL 0x80004001)
-```
-
-`clear` already proves the whole resource → clear → barrier → copy → readback chain through
-the Vulkan device. The five drawn scenes stop at the first call the shim genuinely lacks, so
-each one becomes a progress marker as the draw path lands: `CreateRootSignature` →
-`CreateGraphicsPipelineState` → the `SetPipelineState` / root-binding group → viewport and
-scissor → vertex/index buffers → `OMSetRenderTargets` → `DrawInstanced` /
-`DrawIndexedInstanced`.
+- **Implemented in `runtime/`:** `ID3D12Device::CreateRootSignature` and
+  `ID3D12Device::CreateGraphicsPipelineState` (`runtime/shims/d3d12_vulkan_device.cpp`), along
+  with `SetPipelineState`, `SetGraphicsRootSignature` and root-argument setters,
+  `RSSetViewports`, `RSSetScissorRects`, `IASetVertexBuffers`, `IASetIndexBuffer`,
+  `OMSetRenderTargets`, `DrawInstanced`, and `DrawIndexedInstanced`
+  (`runtime/shims/d3d12_com.cpp`).
+- **Covered by runtime CTest today:** `runtime/CMakeLists.txt` registers graphics draw tests
+  such as `d3d12_draw` (`runtime/test/d3d12_draw_test.cpp`, synthetic GLSL shaders compiled to
+  SPIR-V covering indexed draws, root constants/CBVs, culling, and alpha blending) and
+  `d3d12_first_light` (`runtime/test/d3d12_first_light_test.cpp`, package-gated via
+  `LEONIDA_FIRST_LIGHT_DIR`).
+- **What `tools/conformance/` ships today:** the six-scene contract (`spec/scenes.h` and
+  `spec/shaders/*.hlsl`), the native D3D12 reference renderer (`native/`), and the manifest
+  checker / image diff tool (`compare.py`, documented in `COMPARE.md`). No Vulkan-shim
+  conformance driver or SPIR-V compilation step for `spec/shaders/*.hlsl` is wired into
+  `tools/conformance/` yet.
 
 ## The shader format question
 
@@ -82,9 +85,10 @@ The reference renderer compiles HLSL to **DXIL** because native D3D12 requires i
 shim's documented contract is **SPIR-V**, because the game's shaders reach it from the RDNA2
 translator. A PSO implementation that understands only one of them cannot serve both.
 
-The cheapest resolution, when the draw path lands: compile each conformance shader twice
-(`dxc -T vs_6_6` and `dxc -spirv -T vs_6_6`) and let each renderer take the blob it wants.
-One workload, one set of expected pixels, no DXIL translator in the shim.
+The cheapest resolution when wiring a shim driver into `tools/conformance/`: compile each
+conformance shader twice (`dxc -T vs_6_6` and `dxc -spirv -T vs_6_6`) and let each renderer
+take the blob it wants. One workload, one set of expected pixels, no DXIL translator in the
+shim.
 
 ## Why the scenes are trustworthy
 
@@ -103,5 +107,5 @@ Three independent checks, all reproducible:
 
 Add a `Scene` to `spec/scenes.h` with its expected pixels. The renderer picks it up through
 `SceneKind`; `/we4062` makes an unhandled enumerator a build error, so a new kind cannot
-silently render as a clear-only scene. Add a matching row to the shim driver's switch when
-the draw path exists.
+silently render as a clear-only scene. Once a shim driver is added to `tools/conformance/`,
+add a matching row to its switch as well.

@@ -208,8 +208,8 @@ def classify_graphics_head(data):
     return "other"
 
 
-def parse_page_map(sys_bytes):
-    """Parse the datResourceMap header pointed to by u64@+0x08."""
+def _parse_page_map_header(sys_bytes):
+    """Parse the 16-byte datResourceMap header and check any slot bytes already present."""
     if len(sys_bytes) < 16 or _u64(sys_bytes, 0) != 0:
         raise JoinError("missing zero-prefix resource header")
     p8 = _u64(sys_bytes, 8)
@@ -227,10 +227,10 @@ def parse_page_map(sys_bytes):
         raise JoinError(f"invalid page counts ({sys_pages}, {gfx_pages})")
     total = sys_pages + gfx_pages
     end = off + 16 + 8 * total
-    if end > len(sys_bytes):
-        raise JoinError("page-map slot array extends past system segment")
-    slots = struct.unpack_from(f"<{total}Q", sys_bytes, off + 16)
-    if w0 != 0 or w4 != 0 or pad10 != 0 or pad12 != 0 or any(slots):
+    if w0 != 0 or w4 != 0 or pad10 != 0 or pad12 != 0:
+        raise JoinError("non-zero reserved or runtime slot word in page-map header")
+    avail = min(end, len(sys_bytes))
+    if avail > off + 16 and any(sys_bytes[off + 16:avail]):
         raise JoinError("non-zero reserved or runtime slot word in page-map header")
     return {
         "offset": off,
@@ -238,6 +238,14 @@ def parse_page_map(sys_bytes):
         "system_pages": sys_pages,
         "graphics_pages": gfx_pages,
     }
+
+
+def parse_page_map(sys_bytes):
+    """Parse the datResourceMap header pointed to by u64@+0x08."""
+    pm = _parse_page_map_header(sys_bytes)
+    if pm["end"] > len(sys_bytes):
+        raise JoinError("page-map slot array extends past system segment")
+    return pm
 
 
 class ModelSystemPages:
@@ -266,7 +274,9 @@ class ModelSystemPages:
             self.remaining = previous - 1
         elif root_framed and classify_system_root(data) in ("drawable", "drawable_dict", "fragment"):
             try:
-                self.remaining = parse_page_map(data)["system_pages"] - 1
+                pm = _parse_page_map_header(data)
+                if pm["end"] <= len(data) or pm["system_pages"] > 1:
+                    self.remaining = pm["system_pages"] - 1
             except JoinError:
                 pass  # The full join still checks maps that extend into another system page.
 
@@ -718,7 +728,7 @@ def join_streams(streams, get_payload, require_archive_framing=True):
 
         sys_probe = b"".join(sys_chunks)
         try:
-            pm = parse_page_map(sys_probe)
+            pm = _parse_page_map_header(sys_probe)
         except JoinError as exc:
             kind_guess = classify_system_root(sys_probe)
             if kind_guess in ("drawable", "drawable_dict", "fragment"):
@@ -749,6 +759,15 @@ def join_streams(streams, get_payload, require_archive_framing=True):
             sys_chunks.append(get_payload(extra_idx))
 
         sys_bytes = b"".join(sys_chunks)
+        if framing_err is None:
+            try:
+                pm = parse_page_map(sys_bytes)
+            except JoinError as exc:
+                kind_guess = classify_system_root(sys_bytes)
+                if kind_guess in ("drawable", "drawable_dict", "fragment"):
+                    resources.append(_failed_row(st, kind_guess, str(exc), sp, gp))
+                idx += 1
+                continue
         rkind = classify_system_root(sys_bytes)
         if rkind not in ("drawable", "drawable_dict", "fragment"):
             if framing_err is None and idx + sp + gp <= n and all(
@@ -1047,11 +1066,14 @@ def scan_rpf(path, start=None, limit=None, max_inflate=MAX_INFLATE):
 def _carve_rows(path):
     """Read physical stream boundaries in the order recorded by rpf9_carve."""
     try:
-        fh = open(os.path.join(path, "index.json"), encoding="utf-8")
+        fh = open(os.path.join(path, "index.json"), encoding="utf-8-sig")
     except FileNotFoundError:
         return None
     with fh:
-        index = json.load(fh)
+        try:
+            index = json.load(fh)
+        except RecursionError:
+            raise ValueError("index.json nesting is too deep") from None
     rows = index.get("files") if isinstance(index, dict) else None
     if not isinstance(rows, list):
         raise ValueError("index.json requires a files array")
@@ -1083,10 +1105,17 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
     system_pages = ModelSystemPages()
     rows = _carve_rows(path)
     previous_end = 0
-    names = rows if rows is not None else sorted(os.listdir(path))
+    def _loose_sort_key(entry_name):
+        match = re.match(r"([0-9a-fA-F]{6,})", entry_name)
+        if match:
+            return (0, int(match.group(1), 16), entry_name.lower(), entry_name)
+        return (1, 0, entry_name.lower(), entry_name)
+
+    names = rows if rows is not None else sorted(os.listdir(path), key=_loose_sort_key)
     for name in names:
         full = os.path.join(path, name)
-        if rows is None and (not os.path.isfile(full) or not name.endswith((".bin", ".bk2"))):
+        lower_name = name.lower()
+        if rows is None and (not os.path.isfile(full) or not lower_name.endswith((".bin", ".bk2"))):
             continue
         fsize = os.path.getsize(full)
         if rows is None:
@@ -1102,11 +1131,11 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
             pre16_zero = pre == bytes(16)
         adjacent = rows is None or (off == ((previous_end + 15) & ~15) and gap_zero)
         root_framed = rows is None or ((off & 0xFFF) == 0x10 and pre16_zero)
-        if name.endswith(".bin") and fsize > max_inflate:
+        if lower_name.endswith(".bin") and fsize > max_inflate:
             skipped += 1
             system_pages.reset()
             continue
-        minimum = 64 if name.endswith(".bk2") else system_pages.minimum_size(adjacent)
+        minimum = 64 if lower_name.endswith(".bk2") else system_pages.minimum_size(adjacent)
         if fsize < minimum:
             system_pages.reset()
             continue
@@ -1114,7 +1143,7 @@ def scan_dir(path, max_inflate=MAX_INFLATE):
         with open(full, "rb") as fh:
             head = fh.read(32)
             # The carver writes raw video as .bk2; a compressed .bin payload can also start with KB2.
-            is_bink = name.endswith(".bk2") and head[:3] == b"KB2"
+            is_bink = lower_name.endswith(".bk2") and head[:3] == b"KB2"
             if fsize % 65536 == 0 and not is_bink:
                 # Inspect the model header and map without copying a full page just for this metadata pass.
                 with mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ) as data:

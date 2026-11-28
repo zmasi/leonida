@@ -60,6 +60,22 @@ bool setup(FramePacer& pacer, std::uint32_t latency, std::uint32_t offset = 0) {
            pacer.schedule_frame_event(frame_event_origin, offset, 0) == pacer_hr::ok;
 }
 
+// Run a lifecycle change while the wait has released the pacer mutex, then deliver its wake at the deadline.
+class InterruptedFrameClock final : public FrameClock {
+public:
+    std::function<void()> while_waiting;
+    std::uint64_t now_us() override { return now_; }
+    void wait(std::unique_lock<std::mutex>& lock, std::condition_variable&, std::uint64_t deadline) override {
+        lock.unlock();
+        while_waiting();
+        lock.lock();
+        now_ = deadline;
+    }
+
+private:
+    std::uint64_t now_ = 0;
+};
+
 }  // namespace
 
 int main() {
@@ -193,6 +209,28 @@ int main() {
         EXPECT(blocked(next));
         clock.advance_us(period * 3 / 4);
         EXPECT(next.get().token == 4);
+    }
+
+    // A current-token poll before the first origin offset still issues immediately.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock, nullptr, true);
+        const std::uint32_t offset = period / 3;
+        const std::uint64_t poll_us = offset / 2;
+        EXPECT(pacer.set_frame_interval(period, 1, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, offset, 0) == pacer_hr::ok);
+        clock.advance_us(poll_us);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, wait_flag_current_token, &token) == pacer_hr::ok);
+        pacer.commit_present_token(token, 1);
+        std::uint32_t count = 2;
+        FrameStatistic stats[2];
+        EXPECT(pacer.get_frame_statistics(token, stat_frame_event | stat_present, &count, stats) == pacer_hr::ok);
+        EXPECT(count == 2 && stats[0].time_us == poll_us && stats[1].time_us == poll_us);
+        clock.advance_us(period - poll_us);
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, stats) == pacer_hr::ok);
+        EXPECT(count == 1 && stats[0].time_us == period);
     }
 
     // Timeouts: 0 polls, a finite one counts fake time, the token is left alone, and a later wait still works.
@@ -416,6 +454,82 @@ int main() {
         EXPECT(pacer.registered());
     }
 
+    // Preserve already displayed frames and move each remaining frame to a vblank on the rebased grid.
+    {
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(setup(pacer, 3));
+        clock.advance_us(period);
+        std::uint64_t first = 0, second = 0, third = 0, fourth = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &first) == pacer_hr::ok);
+        pacer.commit_present_token(first, 1);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, frame_wait_flag_token_on_timeout, &second) ==
+               pacer_hr::false_);
+        pacer.commit_present_token(second, 1);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, frame_wait_flag_token_on_timeout, &third) ==
+               pacer_hr::false_);
+        pacer.commit_present_token(third, 1);
+        EXPECT(pacer.frames_in_flight() == 3);
+
+        constexpr auto new_epoch = 2 * period + period / 4;
+        constexpr auto new_period = period / 2;
+        clock.advance_us(new_epoch - period);
+        EXPECT(pacer.set_frame_interval(new_period, 3, 0) == pacer_hr::ok);
+        EXPECT(pacer.frames_in_flight() == 2);
+
+        const auto displayed_at = [&](std::uint64_t token) {
+            FrameStatistic stats;
+            std::uint32_t count = 1;
+            return pacer.get_frame_statistics(token, stat_display, &count, &stats) == pacer_hr::ok ?
+                   stats.time_us : no_deadline;
+        };
+        EXPECT(displayed_at(first) == 2 * period);
+        EXPECT(displayed_at(second) == no_deadline);
+        clock.advance_us(new_period);
+        EXPECT(displayed_at(second) == new_epoch + new_period);
+        EXPECT(displayed_at(third) == no_deadline);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &fourth) == pacer_hr::ok);
+        pacer.commit_present_token(fourth, 1);
+        clock.advance_us(new_period);
+        EXPECT(displayed_at(third) == new_epoch + 2 * new_period);
+        EXPECT(displayed_at(fourth) == no_deadline);
+        clock.advance_us(new_period);
+        EXPECT(displayed_at(fourth) == new_epoch + 3 * new_period);
+    }
+
+    // Reapplying the same interval leaves a queued frame on its original display deadline.
+    {
+        constexpr std::uint32_t unchanged_period = 16000;
+        ManualFrameClock clock;
+        FramePacer pacer(clock);
+        EXPECT(pacer.set_frame_interval(unchanged_period, 3, 0) == pacer_hr::ok);
+        EXPECT(pacer.schedule_frame_event(frame_event_origin, 0, 0) == pacer_hr::ok);
+        clock.advance_us(unchanged_period);
+        std::uint64_t token = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok);
+        pacer.commit_present_token(token, 1);
+        clock.advance_us(unchanged_period / 2);
+        EXPECT(pacer.set_frame_interval(unchanged_period, 3, 0) == pacer_hr::ok);
+
+        FrameStatistic stat;
+        std::uint32_t count = 1;
+        clock.advance_us(unchanged_period / 2 - 1);
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, &stat) == pacer_hr::false_ && count == 0);
+        count = 1;
+        clock.advance_us(1);
+        EXPECT(pacer.get_frame_statistics(token, stat_display, &count, &stat) == pacer_hr::ok);
+        EXPECT(stat.time_us == 2 * unchanged_period);
+
+        // Origin events still use the epoch set by the latest call.
+        std::uint64_t next = 0;
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &next) == pacer_hr::timeout);
+        clock.advance_us(unchanged_period / 2);
+        EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &next) == pacer_hr::ok);
+        count = 1;
+        EXPECT(pacer.get_frame_statistics(next, stat_frame_event, &count, &stat) == pacer_hr::ok);
+        EXPECT(stat.time_us == 2 * unchanged_period + unchanged_period / 2);
+    }
+
     // Scheduling inside a period, before the offset has passed: that period's origin is still to come.
     {
         ManualFrameClock clock;
@@ -499,6 +613,28 @@ int main() {
         EXPECT(pacer.wait_frame_event(frame_event_origin, 0, 0, &token) == pacer_hr::ok && token == 2);
         EXPECT(pacer.check_present_token(2) == pacer_hr::ok);
         EXPECT(pacer.check_present_token(1) == pacer_hr::ok);  // never presented, so not stale
+    }
+
+    // The old wait wakes after a complete suspend, resume and re-registration. The first new tick stays available.
+    for (auto event : {frame_event_origin, frame_event_vblank, frame_event_flip}) {
+        InterruptedFrameClock clock;
+        FramePacer pacer(clock);
+        auto arm = [&] {
+            return pacer.set_frame_interval(period, 1, 0) == pacer_hr::ok &&
+                   pacer.schedule_frame_event(event, 0, 0) == pacer_hr::ok;
+        };
+        EXPECT(arm());
+        bool rearmed = false;
+        clock.while_waiting = [&] {
+            pacer.suspend();
+            pacer.resume();
+            rearmed = arm();
+        };
+        std::uint64_t token = 42;
+        EXPECT(pacer.wait_frame_event(event, 100, 0, &token) == pacer_hr::invalid_state);
+        EXPECT(rearmed && token == 42 && pacer.tokens_issued() == 0);
+        EXPECT(pacer.wait_frame_event(event, 0, 0, &token) == pacer_hr::ok);
+        EXPECT(token == (event == frame_event_origin ? 1u : 42u));
     }
 
     // Destroying a pacer with a blocked waiter lets the waiter go.

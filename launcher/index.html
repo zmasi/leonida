@@ -1,0 +1,919 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- launcher/serve.py writes this run's token here; opened as a file, the page shows sample data instead. -->
+<meta name="leonida-token" content="">
+<title>Leonida Launcher</title>
+<style>
+/* Layout, after the usual shape of a publisher's game launcher: a slim black rail of square tiles with a selection
+   bar, picture art over the whole window, the sections as uppercase words top right, the logo with one big light
+   button and a small menu button beside it. The other pages are a dark sheet over the art.
+   The page loads nothing from the network: system fonts, the repository's assets/logo.svg, and the background
+   picture the server keeps on this PC (else art drawn here). */
+:root {
+  color-scheme: dark;
+  --ink: #0b0b0d;          /* text on the light button, and the dark sheet */
+  --panel: #18181b;
+  --panel-2: #212125;
+  --line: #2e2e33;
+  --text: #f4f4f5;
+  --muted: #a3a3ab;
+  --faint: #6e6e77;
+  --accent: #fa5776;       /* from the middle of the logo's gradient: the selection bar, switches that are on */
+  --accent-2: #fc724f;
+  --warn: #ffc15a;
+  --bad: #ff6b5e;
+  --font: "Segoe UI Variable Display", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, "Liberation Sans", sans-serif;
+  --font-heavy: "Segoe UI Black", "Arial Black", "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, "DejaVu Sans Mono", ui-monospace, monospace;
+  --pad: 58px;
+}
+*, *::before, *::after { box-sizing: border-box; }
+html, body { height: 100%; margin: 0; }
+body { background: #000; color: var(--text); font: 14px/1.5 var(--font); overflow: hidden; }
+[hidden] { display: none !important; }
+button, input { font: inherit; color: inherit; }
+a { color: inherit; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ic { width: 20px; height: 20px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+
+.app { display: grid; grid-template-columns: 104px minmax(0, 1fr); height: 100%; }
+.app[data-rail="wide"] { grid-template-columns: 292px minmax(0, 1fr); }
+
+/* ---- the rail ---- */
+.rail { background: #000; display: flex; flex-direction: column; padding: 36px 0 26px; min-height: 0; overflow: hidden; }
+.rail .logo { display: flex; align-items: center; gap: 14px; height: 56px; padding-left: 24px; margin-bottom: 60px; text-decoration: none; }
+.rail .logo img, .rail .logo svg { width: 56px; height: 56px; flex: none; object-fit: contain; }
+.rail .logo b { font: 900 21px/1 var(--font-heavy); letter-spacing: .04em; display: none; }
+.lib { display: grid; }
+.lib .game { position: relative; display: flex; align-items: center; gap: 14px; height: 36px; padding: 0 12px 0 34px; text-decoration: none; min-width: 0; }
+.lib .game::before { content: ""; position: absolute; left: 2px; top: -2px; bottom: -2px; width: 3px; border-radius: 2px; background: var(--accent); }
+.lib .tile { width: 36px; height: 36px; flex: none; border-radius: 5px; display: grid; place-items: center; overflow: hidden;
+             background: #1d1d20 50% 50% / cover no-repeat; box-shadow: inset 0 0 0 1px rgba(255, 255, 255, .14); }
+.lib .tile img, .lib .tile svg { width: 27px; height: 27px; object-fit: contain; }
+/* a square cut from the upper middle of the background picture */
+.lib .tile.picture { background-size: auto 200%; background-position: 62% 8%; box-shadow: none; }
+.lib .tile.picture img, .lib .tile.picture svg { display: none; }
+.lib .game:hover .tile { filter: brightness(1.15); }
+.lib .name { display: none; min-width: 0; }
+.lib .name b { display: block; font-weight: 600; font-size: 13.5px; line-height: 1.2; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.lib .name small { display: block; color: var(--muted); font-size: 11.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.app[data-rail="wide"] .rail .logo b, .app[data-rail="wide"] .lib .name { display: block; }
+.rail-toggle { margin: auto 0 0 36px; width: 32px; height: 32px; display: grid; place-items: center; background: none; border: 0; color: #8b8b93; cursor: pointer; }
+.rail-toggle:hover { color: #fff; }
+.rail-toggle .ic { width: 30px; height: 30px; stroke-width: 1.4; }
+.app[data-rail="wide"] .rail-toggle .ic { transform: scaleX(-1); }
+
+/* ---- the main area: art, the words top right, the pages ---- */
+main { position: relative; min-width: 0; min-height: 0; overflow: hidden; background: #dba6c2; }
+.art { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+/* A picture sits a little lower, so heads clear the words top right; its top row, measured, fills the band above it,
+   and the picture fades into that. */
+#shot { top: 7%; bottom: auto; object-position: 50% 0; -webkit-mask-image: linear-gradient(to bottom, transparent, #000 9%);
+        mask-image: linear-gradient(to bottom, transparent, #000 9%); }
+main[data-art="picture"] #art { display: none; }
+.veil { position: absolute; inset: 0; background: rgba(9, 9, 11, .93); display: none; }
+main:not([data-page="play"]) .veil { display: block; }
+.top { position: absolute; inset: 0 0 auto 0; height: 124px; z-index: 3; display: flex; align-items: center; justify-content: flex-end; gap: 36px;
+       padding: 14px 34px 0 var(--pad); }
+.top nav { display: flex; gap: 36px; flex: none; }
+.top nav a { font: 500 15.5px/1 var(--font); letter-spacing: .085em; text-transform: uppercase; text-decoration: none; color: rgba(28, 16, 30, .64); white-space: nowrap; }
+.top nav a:hover { color: #0b0b0d; }
+.top nav a[aria-current="page"] { color: #0b0b0d; font-weight: 800; }
+main[data-tone="dark"] .top nav a { color: rgba(255, 255, 255, .62); }
+main[data-tone="dark"] .top nav a:hover, main[data-tone="dark"] .top nav a[aria-current="page"] { color: #fff; }
+.avatar { width: 40px; height: 40px; flex: none; border-radius: 50%; border: 0; padding: 0; cursor: pointer; display: grid; place-items: center; overflow: hidden;
+          background: linear-gradient(180deg, #fbfbfb, #c6c6ca); box-shadow: 0 1px 4px rgba(0, 0, 0, .45); }
+.avatar img, .avatar svg { width: 28px; height: 28px; object-fit: contain; }
+.scroll { position: absolute; inset: 124px 0 0 0; overflow-y: auto; z-index: 2; scrollbar-color: #3a3a40 transparent; }
+.sample { position: absolute; left: var(--pad); top: 46px; z-index: 3; padding: 6px 11px; border-radius: 5px; font-size: 12px; background: rgba(11, 11, 13, .82); color: var(--warn); }
+
+/* ---- Play ---- */
+#page-play { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 12px; padding: 40px 0 70px var(--pad); align-items: start; }
+.title { display: grid; justify-items: start; gap: 4px; min-width: 0; }
+.biglogo { width: 236px; height: 150px; object-fit: contain; object-position: left center; filter: drop-shadow(0 5px 12px rgba(20, 6, 30, .4)); margin-left: -6px; }
+.wordmark { margin: -6px 0 0; font: 900 50px/1 var(--font-heavy); letter-spacing: .015em; text-transform: uppercase; color: #fff;
+            text-shadow: 3px 0 #0b0b0d, -3px 0 #0b0b0d, 0 3px #0b0b0d, 0 -3px #0b0b0d, 2px 2px #0b0b0d, -2px 2px #0b0b0d, 2px -2px #0b0b0d, -2px -2px #0b0b0d,
+                         0 7px 0 #0b0b0d, 0 12px 22px rgba(20, 6, 30, .35); }
+.cta { display: flex; gap: 12px; margin: 22px 0 0 -8px; padding: 4px; position: relative; }
+.play, .kebab { height: 60px; border-radius: 8px; border: 1px solid rgba(0, 0, 0, .62); cursor: pointer; color: #0b0b0d;
+                background: linear-gradient(180deg, #fcfcfc 0%, #e6e6e6 46%, #c9c9c9 100%);
+                box-shadow: 0 0 0 4px rgba(255, 255, 255, .62), 0 8px 20px rgba(20, 6, 30, .38), inset 0 1px 0 #fff; }
+.play { min-width: 204px; padding: 0 28px; font: 800 19px/1 var(--font); letter-spacing: .13em; text-transform: uppercase; white-space: nowrap; }
+.kebab { width: 44px; padding: 0; display: grid; place-items: center; }
+.kebab i { width: 5px; height: 5px; border-radius: 50%; background: #0b0b0d; box-shadow: 0 -9px #0b0b0d, 0 9px #0b0b0d; }
+.play:hover, .kebab:hover { background: linear-gradient(180deg, #fff 0%, #f1f1f1 46%, #d8d8d8 100%); }
+.play:active, .kebab:active { transform: translateY(1px); }
+.play.is-stop { color: #b3261e; }
+.menu { position: absolute; left: calc(100% + 10px); bottom: 4px; z-index: 5; width: 270px; padding: 6px; border-radius: 8px; background: #111113; border: 1px solid #34343a;
+        box-shadow: 0 18px 40px rgba(0, 0, 0, .55); display: grid; }
+.menu button { text-align: left; background: none; border: 0; border-radius: 5px; padding: 7px 12px; cursor: pointer; font-size: 13.5px; }
+.menu button:hover { background: #26262b; }
+.menu .head { font: 700 11px/1 var(--font); letter-spacing: .14em; text-transform: uppercase; color: var(--faint); padding: 9px 12px 5px; }
+.menu .setup { display: grid; grid-template-columns: 16px minmax(0, 1fr); gap: 8px; align-items: baseline; }
+.menu .setup::before { content: ""; color: var(--accent); font-weight: 700; }
+.menu .setup[aria-checked="true"]::before { content: "\2713"; }
+.menu .setup b { font-weight: 600; }
+.menu hr { border: 0; border-top: 1px solid #34343a; margin: 6px 4px; }
+.status { margin: 16px 0 0 -4px; max-width: 300px; padding: 8px 12px; border-radius: 6px; background: rgba(11, 11, 13, .8); font-size: 12.5px; line-height: 1.4; display: grid; gap: 6px; }
+.status b { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 13px; }
+.status b::before { content: ""; width: 8px; height: 8px; border-radius: 50%; flex: none; background: #6fdc8c; }
+.status[data-tone="todo"] b::before, .status[data-tone="run"] b::before { background: var(--warn); }
+.status[data-tone="run"] b::before { animation: pulse 1.2s ease-in-out infinite; }
+.status[data-tone="bad"] b::before { background: var(--bad); }
+.status span { color: #c9c9d0; overflow-wrap: anywhere; }
+.status a { color: var(--warn); overflow-wrap: anywhere; }
+.status .row { display: flex; gap: 8px; }
+@keyframes pulse { 50% { opacity: .3; } }
+
+/* ---- the log, a drawer along the bottom ---- */
+.logchip { position: absolute; left: 20px; bottom: 16px; z-index: 4; max-width: min(560px, calc(100% - 40px)); display: flex; align-items: center; gap: 10px; padding: 7px 12px;
+           border: 0; border-radius: 6px; background: rgba(11, 11, 13, .84); cursor: pointer; font-size: 12px; }
+.logchip b { font-weight: 700; letter-spacing: .12em; text-transform: uppercase; font-size: 11px; }
+.logchip span { color: #c9c9d0; font-family: var(--font-mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.logsheet { position: absolute; left: 0; right: 0; bottom: 0; z-index: 6; height: min(48%, 340px); display: flex; flex-direction: column; background: rgba(9, 9, 11, .97);
+            border-top: 1px solid #34343a; }
+.logsheet header { display: flex; align-items: center; gap: 8px; padding: 9px 14px 9px 20px; border-bottom: 1px solid var(--line); }
+.logsheet header h2 { margin: 0 auto 0 0; }
+.logsheet pre { margin: 0; padding: 12px 20px 16px; flex: 1; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font: 12.5px/1.55 var(--font-mono); color: #c9c9d0; }
+
+/* ---- the other pages ---- */
+.page { padding: 6px var(--pad) 70px; display: grid; gap: 26px; align-content: start; max-width: 1240px; }
+.page-head h1 { margin: 0; font: 800 34px/1.05 var(--font); letter-spacing: .09em; text-transform: uppercase; }
+.page-head p { color: var(--muted); margin: 10px 0 0; max-width: 72ch; }
+.page-head .row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+h2.label { font: 700 12px/1 var(--font); letter-spacing: .16em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; }
+.btn { font: 600 13px/1 var(--font); color: var(--text); background: var(--panel-2); border: 1px solid #3a3a40; border-radius: 5px; padding: 9px 14px; cursor: pointer;
+       display: inline-flex; align-items: center; gap: 8px; text-decoration: none; }
+.btn:hover { background: #2c2c31; border-color: #4a4a52; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+.btn .ic { width: 16px; height: 16px; }
+.btn.quiet { background: transparent; border-color: transparent; }
+.btn.light { background: #f1f1f2; border-color: #f1f1f2; color: #0b0b0d; }
+.btn.danger { color: var(--bad); }
+.settings { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 44px; align-items: start; }
+.groups { display: grid; gap: 34px; min-width: 0; }
+.field { display: grid; grid-template-columns: minmax(170px, 2fr) minmax(0, 3fr); gap: 8px 28px; align-items: start; padding: 15px 0; border-top: 1px solid var(--line); }
+.field .lbl b { display: block; font-weight: 600; }
+.field .lbl small { display: block; color: var(--muted); font-size: 12.5px; line-height: 1.45; margin-top: 3px; max-width: 46ch; }
+.field .ctl { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; min-width: 0; }
+.field .ctl input[type="text"] { flex: 1 1 220px; min-width: 0; background: var(--panel); border: 1px solid #3a3a40; border-radius: 5px; padding: 8px 10px; }
+.field .ctl input[type="text"]::placeholder { color: var(--faint); }
+.field .ctl .verdict { flex-basis: 100%; font-size: 12.5px; color: var(--muted); }
+.field .ctl .verdict[data-state="ok"] { color: #6fdc8c; }
+.field .ctl .verdict[data-state="todo"] { color: var(--warn); }
+.field[aria-disabled="true"] { opacity: .45; }
+.seg { display: inline-flex; flex-wrap: wrap; border: 1px solid #3a3a40; border-radius: 5px; overflow: hidden; background: var(--panel); }
+.seg label { position: relative; cursor: pointer; }
+.seg input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.seg span { display: block; padding: 8px 13px; font-size: 13px; color: var(--muted); white-space: nowrap; }
+.seg label + label span { box-shadow: -1px 0 0 #3a3a40; }
+.seg input:checked + span { background: #f1f1f2; color: #0b0b0d; font-weight: 600; }
+.seg input:focus-visible + span { outline: 2px solid var(--accent); outline-offset: -2px; }
+.switch { position: relative; display: inline-block; width: 44px; height: 24px; flex: none; }
+.switch input { position: absolute; inset: 0; opacity: 0; margin: 0; cursor: pointer; }
+.switch i { position: absolute; inset: 0; border-radius: 12px; background: #3a3a40; transition: background .15s; pointer-events: none; }
+.switch i::after { content: ""; position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: #c9c9d0; transition: transform .15s, background .15s; }
+.switch input:checked + i { background: var(--accent); }
+.switch input:checked + i::after { transform: translateX(20px); background: #fff; }
+.switch input:focus-visible + i { outline: 2px solid var(--accent); outline-offset: 2px; }
+.summary { position: sticky; top: 8px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; display: grid; gap: 14px; }
+.summary dl { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; font-size: 13px; }
+.summary dt { color: var(--muted); }
+.summary dd { margin: 0; }
+.cmd { background: #0b0b0d; border: 1px solid var(--line); border-radius: 5px; padding: 10px 12px; font: 12px/1.6 var(--font-mono); color: #c9c9d0; white-space: pre-wrap; overflow-wrap: anywhere; margin: 0; }
+.notes { margin: 0; padding: 0; list-style: none; display: grid; gap: 6px; font-size: 12.5px; color: var(--warn); }
+.rows { list-style: none; margin: 0; padding: 0; border-bottom: 1px solid var(--line); }
+.rows > li { display: flex; flex-wrap: wrap; align-items: center; gap: 10px 18px; padding: 14px 0; border-top: 1px solid var(--line); }
+.rows .grow { flex: 1 1 260px; min-width: 0; }
+.rows b { font-weight: 600; font-size: 15px; }
+.rows small { display: block; color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
+.rows .num { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.mono { font-family: var(--font-mono); }
+.tagline { font-size: 11px; letter-spacing: .1em; text-transform: uppercase; color: var(--muted); border: 1px solid #3a3a40; border-radius: 4px; padding: 2px 7px; white-space: nowrap; }
+.tagline.warn { color: var(--warn); border-color: rgba(255, 193, 90, .45); }
+.empty { color: var(--muted); max-width: 64ch; padding: 22px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0; }
+.shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 16px; }
+.shots figure { margin: 0; background: #000; padding: 6px 6px 0; }
+.shots img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; background: var(--panel); }
+.shots figcaption { font-size: 12px; color: #d6d6db; padding: 9px 4px 11px; overflow-wrap: anywhere; }
+.tools { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 16px; }
+.tool { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 18px; display: grid; gap: 8px; align-content: start; justify-items: start; }
+.tool b { font: 800 15px/1.2 var(--font); letter-spacing: .08em; text-transform: uppercase; }
+.tool p { margin: 0 0 6px; color: var(--muted); font-size: 13px; }
+.prose { max-width: 72ch; display: grid; gap: 14px; color: #dcdce0; }
+.prose p, .prose ul { margin: 0; }
+.prose ul { padding-left: 18px; color: var(--muted); display: grid; gap: 4px; }
+.confirm { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12.5px; color: var(--warn); }
+.toast { position: fixed; right: 22px; bottom: 22px; max-width: min(520px, calc(100vw - 44px)); background: #1d1d20; border: 1px solid #45454c; border-radius: 8px; padding: 12px 16px;
+         box-shadow: 0 16px 40px rgba(0, 0, 0, .55); z-index: 20; overflow-wrap: anywhere; }
+
+@media (max-width: 1180px) {
+  .top, .top nav { gap: 26px; }
+  .top nav a { font-size: 14.5px; }
+  .settings { grid-template-columns: minmax(0, 1fr); }
+  .summary { position: static; }
+}
+@media (max-width: 940px) {
+  :root { --pad: 28px; }
+  .app, .app[data-rail="wide"] { grid-template-columns: 76px minmax(0, 1fr); }
+  .rail .logo { padding-left: 14px; } .rail .logo img, .rail .logo svg { width: 48px; height: 48px; }
+  .lib .game { padding-left: 20px; } .rail-toggle { display: none; }
+  .app[data-rail="wide"] .rail .logo b, .app[data-rail="wide"] .lib .name { display: none; }
+  .top { justify-content: flex-start; height: 96px; gap: 20px; } .top nav { gap: 22px; flex: 0 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none; } .top nav a { font-size: 14px; }
+  .scroll { top: 96px; }
+  #page-play { grid-template-columns: minmax(0, 1fr); gap: 34px; padding-top: 16px; }
+  .menu { left: 4px; bottom: auto; top: 76px; }
+  .field { grid-template-columns: minmax(0, 1fr); }
+}
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+  <!-- shown only when assets/logo.svg cannot be loaded -->
+  <symbol id="mark" viewBox="0 0 32 32"><path d="M5 3h7v19h15v7H5z" fill="#fa5776"/><path d="M15 19.5a6 6 0 0 1 12 0z" fill="#fc9a4f"/></symbol>
+  <symbol id="i-panel" viewBox="0 0 24 24"><rect x="3.5" y="4.5" width="17" height="15"/><path d="M13.5 4.5v15M7 9.5l3 2.5-3 2.5"/></symbol>
+  <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3 6h6l2 2h10v11H3z"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12" height="12" rx="1.5"/><path d="M16 8V4H4v12h4"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+</defs></svg>
+
+<div class="app" id="app" data-rail="narrow">
+  <aside class="rail">
+    <a class="logo" href="#play" aria-label="Leonida"><img data-logo src="../assets/logo.svg" alt=""><b>LEONIDA</b></a>
+    <nav class="lib" aria-label="Library">
+      <a class="game" href="#play" aria-current="page" title="Leonida">
+        <span class="tile" id="game-tile"><img data-logo src="../assets/logo.svg" alt=""></span>
+        <span class="name"><b>Leonida</b><small id="game-state">Ready</small></span>
+      </a>
+    </nav>
+    <button class="rail-toggle" type="button" id="rail-toggle" aria-label="Show or hide the names" title="Show or hide the names"><svg class="ic" aria-hidden="true"><use href="#i-panel"/></svg></button>
+  </aside>
+
+  <main id="main" data-page="play" data-tone="light">
+    <canvas class="art" id="art" aria-hidden="true"></canvas>
+    <img class="art" id="shot" alt="" hidden>
+    <div class="veil"></div>
+    <span class="sample" id="sample" hidden>Sample data. Launcher.bat shows your own.</span>
+    <header class="top">
+      <nav aria-label="Sections" id="nav">
+        <a href="#play">Play</a><a href="#mods">Mods</a><a href="#saves">Saves</a><a href="#captures">Captures</a><a href="#tools">Tools</a><a href="#settings">Settings</a>
+      </nav>
+      <button class="avatar" type="button" id="avatar" aria-label="About Leonida" title="About Leonida"><img data-logo src="../assets/logo.svg" alt=""></button>
+    </header>
+
+    <div class="scroll" id="scroll">
+      <!-- Play -->
+      <section id="page-play">
+        <div class="title">
+          <img class="biglogo" data-logo src="../assets/logo.svg" alt="">
+          <h1 class="wordmark">Leonida</h1>
+          <div class="cta">
+            <button class="play" type="button" id="play">Play</button>
+            <button class="kebab" type="button" id="kebab" aria-label="More for this start" aria-haspopup="menu" aria-expanded="false"><i></i></button>
+            <div class="menu" id="menu" role="menu" hidden>
+              <div class="head">Setup</div>
+              <div id="menu-setups"></div>
+              <hr>
+              <button type="button" role="menuitem" data-menu="check">Check this start, without starting it</button>
+              <button type="button" role="menuitem" data-menu="copy">Copy the command</button>
+            </div>
+          </div>
+          <div class="status" id="status" role="status"><b></b><span></span></div>
+        </div>
+      </section>
+
+      <!-- Mods -->
+      <section class="page" id="page-mods" hidden>
+        <header class="page-head"><h1>Mods</h1><p id="mods-where"></p>
+          <div class="row"><button class="btn" type="button" data-open="mods"><svg class="ic" aria-hidden="true"><use href="#i-folder"/></svg>Open the mods folder</button></div>
+        </header>
+        <ul class="rows" id="mods"></ul>
+      </section>
+
+      <!-- Saves -->
+      <section class="page" id="page-saves" hidden>
+        <header class="page-head"><h1>Saves</h1><p id="saves-where"></p>
+          <div class="row">
+            <button class="btn" type="button" data-save="backup-all">Back up all</button>
+            <button class="btn" type="button" data-open="backups"><svg class="ic" aria-hidden="true"><use href="#i-folder"/></svg>Backups folder</button>
+          </div>
+        </header>
+        <ul class="rows" id="saves"></ul>
+      </section>
+
+      <!-- Captures -->
+      <section class="page" id="page-captures" hidden>
+        <header class="page-head"><h1>Captures</h1>
+          <p>Pictures you made in the game. They stay on this PC.</p>
+          <div class="row"><button class="btn" type="button" data-open="captures"><svg class="ic" aria-hidden="true"><use href="#i-folder"/></svg>Open the captures folder</button></div>
+        </header>
+        <div id="captures"></div>
+      </section>
+
+      <!-- Tools -->
+      <section class="page" id="page-tools" hidden>
+        <header class="page-head"><h1>Tools</h1><p>One thing runs at a time; its output goes to the log.</p></header>
+        <h2 class="label" style="margin:0">Before you play</h2>
+        <ul class="rows" id="checks"></ul>
+        <div class="tools" id="tools"></div>
+      </section>
+
+      <!-- Settings -->
+      <section class="page" id="page-settings" hidden>
+        <header class="page-head"><h1>Settings</h1><p id="settings-where"></p></header>
+        <div class="settings">
+          <div class="groups" id="groups"></div>
+          <aside class="summary" aria-label="This start">
+            <h2 class="label" style="margin:0">This start</h2>
+            <dl id="summary"></dl>
+            <pre class="cmd" id="cmd"></pre>
+            <ul class="notes" id="notes"></ul>
+            <button class="btn" type="button" id="cmd-copy"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Copy the command</button>
+          </aside>
+        </div>
+      </section>
+
+      <!-- About -->
+      <section class="page" id="page-about" hidden>
+        <header class="page-head"><h1>About</h1><p id="build"></p></header>
+        <div class="prose">
+          <p>Leonida is a compatibility runtime that runs your own copy of the Xbox Series build of GTA VI on a PC: a loader that maps the
+             game's executable and a Direct3D 12 layer that draws its frames on your graphics card.</p>
+          <p>It is an unofficial, independent project. It is not made, endorsed or supported by the game's publisher, and it contains none of
+             the game: you build it from a copy you own, and the game itself never goes online. The picture behind PLAY is the
+             game's key art, fetched once from rockstargames.com and kept on this PC, unless you choose your own in Settings; the logo is the repository's assets/logo.svg.</p>
+          <h2 class="label" style="margin:10px 0 0">Built on the work of others</h2>
+          <ul>
+            <li>VIctory by Marvisak and its contributors: the loader, the runtime services, the Direct3D 12 back end, the shader recompiler</li>
+            <li>avatarmanz/VIctory-7900XTX, the fork this one started from</li>
+            <li>fxceless/victory-fork, DexNom/VIctory, Belobug/VIctory-Belobug-AMD, FQY55kai/ZJOU-VICTORY, myokex/victory-amd</li>
+            <li>Aki-Developer, who shared the aki-runtime port for reference</li>
+            <li>NVIDIA's DLSS and Streamline, which you fetch yourself under NVIDIA's own licences</li>
+          </ul>
+          <p>Full credits are in d3d12/README.md and README.md. Licence: GPL-3.0-or-later (the LICENSE file). The launcher is part of it.</p>
+        </div>
+      </section>
+    </div>
+
+    <button class="logchip" type="button" id="logchip"><b>Log</b><span id="logline"></span></button>
+    <section class="logsheet" id="logsheet" hidden aria-label="Log">
+      <header><h2 class="label">Log</h2>
+        <button class="btn quiet" type="button" id="log-copy"><svg class="ic" aria-hidden="true"><use href="#i-copy"/></svg>Copy</button>
+        <button class="btn quiet" type="button" data-open="logs"><svg class="ic" aria-hidden="true"><use href="#i-folder"/></svg>Logs folder</button>
+        <button class="btn quiet" type="button" id="log-close" aria-label="Close the log"><svg class="ic" aria-hidden="true"><use href="#i-close"/></svg></button>
+      </header>
+      <pre id="log" tabindex="0" aria-label="Output of the start script"></pre>
+    </section>
+  </main>
+</div>
+<div class="toast" id="toast" role="status" hidden></div>
+
+<script>
+"use strict";
+// ---------------------------------------------------------------- small helpers
+const $ = id => document.getElementById(id);
+const SVGNS = "http://www.w3.org/2000/svg";
+function h(tag, props, ...kids) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(props || {})) {
+    if (v == null || v === false) continue;
+    if (k === "class") e.className = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v);
+    else e.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat(Infinity)) {
+    if (kid == null || kid === false) continue;
+    e.append(kid.nodeType ? kid : document.createTextNode(String(kid)));   // text only: paths and log lines are never markup
+  }
+  return e;
+}
+function icon(name) {
+  const s = document.createElementNS(SVGNS, "svg"), u = document.createElementNS(SVGNS, "use");
+  s.setAttribute("class", "ic"); s.setAttribute("aria-hidden", "true"); u.setAttribute("href", "#i-" + name); s.append(u);
+  return s;
+}
+function fill(node, ...kids) { node.replaceChildren(...kids.flat(Infinity).filter(k => k != null && k !== false)); }
+let toastTimer = 0;
+function toast(text) {
+  const t = $("toast"); t.textContent = text; t.hidden = false;
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => { t.hidden = true; }, 6000);
+}
+function copyText(text, done) {
+  (navigator.clipboard ? navigator.clipboard.writeText(text) : Promise.reject()).then(() => toast(done), () => toast("Copying is not allowed here; select the text instead."));
+}
+function bytes(n) { return n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : n >= 1024 ? Math.round(n / 1024) + " KB" : n + " B"; }
+function day(value) {   // "2026-11-27" or seconds since 1970 -> "27 Nov 2026"
+  const d = typeof value === "number" ? new Date(value * 1000) : new Date(value + "T12:00:00");
+  return isNaN(d) ? String(value) : d.toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+}
+// The repository's logo; where it cannot be loaded, a plain mark drawn here.
+for (const img of document.querySelectorAll("img[data-logo]")) {
+  const swap = () => { const s = document.createElementNS(SVGNS, "svg"), u = document.createElementNS(SVGNS, "use"); u.setAttribute("href", "#mark"); s.append(u); s.setAttribute("class", img.className); img.replaceWith(s); };
+  if (img.complete && !img.naturalWidth) swap(); else img.addEventListener("error", swap);
+}
+
+// ---------------------------------------------------------------- the options and what they stand for
+// The keys are those of the launcher's settings file (tools/leonida_launcher.py). Two controls stand for two keys
+// each: `console` (series_s, series_x) and `upscale` (dlss, off = -NoDlss, and dlss_mode, -Dlss <mode>).
+const DEFAULTS = { game_dir: "", data_dir: "", mods_dir: "", background: "", series_s: false, series_x: false, dlss: true, dlss_mode: "", resolution: "",
+  frame_gen: 0, smooth_motion: false, aspect: "", present_scale: "", ray_tracing: false, quality: false, adapter: "", precompile: true,
+  capture: false, log: false };
+const GROUPS = [
+  { title: "Folders", fields: [
+    { key: "game_dir", kind: "path", label: "Game folder", check: "game",
+      help: "Your own copy: the folder with game_scarlett_master.exe in it. The launcher only reads it." },
+    { key: "data_dir", kind: "path", label: "Data folder", placeholder: "%LOCALAPPDATA%\\Leonida\\d3d12",
+      help: "Shader caches and saves are kept here. Empty uses the folder shown." },
+    { key: "mods_dir", kind: "path", label: "Mods folder", placeholder: "mods, in this repository", help: "Empty uses the repository's own." } ] },
+  { title: "Picture", fields: [
+    { key: "console", kind: "seg", label: "Console profile", options: [["x", "Series X"], ["s", "Series S"]],
+      help: "Series X renders 2560x1440 for a 3840x2160 output. Series S is lighter: the game's own 720p picture, taken to 1080p." },
+    { key: "upscale", kind: "seg", label: "Upscaling", windows: true,
+      options: [["default", "Default"], ["quality", "DLSS Quality"], ["balanced", "Balanced"], ["performance", "Performance"], ["ultra", "Ultra"], ["off", "Off"]],
+      help: "Default is the game's own upscaler on Series X. A DLSS mode renders at 1440, 1296, 1080 or 720 lines of the 2160. Off stretches the picture." },
+    { key: "resolution", kind: "seg", label: "Render height", windows: true,
+      options: [["", "Default"], ["2160", "2160"], ["1440", "1440"], ["1080", "1080"], ["720", "720"], ["540", "540"], ["480", "480"]],
+      help: "The older path: the game renders at this height and its own upscaler does the rest. Not used with a DLSS mode." },
+    { key: "ray_tracing", kind: "switch", label: "Ray tracing", windows: true, help: "The game's real ray tracing. Slower, and shaders build for minutes the first time." },
+    { key: "quality", kind: "switch", label: "Careful drawing", windows: true, help: "Fewer stretched or jumping bodies, at a lower frame rate (-Quality)." } ] },
+  { title: "Frames", fields: [
+    { key: "frame_gen", kind: "seg", type: "int", label: "Frame generation", windows: true, options: [[0, "Off"], [2, "2x"], [3, "3x"], [4, "4x"], [5, "5x"], [6, "6x"]],
+      help: "DLSS shows 2 to 6 frames for each one the game renders (RTX 40: 2x). The rate the game itself renders at stays what it is." },
+    { key: "smooth_motion", kind: "switch", label: "NVIDIA Smooth Motion", windows: true,
+      help: "The driver shows twice the frames (RTX 40 and 50). One start with it ended after 2.4 s on 27 Nov 2026." } ] },
+  { title: "Window", fields: [
+    { key: "aspect", kind: "seg", label: "Shape", windows: true, options: [["", "16:9"], ["21:9", "21:9"], ["32:9", "32:9"], ["auto", "The screen's"]], help: "The game still draws 16:9." },
+    { key: "present_scale", kind: "seg", label: "The 16:9 picture in it", windows: true, options: [["", "Centred, black bars"], ["stretch", "Stretched"]], when: s => !!s.aspect },
+    { key: "adapter", kind: "text", label: "Graphics card", windows: true, placeholder: "Windows' default card",
+      help: "On a PC with more than one: part of its name (5060) or its index (#1)." } ] },
+  { title: "Start", fields: [
+    { key: "precompile", kind: "switch", label: "Prepare shaders first", windows: true,
+      help: "Every shader is translated and the pipelines of earlier runs are made before the game starts: minutes the first time, seconds after. Off starts at once, and the world can come up half drawn." },
+    { key: "capture", kind: "switch", label: "Capture key", windows: true, help: "F9 in the game saves that frame to %LOCALAPPDATA%\\Leonida\\captures." },
+    { key: "log", kind: "switch", label: "Write a log file", windows: true, help: "The runtime's log goes to %LOCALAPPDATA%\\Leonida\\logs." } ] },
+  { title: "Launcher", fields: [
+    { key: "background", kind: "file", label: "Background picture", placeholder: "The key art, kept in %APPDATA%\\Leonida",
+      help: "A picture of your own behind PLAY. Without one, the launcher fetches the game's key art from rockstargames.com once and keeps it in %APPDATA%\\Leonida. Pictures are never part of the repository." } ] },
+];
+// Four ready setups, offered in the menu beside PLAY.
+const PRESETS = [
+  { name: "Console picture", text: "Series X, 1440 lines, the game's upscaler", console: "x", set: { dlss: true, dlss_mode: "", frame_gen: 0, resolution: "" } },
+  { name: "DLSS Quality", text: "1440 lines rendered, DLSS makes the 2160", console: "x", set: { dlss: true, dlss_mode: "quality", frame_gen: 0, resolution: "" } },
+  { name: "Generated frames", text: "DLSS Quality, twice the frames shown", console: "x", set: { dlss: true, dlss_mode: "quality", frame_gen: 2, resolution: "" } },
+  { name: "Lighter", text: "Series S: the game's 720p, taken to 1080p", console: "s", set: { dlss: true, dlss_mode: "", frame_gen: 0, resolution: "" } },
+];
+const MODE_NAMES = { quality: "Quality", balanced: "Balanced", performance: "Performance", ultra: "Ultra" };
+function consoleOf(s) { return s.series_s ? "s" : s.series_x ? "x" : (S && S.platform !== "windows" ? "s" : "x"); }   // each start script's own default
+function consolePatch(v) { return v === "s" ? { series_s: true, series_x: false } : { series_s: false, series_x: true }; }
+function presetOn(p, s) { return consoleOf(s) === p.console && Object.entries(p.set).every(([k, v]) => s[k] === v); }
+
+// The switches the options stand for, in the order tools/leonida_launcher.py writes them. With the server running the
+// command shown is the server's; this copy serves the page opened on its own.
+function switchArgs(s) {
+  const a = [];
+  if (s.series_s) a.push("-SeriesS");
+  if (!s.dlss) a.push("-NoDlss"); else if (s.dlss_mode) a.push("-Dlss", s.dlss_mode);
+  if (s.frame_gen) a.push("-FrameGen", String(s.frame_gen));
+  if (s.ray_tracing) a.push("-RayTracing");
+  if (s.smooth_motion) a.push("-SmoothMotion");
+  if (!s.precompile) a.push("-NoPrecompile");
+  if (s.series_x && !s.series_s) a.push("-SeriesX");
+  if (s.quality) a.push("-Quality");
+  if (s.resolution && !(s.dlss && s.dlss_mode)) a.push("-Resolution", s.resolution);
+  if (s.aspect) { a.push("-Aspect", s.aspect); if (s.present_scale) a.push("-PresentScale", s.present_scale); }
+  if (s.adapter.trim()) a.push("-Adapter", s.adapter.trim());
+  if (s.capture) a.push("-Capture");
+  if (s.log) a.push("-Log");
+  return a;
+}
+function localCommand(s) {
+  if (!s.game_dir.trim()) return null;
+  const c = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts\\play-d3d12.ps1", "-Game", s.game_dir.trim()];
+  if (s.data_dir.trim()) c.push("-Data", s.data_dir.trim());
+  return c.concat(switchArgs(s));
+}
+function quote(arg) { return /[\s"']/.test(arg) ? '"' + arg.replace(/"/g, '\\"') + '"' : arg; }
+function facts(s) {
+  const lighter = consoleOf(s) === "s";
+  const picture = !s.dlss ? "Stretched, no DLSS"
+    : s.dlss_mode ? "DLSS " + MODE_NAMES[s.dlss_mode]
+    : s.resolution ? s.resolution + " lines, game's upscaler"
+    : lighter ? "720p to 1080p" : "1440 lines, game's upscaler";
+  const frames = (s.frame_gen ? "Frame generation " + s.frame_gen + "x" : "No generated frames") + (s.smooth_motion ? ", Smooth Motion" : "");
+  const shape = s.aspect ? (s.aspect === "auto" ? "The screen's shape" : s.aspect) + (s.present_scale === "stretch" ? ", stretched" : ", black bars") : "16:9";
+  const start = s.precompile ? "Shaders prepared first" : "Starts at once";
+  return [["Profile", lighter ? "Series S" : "Series X"], ["Picture", picture + (s.ray_tracing ? ", ray tracing" : "")], ["Frames", frames],
+          ["Window", shape], ["Start", start + (s.capture ? ", F9 captures" : "") + (s.log ? ", log file" : "")]];
+}
+function notes(s, checks) {
+  const n = [];
+  if (s.frame_gen && !s.dlss) n.push("Frame generation needs DLSS, and Upscaling is Off.");
+  else if (s.frame_gen && !s.dlss_mode && consoleOf(s) === "x") n.push("Frame generation turns DLSS Quality on.");
+  if (s.frame_gen && s.ray_tracing) n.push("Frame generation is left off with ray tracing: the two do not work together yet.");
+  if (s.resolution && s.dlss && s.dlss_mode) n.push("Render height is not used with a DLSS mode.");
+  const dlss = checks.find(c => c.id === "dlss");
+  if (dlss && dlss.state !== "ok" && s.dlss && (s.dlss_mode || s.frame_gen || consoleOf(s) === "s")) n.push("NVIDIA's DLSS files are missing: Tools fetches them.");
+  return n;
+}
+
+// ---------------------------------------------------------------- the state, and where it comes from
+// What the page shows when it is opened as a file, without launcher/serve.py behind it. Marked as sample data.
+const SAMPLE = {
+  sample: true, can_run: false, platform: "windows", version: "ee215edf9", package: "1.0.2.1",
+  settings: Object.assign({}, DEFAULTS, { game_dir: "D:\\Games\\your-copy" }),
+  checks: [
+    { id: "game", state: "ok", title: "Game folder", detail: "game_scarlett_master.exe found" },
+    { id: "data", state: "ok", title: "Data folder", detail: "%LOCALAPPDATA%\\Leonida\\d3d12" },
+    { id: "runtime", state: "ok", title: "Runtime", detail: "leonida.exe is built" },
+    { id: "dlss", state: "todo", title: "NVIDIA's DLSS files", detail: "Not fetched: about 70 MB from NVIDIA's GitHub", go: "#tools", action: "Fetch" },
+  ],
+  mods: [
+    { folder: "first_person", name: "First-person view on foot", enabled: true, swaps: 0 },
+    { folder: "mandy_prison_intro", name: "Mandy in the prison intro", enabled: true, swaps: 1 },
+    { folder: "example_lua", name: "Example Lua mod", enabled: false, swaps: 0 },
+    { folder: "lucia_cutscene_model", name: "Lucia cutscene model", enabled: false, swaps: 1 },
+    { folder: "mandy_to_monalisa", name: "Mandy as Mona Lisa", enabled: false, swaps: 1 },
+    { folder: "monalisa_player_model", name: "Mona Lisa instead of Lucia", enabled: false, swaps: 1 },
+  ],
+  mod_errors: [], mods_dir: "mods",
+  saves: { root: "%LOCALAPPDATA%\\Leonida\\d3d12\\data\\7952987A\\saves", containers: [
+    { name: "Example story save", version: 4, size: 1482296, modified: 1795813200, blobs: 2 },
+    { name: "Example profile", version: 12, size: 20776, modified: 1795809600, blobs: 2 } ] },
+  captures: [], hero: null,
+  job: { running: false, state: "Ready", kind: "" }, log: ["The launcher is ready."],
+};
+let S = null;
+const TOKEN = document.querySelector('meta[name="leonida-token"]').content;
+async function call(path, body) {
+  const r = await fetch("/api/" + path, body === undefined ? { headers: { "X-Leonida-Token": TOKEN } }
+    : { method: "POST", headers: { "X-Leonida-Token": TOKEN, "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.message || ("The launcher's server answered " + r.status));
+  return data;
+}
+// One request, then the page shows what came back: {state?, message?}.
+async function act(path, body) {
+  if (S.sample) { toast("Sample view: start the launcher with Launcher.bat and this works on your own folders."); return null; }
+  try {
+    const data = await call(path, body);
+    if (data.state) S = data.state;
+    if (data.message) toast(data.message);
+    render();
+    return data;
+  } catch (err) { toast(err.message); return null; }
+}
+
+// ---------------------------------------------------------------- Play
+let stopAsked = false;
+function readiness() {
+  const game = S.checks.find(c => c.id === "game");
+  if (S.job.running) return { tone: "run", label: S.job.state, detail: S.job.kind === "play" ? "The log has the start script's output." : "PLAY is back when this is done." };
+  if (!game || game.state !== "ok") return { tone: "todo", label: "Choose the game folder", detail: "Settings, Folders: the folder with game_scarlett_master.exe." };
+  if (/^Exited with code [^0]/.test(S.job.state)) return { tone: "bad", label: S.job.state, detail: "The log has the script's last lines." };
+  const f = facts(S.settings);
+  return { tone: "ok", label: "Ready", detail: f[0][1] + " · " + f[1][1] + (S.settings.frame_gen ? " · " + f[2][1] : "") };
+}
+function renderPlay() {
+  const s = S.settings, ready = readiness(), b = $("play");
+  b.className = "play" + (S.job.running ? " is-stop" : "");
+  b.textContent = S.job.running ? "Stop" : ready.tone === "todo" ? "Set up" : "Play";
+  const st = $("status"); st.dataset.tone = ready.tone;
+  if (stopAsked && S.job.running) {
+    fill(st, h("b", null, "Stop the game?"), h("span", null, "It ends at once, with everything the start script began. Progress since the last save is lost."),
+      h("div", { class: "row" }, h("button", { class: "btn danger", type: "button", onclick: () => { stopAsked = false; act("stop", {}); } }, "Stop it"),
+        h("button", { class: "btn", type: "button", onclick: () => { stopAsked = false; renderPlay(); } }, "Keep playing")));
+  } else {
+    stopAsked = false;
+    const todo = ready.tone === "ok" && S.checks.find(c => c.state !== "ok" && c.id !== "game");
+    fill(st, h("b", null, ready.label), h("span", null, ready.detail), todo ? h("a", { href: todo.go || "#tools" }, todo.title + ": " + todo.detail) : null);
+  }
+  renderSetups(s); renderRail(ready); chip();
+  $("sample").hidden = !S.sample;
+  $("logline").textContent = S.log.length ? S.log[S.log.length - 1] : "";
+  const shot = $("shot"), main = $("main");
+  if (S.hero) {
+    if (shot.dataset.src !== S.hero.url) { shot.dataset.src = S.hero.url; shot.src = S.hero.url; }
+    shot.hidden = false; main.dataset.art = "picture";
+  } else if (main.dataset.art !== "drawn") {
+    shot.hidden = true; shot.dataset.tone = ""; shot.dataset.src = ""; main.dataset.art = "drawn"; main.style.backgroundColor = ""; paintArt();
+  }
+  tone();
+}
+// The menu beside PLAY: the four setups with the one in use ticked, and your own options when they are none of them.
+function renderSetups(s) {
+  const own = !PRESETS.some(p => presetOn(p, s));
+  fill($("menu-setups"), PRESETS.map(p => h("button", { class: "setup", type: "button", role: "menuitemradio", "aria-checked": String(presetOn(p, s)), title: p.text,
+      onclick: () => { menu(false); change(Object.assign(consolePatch(p.console), p.set)); } }, h("b", null, p.name))),
+    h("button", { class: "setup", type: "button", role: "menuitemradio", "aria-checked": String(own), title: "Every option, in Settings", onclick: () => { menu(false); location.hash = "#settings"; } },
+      h("b", null, "Your own options")));
+}
+// The rail: the one game of this library. Its tile is cut from the background picture when there is one.
+function renderRail(ready) {
+  const tile = $("game-tile"), art = !!(S.hero && S.hero.kind === "picture");
+  tile.classList.toggle("picture", art);
+  tile.style.backgroundImage = art ? 'url("' + S.hero.url + '")' : "";
+  $("game-state").textContent = ready.label;
+}
+function pressPlay() {
+  if (S.job.running) { stopAsked = true; renderPlay(); return; }
+  if (readiness().tone === "todo") { location.hash = "#settings"; toast("Choose the game folder first."); return; }
+  if (S.sample) {
+    logLines(["Sample view: nothing was started. PLAY would run:", "  " + localCommand(S.settings).map(quote).join(" ")]);
+    showLog(true); return;
+  }
+  act("play", {}).then(() => { if (S.job.running || !S.can_run) showLog(true); });
+}
+function logLines(lines) {
+  const pre = $("log"), stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 8;
+  S.log = S.log.concat(lines).slice(-2000);
+  pre.textContent = S.log.join("\n");
+  if (stick) pre.scrollTop = pre.scrollHeight;
+  $("logline").textContent = S.log[S.log.length - 1];
+}
+function chip() { $("logchip").hidden = !$("logsheet").hidden || ($("main").dataset.page !== "play" && !(S && S.job.running)); }
+function showLog(open) { $("logsheet").hidden = !open; chip(); if (open) { const pre = $("log"); pre.scrollTop = pre.scrollHeight; } }
+function menu(open) { $("menu").hidden = !open; $("kebab").setAttribute("aria-expanded", String(open)); }
+
+// ---------------------------------------------------------------- Settings
+let saveTimer = 0;
+function change(patch) {
+  Object.assign(S.settings, patch);
+  if (S.settings.series_s) S.settings.series_x = false;
+  render();
+  if (S.sample) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => { try { S = (await call("settings", S.settings)).state; renderSummary(); renderPlay(); renderVerdicts(); } catch (err) { toast(err.message); } }, 250);
+}
+function valueOf(f, s) { return f.key === "upscale" ? (!s.dlss ? "off" : s.dlss_mode || "default") : f.key === "console" ? consoleOf(s) : s[f.key]; }
+function patchFor(f, raw) {
+  if (f.key === "upscale") return { dlss: raw !== "off", dlss_mode: MODE_NAMES[raw] ? raw : "" };
+  if (f.key === "console") return consolePatch(raw);
+  return { [f.key]: f.type === "int" ? Number(raw) : raw };
+}
+function control(f, s, off) {
+  const id = "f-" + f.key;
+  if (f.kind === "switch")
+    return h("label", { class: "switch" }, h("input", { type: "checkbox", id, checked: !!s[f.key], disabled: off, "aria-label": f.label, onchange: e => change({ [f.key]: e.target.checked }) }), h("i"));
+  if (f.kind === "seg")
+    return h("div", { class: "seg", role: "radiogroup", "aria-label": f.label }, f.options.map(([v, text]) =>
+      h("label", null, h("input", { type: "radio", name: id, id: id + "-" + (v === "" ? "none" : v), value: String(v), disabled: off, checked: valueOf(f, s) === v, onchange: e => change(patchFor(f, e.target.value)) }), h("span", null, text))));
+  // a typed character must not rebuild the field under the cursor: only what follows from it is painted again
+  const input = h("input", { type: "text", id, value: s[f.key], placeholder: f.placeholder, spellcheck: "false", autocomplete: "off", disabled: off, "aria-label": f.label,
+    oninput: e => { S.settings[f.key] = e.target.value; softChange(); } });
+  if (f.kind !== "path" && f.kind !== "file") return input;
+  const v = verdictFor(f);
+  return [input, h("button", { class: "btn", type: "button", disabled: off, onclick: () => act("browse", { key: f.key }) }, icon("folder"), f.kind === "file" ? "Choose" : "Browse"),
+    v ? h("span", { class: "verdict", "data-state": v.state }, v.detail) : null];
+}
+function verdictFor(f) {
+  if (f.key === "background") {
+    if (S.background) return { state: "ok", detail: "In use: " + S.background };
+    if (S.settings.background.trim()) return { state: "todo", detail: "No PNG, JPEG or WebP picture at this path." };
+    return { state: "", detail: "Not fetched yet: the launcher tries at each start. Until then your newest capture, else the drawn art." };
+  }
+  const c = f.check && S.checks.find(c => c.id === f.check);
+  return c ? { state: c.state, detail: c.detail } : null;
+}
+function softChange() {
+  renderSummary(); renderPlay();
+  if (S.sample) return;
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(async () => { try { S = (await call("settings", S.settings)).state; renderSummary(); renderPlay(); renderVerdicts(); renderSaves(); renderMods(); } catch (err) { toast(err.message); } }, 500);
+}
+function renderVerdicts() {
+  for (const g of GROUPS) for (const f of g.fields) {
+    const el = document.querySelector("#field-" + f.key + " .verdict"), v = el && verdictFor(f);
+    if (v) { el.dataset.state = v.state; el.textContent = v.detail; }
+  }
+}
+function renderSettings() {
+  const s = S.settings, linux = S.platform !== "windows";
+  $("settings-where").textContent = linux
+    ? "On Linux the start script takes the game folder and the console profile; the other options are switches of the Windows script and are greyed here."
+    : "Each option is a switch of scripts\\play-d3d12.ps1. Changes are saved as you make them.";
+  fill($("groups"), GROUPS.map(g => h("section", null, h("h2", { class: "label" }, g.title),
+    g.fields.filter(f => !f.when || f.when(s)).map(f => {
+      const off = linux && !!f.windows;
+      return h("div", { class: "field", id: "field-" + f.key, "aria-disabled": off ? "true" : null },
+        h("div", { class: "lbl" }, h("b", null, f.label), f.help ? h("small", null, f.help) : null),
+        h("div", { class: "ctl" }, control(f, s, off)));
+    }))));
+  renderSummary();
+}
+function commandText() { const c = S.sample ? localCommand(S.settings) : S.command; return c ? c.map(quote).join(" ") : ""; }
+function renderSummary() {
+  const s = S.settings;
+  fill($("summary"), facts(s).map(([k, v]) => [h("dt", null, k), h("dd", null, v)]));
+  $("cmd").textContent = commandText() || "Choose the game folder and the command appears here.";
+  fill($("notes"), notes(s, S.checks).map(n => h("li", null, n)));
+}
+
+// ---------------------------------------------------------------- Mods, Saves, Captures, Tools
+function renderMods() {
+  $("mods-where").textContent = "Every folder with a mod.json under " + S.mods_dir + ". A switch here writes the enabled line of that file; the game reads it at its next start.";
+  fill($("mods"), S.mods.length ? S.mods.map(m => h("li", null,
+      h("label", { class: "switch" }, h("input", { type: "checkbox", id: "mod-" + m.folder, checked: m.enabled, "aria-label": m.name,
+        onchange: e => { const want = e.target.checked; if (S.sample) { m.enabled = want; renderMods(); return; } act("mod", { folder: m.folder, enabled: want }); } }), h("i")),
+      h("div", { class: "grow" }, h("b", null, m.name), h("small", { class: "mono" }, m.folder)),
+      m.swaps ? h("span", { class: "tagline" }, m.swaps + (m.swaps === 1 ? " model swap" : " model swaps")) : null))
+    : h("li", null, h("span", { class: "grow" }, "No mods in this folder yet.")),
+    S.mod_errors.map(e => h("li", null, h("span", { class: "tagline warn" }, "Not read"), h("small", { class: "grow" }, e))));
+}
+function renderSaves() {
+  const list = S.saves.containers;
+  $("saves-where").textContent = "The runtime's save containers under " + S.saves.root + ". Back-ups are ZIP files in the data folder; nothing here edits a save.";
+  fill($("saves"), list.length ? list.map(c => h("li", null,
+      h("div", { class: "grow" }, h("b", null, c.name), h("small", null, c.problem || (c.blobs + " blobs, version " + c.version + ", changed " + day(c.modified)))),
+      h("span", { class: "num" }, bytes(c.size)),
+      h("button", { class: "btn", type: "button", onclick: () => act("save", { name: c.name, action: "backup" }) }, "Back up")))
+    : h("li", null, h("span", { class: "grow" }, S.saves.error || "No saves under this data folder yet. The game writes the first one.")));
+}
+function renderCaptures() {
+  fill($("captures"), S.captures.length
+    ? h("div", { class: "shots" }, S.captures.map(c => h("figure", null, h("img", { src: c.url, alt: "Capture " + c.name, loading: "lazy" }), h("figcaption", null, c.name + " · " + day(c.time)))))
+    : h("p", { class: "empty" }, "No captures yet. Turn on Capture key in Settings, then F9 in the game saves that frame to %LOCALAPPDATA%\\Leonida\\captures. Until then the picture behind PLAY is drawn by the launcher itself."));
+}
+let asking = "";   // the tool waiting for a second click
+const TOOLS = [
+  { id: "dry_run", name: "Check this start", text: "Runs the start script with -DryRun: it prints the settings this start would run with and stops. Nothing is built or started.", button: "Check" },
+  { id: "get_dlss", name: "Fetch NVIDIA's DLSS files", text: "DLSS and frame generation need a few of NVIDIA's own files that no repository may carry. This fetches about 70 MB from NVIDIA's GitHub, once.", button: "Fetch", confirm: "This downloads about 70 MB from NVIDIA's GitHub." },
+  { id: "build", name: "Rebuild the runtime", text: "Builds d3d12 again (d3d12\\scripts\\build-nvidia.ps1). Minutes; needed after NVIDIA's files arrive or the code changes.", button: "Rebuild" },
+  { id: "open_logs", name: "Logs", text: "The runtime's log files, when Write a log file is on: %LOCALAPPDATA%\\Leonida\\logs.", button: "Open the folder", open: "logs" },
+];
+function runTool(id) { act("tool", { name: id }).then(() => showLog(true)); }
+function renderTools() {
+  const busy = S.job.running, linux = S.platform !== "windows";
+  fill($("checks"), S.checks.map(c => h("li", null, h("span", { class: "tagline" + (c.state === "ok" ? "" : " warn") }, c.state === "ok" ? "Ready" : "To do"),
+    h("div", { class: "grow" }, h("b", null, c.title), h("small", null, c.detail)))));
+  fill($("tools"), TOOLS.map(t => h("div", { class: "tool" }, h("b", null, t.name), h("p", null, t.text),
+    asking === t.id
+      ? h("div", { class: "confirm" }, t.confirm, h("button", { class: "btn", type: "button", onclick: () => { asking = ""; runTool(t.id); } }, "Go ahead"),
+          h("button", { class: "btn quiet", type: "button", onclick: () => { asking = ""; renderTools(); } }, "Cancel"))
+      : h("button", { class: "btn", type: "button", disabled: (!t.open && (busy || linux)) || null,
+          onclick: () => { if (t.open) act("open", { what: t.open }); else if (t.confirm) { asking = t.id; renderTools(); } else runTool(t.id); } }, t.button),
+    !t.open && linux ? h("small", { class: "num" }, "A Windows script.") : null)));
+}
+
+// ---------------------------------------------------------------- the frame around the pages
+const PAGES = ["play", "mods", "saves", "captures", "tools", "settings", "about"];
+function tone() {   // dark words over the drawn sky, light ones over the dark sheet or a dark capture
+  const main = $("main"), play = main.dataset.page === "play";
+  main.dataset.tone = !play ? "dark" : (!$("shot").hidden && $("shot").dataset.tone === "dark") ? "dark" : "light";
+}
+function route() {
+  const name = PAGES.includes(location.hash.slice(1)) ? location.hash.slice(1) : "play";
+  for (const p of PAGES) $("page-" + p).hidden = p !== name;
+  for (const a of document.querySelectorAll("#nav a")) a.getAttribute("href") === "#" + name ? a.setAttribute("aria-current", "page") : a.removeAttribute("aria-current");
+  $("main").dataset.page = name; $("scroll").scrollTop = 0; menu(false); tone(); chip();
+  paintArt();
+}
+function render() {
+  $("build").textContent = "Leonida " + S.version + ", for package " + S.package + (S.can_run ? "." : S.sample ? ". Sample data." : ". Preview: nothing is started.");
+  renderPlay(); renderSettings(); renderMods(); renderSaves(); renderCaptures(); renderTools();
+  $("log").textContent = S.log.join("\n");
+}
+function listen() {   // the script's output and the state, as the server sends them
+  const es = new EventSource("/api/events");
+  es.addEventListener("log", e => logLines(JSON.parse(e.data)));
+  es.addEventListener("state", e => { const log = S.log; S = JSON.parse(e.data); S.log = log; renderPlay(); renderSummary(); renderMods(); renderSaves(); renderCaptures(); renderTools(); });
+}
+document.addEventListener("click", e => {
+  const open = e.target.closest("[data-open]"), save = e.target.closest("[data-save]"), item = e.target.closest("[data-menu]");
+  if (open) act("open", { what: open.dataset.open });
+  if (save) act("save", { action: save.dataset.save });
+  if (item) {
+    menu(false);
+    if (item.dataset.menu === "copy") { const c = commandText(); c ? copyText(c, "The command is copied.") : toast("Choose the game folder first."); }
+    if (item.dataset.menu === "check") { if (S.sample) { logLines(["Sample view: the check runs the command with -DryRun.", "  " + localCommand(S.settings).concat("-DryRun").map(quote).join(" ")]); showLog(true); } else runTool("dry_run"); }
+  } else if (!e.target.closest("#kebab")) menu(false);
+});
+$("play").addEventListener("click", pressPlay);
+$("kebab").addEventListener("click", () => menu($("menu").hidden));
+$("avatar").addEventListener("click", () => { location.hash = "#about"; });
+$("rail-toggle").addEventListener("click", () => { const app = $("app"); app.dataset.rail = app.dataset.rail === "wide" ? "narrow" : "wide"; setTimeout(paintArt, 0); });
+$("logchip").addEventListener("click", () => showLog(true));
+$("log-close").addEventListener("click", () => showLog(false));
+$("log-copy").addEventListener("click", () => copyText(S.log.join("\n"), "The log is copied."));
+$("cmd-copy").addEventListener("click", () => { const c = commandText(); if (c) copyText(c, "The command is copied."); });
+$("shot").addEventListener("load", e => {   // how bright the capture is where the words sit
+  const c = document.createElement("canvas"); c.width = 32; c.height = 18;
+  const g = c.getContext("2d"); g.drawImage(e.target, 0, 0, 32, 18);
+  const d = g.getImageData(12, 0, 20, 5).data; let sum = 0;
+  for (let i = 0; i < d.length; i += 4) sum += d[i] * .299 + d[i + 1] * .587 + d[i + 2] * .114;
+  e.target.dataset.tone = sum / (d.length / 4) < 150 ? "dark" : "light";
+  const t = g.getImageData(0, 0, 32, 1).data; let cr = 0, cg = 0, cb = 0;   // its top row, continued above it
+  for (let i = 0; i < t.length; i += 4) { cr += t[i]; cg += t[i + 1]; cb += t[i + 2]; }
+  $("main").style.backgroundColor = "rgb(" + [cr, cg, cb].map(v => Math.round(v / 32)).join(",") + ")";
+  tone();
+});
+document.addEventListener("keydown", e => { if (e.key === "Escape") { menu(false); showLog(false); } });
+window.addEventListener("hashchange", route);
+
+// ---------------------------------------------------------------- the art
+// A flat picture in layers, drawn here from a fixed seed: a bay city in haze, water, a sandy bank with palms and
+// spiky plants. It stands in until there is a background picture, and it is
+// drawn once per size, so it costs nothing while the game runs.
+const SKIES = {
+  dusk:  { sky: ["#e7a2bb", "#dca7cb", "#f6cbb3"], sun: "255,240,218", far: "#bb8fc6", mid: "#9a71b4", near: "#73509a", water: ["#efbcbb", "#c08db8"], ground: ["#d9946a", "#a9603f"], plant: "#3f1c3d", light: "255,226,180", lights: .1 },
+};
+function mulberry32(a) { return function () { a |= 0; a = a + 0x6D2B79F5 | 0; let t = Math.imul(a ^ a >>> 15, 1 | a); t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t; return ((t ^ t >>> 14) >>> 0) / 4294967296; }; }
+function skyline(g, r, W, base, maxH, color, u, light, lights, big) {
+  for (let x = -24 * u; x < W + 24 * u;) {
+    const bw = (18 + r() * 40) * u, at = x / W;
+    const lift = big ? Math.exp(-Math.pow((at - .27) / .13, 2)) + .8 * Math.exp(-Math.pow((at - .7) / .2, 2)) : Math.exp(-Math.pow((at - .6) / .2, 2)) + .55 * Math.exp(-Math.pow((at - .16) / .1, 2));
+    const bh = maxH * (.1 + .16 * r()) + maxH * .74 * lift * Math.pow(r(), 1.5), top = base - bh, k = r();
+    g.fillStyle = color; g.fillRect(x, top, bw + 1, bh + 2);
+    if (bh > maxH * .45) {
+      if (k < .34) { g.fillRect(x + bw * .22, top - bw * .3, bw * .56, bw * .3 + 1); g.fillRect(x + bw * .47, top - bw * .3 - 20 * u, Math.max(1.5, bw * .07), 20 * u); }
+      else if (k < .58) { g.beginPath(); g.moveTo(x, top + 1); g.lineTo(x + bw + 1, top - bw * .42); g.lineTo(x + bw + 1, top + 1); g.fill(); }
+      else if (k < .72) { g.beginPath(); g.arc(x + bw / 2, top + 1, bw / 2, Math.PI, 0); g.fill(); }
+    }
+    if (lights > 0) for (let c = 0, cols = Math.floor((bw - 4 * u) / (5 * u)); c < cols; c++) for (let q = 0, rows = Math.floor((bh - 5 * u) / (7 * u)); q < rows; q++)
+      if (r() < lights) { g.fillStyle = "rgba(" + light + "," + (.5 + r() * .5).toFixed(2) + ")"; g.fillRect(x + 3 * u + c * 5 * u, top + 4 * u + q * 7 * u, 2.2 * u, 2.8 * u); }
+    x += bw + (r() < .3 ? r() * 16 * u : -r() * 5 * u);
+  }
+}
+function palm(g, x, base, height, lean, r, u) {
+  const tx = x + lean, ty = base - height, cx = x + lean * .1, cy = base - height * .55;
+  const at = t => [(1 - t) * (1 - t) * x + 2 * (1 - t) * t * cx + t * t * tx, (1 - t) * (1 - t) * base + 2 * (1 - t) * t * cy + t * t * ty];
+  g.lineCap = "round";
+  for (let i = 0; i < 24; i++) { const a = at(i / 24), b = at((i + 1) / 24); g.lineWidth = (13 - 7 * i / 24) * u; g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke(); }
+  for (let i = 0, n = 11; i < n; i++) {   // fronds: a curved spine, filled as a leaf, notched by the sky showing through
+    const a = -Math.PI / 2 + (i - (n - 1) / 2) * .54 + (r() - .5) * .16, len = height * (.34 + r() * .1);
+    const ex = tx + Math.cos(a) * len, ey = ty + Math.sin(a) * len * .5 + len * (.2 + .42 * Math.abs(Math.cos(a)));
+    const mx = tx + Math.cos(a) * len * .55, my = ty + Math.sin(a) * len * .6 - len * .24, wide = len * .16;
+    g.beginPath(); g.moveTo(tx, ty); g.quadraticCurveTo(mx, my - wide * .2, ex, ey); g.quadraticCurveTo(mx + wide * .25 * Math.sign(Math.cos(a) || 1), my + wide * 1.5, tx, ty); g.fill();
+  }
+  g.beginPath(); g.arc(tx, ty, 7 * u, 0, 7); g.fill();
+}
+function spikes(g, x, y, size, r) {   // an agave: tapered leaves fanned from one point
+  for (let i = 0, n = 13; i < n; i++) {
+    const a = -Math.PI + .28 + (i / (n - 1)) * (Math.PI - .56) + (r() - .5) * .12, len = size * (.55 + r() * .45), w = size * .07;
+    const ex = x + Math.cos(a) * len, ey = y + Math.sin(a) * len, nx = -Math.sin(a) * w, ny = Math.cos(a) * w;
+    g.beginPath(); g.moveTo(x + nx, y + ny); g.quadraticCurveTo(x + Math.cos(a) * len * .5 + nx * 1.3, y + Math.sin(a) * len * .5 + ny * 1.3 - len * .06, ex, ey);
+    g.quadraticCurveTo(x + Math.cos(a) * len * .5 - nx * 1.3, y + Math.sin(a) * len * .5 - ny * 1.3 - len * .06, x - nx, y - ny); g.fill();
+  }
+}
+function paintScene(cv, key, seed, o) {
+  o = o || {};
+  const W = cv.clientWidth, H = cv.clientHeight;
+  if (!W || !H || cv.dataset.done === key + seed + W + "x" + H) return;
+  cv.dataset.done = key + seed + W + "x" + H;
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr);
+  const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const P = SKIES[key], r = mulberry32(seed), u = H / 640, big = !!o.big, hz = H * (big ? .76 : .62), shore = H * (big ? .85 : .8), tall = big ? 1.4 : 1;
+  const down = (y0, y1, a, b, mid) => { const s = g.createLinearGradient(0, y0, 0, y1); s.addColorStop(0, a); if (mid) s.addColorStop(.55, mid); s.addColorStop(1, b); return s; };
+  g.fillStyle = down(0, hz, P.sky[0], P.sky[2], P.sky[1]); g.fillRect(0, 0, W, hz + 2);
+  const sx = W * (o.sun || .64), sy = big ? H * .2 : hz - H * .17, sr = H * (big ? .07 : .085);
+  const halo = g.createRadialGradient(sx, sy, sr * .5, sx, sy, sr * 5); halo.addColorStop(0, "rgba(" + P.sun + ",.55)"); halo.addColorStop(1, "rgba(" + P.sun + ",0)");
+  g.fillStyle = halo; g.fillRect(0, 0, W, hz);
+  if (key === "night") for (let i = 0; i < 90; i++) { g.fillStyle = "rgba(255,255,255," + (.2 + r() * .7).toFixed(2) + ")"; g.fillRect(r() * W, r() * hz * .7, 1.4 * u + .6, 1.4 * u + .6); }
+  g.fillStyle = "rgba(" + P.sun + ",.9)"; g.beginPath(); g.arc(sx, sy, sr, 0, 7); g.fill();
+  for (let i = 0; i < 7; i++) {   // long flat clouds
+    const cx = r() * W, cy = hz * (.1 + r() * .5), rw = W * (.12 + r() * .2), rh = H * (.007 + r() * .009);
+    g.fillStyle = "rgba(" + P.sun + "," + (.12 + r() * .12).toFixed(2) + ")";
+    for (const [dx, dy, kw, kh] of [[0, 0, 1, 1], [.3, -.8, .55, .8], [-.35, .7, .6, .7]]) { g.beginPath(); g.ellipse(cx + rw * dx, cy + rh * dy, rw * kw, rh * kh, 0, 0, 7); g.fill(); }
+  }
+  skyline(g, r, W, hz, H * .43 * tall, P.far, u, P.light, P.lights * .25, big);
+  g.fillStyle = down(hz - H * .3, hz, "rgba(" + P.sun + ",0)", "rgba(" + P.sun + ",.16)"); g.fillRect(0, hz - H * .3, W, H * .3);
+  skyline(g, r, W, hz, H * .3 * tall, P.mid, u, P.light, P.lights * .6, big);
+  g.fillStyle = down(hz - H * .2, hz, "rgba(" + P.sun + ",0)", "rgba(" + P.sun + ",.22)"); g.fillRect(0, hz - H * .2, W, H * .2);
+  skyline(g, r, W, hz, H * .15 * tall, P.near, u, P.light, big ? Math.max(P.lights, .07) : P.lights, big);
+  g.fillStyle = P.near; g.strokeStyle = P.near;   // palms along the water's edge
+  for (let i = 0, n = big ? 15 : 0; i < n; i++) palm(g, W * (i + r()) / n, hz + 3 * u, H * (.09 + r() * .1), (r() - .5) * 26 * u, r, u * .4);
+  g.fillStyle = down(hz, shore + H * .08, P.water[0], P.water[1]); g.fillRect(0, hz, W, H - hz);
+  for (let i = 0; i < 60; i++) {   // light lying on the water
+    const t = r(), y = hz + 3 * u + t * (shore - hz), near = !big && r() < .55, x = near ? sx + (r() - .5) * W * (.05 + t * .22) : r() * W, len = (14 + r() * 70) * u * (.4 + t);
+    g.fillStyle = "rgba(" + P.sun + "," + ((near ? .5 : .22) * (1 - t * .5)).toFixed(2) + ")"; g.fillRect(x - len / 2, y, len, Math.max(1, (1.2 + t * 2) * u));
+  }
+  g.fillStyle = down(shore, H, P.ground[0], P.ground[1]);   // the bank
+  g.beginPath(); g.moveTo(0, shore + H * .05); g.bezierCurveTo(W * .22, shore - H * .02, W * .5, shore + H * .08, W * .72, shore + H * .04); g.bezierCurveTo(W * .86, shore + H * .02, W * .95, shore - H * .01, W, shore + H * .01);
+  g.lineTo(W, H); g.lineTo(0, H); g.closePath(); g.fill();
+  g.fillStyle = "rgba(0,0,0,.09)";
+  for (let i = 0; i < 26; i++) { const x = r() * W, y = shore + H * .08 + r() * H * .08; g.beginPath(); g.ellipse(x, y, (8 + r() * 30) * u, (1.5 + r() * 2.5) * u, 0, 0, 7); g.fill(); }
+  g.fillStyle = P.plant; g.strokeStyle = P.plant;
+  if (!big) { palm(g, W * .035, H * .93, H * .6, W * .03, r, u); palm(g, W * .975, H * .9, H * .7, -W * .035, r, u); palm(g, W * .915, H * .92, H * .44, W * .012, r, u); }
+  const k = big ? 1.25 : 1;   // spiky plants in the two bottom corners
+  spikes(g, W * .05, H * 1.0, 135 * u * k, r); spikes(g, W * .125, H * 1.03, 95 * u * k, r); spikes(g, W * -.005, H * 1.02, 100 * u * k, r);
+  spikes(g, W * .88, H * .99, 160 * u * k, r); spikes(g, W * .8, H * 1.03, 105 * u * k, r); spikes(g, W * .975, H * 1.02, 125 * u * k, r);
+  g.lineWidth = 2 * u; g.lineCap = "round";   // a few birds
+  for (let i = 0; i < 5; i++) { const x = W * (.3 + r() * .3), y = hz * (.16 + r() * .22), s = (6 + r() * 6) * u; g.beginPath(); g.moveTo(x - s, y - s * .35); g.quadraticCurveTo(x - s * .4, y - s * .6, x, y); g.quadraticCurveTo(x + s * .4, y - s * .6, x + s, y - s * .35); g.stroke(); }
+}
+function paintArt() { paintScene($("art"), "dusk", 20261127, { big: true, sun: .2 }); }
+let sizing = 0;
+window.addEventListener("resize", () => { clearTimeout(sizing); sizing = setTimeout(paintArt, 120); });
+
+// ---------------------------------------------------------------- start
+(async function start() {
+  try { if (!TOKEN) throw new Error("no server"); S = await call("state"); listen(); }
+  catch (err) { S = JSON.parse(JSON.stringify(SAMPLE)); }
+  render(); route();
+})();
+</script>
+</body>
+</html>

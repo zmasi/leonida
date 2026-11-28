@@ -226,10 +226,15 @@ def stage_index(path):
     Prefer the local index when it has stage rows.
     """
     base = path if os.path.isdir(path) else (os.path.dirname(path) or ".")
+    seen = set()
     for candidate in (os.path.join(base, "index.json"), os.path.join(base, "..", "index.json")):
+        key = os.path.normcase(os.path.realpath(candidate))
+        if key in seen:
+            continue
+        seen.add(key)
         if os.path.isfile(candidate):
             try:
-                with open(candidate, encoding="utf-8") as f:
+                with open(candidate, encoding="utf-8-sig") as f:
                     rows = json.load(f)
             except (OSError, ValueError):
                 continue
@@ -265,7 +270,7 @@ def files_of(path):
     return [
         full
         for name in sorted(os.listdir(path))
-        if name.endswith(".fssm") and os.path.isfile(full := os.path.join(path, name))
+        if name.lower().endswith(".fssm") and os.path.isfile(full := os.path.join(path, name))
     ]
 
 
@@ -343,6 +348,9 @@ def main(argv=None):
 
     if not os.path.exists(args.path):
         print(f"ERROR: {args.path} does not exist", file=sys.stderr)
+        return 2
+    if not (os.path.isfile(args.path) or os.path.isdir(args.path)):
+        print(f"ERROR: {args.path} is not a file or directory", file=sys.stderr)
         return 2
     try:
         paths = files_of(args.path)

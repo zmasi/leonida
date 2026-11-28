@@ -25,6 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dds_png  # noqa: E402
 import glb_writer  # noqa: E402
 import world_build  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 
 DIFFUSE_TEX = "C8E8C282"   # joaat("DiffuseTex"), the albedo Param of a material texture reference
 # Two-layer blend materials have no DiffuseTex; their first layer's albedo sits in this slot (name not known yet;
@@ -67,8 +68,7 @@ def mesh_bytes(prim):
 def texture_bytes(dds_path, max_size):
     try:
         with open(dds_path, "rb") as f:
-            w, h, rgba = dds_png.decode_dds(f.read())
-        w, h, rgba = dds_png.downscale_rgba(w, h, rgba, max_size)
+            w, h, rgba = dds_png.decode_dds(f.read(), max_size=max_size)
     except (dds_png.DdsError, OSError, ValueError):
         return None
     return struct.pack("<II", w, h) + bytes(rgba)
@@ -88,9 +88,14 @@ def build(args):
             ttpf.setdefault(k, v)
     if args.center is None:   # the 50 m cell holding the most entities that resolve to a model
         # Only automatic centering needs to visit the placements twice.
-        rows = list(rows)
+        if os.path.isfile(args.entities):
+            center_rows = world_build.iter_placements(args.entities, world_build._placement_counts())
+        else:
+            # A pipe can only be consumed once.
+            rows = list(rows)
+            center_rows = rows
         cells = {}
-        for row in rows:
+        for row in center_rows:
             model, _ = world_build.resolve_placement(index, row["_arch"], row.get("key"))
             if model is not None:
                 key = (math.floor(row["_pos"][0] / 50), math.floor(row["_pos"][1] / 50))
@@ -187,6 +192,9 @@ def main(argv=None):
         ap.error("--radius must be finite and non-negative")
     if args.max_props < 0:
         ap.error("--max-props must be non-negative")
+    if same_report_path(args.out, args.entities):
+        print("ERROR: --out would overwrite --entities", file=sys.stderr)
+        return 2
     if os.path.isdir(args.out):
         print(f"ERROR: --out is a folder, not a scene file: {args.out}", file=sys.stderr)
         return 2

@@ -329,8 +329,20 @@ void time_miss_after_free() {
 
 } // namespace
 
+void signed_id_cases() {
+    BufferVaIndex<int> index;
+    index.insert(0x1000, 0x100, 0);
+    index.insert(0x1000, 0x100, 7);
+    index.insert(0x2000, 0x100, -5);
+    BufferVaIndex<int>::Hit hit{};
+    check(index.find(0x1000, hit, 1) && hit.id == 7, "signed Id: exact start picks larger positive id");
+    check(index.find(0x1050, hit, 1) && hit.id == 7, "signed Id: interior lookup hits");
+    check(index.find(0x2000, hit, 1) && hit.id == -5, "signed Id: negative id at exact start hits");
+}
+
 int main(int argc, char** argv) {
     fixed_cases();
+    signed_id_cases();
     allocation_failures();
     random_tables();
     if (failures) {

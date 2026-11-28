@@ -1,8 +1,12 @@
 @echo off
 setlocal
-set EXE=%~dp0..\build\Release\conform_native.exe
-set ROOT=%~dp0..\out\failures
-set LOG=%~dp0..\out\failures.log
+set "EXE=%~dp0..\build\Release\conform_native.exe"
+set "ROOT=%~dp0..\out\failures"
+set "LOG=%~dp0..\out\failures.log"
+if not exist "%EXE%" (
+    echo "%EXE%" does not exist; build first ^(scripts\build.ps1^)
+    exit /b 1
+)
 if exist "%ROOT%" rmdir /s /q "%ROOT%"
 mkdir "%ROOT%"
 

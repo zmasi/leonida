@@ -42,7 +42,7 @@ fn create(uuid: *mut Guid, _sequential: bool) -> i32 {
     bytes[7] = (bytes[7] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
     // SAFETY: the caller passes a GUID to fill.
-    unsafe { uuid.write(from_bytes(bytes)) };
+    unsafe { uuid.write_unaligned(from_bytes(bytes)) };
     OK
 }
 
@@ -87,9 +87,10 @@ extern "system" fn UuidFromStringA(text: *const c_char, uuid: *mut Guid) -> i32 
     // SAFETY: a NUL-terminated string from the caller.
     let bytes = unsafe { std::ffi::CStr::from_ptr(text.cast()) }.to_bytes();
     match parse(bytes.iter().copied()) {
-        // SAFETY: the caller passes a GUID to fill.
+        // SAFETY: the caller passes a GUID to fill; it may be misaligned,
+        // so it is written unaligned.
         Some(g) => unsafe {
-            uuid.write(g);
+            uuid.write_unaligned(g);
             OK
         },
         None => INVALID_STRING_UUID,
@@ -110,9 +111,10 @@ extern "system" fn UuidFromStringW(text: *const u16, uuid: *mut Guid) -> i32 {
         }
     }
     match parse(units.into_iter().map(|u| u as u32)) {
-        // SAFETY: the caller passes a GUID to fill.
+        // SAFETY: the caller passes a GUID to fill; it may be misaligned,
+        // so it is written unaligned.
         Some(g) => unsafe {
-            uuid.write(g);
+            uuid.write_unaligned(g);
             OK
         },
         None => INVALID_STRING_UUID,
@@ -120,37 +122,37 @@ extern "system" fn UuidFromStringW(text: *const u16, uuid: *mut Guid) -> i32 {
 }
 
 extern "system" fn UuidToStringA(uuid: *const Guid, out: *mut *mut c_char) -> i32 {
-    // SAFETY: the caller passes a GUID to read, as the import declares.
-    let Some(g) = (unsafe { uuid.as_ref() }) else {
+    if uuid.is_null() {
         return INVALID_STRING_UUID;
-    };
+    }
+    // SAFETY: the caller passes a GUID to read, as the import declares; it
+    // may be misaligned, so it is read unaligned.
+    let g = unsafe { uuid.read_unaligned() };
     if out.is_null() {
         return INVALID_STRING_UUID;
     }
-    let text = format(g);
+    let text = format(&g);
     let mut bytes = Vec::with_capacity(37);
     bytes.extend_from_slice(&text);
     bytes.push(0);
-    // SAFETY: `out` is the caller's pointer variable.
-    unsafe { out.write(allocate(&bytes).cast()) };
-    OK
+    publish(out, allocate(&bytes).cast())
 }
 
 extern "system" fn UuidToStringW(uuid: *const Guid, out: *mut *mut u16) -> i32 {
-    // SAFETY: the caller passes a GUID to read, as the import declares.
-    let Some(g) = (unsafe { uuid.as_ref() }) else {
+    if uuid.is_null() {
         return INVALID_STRING_UUID;
-    };
+    }
+    // SAFETY: the caller passes a GUID to read, as the import declares; it
+    // may be misaligned, so it is read unaligned.
+    let g = unsafe { uuid.read_unaligned() };
     if out.is_null() {
         return INVALID_STRING_UUID;
     }
-    let text = format(g);
+    let text = format(&g);
     let mut units: Vec<u16> = text.iter().map(|&b| u16::from(b)).collect();
     units.push(0);
     let bytes: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
-    // SAFETY: `out` is the caller's pointer variable.
-    unsafe { out.write(allocate(&bytes).cast()) };
-    OK
+    publish(out, allocate(&bytes).cast())
 }
 
 extern "system" fn RpcStringFreeA(string: *mut *mut c_char) -> i32 {
@@ -200,16 +202,53 @@ fn format(g: &Guid) -> [u8; 36] {
 }
 
 /// A GUID from its text, with or without braces and the dashes in place.
+///
+/// Win32 takes the canonical form only: 32 hex digits with the dashes at
+/// 8, 13, 18 and 23, and the braces both there or both not. Every other
+/// text is `RPC_S_INVALID_STRING_UUID`.
 fn parse(mut chars: impl Iterator<Item = impl Into<u32>>) -> Option<Guid> {
-    let mut digits = [0u8; 32];
+    /// The longest legal text: the canonical 36 characters and the braces.
+    const MAX: usize = 38;
+    /// Where the dashes of the canonical form stand.
+    const DASHES: [usize; 4] = [8, 13, 18, 23];
+
+    let mut text = [0u8; MAX];
     let mut n = 0;
     for c in &mut chars {
         let c = c.into();
-        if n == 32 {
-            // Only the closing brace may follow the last digit.
-            return (c == u32::from(b'}')).then(|| assemble(&digits));
+        if n == MAX {
+            // Longer than any legal form.
+            return None;
         }
-        if c == u32::from(b'-') || (n == 0 && c == u32::from(b'{')) {
+        if c > 0x7f {
+            // The canonical form is ASCII.
+            return None;
+        }
+        text[n] = c as u8;
+        n += 1;
+    }
+    if n == 0 {
+        return None;
+    }
+    let body = if text[0] == b'{' {
+        // A brace without its match is not a GUID.
+        if n < 2 || text[n - 1] != b'}' {
+            return None;
+        }
+        &text[1..n - 1]
+    } else {
+        &text[..n]
+    };
+    if body.len() != 36 {
+        return None;
+    }
+    let mut digits = [0u8; 32];
+    let mut d = 0;
+    for (at, &c) in body.iter().enumerate() {
+        if DASHES.contains(&at) {
+            if c != b'-' {
+                return None;
+            }
             continue;
         }
         let digit = match c {
@@ -218,10 +257,10 @@ fn parse(mut chars: impl Iterator<Item = impl Into<u32>>) -> Option<Guid> {
             0x41..=0x46 => c - 0x41 + 10,
             _ => return None,
         };
-        digits[n] = digit as u8;
-        n += 1;
+        digits[d] = digit;
+        d += 1;
     }
-    (n == 32).then(|| assemble(&digits))
+    Some(assemble(&digits))
 }
 
 fn assemble(digits: &[u8; 32]) -> Guid {
@@ -261,6 +300,19 @@ fn allocate(bytes: &[u8]) -> *mut u8 {
         std::ptr::copy_nonoverlapping(bytes.as_ptr(), base.add(8), bytes.len());
         base.add(8)
     }
+}
+
+/// The caller's pointer variable, with the string we made.
+///
+/// A failed allocation is `RPC_S_OUT_OF_MEMORY`, and the caller's pointer
+/// is left as it was.
+fn publish<T>(out: *mut *mut T, pointer: *mut T) -> i32 {
+    if pointer.is_null() {
+        return OUT_OF_MEMORY;
+    }
+    // SAFETY: `out` is the caller's pointer variable.
+    unsafe { out.write(pointer) };
+    OK
 }
 
 fn free(pointer: *mut *mut c_void) {
@@ -409,5 +461,105 @@ mod tests {
             UuidFromStringA(c"nope".as_ptr().cast(), &mut w),
             INVALID_STRING_UUID
         );
+    }
+
+    #[test]
+    fn a_malformed_guid_is_refused() {
+        // A brace without its match.
+        assert_eq!(
+            parse(b"{1234abcd-00ef-4a5b-8012-3456789abcde".iter().copied()),
+            None
+        );
+        assert_eq!(
+            parse(b"1234abcd-00ef-4a5b-8012-3456789abcde}".iter().copied()),
+            None
+        );
+        // Text after the closing brace.
+        assert_eq!(
+            parse(b"{1234abcd-00ef-4a5b-8012-3456789abcde}x".iter().copied()),
+            None
+        );
+        // A dash where the canonical form has none, and one where it has one.
+        assert_eq!(
+            parse(b"1234abc-d00ef-4a5b-8012-3456789abcde".iter().copied()),
+            None
+        );
+        assert_eq!(
+            parse(b"1234abcd00ef-4a5b-8012-3456789abcde".iter().copied()),
+            None
+        );
+        // Nothing at all, and more text than any legal form is long.
+        assert_eq!(parse(b"".iter().copied()), None);
+        assert_eq!(
+            parse(b"{1234abcd-00ef-4a5b-8012-3456789abcde}{}".iter().copied()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_text_outside_ascii_is_refused() {
+        // The canonical form is ASCII: a wide string with a unit above it is
+        // not a GUID, whatever it looks like.
+        let mut units: Vec<u16> = "1234abcd-00ef-4a5b-8012-3456789abcde"
+            .chars()
+            .map(|c| c as u16)
+            .collect();
+        units[0] = 0x00e9;
+        units.push(0);
+        let mut g = Guid::new(0, 0, 0, [0; 8]);
+        assert_eq!(UuidFromStringW(units.as_ptr(), &mut g), INVALID_STRING_UUID);
+        assert_eq!(g, Guid::new(0, 0, 0, [0; 8]));
+    }
+
+    #[test]
+    fn a_refused_text_leaves_the_guid_alone() {
+        let mut g = Guid::new(9, 9, 9, [9; 8]);
+        assert_eq!(
+            UuidFromStringA(
+                c"{1234abcd-00ef-4a5b-8012-3456789abcde".as_ptr().cast(),
+                &mut g
+            ),
+            INVALID_STRING_UUID
+        );
+        assert_eq!(g, Guid::new(9, 9, 9, [9; 8]));
+    }
+
+    #[test]
+    fn a_failed_allocation_leaves_the_callers_pointer_alone() {
+        let mut buffer = [0u8; 4];
+        let mut text: *mut c_char = buffer.as_mut_ptr().cast();
+        assert_eq!(publish(&mut text, std::ptr::null_mut()), OUT_OF_MEMORY);
+        assert_eq!(text as usize, buffer.as_ptr() as usize);
+    }
+
+    #[test]
+    fn a_misaligned_guid_is_written_and_read() {
+        // A GUID that does not start on its own alignment: it comes from the
+        // title's own buffer, not from Rust.
+        let mut storage = [0u64; 4];
+        let at = unsafe { storage.as_mut_ptr().cast::<u8>().add(1) }.cast::<Guid>();
+        let text = c"1234abcd-00ef-4a5b-8012-3456789abcde";
+        assert_eq!(UuidFromStringA(text.as_ptr().cast(), at), OK);
+        // SAFETY: the GUID we just wrote, inside the buffer.
+        let g = unsafe { at.read_unaligned() };
+        assert_eq!(
+            g,
+            Guid::new(
+                0x1234_abcd,
+                0x00ef,
+                0x4a5b,
+                [0x80, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde]
+            )
+        );
+        // And the string comes back the same way.
+        let mut out: *mut c_char = std::ptr::null_mut();
+        assert_eq!(UuidToStringA(at, &mut out), OK);
+        assert_eq!(
+            // SAFETY: the string we just made, NUL-terminated.
+            unsafe { std::ffi::CStr::from_ptr(out) }.to_str().unwrap(),
+            "1234abcd-00ef-4a5b-8012-3456789abcde"
+        );
+        assert_eq!(RpcStringFreeA(&mut out), OK);
+        assert!(out.is_null());
     }
 }

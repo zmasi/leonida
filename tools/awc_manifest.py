@@ -24,6 +24,7 @@ interleaved count). `data_offset`/`size` is the shared data tag.
 Usage: `python -I tools/awc_manifest.py --help` lists the options.
 """
 import argparse
+from collections import Counter
 import csv
 import json
 import os
@@ -129,6 +130,7 @@ def _bank_rows(path: str, bank: str) -> list:
             note = f"same id as an earlier stream in this bank; awc_opus exports it as {stem}"
             row["notes"] = "; ".join(x for x in (row["notes"], note) if x)
         rows.append(row)
+    used_stems = Counter(s["id"] for s in streams)
     for mus, data in music or []:
         try:
             channels = awc_opus.music_channels(d, mus, data, collect_packets=False)
@@ -141,11 +143,11 @@ def _bank_rows(path: str, bank: str) -> list:
             continue
         for cid, samples, rate, codec, _packets, packet_channels in channels:
             row = _row(bank, cid, codec, packet_channels, rate, samples, data, bank_size, True)
-            same = next((i for i, r in enumerate(rows) if r["stream"] == row["stream"]), None)
-            if same is None:
-                rows.append(row)
-            else:   # as before: a streamed-music channel replaces a row with its id
-                rows[same] = row
+            stem = awc_opus.next_export_stem(cid, used_stems)
+            if stem != row["stream"]:
+                note = f"same id as an earlier stream in this bank; awc_opus exports it as {stem}"
+                row["notes"] = "; ".join(x for x in (row["notes"], note) if x)
+            rows.append(row)
     return rows
 
 

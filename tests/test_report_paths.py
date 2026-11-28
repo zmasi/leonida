@@ -195,9 +195,19 @@ class FoldingVolumeTests(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.p("reports"))), [])
 
     def test_a_folder_that_does_not_exist_is_not_created(self):
-        self.assertFalse(report_paths.same_name_on_folding_volume(self.p("missing", "R.json"),
-                                                                  self.p("missing", "r.json")))
+        self.assertEqual(report_paths.same_name_on_folding_volume(self.p("missing", "R.json"),
+                                                                  self.p("missing", "r.json")),
+                         self.volume_folds_case())
         self.assertFalse(os.path.exists(self.p("missing")))
+
+    def test_nested_output_aliases_are_checked_before_the_folders_exist(self):
+        first = self.p("New", "reports", "R.json")
+        second = self.p("new", "Reports", "r.JSON")
+        # Force the generic volume-probe path, even on hosts where normcase already folds these names.
+        with mock.patch.object(report_paths, "_resolved_key", side_effect=os.path.realpath):
+            self.assertEqual(report_paths.same_report_path(first, second), self.volume_folds_case())
+            self.assertFalse(report_paths.same_report_path(first, self.p("other", "Reports", "r.JSON")))
+        self.assertEqual(os.listdir(self.dir), ["probe.tmp"])
 
     def test_same_report_path_asks_the_volume_when_the_name_rules_disagree(self):
         # The name rules say "different"; the volume has the last word on a pair that differs only by case.

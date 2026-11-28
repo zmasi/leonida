@@ -210,6 +210,49 @@ class OracleLifecycleTest(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("no device", buf.getvalue())
 
+    def test_hw_run_unavailable_runtime_error_and_word_masking(self):
+        flat = self._expected_flat()
+
+        class StubOracle:
+            device = "fake-gpu"
+            arch = "gfx1036"
+
+            def __init__(self, run_fn):
+                self._run_fn = run_fn
+                self.closed = False
+
+            def run(self, kernels):
+                return self._run_fn(kernels)
+
+            def close(self):
+                self.closed = True
+
+        # Words with high bits set are masked to 32 bits before comparison.
+        fake = StubOracle(lambda _ks: [[w | (1 << 32) for w in flat]])
+        rc, out = self._run_hw(fake)
+        self.assertEqual(rc, 0, out)
+        self.assertTrue(fake.closed)
+
+        # runner.Unavailable during oracle.run() exits 77 cleanly and closes oracle.
+        def raise_unavail(_ks):
+            raise runner.Unavailable("mode unsupported")
+
+        fake = StubOracle(raise_unavail)
+        rc, out = self._run_hw(fake)
+        self.assertEqual(rc, 77, out)
+        self.assertTrue(fake.closed)
+        self.assertIn("hardware oracle unavailable: mode unsupported", out)
+
+        # RuntimeError during oracle.run() exits 2 cleanly and closes oracle.
+        def raise_runtime(_ks):
+            raise RuntimeError("gpu hung")
+
+        fake = StubOracle(raise_runtime)
+        rc, out = self._run_hw(fake)
+        self.assertEqual(rc, 2, out)
+        self.assertTrue(fake.closed)
+        self.assertIn("harness error: gpu hung", out)
+
 
 if __name__ == "__main__":
     unittest.main()

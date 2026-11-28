@@ -84,6 +84,16 @@ Runtime workflow. The stage writes `<out>/gta6rt.sh`, which starts `gta6rt.exe` 
 [testing.md](testing.md#the-windows-runtime-on-linux-under-wine-or-proton) has the test runs under Wine and Proton
 and what fails there.
 
+On Apple Silicon, set `LEONIDA_CX_BOTTLE` to the name of an existing CrossOver bottle to use the same launcher:
+
+```sh
+LEONIDA_CX_BOTTLE=Leonida ./gta6rt.sh --dry-run
+```
+
+Run this from the packaged output directory. The launcher uses CrossOver in `/Applications` by default. Set `WINE`
+to the CrossOver `bin/wine` path if the app is installed elsewhere. It enables Rosetta's AVX advertisement by default
+for this mode and honours an explicit `ROSETTA_ADVERTISE_AVX` value.
+
 For XMA2 audio, `runtime/CMakeLists.txt` builds `runtime/xma_decoder` for `x86_64-pc-windows-msvc` when `cargo` is on
 `PATH`. Distribution Rust packages typically omit the Windows MSVC standard library, which leaves XMA voices silent
 unless you add the `x86_64-pc-windows-msvc` Rust target or pass a prebuilt static library with

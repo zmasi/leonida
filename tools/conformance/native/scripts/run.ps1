@@ -9,6 +9,14 @@ param(
 # when the renderer has not been built.
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $PSScriptRoot
+
+function Refuse-Output([string]$Why) {
+  Write-Output "-Output $Output $Why; not deleting it. Pass an empty folder or a previous run's output folder."
+  Write-Output 'EXITCODE 2'
+  exit 2
+}
+
+if ($Output.Length -gt 0 -and [string]::IsNullOrWhiteSpace($Output)) { Refuse-Output 'is blank' }
 if ([string]::IsNullOrEmpty($Output)) { $Output = Join-Path $root 'out/run1' }
 $exe = Join-Path $root 'build/Release/conform_native.exe'
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
@@ -17,18 +25,15 @@ if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
   exit 1
 }
 
-function Refuse-Output([string]$Why) {
-  Write-Output "-Output $Output $Why; not deleting it. Pass an empty folder or a previous run's output folder."
-  Write-Output 'EXITCODE 2'
-  exit 2
-}
-
 if (Test-Path -LiteralPath $Output) {
   $item = Get-Item -LiteralPath $Output -Force
   if (-not $item.PSIsContainer) { Refuse-Output 'is a file' }
   # A junction or symbolic link: a recursive Remove-Item on it can delete the contents of the folder it points to.
   if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { Refuse-Output 'is a link or junction' }
   if ($null -eq $item.Parent) { Refuse-Output 'is a drive root' }
+  if ([IO.Path]::GetFullPath($item.FullName).TrimEnd('\', '/') -ieq [IO.Path]::GetFullPath($root).TrimEnd('\', '/')) {
+    Refuse-Output 'is the native conformance folder'
+  }
   $foreign = @(Get-ChildItem -LiteralPath $item.FullName -Force |
     Where-Object { $_.PSIsContainer -or -not ($_.Name -eq 'manifest.json' -or $_.Extension -eq '.png') })
   if ($foreign.Count -gt 0) {
@@ -38,4 +43,6 @@ if (Test-Path -LiteralPath $Output) {
   Remove-Item -LiteralPath $item.FullName -Recurse -Force
 }
 & $exe $Output @Extra
-Write-Output "EXITCODE $LASTEXITCODE"
+$rc = $LASTEXITCODE
+Write-Output "EXITCODE $rc"
+exit $rc

@@ -436,8 +436,9 @@ def prepare_gpu(exe, tmpdir):
     if not os.path.isfile(vertex): raise HarnessError(f"full-screen vertex shader is missing: {vertex}")
     vs_spv = os.path.join(tmpdir, "f64_diff_vs.spv")
     try:
-        r = subprocess.run([glslc, vertex, "-o", vs_spv], capture_output=True, text=True, timeout=30)
+        r = subprocess.run([glslc, vertex, "-o", vs_spv], capture_output=True, text=True, errors="replace", timeout=30)
     except subprocess.TimeoutExpired: raise HarnessError("glslc timed out while compiling the full-screen vertex shader") from None
+    except OSError as exc: raise HarnessError(f"cannot start glslc: {exc}") from None
     if r.returncode: raise HarnessError(f"glslc failed: {(r.stdout + r.stderr).strip()}")
     return {"exe": exe, "glslc": glslc, "spirv_as": spirv_as, "vs_spv": vs_spv}
 
@@ -450,13 +451,15 @@ def run_gpu(lines, name, tmpdir, gpu):
     with open(asm_path, "w", encoding="utf-8", newline="\n") as f: f.write(asm)
     try:
         r = subprocess.run([gpu["spirv_as"], "--target-env", "vulkan1.2", asm_path, "-o", fs_spv],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, errors="replace", timeout=30)
     except subprocess.TimeoutExpired: raise HarnessError("spirv-as timed out while assembling the translated shader") from None
+    except OSError as exc: raise HarnessError(f"cannot start spirv-as: {exc}") from None
     if r.returncode: raise HarnessError(f"spirv-as failed: {(r.stdout + r.stderr).strip()}")
     try:
         r = subprocess.run([gpu["exe"], gpu["vs_spv"], fs_spv, raw, "1", "1"],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, errors="replace", timeout=60)
     except subprocess.TimeoutExpired: raise HarnessError("vk_harness timed out after 60 s") from None
+    except OSError as exc: raise HarnessError(f"cannot start vk_harness: {exc}") from None
     detail = " ".join((r.stdout + r.stderr).split())
     if r.returncode == 77: raise GPUUnavailable(detail or "vk_harness reports that the Vulkan device cannot run this shader")
     if r.returncode: raise HarnessError(f"vk_harness exited {r.returncode}: {detail}")
@@ -642,8 +645,20 @@ def run_one(lines, name, tmp, oracle="translator", gpu=None, include_known=False
         if any(line.lstrip().startswith(("v_rcp_f64 ", "v_rsq_f64 ", "v_sqrt_f64 ")) for line in lines):
             return "skip", ("native v_rcp_f64/v_rsq_f64/v_sqrt_f64 are approximations (about 26 bits, PROC-216) and "
                             "the reference is exact, so their result is not judged"), expected, None
-        actual = hw_words if hw_words is not None else gpu.run([hw_kernel(lines)])[0]
+        if hw_words is not None:
+            actual = hw_words
+        else:
+            if gpu is None:
+                raise HarnessError("hardware oracle required for --oracle hw")
+            res = gpu.run([hw_kernel(lines)])
+            if not isinstance(res, (list, tuple)) or len(res) != 1:
+                got_desc = len(res) if isinstance(res, (list, tuple)) else type(res).__name__
+                raise HarnessError(f"hardware oracle returned {got_desc} results for 1 program")
+            actual = res[0]
         if isinstance(actual, str): return "skip", f"hardware: {actual}", expected, None
+        if not isinstance(actual, (list, tuple)) or len(actual) != 4:
+            got_desc = f"{len(actual)} words" if isinstance(actual, (list, tuple)) else type(actual).__name__
+            raise HarnessError(f"hardware oracle returned {got_desc} (expected 4 words)")
         actual = [int(x) & M32 for x in actual]
         return ("match", "", expected, actual) if equivalent(expected, actual, output_kind(lines)) else ("mismatch", "word comparison", expected, actual)
     try: actual = run_gpu(lines, name, tmp, gpu) if oracle == "gpu" else translate(lines, name, tmp)
@@ -664,7 +679,7 @@ def shrink(lines, expected, oracle="translator", gpu=None, gpu_ctx=None, tmpdir=
                 if status == "mismatch":
                     current[:] = trial
                     continue
-            except GPUUnavailable:
+            except (GPUUnavailable, HarnessError):
                 raise
             except Exception:
                 pass
@@ -698,7 +713,14 @@ def run_batch(ops, programs, seed, max_ops=1, sweep=True, allow_literal=True, kn
                 lines.extend(extra_body)
         cases.append((idx, lines, known_case))
     # One launch for the whole campaign; a failing program is re-run alone while it is shrunk.
-    hw_results = hw.run([hw_kernel(lines) for _, lines, _ in cases]) if oracle == "hw" else None
+    hw_results = None
+    if oracle == "hw" and cases:
+        if hw is None:
+            raise HarnessError("hardware oracle required for --oracle hw")
+        hw_results = hw.run([hw_kernel(lines) for _, lines, _ in cases])
+        if not isinstance(hw_results, (list, tuple)) or len(hw_results) != len(cases):
+            got_desc = len(hw_results) if isinstance(hw_results, (list, tuple)) else type(hw_results).__name__
+            raise HarnessError(f"hardware oracle returned {got_desc} results for {len(cases)} programs")
     with tempfile.TemporaryDirectory(prefix="f64-diff-") as tmp:
         gpu_ctx = prepare_gpu(gpu, tmp) if oracle == "gpu" else hw if oracle == "hw" else None
         for idx, lines, known_case in cases:
@@ -766,7 +788,19 @@ def main(argv=None):
     ap.add_argument("--hw-arch", help="GPU architecture hw_oracle assembles for (default: detected)")
     args = ap.parse_args(argv)
     if args.programs < 0 or args.max_ops < 1: print("programs must be nonnegative and max-ops positive", file=sys.stderr); return 2
-    ops = [x.strip() for x in args.ops.split(",")] if args.ops else list(BASE)
+    if args.hw_arch is not None:
+        args.hw_arch = args.hw_arch.strip()
+        if not args.hw_arch: print("--hw-arch must not be empty", file=sys.stderr); return 2
+    if args.exe is not None:
+        args.exe = args.exe.strip()
+        if not args.exe: print("--exe must not be empty", file=sys.stderr); return 2
+    if args.ops is not None:
+        tokens = [x.strip() for x in args.ops.split(",")]
+        if not any(tokens) or any(not x for x in tokens):
+            print("--ops must be a comma-separated list of opcodes", file=sys.stderr); return 2
+        ops = list(dict.fromkeys(tokens))
+    else:
+        ops = list(BASE)
     bad = sorted(set(ops) - set(BASE))
     if bad: print(f"unknown opcode(s): {','.join(bad)}", file=sys.stderr); return 2
     if args.list_ops:
@@ -774,6 +808,8 @@ def main(argv=None):
         print("Excluded (not translated by main): v_mul_f64, v_min_f64, v_max_f64, v_fract_f64, v_cvt_f64_f32, v_ldexp_f64, v_mad_f64, v_cvt_i32_f64, v_cvt_u32_f64, v_div_scale_f64")
         return 0
     if args.self_test: return 0 if self_test() else 1
+    if not args.sweep and args.programs == 0 and not args.known:
+        print("nothing to run: pass --programs >= 1, omit --no-sweep, or pass --known", file=sys.stderr); return 2
     gpu = hw = None
     if args.oracle == "hw":
         try: hw = open_hw_oracle(args.hw_arch)

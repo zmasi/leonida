@@ -63,12 +63,22 @@ def read_lines(source: Path):
         if not dumpbin:
             sys.exit("dumpbin.exe not found: run from a VS developer shell or install the MSVC build tools")
         proc = subprocess.Popen([str(dumpbin), "/nologo", "/disasm:nobytes", str(source)],
-                                stdout=subprocess.PIPE, text=True, errors="replace")
-        yield from proc.stdout
-        if proc.wait():
+                                stdout=subprocess.PIPE, text=True, encoding="utf-8", errors="replace")
+        completed = False
+        try:
+            if proc.stdout is not None:
+                yield from proc.stdout
+            completed = True
+        finally:
+            if proc.stdout is not None:
+                proc.stdout.close()
+            if not completed and proc.poll() is None:
+                proc.terminate()
+                proc.wait()
+        if completed and proc.wait():
             sys.exit(f"dumpbin failed with exit code {proc.returncode}")
         return
-    with open(source, encoding="utf-8", errors="replace") as f:
+    with open(source, encoding="utf-8-sig", errors="replace") as f:
         yield from f
 
 
@@ -204,17 +214,31 @@ def summarize(sites, instructions=None):
     return "\n".join(out)
 
 
-def main() -> int:
+def _parse_base(s: str) -> int:
+    try:
+        val = int(s, 16)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid hex image base: {s!r}") from exc
+    if val < 0:
+        raise argparse.ArgumentTypeError("image base must be non-negative")
+    return val
+
+
+def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("source", type=Path)
-    p.add_argument("--base", type=lambda s: int(s, 16), help="image base (default: inferred from the first site)")
+    p.add_argument("--base", type=_parse_base, help="image base (default: inferred from the first site)")
     p.add_argument("--sites", action="store_true", help="print every site")
-    args = p.parse_args()
+    args = p.parse_args(argv)
     if not args.source.is_file():
         print(f"{args.source} not found", file=sys.stderr)
         return 2
     stats = {}
-    sites = list(scan(read_lines(args.source), stats))
+    try:
+        sites = list(scan(read_lines(args.source), stats))
+    except OSError as exc:
+        print(f"{args.source}: {exc.strerror or exc}", file=sys.stderr)
+        return 2
     if not stats["instructions"]:
         print(f"{args.source}: no instructions found (not a dumpbin listing, or an image without code)",
               file=sys.stderr)

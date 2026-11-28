@@ -369,7 +369,15 @@ def check_guid_values():
         if len(g) != 11:
             errors.append("%s: expected 11 components, got %d" % (name, len(g)))
             continue
-        if g[0] > 0xFFFFFFFF or g[1] > 0xFFFF or g[2] > 0xFFFF or any(x > 0xFF for x in g[3:]):
+        if (
+            g[0] < 0
+            or g[0] > 0xFFFFFFFF
+            or g[1] < 0
+            or g[1] > 0xFFFF
+            or g[2] < 0
+            or g[2] > 0xFFFF
+            or any(x < 0 or x > 0xFF for x in g[3:])
+        ):
             errors.append("%s: component out of range" % name)
         if guid_version(g) != 4:
             errors.append("%s: not an RFC 4122 version 4 UUID" % name)
@@ -483,7 +491,7 @@ def check_sdk():
 
 
 def parse_scarab_iid_table(path):
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         text = f.read()
     out = {}
     for name, body in re.findall(r"GUID\s+((?:IID|DXGI_DEBUG)_[A-Za-z0-9_]+)\s*=\s*\{([^;]*)\};", text):
@@ -494,7 +502,7 @@ def parse_scarab_iid_table(path):
 
 
 def parse_scarab_iid_console(path):
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8-sig") as f:
         text = f.read()
     out = {}
     for m in re.finditer(r"GUID\s+(IID_[A-Za-z0-9_]+).*?ordinal\s+(\d+)", text):
@@ -504,10 +512,10 @@ def parse_scarab_iid_console(path):
 
 def parse_scarab_catalogue(path):
     rows = []
-    with open(path, encoding="utf-8") as fh:
+    with open(path, encoding="utf-8-sig") as fh:
         header = fh.readline()
         for line in fh:
-            parts = line.rstrip("\n").split("\t")
+            parts = line.rstrip("\r\n").split("\t")
             if len(parts) >= 3:
                 rows.append(tuple(parts[:3]))
     return rows
@@ -517,51 +525,66 @@ def check_scarab(root):
     """Cross-check the table against a SCARAB checkout. Returns (errors, notes)."""
     errors = []
     notes = []
+    if not root or not os.path.isdir(root):
+        errors.append("SCARAB checkout is not a directory: %r" % (root,))
+        return errors, notes
     iid_table = os.path.join(root, "components", "runtime-bridge", "src", "iid_table.cpp")
     iid_console = os.path.join(root, "components", "extension-wrapper", "src", "iid_console.inc")
     catalogue = os.path.join(root, "components", "extension-wrapper", "docs",
                              "console-extension-catalogue.tsv")
-    if os.path.exists(iid_table):
-        theirs = parse_scarab_iid_table(iid_table)
-        mine = dict(STANDARD_GUIDS)
-        mine.update(CONSOLE_IIDS)
-        if set(theirs) != set(mine):
-            errors.append("SCARAB iid_table names differ from this table")
-        for name in sorted(set(theirs) & set(mine)):
-            if theirs[name] != mine[name]:
-                errors.append("%s: SCARAB %s != table %s"
-                              % (name, guid_text(theirs[name]), guid_text(mine[name])))
-        notes.append("iid_table.cpp: %d GUID values compared" % len(theirs))
+    if os.path.isfile(iid_table):
+        try:
+            theirs = parse_scarab_iid_table(iid_table)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            errors.append("unreadable %s: %s" % (iid_table, exc))
+        else:
+            mine = dict(STANDARD_GUIDS)
+            mine.update(CONSOLE_IIDS)
+            if set(theirs) != set(mine):
+                errors.append("SCARAB iid_table names differ from this table")
+            for name in sorted(set(theirs) & set(mine)):
+                if theirs[name] != mine[name]:
+                    errors.append("%s: SCARAB %s != table %s"
+                                  % (name, guid_text(theirs[name]), guid_text(mine[name])))
+            notes.append("iid_table.cpp: %d GUID values compared" % len(theirs))
     else:
-        errors.append("missing %s" % iid_table)
-    if os.path.exists(iid_console):
-        theirs = parse_scarab_iid_console(iid_console)
-        known = {name for _n, name, _kind, _ev in DATA_EXPORTS}
-        unexpected = set(theirs) - known
-        if unexpected:
-            errors.append("iid_console.inc has names not in the table: %s" % sorted(unexpected))
-        mine = {name: n for n, name, _kind, _ev in DATA_EXPORTS
-                if name in theirs}
-        for name in sorted(set(theirs) & set(mine)):
-            if theirs[name] != mine[name]:
-                errors.append("%s: SCARAB ordinal %d != table %d"
-                              % (name, theirs[name], mine[name]))
-        notes.append("iid_console.inc: %d documented ordinals compared" % len(set(theirs) & set(mine)))
+        errors.append("missing %s" % iid_table if not os.path.exists(iid_table) else "not a file: %s" % iid_table)
+    if os.path.isfile(iid_console):
+        try:
+            theirs = parse_scarab_iid_console(iid_console)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            errors.append("unreadable %s: %s" % (iid_console, exc))
+        else:
+            known = {name for _n, name, _kind, _ev in DATA_EXPORTS}
+            unexpected = set(theirs) - known
+            if unexpected:
+                errors.append("iid_console.inc has names not in the table: %s" % sorted(unexpected))
+            mine = {name: n for n, name, _kind, _ev in DATA_EXPORTS
+                    if name in theirs}
+            for name in sorted(set(theirs) & set(mine)):
+                if theirs[name] != mine[name]:
+                    errors.append("%s: SCARAB ordinal %d != table %d"
+                                  % (name, theirs[name], mine[name]))
+            notes.append("iid_console.inc: %d documented ordinals compared" % len(set(theirs) & set(mine)))
     else:
-        errors.append("missing %s" % iid_console)
-    if os.path.exists(catalogue):
-        rows = parse_scarab_catalogue(catalogue)
-        methods = [r for r in rows if r[0] == "method"]
-        enums = [r for r in rows if r[0] == "enum"]
-        notes.append("catalogue: %d method rows, %d enum rows" % (len(methods), len(enums)))
-        if (len(methods), len(enums)) != (105, 106):
-            notes.append("catalogue counts changed since the pin (expected 105/106)")
-        present = {r[1] for r in methods}
-        missing = sorted(CATALOGUE_NON_METHODS - present)
-        if missing:
-            errors.append("catalogue non-method rows missing: %s" % missing)
+        errors.append("missing %s" % iid_console if not os.path.exists(iid_console) else "not a file: %s" % iid_console)
+    if os.path.isfile(catalogue):
+        try:
+            rows = parse_scarab_catalogue(catalogue)
+        except (OSError, UnicodeDecodeError, ValueError) as exc:
+            errors.append("unreadable %s: %s" % (catalogue, exc))
+        else:
+            methods = [r for r in rows if r[0] == "method"]
+            enums = [r for r in rows if r[0] == "enum"]
+            notes.append("catalogue: %d method rows, %d enum rows" % (len(methods), len(enums)))
+            if (len(methods), len(enums)) != (105, 106):
+                notes.append("catalogue counts changed since the pin (expected 105/106)")
+            present = {r[1] for r in methods}
+            missing = sorted(CATALOGUE_NON_METHODS - present)
+            if missing:
+                errors.append("catalogue non-method rows missing: %s" % missing)
     else:
-        errors.append("missing %s" % catalogue)
+        errors.append("missing %s" % catalogue if not os.path.exists(catalogue) else "not a file: %s" % catalogue)
     return errors, notes
 
 
@@ -606,7 +629,7 @@ def main(argv=None):
         else:
             print("sdk: SKIP (Windows SDK headers not found)")
 
-    if args.scarab:
+    if args.scarab is not None:
         scarab_errors, notes = check_scarab(args.scarab)
         errors += scarab_errors
         for note in notes:
@@ -616,7 +639,7 @@ def main(argv=None):
         for e in errors:
             print("FAIL: " + e)
         return 1
-    if args.check or args.sdk or args.scarab:
+    if args.check or args.sdk or args.scarab is not None:
         print("PASS: 116 slots (23 functions + 93 GUID data), %d standard + %d console GUIDs, "
               "%d unresolved command-list IIDs absent from local tables"
               % (len(STANDARD_GUIDS), len(CONSOLE_IIDS), len(UNRECOVERED_CONSOLE_IIDS)))

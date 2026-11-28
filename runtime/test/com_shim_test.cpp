@@ -115,6 +115,34 @@ void test_com_lifecycle_and_sta_isolation() {
              apt_after_guest == CO_E_NOTINITIALIZED);
     }).join();
     check(host_first_teardown_ok, "guest COM stays live after host CoUninitialize and unwinds cleanly on guest balance");
+
+    // 4. Balanced nested pairs under an outer init give their host references back as they go (kevincommits' finding
+    //    in #1608, Finding 19 item 1): only the outer init's reference is left, so one host CoUninitialize ends COM
+    //    on the thread. They used to stay until the outermost CoUninitialize, one per pair.
+    int host_refs_left = -1;
+    bool nested_ok = false;
+    std::thread([&]() {
+        const HRESULT outer = co_init(nullptr, COINIT_MULTITHREADED);
+        bool inner_ok = true;
+        for (int i = 0; i < 100; ++i) {
+            inner_ok = inner_ok && co_init(nullptr, COINIT_MULTITHREADED) == S_FALSE;
+            co_uninit();
+        }
+        APTTYPE apt = APTTYPE_CURRENT;
+        APTTYPEQUALIFIER qual = APTTYPEQUALIFIER_NONE;
+        const HRESULT still_live = ::CoGetApartmentType(&apt, &qual);
+        // Count the host references by giving them back one at a time (this thread ends right after).
+        int refs = 0;
+        while (refs < 1000 && SUCCEEDED(::CoGetApartmentType(&apt, &qual))) {
+            ::CoUninitialize();
+            ++refs;
+        }
+        host_refs_left = refs;
+        co_uninit();  // the guest's outer balance: the shim's state goes
+        nested_ok = outer == S_OK && inner_ok && SUCCEEDED(still_live);
+    }).join();
+    check(nested_ok, "an outer init stays live across 100 balanced nested pairs");
+    check(host_refs_left == 1, "balanced nested pairs leave only the outer init's host reference");
 }
 
 void test_com_helpers() {

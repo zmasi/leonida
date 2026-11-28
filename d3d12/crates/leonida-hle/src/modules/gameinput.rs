@@ -1,7 +1,8 @@
 //! `gameinput.dll`: input devices from the host. Gamepads come from XInput
 //! (host slots 0-3) and, read over HID, from Sony pads (`hid`; the kind of input in use is `family`);
-//! while none is connected, the keyboard drives one
-//! stand-in gamepad (`FALLBACK_BUTTONS`). The keyboard is a device of its own
+//! while none is connected, the keyboard and mouse drive one
+//! stand-in gamepad, in Grand Theft Auto V's PC layout (`kbm`: one table on foot, one in a vehicle; the table
+//! of before is `FALLBACK_BUTTONS`). The keyboard is a device of its own
 //! too. A focused window also has a mouse. A poll thread records changes
 //! and runs device callbacks on connect and disconnect.
 #![allow(non_snake_case)]
@@ -24,8 +25,10 @@ use crate::{HleExport, HleModule};
 
 mod family;
 mod hid;
+mod kbm;
 
 pub use family::Family;
+pub use kbm::{PlayerContext, driving_controls, player_context, player_context_wanted, set_player_context};
 
 /// Leonida: the kind of input the player is using (Xbox pad, PlayStation pad, keyboard and mouse), for the
 /// runtime's own use: the button prompts follow it. `LEONIDA_PROMPTS` forces it. Reading it starts the input hub.
@@ -93,7 +96,8 @@ const DEVICES: usize = MOUSE + 1;
 const HISTORY: usize = 256;
 const POLL: Duration = Duration::from_millis(8);
 
-/// The keyboard's stand-in gamepad (virtual key, button), in Leonida's layout (the one its Vulkan runtime's
+/// The keyboard's stand-in gamepad as it was before `kbm` (`LEONIDA_KBM=classic` brings it back): (virtual key,
+/// button), in Leonida's layout (the one its Vulkan runtime's
 /// gameinput shim has): the pad-named keys, and PC-style ones beside them: Space confirms/jumps (A), F interacts (Y),
 /// R goes back/reloads (B), Left Shift and C click the sticks. H stays a second right-stick click.
 /// Sticks: W/A/S/D left, I/J/K/L right (and the mouse, once a click in the window has it: `MouseLook`);
@@ -260,6 +264,7 @@ trait Source: Send {
     fn observe(&mut self, _keys: &[KeyState], _look: (f32, f32)) {}
 }
 
+/// The stand-in pad of before `kbm`: one table whatever the player is in (`LEONIDA_KBM=classic`).
 fn fallback(keys: &[KeyState]) -> PadState {
     let on = |vk: u8| {
         if keys.iter().any(|k| k.virtual_key == vk) {
@@ -498,6 +503,8 @@ struct State {
     pending: Vec<Event>,
     /// Device callbacks running now: token and thread.
     running: Vec<(u64, ThreadId)>,
+    /// Leonida: the keyboard and mouse half of the stand-in pad.
+    kbm: kbm::Kbm,
 }
 
 pub struct Hub {
@@ -531,7 +538,7 @@ fn now() -> u64 {
 }
 
 impl Hub {
-    fn new(source: Box<dyn Source>, one_pad: bool) -> &'static Hub {
+    fn with(source: Box<dyn Source>, one_pad: bool, keys: kbm::Config) -> &'static Hub {
         let hub = Box::into_raw(Box::new(Hub {
             object: Object {
                 vtable: &INPUT,
@@ -545,6 +552,7 @@ impl Hub {
                 callbacks: Vec::new(),
                 pending: Vec::new(),
                 running: Vec::new(),
+                kbm: kbm::Kbm::new(keys),
             }),
             returned: Condvar::new(),
         }));
@@ -560,7 +568,7 @@ impl Hub {
 
     /// A hub over the host's input, polled from now on.
     fn start(source: Box<dyn Source>) -> &'static Hub {
-        let hub = Hub::new(source, one_pad());
+        let hub = Hub::with(source, one_pad(), kbm::Config::from_env());
         hub.poll();
         std::thread::spawn(move || {
             loop {
@@ -649,8 +657,10 @@ impl State {
             .collect();
         let mut events = std::mem::take(&mut self.pending);
         self.update(devices, MOUSE, mouse.map(Value::Mouse), now, &mut events);
+        // Leonida: the keys and mouse buttons as a pad, by the table of what the player is in (`kbm`).
+        let stand_in = merged(self.kbm.pad(&pad_keys, kbm::measured(now), now), look);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(merged(fallback(&pad_keys), look), merged);
+            let pad = pads.into_iter().flatten().fold(stand_in, merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -662,7 +672,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(merged(fallback(&pad_keys), look)));
+        let fallback = (!any_pad).then_some(Value::Pad(stand_in));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events
@@ -1551,7 +1561,7 @@ mod host {
             // to the pad (the title's start screen) saw nothing.
             if slot == 0 {
                 for vk in scripted() {
-                    if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
+                    if let Some(button) = kbm::scripted_button(vk) {
                         pad.buttons |= button;
                     }
                 }
@@ -1571,11 +1581,16 @@ mod host {
         fn begin(&mut self) {
             self.view = self.sony.poll();
             if !std::mem::replace(&mut self.began, true) {
+                // Leonida: before any input the family is what is connected; with no pad at all, the keyboard.
+                let xinput = (0..PADS as u32).any(|slot| {
+                    let mut state = XINPUT_STATE::default();
+                    // SAFETY: room for the state.
+                    unsafe { XInputGetState(slot, &mut state) == 0 }
+                });
+                let (start, why) = family::at_start(self.view.present, xinput);
                 let mut shared = family::SHARED.lock().unwrap_or_else(|e| e.into_inner());
-                if self.view.present {
-                    shared.tracker().start_with(Family::PlayStation);
-                }
-                shared.publish(if self.view.present { "a Sony pad is connected" } else { "no input yet" });
+                shared.tracker().start_with(start);
+                shared.publish(why);
             }
         }
 
@@ -1904,8 +1919,14 @@ mod tests {
     }
 
     fn fake_with(one_pad: bool) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
+        fake_layout(one_pad, kbm::Config::default())
+    }
+
+    /// A hub whose stand-in pad has this layout. No test sets the player's context (it is one for the process):
+    /// the hubs here see it unknown, and `kbm`'s own tests hand theirs in.
+    fn fake_layout(one_pad: bool, keys: kbm::Config) -> (&'static Hub, Arc<Mutex<FakeHost>>) {
         let host = Arc::new(Mutex::new(FakeHost::default()));
-        let hub = Hub::new(Box::new(Fake(Arc::clone(&host))), one_pad);
+        let hub = Hub::with(Box::new(Fake(Arc::clone(&host))), one_pad, keys);
         hub.poll();
         (hub, host)
     }
@@ -2187,6 +2208,17 @@ mod tests {
         assert_eq!(got[..4], keys[..]);
         release(r);
 
+        // The pad: GTA V's layout on foot, where V is no trigger.
+        let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+        assert_eq!(pad(r), PadState { buttons: A, left_y: 1.0, right_x: 1.0, ..Default::default() });
+        release(r);
+        // A keyboard reading is no gamepad reading.
+        assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+        // The layout of before (`LEONIDA_KBM=classic`): V is the right trigger.
+        let classic = kbm::Config { layout: kbm::Layout::Classic, ..Default::default() };
+        let (hub, host) = fake_layout(false, classic);
+        host.lock().unwrap().keys = keys;
+        hub.poll();
         let r = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
         assert_eq!(
             pad(r),
@@ -2199,8 +2231,51 @@ mod tests {
             }
         );
         release(r);
-        // A keyboard reading is no gamepad reading.
-        assert_eq!(current(hub, GAMEPAD_KIND, KEYBOARD), Err(READING_NOT_FOUND));
+    }
+
+    #[test]
+    fn the_stand_in_pad_is_gta_vs_layout_in_both_pad_modes() {
+        let newest = |hub: &Hub| match &hub.state().slots[FALLBACK].history.back().unwrap().value {
+            Value::Pad(p) => *p,
+            _ => unreachable!(),
+        };
+        for one_pad in [false, true] {
+            // On foot (nobody says what the player is in): W walks, the mouse shoots and aims, and the mouse look
+            // stick is the camera beside them.
+            let (hub, host) = fake_with(one_pad);
+            host.lock().unwrap().keys =
+                vec![key(b'W'), key(VK_MOUSE_LEFT), key(VK_MOUSE_RIGHT), key(0x20), key(0xA0)];
+            hub.poll();
+            assert_eq!(
+                newest(hub),
+                PadState {
+                    buttons: A | LEFT_STICK,
+                    left_y: 1.0,
+                    left_trigger: 1.0,
+                    right_trigger: 1.0,
+                    ..Default::default()
+                }
+            );
+            // The driving table (forced, as `LEONIDA_KBM_DRIVE=on` does): W is the accelerator, the left mouse
+            // button shoots from the vehicle, Left Shift leans.
+            let driving = kbm::Config { drive: kbm::Drive::On, settle: 0, ..Default::default() };
+            let (hub, host) = fake_layout(one_pad, driving);
+            host.lock().unwrap().keys = vec![key(b'W'), key(b'A'), key(VK_MOUSE_LEFT), key(0x20), key(0xA0)];
+            hub.poll();
+            assert_eq!(
+                newest(hub),
+                PadState {
+                    buttons: A | RIGHT_SHOULDER,
+                    left_x: -1.0,
+                    left_y: 1.0,
+                    right_trigger: 1.0,
+                    ..Default::default()
+                }
+            );
+        }
+        // The context is unknown here, and saying so again changes nothing.
+        set_player_context(PlayerContext::Unknown);
+        assert_eq!(player_context(), PlayerContext::Unknown);
     }
 
     #[test]

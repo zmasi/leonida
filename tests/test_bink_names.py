@@ -64,6 +64,16 @@ class TestListOrder(unittest.TestCase):
         # duplicates collapse case-insensitively; '_' (0x5F) sorts before 'e' (0x65)
         self.assertEqual(got, ["Aa/clip_x.bk2", "aa/clipe.bk2", "mm/one.bk2", "zz/b.bk2"])
 
+    def test_inactive_mount_entries_do_not_shift_names(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            active = mount_xml(["A.bk2", "C.bk2"])
+            tag = "<filename>$(common)/movies/B.bk2</filename>"
+            for ignored in ("<!--\n" + tag + "\n-->", "<![CDATA[" + tag + "]]>", "<?note " + tag + "?>"):
+                with self.subTest(ignored=ignored):
+                    xml = active.replace("<filesToEnable>", "<filesToEnable>" + ignored)
+                    path = self.write(tmp, "list.xml", xml)
+                    self.assertEqual(names_mod.read_mount_lists([path]), ["A.bk2", "C.bk2"])
+
     def test_name_without_extension_compared(self):
         # "ab" is a prefix of "ab-1", so it sorts first; with the extension '-' (0x2D) < '.' (0x2E) would flip them
         self.assertEqual(sorted(["f/ab-1.bk2", "f/ab.bk2"], key=names_mod.sort_key), ["f/ab.bk2", "f/ab-1.bk2"])
@@ -530,6 +540,32 @@ class TestCli(unittest.TestCase):
             with open(out, encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), "previous report\n")
 
+    def test_unlistable_folder_case_alias_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src_dir, locked, xml = self._locked_tree(tmp)
+            out = os.path.join(locked, "names.csv")
+            with open(out, "w", encoding="utf-8") as fh:
+                fh.write("previous report\n")
+            alias = os.path.join(src_dir, "LOCKED", "names.csv")
+            original_isfile = os.path.isfile
+            original_compare = names_mod.same_report_path
+
+            def isfile(path):
+                return path == alias or original_isfile(path)
+
+            def compare(first, second):
+                if first == os.path.dirname(alias) and second == locked:
+                    return True  # emulate a case-insensitive volume
+                return original_compare(first, second)
+
+            with mock.patch.object(names_mod.os.path, "isfile", side_effect=isfile), \
+                    mock.patch.object(names_mod, "same_report_path", side_effect=compare):
+                code, err = self._run_with_locked_folder(src_dir, locked, xml, alias)
+            self.assertEqual(code, 2, err)
+            self.assertIn("cannot list", err)
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "previous report\n")
+
     def test_unlistable_sub_folder_gives_the_same_result_whether_or_not_the_report_exists(self):
         # An --out outside the unlistable folder is not refused by the check, so the run does not depend on
         # whether a report is already there: the scan stops on the folder with exit 1 both times and leaves an
@@ -564,6 +600,24 @@ class TestReportErrors(unittest.TestCase):
         with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
             code = names_mod.main([source, "--mount", xml, "--out", out])
         return code, err.getvalue(), out
+
+    def test_duplicate_stream_locations_are_not_named_twice(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            movie = stream(12, source="clips/one.rpf")
+            other = stream(12, source="clips/two.rpf")
+            index = self.write(tmp, "index.json", json.dumps({"streams": [other, movie]}))
+            self.assertEqual(len(names_mod.load_streams(index)), 2)
+            duplicate = dict(movie, source="clips\\one.rpf", frames=movie["frames"] + 1)
+            self.write(tmp, "index.json", json.dumps({"streams": [movie, other, duplicate]}))
+            output = self.write(tmp, "names.csv", "previous report")
+            xml = self.write(tmp, "list.xml", mount_xml(["a.bk2", "b.bk2", "c.bk2"]))
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+                rc = names_mod.main([index, "--mount", xml, "--out", output])
+            self.assertEqual(rc, 1)
+            self.assertIn("duplicate stream location", err.getvalue())
+            with open(output, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "previous report")
 
     def test_bad_sources_are_rejected(self):
         # (extension, contents, expected error fragment or None to only require the path)

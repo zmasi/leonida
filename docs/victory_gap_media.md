@@ -19,7 +19,7 @@ Status: **same** (Leonida already matched VIctory), **ported** (on this branch),
 | process command | Opus decoded to float PCM (`opus_pure`) | packet parsed (`src/opus_packet.h`): frame counts, lengths and errors are the packet's, samples are silence | **left**: Leonida has no Opus decoder. VIctory's comes from the `opus-pure` crate, which is not in this repository; a port is a full SILK/CELT decoder. Speech and Opus-coded audio stay silent, nothing waits on it |
 | `XApuDequeueResult`, `XApuGetResultCount` | result queue | same | same |
 
-## Audio DSP: `chad.dll` (`dsp.rs` / `runtime/shims/chad_dsp.cpp`)
+## Audio DSP: `chad.dll` (`dsp.rs` / `runtime/shims/chad.cpp`)
 
 | Export | VIctory | Leonida before | Status |
 |---|---|---|---|
@@ -38,7 +38,7 @@ Status: **same** (Leonida already matched VIctory), **ported** (on this branch),
 | other SHAPE units (rate conversion, EQ, filters, flowgraph mixing) | acknowledged, not carried out | same | same (neither emulates them) |
 | `audio/capture.rs` (`VICTORY_AUDIO_CAPTURE`) | diagnostics build only: records the title's output to a WAVE file through process loopback | none | **left**: a debugging aid outside the title's API, not on any boot path |
 
-## Media Foundation: `mfplat.dll` (`media.rs` / new `runtime/shims/media_foundation.cpp`)
+## Media Foundation: `mfplat.dll` (`media.rs` / unmerged `port/gap-media` `media_foundation.cpp`)
 
 | Export or method | VIctory | Leonida before | Status |
 |---|---|---|---|
@@ -61,7 +61,7 @@ Status: **same** (Leonida already matched VIctory), **ported** (on this branch),
 | 16 `GetStreamData` | an empty 16 kHz mono 16-bit WAVE file; too small a buffer `E_NOT_SUFFICIENT_BUFFER` | `E_INVALIDARG` | **ported** |
 | 3-7, 17-20 captions, high contrast, speech to text | missing in VIctory | answered (contrast Off, captions accepted, the rest `E_FAIL`) | same or better |
 
-## Input: `gameinput.dll` (`gameinput.rs`, `gameinput/dualsense.rs` / `runtime/shims/gameinput.cpp`, new `runtime/shims/gameinput_xinput.cpp`)
+## Input: `gameinput.dll` (`gameinput.rs`, `gameinput/dualsense.rs` / `runtime/shims/gameinput.cpp`, `runtime/shims/gameinput_no_sdl.cpp`; unmerged `port/gap-media` `gameinput_xinput.cpp`)
 
 Leonida's GameInput shim (`gameinput.cpp`) runs on SDL3 and is much broader than VIctory's (any SDL pad, force
 feedback, raw HID, motion, UI navigation, a dispatcher). But it is built only when SDL3 is found, and the main build
@@ -104,8 +104,9 @@ Without it the XInput shim above serves the title, so input works either way.
 
 All synthetic, run one by one with `ctest -R`:
 
-- `gameinput_xinput` (`runtime/test/gameinput_xinput_test.cpp`): VIctory's GameInput cases over a fake host, the
+- `gameinput_xinput` (`gameinput_xinput_test.cpp` on the unmerged `port/gap-media` branch; `main` tests the
+  non-SDL3 fallback in `runtime/test/gameinput_no_sdl_test.cpp`): VIctory's GameInput cases over a fake host, the
   DualSense report decoder, the stand-in key map, and the `#1` registration.
-- `media_foundation` (`runtime/test/media_foundation_test.cpp`): VIctory's URL cases, console paths through
-  `rt::fs::read_path`, and the proxy over a fake host resolver.
+- `media_foundation` (`media_foundation_test.cpp` on the unmerged `port/gap-media` branch): VIctory's URL cases,
+  console paths through `rt::fs::read_path`, and the proxy over a fake host resolver.
 - `xgameruntime_offline` (`runtime/test/xgameruntime_offline_test.cpp`): the silent speech stream, byte for byte.

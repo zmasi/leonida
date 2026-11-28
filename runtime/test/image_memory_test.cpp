@@ -5,8 +5,11 @@
 #include "../src/image_memory.h"
 
 #include <algorithm>
+#include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -65,8 +68,20 @@ void block_ranges() {
     ranges.release(a, 100);
     ranges.release(c, 700);
     ranges.release(b, 1);
+    ranges.release(0, 0);  // zero-size release is a safe no-op
     check(ranges.empty() && ranges.largest() == 1000, "released ranges merge back into one piece");
     check(ranges.allocate(1000, 1, d, reused) && d == 0 && reused, "a range over earlier bytes is marked as reused");
+
+    // Alignment overflow safety: huge alignment on a non-zero piece must not wrap uint64_t below piece.
+    BlockRanges big(1000);
+    std::uint64_t p0 = 0, p1 = 0;
+    check(big.allocate(10, 1, p0, reused) && p0 == 0, "occupy offset 0 so remaining free piece starts at 10");
+    check(!big.allocate(10, std::numeric_limits<std::uint64_t>::max(), p1, reused),
+          "UINT64_MAX alignment on non-zero piece refuses cleanly without wraparound");
+    check(!big.allocate(10, (std::uint64_t(1) << 63) + 1u, p1, reused),
+          "large non-power-of-two alignment on non-zero piece refuses cleanly");
+    check(!big.allocate(10, 0, p1, reused), "zero alignment refused");
+    check(big.allocate(10, 16, p1, reused) && p1 == 16, "normal alignment after overflow attempts still succeeds");
 }
 
 void shared_blocks() {
@@ -175,6 +190,60 @@ void threads() {
     check(driver.live.empty(), "nor a block");
 }
 
+// Verify mutex_ is NOT held across allocate_() so concurrent stats(), release(), and allocations on existing
+// blocks can complete while a slow driver allocation is in flight (would deadlock if mutex_ were held).
+void allocate_runs_unlocked() {
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool in_alloc2 = false;
+    bool allow_alloc2 = false;
+    std::atomic<int> allocs{0};
+
+    Pool pool(
+        [&](std::uint32_t, std::uint64_t) -> std::uintptr_t {
+            const int n = ++allocs;
+            if (n == 2) {
+                std::unique_lock lock(gate_mu);
+                in_alloc2 = true;
+                gate_cv.notify_all();
+                gate_cv.wait(lock, [&] { return allow_alloc2; });
+            }
+            return static_cast<std::uintptr_t>(n);
+        },
+        [](std::uintptr_t) {});
+
+    // Populate memory type 0 with one half-full block.
+    auto r1 = pool.allocate(0, kMiB, 4096, 4 * kMiB);
+    check(r1 != nullptr && allocs.load() == 1, "first block allocated");
+
+    // Start a blocking driver allocation on memory type 1 in a background thread.
+    std::unique_ptr<Pool::Range> r_other;
+    std::thread slow_thread([&] { r_other = pool.allocate(1, kMiB, 4096, 4 * kMiB); });
+    {
+        std::unique_lock lock(gate_mu);
+        gate_cv.wait(lock, [&] { return in_alloc2; });
+    }
+
+    // While slow_thread is inside allocate_(), another thread can allocate from existing block, read stats(), and release.
+    auto r2 = pool.allocate(0, kMiB, 4096, 4 * kMiB);
+    check(r2 != nullptr && r2->memory() == r1->memory(), "existing block serves allocations while driver alloc runs");
+    const auto st = pool.stats();
+    check(st.blocks == 1 && st.ranges == 2, "stats() completes while driver alloc is in flight");
+    r2.reset();
+    check(pool.stats().ranges == 1, "release() completes while driver alloc is in flight");
+
+    {
+        std::lock_guard lock(gate_mu);
+        allow_alloc2 = true;
+    }
+    gate_cv.notify_all();
+    slow_thread.join();
+    check(r_other != nullptr && pool.stats().blocks == 2 && pool.stats().ranges == 2,
+          "slow driver allocation finishes and registers its block");
+    r_other.reset();
+    r1.reset();
+}
+
 }  // namespace
 
 int main() {
@@ -183,6 +252,7 @@ int main() {
     a_full_heap();
     random_requests();
     threads();
+    allocate_runs_unlocked();
     if (!failures) std::printf("image memory: textures share blocks, and released ranges are used again\n");
     return failures ? 1 : 0;
 }

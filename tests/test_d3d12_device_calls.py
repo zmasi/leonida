@@ -405,5 +405,152 @@ class DeviceCallsTest(unittest.TestCase):
             self.assertEqual(ddc.main([os.path.join(tmp, "none.exe"), "--out", tmp]), 1)
 
 
+class DeviceCallsCliTests(unittest.TestCase):
+    def test_invalid_out_fails_before_opening_or_scanning_image(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = os.path.join(tmp, "blocker")
+            with open(blocker, "wb") as f:
+                f.write(b"keep-me")
+            img = os.path.join(tmp, "sample.exe")
+            data, _ = build_image()
+            with open(img, "wb") as f:
+                f.write(data)
+            for bad_out in (blocker, os.path.join(blocker, "nested"), ""):
+                err, out = io.StringIO(), io.StringIO()
+                with mock.patch.object(ddc, "scan", side_effect=AssertionError("scan should not run")), \
+                        redirect_stderr(err), redirect_stdout(out):
+                    rc = ddc.main([img, "--out", bad_out])
+                self.assertEqual(rc, 1)
+                self.assertEqual(out.getvalue(), "")
+                self.assertIn("cannot write the report:", err.getvalue())
+            # Even with a missing image, invalid --out is reported upfront before opening the image.
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = ddc.main([os.path.join(tmp, "missing.exe"), "--out", blocker])
+            self.assertEqual(rc, 1)
+            self.assertIn("cannot write the report:", err.getvalue())
+            with open(blocker, "rb") as f:
+                self.assertEqual(f.read(), b"keep-me")
+
+    def test_self_overwrite_and_dir_target_rejected_before_scan_without_creating_out(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "reports")
+            os.makedirs(out_dir)
+            img = os.path.join(tmp, "app.exe")
+            with open(img, "wb") as f:
+                f.write(b"MZ")
+            colliding = os.path.join(out_dir, "app.exe.device_calls.json")
+            os.link(img, colliding)
+            err = io.StringIO()
+            with mock.patch.object(ddc, "scan", side_effect=AssertionError("scan should not run")), \
+                    redirect_stderr(err):
+                rc = ddc.main([img, "--out", out_dir])
+            self.assertEqual(rc, 1)
+            self.assertIn("would overwrite the input", err.getvalue())
+            with open(img, "rb") as f:
+                self.assertEqual(f.read(), b"MZ")
+
+            dir_img = os.path.join(tmp, "dirapp.exe")
+            dir_target = os.path.join(out_dir, "dirapp.exe.device_calls.txt")
+            os.makedirs(dir_target)
+            err = io.StringIO()
+            with mock.patch.object(ddc, "scan", side_effect=AssertionError("scan should not run")), \
+                    redirect_stderr(err):
+                rc = ddc.main([dir_img, "--out", out_dir])
+            self.assertEqual(rc, 1)
+            self.assertIn("is a directory", err.getvalue())
+
+    def test_bad_image_does_not_create_empty_out_dir(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "unused_out")
+            bad_img = os.path.join(tmp, "bad.exe")
+            with open(bad_img, "wb") as f:
+                f.write(b"not-a-pe")
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = ddc.main([bad_img, "--out", out_dir])
+            self.assertEqual(rc, 1)
+            self.assertIn("not a readable x86-64 PE image", err.getvalue())
+            self.assertFalse(os.path.exists(out_dir))
+
+    def test_atomic_write_preserves_existing_reports_on_staging_failure(self):
+        import io
+        import os
+        import tempfile
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = os.path.join(tmp, "out")
+            os.makedirs(out_dir)
+            img = os.path.join(tmp, "game.exe")
+            data, _ = build_image()
+            with open(img, "wb") as f:
+                f.write(data)
+            json_dest = os.path.join(out_dir, "game.exe.device_calls.json")
+            txt_dest = os.path.join(out_dir, "game.exe.device_calls.txt")
+            with open(json_dest, "wb") as f:
+                f.write(b"old-json\n")
+            with open(txt_dest, "wb") as f:
+                f.write(b"old-txt\n")
+
+            orig_mode = ddc.published_mode
+
+            def fail_txt_mode(path: str) -> int:
+                if path.endswith(".txt"):
+                    raise PermissionError("simulated permission error")
+                return orig_mode(path)
+
+            err, out = io.StringIO(), io.StringIO()
+            with mock.patch.object(ddc, "published_mode", side_effect=fail_txt_mode), \
+                    redirect_stderr(err), redirect_stdout(out):
+                rc = ddc.main([img, "--out", out_dir])
+            self.assertEqual(rc, 1)
+            self.assertEqual(out.getvalue(), "")
+            self.assertIn("cannot write the report:", err.getvalue())
+            with open(json_dest, "rb") as f:
+                self.assertEqual(f.read(), b"old-json\n")
+            with open(txt_dest, "rb") as f:
+                self.assertEqual(f.read(), b"old-txt\n")
+            self.assertEqual(sorted(os.listdir(out_dir)), [
+                "game.exe.device_calls.json",
+                "game.exe.device_calls.txt",
+            ])
+
+            out_ok, err_ok = io.StringIO(), io.StringIO()
+            with redirect_stdout(out_ok), redirect_stderr(err_ok):
+                rc = ddc.main([img, "--out", out_dir])
+            self.assertEqual(rc, 0)
+            self.assertEqual(err_ok.getvalue(), "")
+            self.assertIn("site(s) across", out_ok.getvalue())
+            with open(json_dest, "rb") as f:
+                raw_json = f.read()
+            with open(txt_dest, "rb") as f:
+                raw_txt = f.read()
+            self.assertNotIn(b"\r\n", raw_json)
+            self.assertNotIn(b"\r\n", raw_txt)
+            self.assertEqual(sorted(os.listdir(out_dir)), [
+                "game.exe.device_calls.json",
+                "game.exe.device_calls.txt",
+            ])
+
+
 if __name__ == "__main__":
     unittest.main()

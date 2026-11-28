@@ -746,12 +746,16 @@ def summarise_page(data, name, faces=False, centres=False, normals=False, cones=
 def iter_archive(path):
     """Yield (name, inflated bytes) for every zlib stream in an RPF9 data area that is_mesh_page accepts."""
     with open(path, "rb") as fh:
-        if not os.fstat(fh.fileno()).st_size:
-            return
+        if os.fstat(fh.fileno()).st_size < 8:
+            raise PageError(f"{path}: not an RPF9 archive")
         m = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
         try:
             size = len(m)
-            pos = struct.unpack_from("<I", m, 4)[0] if size >= 8 else size
+            if size < 8 or m[:4] not in (b"RPF9", b"9FPR"):
+                raise PageError(f"{path}: not an RPF9 archive")
+            pos = struct.unpack_from("<I", m, 4)[0]
+            if not 8 <= pos <= size:
+                raise PageError(f"{path}: RPF9 data start is outside the archive")
             while pos < size:
                 match = ZHDR.search(m, pos)
                 if not match:

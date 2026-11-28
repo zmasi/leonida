@@ -294,6 +294,9 @@ def main(argv=None) -> int:
                         help="extract only compute programs with these kind-6 SHA-256 hashes, one per line")
     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
     ap.add_argument("--mcpu", default="gfx1013", help="llvm-mc CPU for --disasm (default gfx1013)")
+    ap.add_argument("--backend", choices=("auto", "llvm-mc", "python"), default="auto",
+                    help="disassembler backend for --disasm: auto (default, llvm-mc with python fallback), "
+                         "llvm-mc, or python")
     ap.add_argument("--carve", help="a tools/shader_carve.py output folder: name each program's source shader by the "
                                     "digest its resource-layout blob ends with (the container's HASH part), and "
                                     "copy that container to <name>.dxbc for the translator's signature reads")
@@ -439,7 +442,7 @@ def main(argv=None) -> int:
 
     def one(job):
         entry, name, code, start, end = job
-        asm, invalid, err = disasm.disasm(code, a.mcpu, wave32=entry.get("wave32", True), compute=True)
+        asm, invalid, err = disasm.disasm(code, a.mcpu, backend=a.backend, wave32=entry.get("wave32", True), compute=True)
         entry["invalid_words"] = invalid
         with open(os.path.join(disasm_dir, name + ".s"), "w", encoding="utf-8", newline="\n") as f:
             f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
@@ -448,6 +451,13 @@ def main(argv=None) -> int:
                 f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
 
     if work:
+        if a.backend == "llvm-mc":
+            disasm.probe(a.mcpu)
+        elif a.backend == "auto":
+            try:
+                disasm.probe(a.mcpu)
+            except SystemExit:
+                a.backend = "python"
         with ThreadPoolExecutor(a.jobs) as ex:   # each job waits on its own llvm-mc process
             list(ex.map(one, work))
 

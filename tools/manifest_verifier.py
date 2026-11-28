@@ -25,10 +25,12 @@ import os
 import re
 import stat
 import sys
+import tempfile
 import time
 from typing import Callable, Optional, TextIO
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 CHUNK = 8 * 1024 * 1024
@@ -149,16 +151,23 @@ def save_cache(path: str, entries: dict[str, dict]) -> None:
     directory = os.path.dirname(os.path.abspath(path))
     if directory:
         os.makedirs(directory, exist_ok=True)
-    tmp = path + ".tmp"
+    tmp = None
     try:
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", dir=directory,
+            prefix=".verify-cache-", suffix=".tmp", delete=False,
+        ) as f:
+            tmp = f.name
             json.dump({"version": CACHE_VERSION, "files": dict(sorted(entries.items()))}, f, indent=1)
+        if os.name != "nt":
+            os.chmod(tmp, published_mode(path))  # do not publish NamedTemporaryFile's private 0600 mode
         os.replace(tmp, path)
     except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
         raise
 
 

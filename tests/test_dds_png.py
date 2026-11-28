@@ -955,6 +955,23 @@ class DownscaleTests(unittest.TestCase):
 
 
 class PngTests(unittest.TestCase):
+    def test_compressible_png_has_bounded_scanline_storage(self):
+        import subprocess
+        import sys
+        # Measure after allocating the source; isolate tracemalloc from the test runner.
+        measure = """
+import sys, tracemalloc
+sys.path.insert(0, sys.argv[1])
+import dds_png
+rgba = bytes(1024 * 1024 * 4)
+tracemalloc.start()
+png = dds_png.encode_png(1024, 1024, rgba)
+print(tracemalloc.get_traced_memory()[1])
+"""
+        peak = subprocess.check_output([sys.executable, "-I", "-c", measure, os.path.join(ROOT, "tools")],
+                                       timeout=60)
+        self.assertLess(int(peak), 1024 * 1024)
+
     def test_png_structure_and_crcs(self):
         rgba = bytes((1, 2, 3, 4, 5, 6, 7, 8))
         png = dds.encode_png(2, 1, rgba)

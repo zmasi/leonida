@@ -21,6 +21,7 @@ import importlib.util
 import json
 import os
 import queue
+import re
 import shutil
 import signal
 import subprocess
@@ -34,6 +35,11 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # Switches of scripts/play-d3d12.ps1 that the Settings page offers, with the value they have by default.
 RESOLUTIONS = ("", "2160", "1440", "1080", "720", "540", "480")
+DLSS_MODES = ("", "quality", "balanced", "performance", "ultra")
+FRAME_GEN = (0, 2, 3, 4, 5, 6)
+PRESENT_SCALES = ("", "fit", "stretch")
+ASPECT = re.compile(r"^(auto|\d+(\.\d+)?([:x/]\d+(\.\d+)?)?)$")   # the script's own pattern for -Aspect
+ADAPTER = re.compile(r"^[\w #.()+-]{0,64}$")                         # part of a card's name, or #<index>
 DEFAULTS: dict = {
     "game_dir": "",
     "data_dir": "",
@@ -47,7 +53,18 @@ DEFAULTS: dict = {
     "resolution": "",        # -Resolution <height>, empty = the default path
     "capture": False,        # -Capture
     "log": False,            # -Log
+    "series_s": False,       # -SeriesS (the script's default is Series X)
+    "dlss_mode": "",         # -Dlss <mode>, empty = the profile's own path
+    "frame_gen": 0,          # -FrameGen <n>, 0 = off
+    "aspect": "",            # -Aspect <shape>, empty = 16:9
+    "present_scale": "",     # -PresentScale, with -Aspect; empty = the script's default (fit)
+    "adapter": "",           # -Adapter <part of the card's name, or #index>
+    "background": "",        # the picture behind PLAY in launcher/; "" = background.* in config_dir()
 }
+# The options with a fixed set of values, and the others whose text has to match a pattern.
+CHOICES: dict = {"resolution": RESOLUTIONS, "dlss_mode": DLSS_MODES, "frame_gen": FRAME_GEN,
+                 "present_scale": PRESENT_SCALES}
+PATTERNS: dict = {"aspect": ASPECT, "adapter": ADAPTER}
 
 
 # ---------------------------------------------------------------- settings
@@ -71,12 +88,16 @@ def normalise(data: object) -> dict:
         return settings
     for key, default in DEFAULTS.items():
         value = data.get(key, default)
-        if isinstance(default, bool):
+        if key in CHOICES:   # the type is checked too: False == 0 would pass for frame_gen
+            settings[key] = value if type(value) is type(default) and value in CHOICES[key] else default
+        elif isinstance(default, bool):
             settings[key] = value if isinstance(value, bool) else default
-        elif key == "resolution":
-            settings[key] = value if value in RESOLUTIONS else default
+        elif key in PATTERNS:
+            settings[key] = value.strip() if isinstance(value, str) and PATTERNS[key].match(value.strip()) else default
         else:
             settings[key] = value if isinstance(value, str) else default
+    if settings["series_s"]:
+        settings["series_x"] = False
     return settings
 
 
@@ -109,20 +130,32 @@ def mods_dir_of(settings: dict) -> str:
 def switch_args(settings: dict) -> list[str]:
     """The PowerShell switches the options stand for (scripts/play-d3d12.ps1)."""
     args: list[str] = []
+    if settings["series_s"]:
+        args.append("-SeriesS")
     if not settings["dlss"]:
         args.append("-NoDlss")
+    elif settings["dlss_mode"]:
+        args += ["-Dlss", settings["dlss_mode"]]
+    if settings["frame_gen"]:
+        args += ["-FrameGen", str(settings["frame_gen"])]
     if settings["ray_tracing"]:
         args.append("-RayTracing")
     if settings["smooth_motion"]:
         args.append("-SmoothMotion")
     if not settings["precompile"]:
         args.append("-NoPrecompile")
-    if settings["series_x"]:
+    if settings["series_x"] and not settings["series_s"]:
         args.append("-SeriesX")
     if settings["quality"]:
         args.append("-Quality")
-    if settings["resolution"]:
-        args += ["-Resolution", settings["resolution"]]
+    if settings["resolution"] and not (settings["dlss"] and settings["dlss_mode"]):
+        args += ["-Resolution", settings["resolution"]]   # the script wants it left out with a DLSS mode
+    if settings["aspect"]:
+        args += ["-Aspect", settings["aspect"]]
+        if settings["present_scale"]:
+            args += ["-PresentScale", settings["present_scale"]]
+    if settings["adapter"]:
+        args += ["-Adapter", settings["adapter"]]
     if settings["capture"]:
         args.append("-Capture")
     if settings["log"]:
@@ -1044,4 +1077,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(errors="replace")
     raise SystemExit(main())

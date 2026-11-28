@@ -428,6 +428,68 @@ class F64DiffTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("minimal program:", stdout.getvalue())
 
+    def test_empty_malformed_cli_and_deduped_ops_and_zero_case_guard(self):
+        for bad in ("", "   ", ",", "v_trunc_f64,", ",v_trunc_f64", "v_trunc_f64,,v_add_f64"):
+            with self.subTest(ops=bad):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(fd.main(["--ops", bad, "--programs", "0"]), 2)
+                self.assertIn("--ops must be a comma-separated list of opcodes", stderr.getvalue())
+
+        for flag in ("--hw-arch", "--exe"):
+            for bad in ("", "   "):
+                with self.subTest(flag=flag, bad=bad):
+                    stderr = io.StringIO()
+                    with contextlib.redirect_stderr(stderr):
+                        self.assertEqual(fd.main([flag, bad, "--list-ops"]), 2)
+                    self.assertIn("must not be empty", stderr.getvalue())
+
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.assertEqual(fd.main(["--no-sweep", "--programs", "0"]), 2)
+        self.assertIn("nothing to run", stderr.getvalue())
+
+        # Duplicate --ops entries are deduplicated so sweep runs once, not twice.
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            self.assertEqual(fd.main(["--ops", "v_trunc_f64,v_trunc_f64", "--programs", "0"]), 0)
+        self.assertIn("1 total", stdout.getvalue())
+
+    def test_hw_oracle_result_count_word_length_and_shrink_harness_error(self):
+        class BadHW:
+            device = "fake-bad"
+
+            def __init__(self, responses):
+                self._responses = list(responses)
+                self.closed = False
+
+            def run(self, kernels):
+                return self._responses.pop(0)
+
+            def close(self):
+                self.closed = True
+
+        # Batch result count mismatch -> exit 2, oracle closed.
+        short_hw = BadHW([[[0, 0, 0, 0]]])
+        code, _, err, _ = self.run_main(short_hw, "--ops", "v_trunc_f64", "--programs", "1")
+        self.assertEqual(code, 2, err)
+        self.assertIn("harness error", err)
+        self.assertTrue(short_hw.closed)
+
+        # Malformed word count (<4 words) -> exit 2 (not a false mismatch!), oracle closed.
+        bad_words_hw = BadHW([[[0, 1]]])
+        code, _, err, _ = self.run_main(bad_words_hw, "--ops", "v_trunc_f64", "--programs", "0")
+        self.assertEqual(code, 2, err)
+        self.assertIn("expected 4 words", err)
+        self.assertTrue(bad_words_hw.closed)
+
+        # Empty oracle response during shrink must propagate HarnessError -> exit 2, oracle closed.
+        shrink_fail_hw = BadHW([[[0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF]], []])
+        code, _, err, _ = self.run_main(shrink_fail_hw, "--ops", "v_trunc_f64", "--programs", "0")
+        self.assertEqual(code, 2, err)
+        self.assertIn("harness error", err)
+        self.assertTrue(shrink_fail_hw.closed)
+
 
 if __name__ == "__main__":
     unittest.main()

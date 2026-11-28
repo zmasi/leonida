@@ -14,7 +14,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use leonida_pipeline::{Cache, Converter};
-use leonida_shader::emit::{HostShader, StaticSampler, UserData};
+use leonida_shader::emit::{FormsFor, HostShader, StaticSampler, UserData};
 use leonida_shader::resource::RootIndexedView;
 use leonida_shader::{HwStage, RootType};
 
@@ -132,14 +132,81 @@ pub fn precompile(container: &[u8]) -> Result<bool, String> {
 /// The translation of a console shader container, from the cache when
 /// there is one.
 pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
-    let translate = |c: &[u8]| leonida_shader::emit::translate(c).map_err(|e| e.to_string());
+    let forms = forms_for(container);
+    let translate = |c: &[u8]| {
+        leonida_shader::emit::with_forms_for(forms, || leonida_shader::emit::translate(c)).map_err(|e| e.to_string())
+    };
     let shader = match CACHE.get() {
-        Some(cache) => cached(cache, &build(), container, translate),
+        Some(cache) => cached(cache, &key_for(build(), forms), container, translate),
         None => translate(container),
     }?;
     #[cfg(feature = "diagnostics")]
     let shader = paired_override(container, shader);
     Ok(shader)
+}
+
+/// The programs a `LEONIDA_PAIRED_FOR` or `LEONIDA_WAVE_WIDE_FOR` list names: hashes as the log
+/// and the frame listings name shaders (the first 16 hex digits of the container's BLAKE3), or
+/// their beginnings from 8 digits on, separated by commas. What is not that is left out and
+/// returned second, to be said in the log. Pure, for testing.
+fn parse_names(value: Option<&str>) -> (Vec<String>, Vec<String>) {
+    value
+        .unwrap_or_default()
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .partition(|h| (8..=64).contains(&h.len()) && h.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The forms asked for `container` by name (`leonida_shader::emit::with_forms_for`), read once:
+/// - `LEONIDA_PAIRED_FOR=<hash>,<hash>`: the paired form before every other for these programs,
+///   the forms the chain counts as exact included (as `LEONIDA_PAIRED_LANES=first`, for them
+///   alone);
+/// - `LEONIDA_WAVE_WIDE_FOR=<hash>,<hash>`: the wave-wide form before the approximate ones for
+///   these (as `LEONIDA_WAVE_WIDE=1`, for them alone, and not the paired form in its place).
+///
+/// Both unset (the default): nothing changes. Only console wave64 compute programs that a host
+/// of 32-lane waves does not take as they are have such forms; naming another changes nothing
+/// but its place in the cache. The named programs are translated again and kept apart
+/// ([`key_for`]); every other program keeps its translation, so trying a form on one program
+/// does not cost a translation of them all, as `LEONIDA_PAIRED_LANES` and `LEONIDA_WAVE_WIDE`
+/// do.
+///
+/// After edsuuu/VI-BR-PORT 7318dee, 1fa0ed1 and cf3394b (edsuuu; `VICTORY_WAVE_WIDE_FOR`,
+/// `VICTORY_WAVE_PAIRED_FOR`), GPL-3.0. There the lists are part of every program's key.
+fn forms_for(container: &[u8]) -> FormsFor {
+    static NAMED: OnceLock<[Vec<String>; 2]> = OnceLock::new();
+    let [paired, wide] = NAMED.get_or_init(|| {
+        ["LEONIDA_PAIRED_FOR", "LEONIDA_WAVE_WIDE_FOR"].map(|switch| {
+            let (named, refused) = parse_names(std::env::var(switch).ok().as_deref());
+            if !refused.is_empty() {
+                tracing::warn!(switch, ?refused, "not shader hashes (8 to 64 hex digits each): left out");
+            }
+            if !named.is_empty() {
+                tracing::info!(switch, programs = ?named, "these programs are translated in a form asked for by name");
+            }
+            named
+        })
+    });
+    if paired.is_empty() && wide.is_empty() {
+        return FormsFor::default();
+    }
+    let hash = blake3::hash(container).to_hex();
+    let is = |names: &[String]| names.iter().any(|h| hash.starts_with(h.as_str()));
+    FormsFor { paired_first: is(paired), wide: is(wide) }
+}
+
+/// The cache's key for a translation with `forms` asked for its program: `build` itself when
+/// none is (every entry made before stays good), else one of its own for each choice.
+fn key_for(build: [u8; 32], forms: FormsFor) -> [u8; 32] {
+    if forms == FormsFor::default() {
+        return build;
+    }
+    let mut hash = blake3::Hasher::new();
+    hash.update(&build);
+    hash.update(b"forms asked for this program");
+    hash.update(&[u8::from(forms.paired_first), u8::from(forms.wide)]);
+    *hash.finalize().as_bytes()
 }
 
 /// Try cache entries made by the paired-wave translator for the 32-lane,
@@ -420,6 +487,33 @@ fn decode(bytes: &[u8]) -> Option<HostShader> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn programs_are_named_by_hash_or_its_beginning() {
+        let (named, refused) = parse_names(Some(" 1AA247ED3653B616 ,d3e5b737,, 55d2 , tiles,6f225b641c5b0708"));
+        assert_eq!(named, ["1aa247ed3653b616", "d3e5b737", "6f225b641c5b0708"]);
+        // (too short to name one program; not a hash)
+        assert_eq!(refused, ["55d2", "tiles"]);
+        assert_eq!(parse_names(None), (vec![], vec![]));
+        assert_eq!(parse_names(Some("")), (vec![], vec![]));
+    }
+
+    #[test]
+    fn only_a_program_with_a_form_asked_for_gets_a_key_of_its_own() {
+        let build = [7u8; 32];
+        let (paired, wide) = (
+            FormsFor { paired_first: true, wide: false },
+            FormsFor { paired_first: false, wide: true },
+        );
+        assert_eq!(key_for(build, FormsFor::default()), build);
+        let keys = [key_for(build, paired), key_for(build, wide), key_for(build, FormsFor { paired_first: true, wide: true })];
+        for (i, k) in keys.iter().enumerate() {
+            assert_ne!(*k, build);
+            assert!(keys[..i].iter().all(|other| other != k));
+        }
+        // (and still by the translation: another build, another key)
+        assert_ne!(key_for([8u8; 32], paired), keys[0]);
+    }
 
     fn shader() -> HostShader {
         HostShader {

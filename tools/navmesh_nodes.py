@@ -153,6 +153,7 @@ def tally_tile(tally, b, by_sector, nodes):
         return
     tally["tiles_with_nodes"] += 1
     polygons = geometry["polygons"]
+    needed_cells = {(int(math.floor(nodes[n][0] / CELL)), int(math.floor(nodes[n][1] / CELL))) for n in mine}
     grid = collections.defaultdict(list)
     for i, (points, flags18, flags28) in enumerate(polygons):
         if len(points) < 3:
@@ -173,9 +174,20 @@ def tally_tile(tally, b, by_sector, nodes):
                 bit += 1
         xs = [p[0] for p in points]
         ys = [p[1] for p in points]
-        for gx in range(int(math.floor(min(xs) / CELL)), int(math.floor(max(xs) / CELL)) + 1):
-            for gy in range(int(math.floor(min(ys) / CELL)), int(math.floor(max(ys) / CELL)) + 1):
-                grid[(gx, gy)].append(i)
+        gx0, gx1 = int(math.floor(min(xs) / CELL)), int(math.floor(max(xs) / CELL))
+        gy0, gy1 = int(math.floor(min(ys) / CELL)), int(math.floor(max(ys) / CELL))
+        # Only cells occupied by nodes in this tile are ever queried; bounding by needed_cells also stops
+        # a damaged tile with a huge finite extent from trying to materialize billions of grid entries.
+        if (gx1 - gx0 + 1) * (gy1 - gy0 + 1) <= len(needed_cells):
+            for gx in range(gx0, gx1 + 1):
+                for gy in range(gy0, gy1 + 1):
+                    cell = (gx, gy)
+                    if cell in needed_cells:
+                        grid[cell].append(i)
+        else:
+            for gx, gy in needed_cells:
+                if gx0 <= gx <= gx1 and gy0 <= gy <= gy1:
+                    grid[(gx, gy)].append(i)
     for n in mine:
         x, y, z = nodes[n]
         found = polygon_under(polygons, grid, x, y, z)

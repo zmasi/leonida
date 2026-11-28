@@ -35,9 +35,9 @@ def _stem_rows(path: str, field: str, suffix: str = "") -> list[tuple[str, dict]
             or posixpath.basename(value) != value
         ):
             raise ValueError(f"{path}: expected a shader basename in {field!r}")
-        if suffix and (not value.endswith(suffix) or len(value) == len(suffix)):
+        if suffix and (not value.lower().endswith(suffix.lower()) or len(value) == len(suffix)):
             raise ValueError(f"{path}: expected a {suffix} filename in {field!r}")
-        stem = value.removesuffix(suffix)
+        stem = value[:-len(suffix)] if suffix else value
         if not stem or stem in (".", ".."):
             raise ValueError(f"{path}: expected a shader basename in {field!r}")
         out.append((stem, row))
@@ -49,10 +49,22 @@ def shader_stems(path: str, field: str, suffix: str = "") -> set[str]:
 
 
 def shader_stages(path: str, field: str, suffix: str = "") -> dict[str, str | None]:
-    """The stage the index records for each shader, by stem. None where an entry has no stage string: the stage is
-    then unknown, not absent, and the caller says so."""
-    stages = {}
+    """The stage the index records for each shader, by stem. None where an entry has no stage string or duplicate
+    entries disagree: the stage is then unknown, not absent, and the caller says so."""
+    stages: dict[str, str | None] = {}
+    conflicted: set[str] = set()
     for stem, row in _stem_rows(path, field, suffix):
         stage = row.get("stage")
-        stages[stem] = stage if isinstance(stage, str) and stage else None
+        val = stage if isinstance(stage, str) and stage else None
+        if stem in conflicted:
+            continue
+        if stem not in stages:
+            stages[stem] = val
+        elif val is not None:
+            prev = stages[stem]
+            if prev is None:
+                stages[stem] = val
+            elif prev != val:
+                stages[stem] = None
+                conflicted.add(stem)
     return stages

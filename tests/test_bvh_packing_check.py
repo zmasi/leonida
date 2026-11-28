@@ -240,6 +240,22 @@ class TestBroken(unittest.TestCase):
         self.assertEqual(dict(res.fails), {})
         self.assertEqual(res.stats["root_leaf"], 1)
 
+    def test_root_union_and_short_total_edge_cases(self):
+        # _root_equal must reject NaN (even NaN vs NaN in BOX16) and non-finite BOX32 bounds.
+        self.assertFalse(C._root_equal(float("nan"), float("nan"), 0, False))
+        self.assertFalse(C._root_equal(1.0, float("inf"), 0, True))
+        self.assertFalse(C._root_equal(float("inf"), 1.0, 3, True))
+
+        # A root with a valid override on child 0 and NaN on child 1 must fail root_union_not_bounds
+        # (Python min([0.0, nan]) would otherwise silently return 0.0).
+        level1_nan = [([ptr(NODES, R.BOX16), ptr(NODES + 64, R.BOX16)], {0: 0.0, 6: float("nan")})]
+        res_nan = C.check_stream(build(level1=level1_nan))
+        self.assertIn("root_union_not_bounds", res_nan.fails)
+
+        # Negative header offset raises ValueError.
+        with self.assertRaises(ValueError):
+            C.check_stream(build(), -4)
+
 
 def payload(structure):
     """A whole bvh4 payload: the 0x100 prefix with the wrapper words, then the structure."""
@@ -272,6 +288,68 @@ class TestArchive(unittest.TestCase):
             self.assertEqual(rep["kinds"].get("bvh4-chunk-joined"), 1)
             self.assertEqual(rep["kinds"].get("continuation"), 1)
             self.assertNotIn("raw", rep["kinds"])
+
+    def test_split_stream_skips_false_zlib_header_and_failed_join_does_not_steal_streams(self):
+        good = payload(build())
+        big = payload(build(total=0x20000))
+
+        # False-positive 0x78 0x9c padding bytes between chunks must not abort continuation joining.
+        body = zlib.compress(big[:0x10000]) + b"\x78\x9c\xff\xff\x00\x00" + zlib.compress(big[0x10000:]) + bytes(16)
+        fd, path_fp = tempfile.mkstemp(suffix=".rpf")
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"RPF9" + struct.pack("<I", 16) + bytes(8) + body)
+        self.addCleanup(os.unlink, path_fp)
+        tally_fp, _ = C.scan_archive(path_fp, 1, 1 << 20, progress=False)
+        rep_fp = tally_fp.report()
+        self.assertEqual((rep_fp["checked"], rep_fp["passed"]), (1, 1))
+        self.assertEqual(rep_fp["kinds"].get("bvh4-chunk-joined"), 1)
+        self.assertEqual(rep_fp["kinds"].get("continuation"), 1)
+
+        # A truncated bvh4-chunk must not swallow a following standalone bvh4 stream.
+        path_stop = self.write_rpf([big[:0x10000], good])
+        tally_stop, _ = C.scan_archive(path_stop, 1, 1 << 20, progress=False)
+        rep_stop = tally_stop.report()
+        self.assertEqual((rep_stop["checked"], rep_stop["passed"]), (2, 1))
+        self.assertEqual(rep_stop["fail_streams"], {"short_input": 1})
+        self.assertNotIn("continuation", rep_stop["kinds"])
+
+        # A truncated bvh4-chunk followed by an insufficient raw stream must not record bogus continuation counts.
+        path_short = self.write_rpf([big[:0x10000], b"\x01\x02\x03\x04" * 32])
+        tally_short, _ = C.scan_archive(path_short, 1, 1 << 20, progress=False)
+        rep_short = tally_short.report()
+        self.assertEqual((rep_short["checked"], rep_short["passed"]), (1, 0))
+        self.assertEqual(rep_short["fail_streams"], {"short_input": 1})
+        self.assertNotIn("continuation", rep_short["kinds"])
+        self.assertEqual(rep_short["kinds"].get("raw"), 1)
+
+        # A damaged continuation stream followed by an unrelated later raw stream must not skip past the damage
+        # and glue in the unrelated stream.
+        bad_cont_body = (
+            zlib.compress(big[:0x10000])
+            + zlib.compress(big[0x10000:])[:-20]
+            + bytes(32)
+            + zlib.compress(b"\x05" * 0x20000)
+            + bytes(16)
+        )
+        fd, path_dmg = tempfile.mkstemp(suffix=".rpf")
+        with os.fdopen(fd, "wb") as f:
+            f.write(b"RPF9" + struct.pack("<I", 16) + bytes(8) + bad_cont_body)
+        self.addCleanup(os.unlink, path_dmg)
+        tally_dmg, _ = C.scan_archive(path_dmg, 1, 1 << 20, progress=False)
+        rep_dmg = tally_dmg.report()
+        self.assertEqual((rep_dmg["checked"], rep_dmg["passed"]), (1, 0))
+        self.assertEqual(rep_dmg["fail_streams"], {"short_input": 1})
+        self.assertNotIn("continuation", rep_dmg["kinds"])
+        self.assertEqual(rep_dmg["kinds"].get("raw"), 1)
+
+        # A truncated bvh4-chunk must also stop before an XML stream.
+        path_xml = self.write_rpf([big[:0x10000], b"<?xml version='1.0'?><root/>" + bytes(0x20000)])
+        tally_xml, _ = C.scan_archive(path_xml, 1, 1 << 20, progress=False)
+        rep_xml = tally_xml.report()
+        self.assertEqual((rep_xml["checked"], rep_xml["passed"]), (1, 0))
+        self.assertEqual(rep_xml["fail_streams"], {"short_input": 1})
+        self.assertEqual(rep_xml["kinds"].get("xml"), 1)
+        self.assertNotIn("continuation", rep_xml["kinds"])
 
     def test_stream_starting_at_window_boundary_is_not_dropped(self):
         good_z = zlib.compress(payload(build()))

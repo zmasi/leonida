@@ -779,6 +779,32 @@ def hw_words(words, wave):
     return [tuple(words[4 * lane:4 * lane + 4]) for lane in range(wave)]
 
 
+def hw_skip(oracle, prog):
+    """Why the oracle's GPU cannot run this program (asm.program_skip_reason: v_cmp_t_u32 / v_cmp_f_i32 and their
+    v_cmpx_ forms on GFX12), or None. An oracle without a GPU architecture name skips nothing."""
+    arch = getattr(oracle, "arch", None)
+    if not isinstance(arch, str):
+        return None
+    from hw_oracle import asm
+    return asm.program_skip_reason(prog.lines(), arch)
+
+
+def hw_results(oracle, progs):
+    """Per program the hardware's per-lane words, or a str reason. A program hw_skip names is never assembled; it
+    gets that reason, so it is a named skip and not one of the assembler's rejections. The others go to the oracle,
+    which must return one result per program."""
+    out = [hw_skip(oracle, p) for p in progs]
+    todo = [i for i, why in enumerate(out) if not why]
+    if todo:
+        raw = oracle.run([hw_kernel(progs[i]) for i in todo])
+        if raw is None or len(raw) != len(todo):
+            count = 0 if raw is None else len(raw)
+            raise RuntimeError(f"the hardware runner returned {count} results for {len(todo)} programs")
+        for i, words in zip(todo, raw):
+            out[i] = hw_words(words, progs[i].wave)
+    return out
+
+
 # ---- comparison, shrinking, the run --------------------------------------------------------------------------
 
 def _diff(prog, want, got, label):
@@ -904,11 +930,7 @@ def run_suite(programs, seed, max_ops, ops, waves=(32,), backends=("translator",
     rng = random.Random(seed)
     progs = [generate(rng, rng.randrange(1, max_ops + 1), ops, waves[i % len(waves)]) for i in range(programs)]
     if "hw" in backends:
-        raw = oracle.run([hw_kernel(p) for p in progs])
-        if raw is None or len(raw) != len(progs):
-            count = 0 if raw is None else len(raw)
-            raise RuntimeError(f"the hardware runner returned {count} results for {len(progs)} programs")
-        hw = [hw_words(w, p.wave) for w, p in zip(raw, progs)]
+        hw = hw_results(oracle, progs)
     else:
         hw = [None] * programs
     if "vk" in backends:
@@ -1035,6 +1057,9 @@ def main(argv=None):
 
         def check_fn(prog):
             def run_hw_one(p):
+                why = hw_skip(oracle, p)
+                if why:
+                    return why
                 res = oracle.run([hw_kernel(p)])
                 if not res:
                     raise RuntimeError("the hardware runner returned no result for shrunk program")

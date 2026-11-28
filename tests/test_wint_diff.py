@@ -392,6 +392,28 @@ class Cli(unittest.TestCase):
         self.assertEqual(d.hw_words(words, 64)[1], (4, 5, 6, 7))
         self.assertEqual(d.hw_words("assembler rejected: x", 64), "assembler rejected: x")
 
+    def test_gfx12_skips_its_removed_compares_by_name_and_never_assembles_them(self):
+        class Fake:
+            def __init__(self, arch):
+                self.arch, self.sent = arch, []
+
+            def run(self, kernels):
+                self.sent += kernels
+                return [[7] * k.words for k in kernels]
+        removed = [program(["v_cmp_t_u32_e64 s[20:21], v1, v2"]), program(["v_cmpx_f_i32_e64 v1, v2"]),
+                   program(["v_mov_b32_e32 v1, 5", "v_cmp_f_i32_e32 vcc, v1, v2"])]
+        kept = program(["v_cmp_eq_u32_e64 s[20:21], v1, v2"])
+        gfx12 = Fake("gfx1201")
+        got = d.hw_results(gfx12, removed + [kept])
+        for i, op in enumerate(("v_cmp_t_u32", "v_cmpx_f_i32", "v_cmp_f_i32")):
+            self.assertEqual(got[i], f"{op}: removed in GFX12 (no always-true/always-false VALU compare there)")
+        self.assertEqual(got[3][0], (7, 7, 7, 7))
+        self.assertEqual(len(gfx12.sent), 1)                   # only the program GFX12 can run is assembled
+        for arch in ("gfx1036", "gfx1150"):                    # GFX10/11 still have them: everything runs
+            other = Fake(arch)
+            self.assertTrue(all(not isinstance(r, str) for r in d.hw_results(other, removed + [kept])), arch)
+            self.assertEqual(len(other.sent), 4, arch)
+
 
 class OracleGuards(unittest.TestCase):
     def setUp(self):

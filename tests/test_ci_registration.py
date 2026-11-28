@@ -281,6 +281,20 @@ def defines_a_test(source, require_test_case=False):
     so a TestCase with none of its own counts when a class of this module that it derives from defines one: the
     mixin of ``tests/semantic/test_sub_co_same_operand.py``, shared by one TestCase per wave size.
     """
+    def has_test_method(cls):
+        # unittest calls getattr on the class and checks callability. A property and its accessors
+        # yield a descriptor on the class, even if the underlying function is named test_*.
+        properties = {}
+        for item in cls.body:
+            if not isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            outer = item.decorator_list[0] if item.decorator_list else None
+            getter = isinstance(outer, ast.Name) and outer.id == "property"
+            accessor = (isinstance(outer, ast.Attribute) and outer.attr in ("getter", "setter", "deleter")
+                        and isinstance(outer.value, ast.Name) and properties.get(outer.value.id, False))
+            properties[item.name] = getter or accessor
+        return any(name.startswith("test") and not prop for name, prop in properties.items())
+
     tree = ast.parse(source)
     bases, own_tests, case_aliases = {}, {}, set()
     # Recognize bare aliases introduced by a direct import; this is not a general name resolver.
@@ -290,8 +304,7 @@ def defines_a_test(source, require_test_case=False):
                 "TestCase" if isinstance(b, ast.Name) and b.id in case_aliases else ast.unparse(b).rsplit(".", 1)[-1]
                 for b in node.bases
             ]
-            own_tests[node.name] = any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
-                                       and item.name.startswith("test") for item in node.body)
+            own_tests[node.name] = has_test_method(node)
             case_aliases.discard(node.name)
         elif isinstance(node, (ast.Import, ast.ImportFrom)):
             for item in node.names:
@@ -333,8 +346,7 @@ def defines_a_test(source, require_test_case=False):
 
     for node in tree.body:
         if isinstance(node, ast.ClassDef) and is_test_case(node.name):
-            if any(isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name.startswith("test")
-                   for item in node.body):
+            if has_test_method(node):
                 return True
             # the test* methods of the classes of this module it derives from are its tests too
             ancestors = local_ancestors(node.name)
@@ -491,6 +503,13 @@ class RepositoryRegistrationTest(unittest.TestCase):
             ("mixin_no_case_derives_from", "import unittest\n" + mixin
              + "class Example(unittest.TestCase): pass\n", False),
             ("mixin_without_a_case", mixin + "class Example(Mixin): pass\n", False),
+            ("property_only_mixin", "import unittest\nclass Mixin:\n"
+             "    @property\n    def test_label(self): return 'ready'\n"
+             "    @test_label.setter\n    def test_label(self, value): pass\n"
+             "class Example(Mixin, unittest.TestCase): pass\n", False),
+            ("staticmethod_in_mixin", "import unittest\nclass Mixin:\n"
+             "    @staticmethod\n    def test_one(): pass\n"
+             "class Example(Mixin, unittest.TestCase): pass\n", True),
         )
         with tempfile.TemporaryDirectory() as tmp:
             sources = [("shared_cases.py", "class Cases:\n    def test_one(self): pass\n")]
@@ -504,7 +523,7 @@ class RepositoryRegistrationTest(unittest.TestCase):
             with self.subTest(kind=kind):
                 self.assertEqual(f"(test_{kind}.Example" in result.stderr, expected, result.stderr)
                 self.assertEqual(defines_a_test(source, require_test_case=True), expected)
-        self.assertIn("Ran 5 tests", result.stderr)
+        self.assertIn("Ran 6 tests", result.stderr)
 
     def test_every_selected_file_exposes_a_test_to_its_runner(self):
         # Selection is not execution: pytest imports a file it is handed and reports zero items without

@@ -165,11 +165,17 @@ def _split_operands(ins):
     if op in SGPR_RMW:
         reads = [r for x in a for r in _sgpr_regs(x)]
         return reads, _sgpr_regs(a[0])
-    if (op.startswith("v_") and "_co_" in op) or op in (
+    if op.startswith(("s_atomic_", "s_buffer_atomic_")):
+        # SMEM atomics always read a[0] (operand data) and only write a[0] back when glc is set.
+        reads = [r for x in a for r in _sgpr_regs(x)]
+        writes = _sgpr_regs(a[0]) if "glc" in ins.get("mods", ()) else []
+        return reads, writes
+    if ((op.startswith("v_") and "_co_" in op) or op in (
         "v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64",
-    ):
+    )) and len(a) >= 4:
         # vdst in a[0], scalar carry/scale-out dst in a[1], sources in a[2:].
-        writes = _sgpr_regs(a[0]) + (_sgpr_regs(a[1]) if len(a) > 1 else [])
+        # (3-operand short forms like `v_add_co_ci_u32 vD, src0, src1` use implicit VCC and fall through.)
+        writes = _sgpr_regs(a[0]) + _sgpr_regs(a[1])
         reads = [r for x in a[2:] for r in _sgpr_regs(x)]
         return reads, writes
     reads = [r for x in a[1:] for r in _sgpr_regs(x)]
@@ -215,10 +221,29 @@ def _fold_scalar_alu(op, x, y):
         offset = y & 31
         width = min((y >> 16) & 0x7F, 32 - offset)
         return ((x & 0xFFFFFFFF) >> offset) & ((1 << width) - 1)
+    if op == "s_bfe_i32":
+        offset = y & 31
+        width = min((y >> 16) & 0x7F, 32 - offset)
+        if width == 0:
+            return 0
+        raw = ((x & 0xFFFFFFFF) >> offset) & ((1 << width) - 1)
+        sign_bit = 1 << (width - 1)
+        return ((raw ^ sign_bit) - sign_bit) & 0xFFFFFFFF
     if op == "s_min_u32":
         return min(x & 0xFFFFFFFF, y & 0xFFFFFFFF)
     if op == "s_max_u32":
         return max(x & 0xFFFFFFFF, y & 0xFFFFFFFF)
+    if op in ("s_min_i32", "s_max_i32"):
+        xu, yu = x & 0xFFFFFFFF, y & 0xFFFFFFFF
+        sx = xu - 0x100000000 if xu & 0x80000000 else xu
+        sy = yu - 0x100000000 if yu & 0x80000000 else yu
+        return (min(sx, sy) if op == "s_min_i32" else max(sx, sy)) & 0xFFFFFFFF
+    if op == "s_pack_ll_b32_b16":
+        return ((x & 0xFFFF) | ((y & 0xFFFF) << 16)) & 0xFFFFFFFF
+    if op == "s_pack_lh_b32_b16":
+        return ((x & 0xFFFF) | (y & 0xFFFF0000)) & 0xFFFFFFFF
+    if op == "s_pack_hh_b32_b16":
+        return (((x & 0xFFFFFFFF) >> 16) | (y & 0xFFFF0000)) & 0xFFFFFFFF
     return None
 
 
@@ -235,7 +260,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
 
     # Record pointer, descriptor, stride and literal-sampler observations BEFORE writes clobber operands.
     if events is not None:
-        if op.startswith(("s_load_dword", "s_store_dword")) and len(a) >= 2:
+        if op.startswith(("s_load_dword", "s_store_dword", "s_atomic_")) and len(a) >= 2:
             slots = _sgpr_slots(a[1], 2)
             if slots is not None:
                 is_desc_width = op in ("s_load_dwordx4", "s_load_dwordx8", "s_load_dwordx16")
@@ -245,7 +270,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                         events["strides"].update(ptr_stride.get(slots[0], ()))
                     if len(a) >= 3 and a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1:
                         events["strides"].update(scale.get(a[2]["r"], ()))
-        elif op.startswith(("s_buffer_load_dword", "s_buffer_store_dword")) and len(a) >= 2:
+        elif op.startswith(("s_buffer_load_dword", "s_buffer_store_dword", "s_buffer_atomic_")) and len(a) >= 2:
             slots = _sgpr_slots(a[1], 4)
             if slots is not None:
                 tags = [_slot_tag(sym, s) for s in slots]
@@ -265,13 +290,16 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                 slots = _sgpr_slots(a[saddr_idx], 2)
                 if slots is not None:
                     _record_ptr_pair(events, sym, slots, is_desc_width=False)
-        elif op.startswith(("buffer_load", "buffer_store", "buffer_atomic", "tbuffer_")) and len(a) >= 3:
-            slots = _sgpr_slots(a[2], 4)
-            if slots is not None:
-                tags = [_slot_tag(sym, s) for s in slots]
-                if all(t is not None and t[0] == "user" for t in tags):
-                    for t in tags:
-                        events["vsharp"].add(t[1])
+        elif op.startswith(("buffer_load", "buffer_store", "buffer_atomic", "tbuffer_")):
+            # buffer_load_* / tbuffer_load_* with `lds` omit vdata: operands are (vaddr, srsrc, soffset).
+            srsrc_idx = 1 if (op.startswith(("buffer_load", "tbuffer_load")) and "lds" in ins.get("mods", ())) else 2
+            if len(a) > srsrc_idx:
+                slots = _sgpr_slots(a[srsrc_idx], 4)
+                if slots is not None:
+                    tags = [_slot_tag(sym, s) for s in slots]
+                    if all(t is not None and t[0] == "user" for t in tags):
+                        for t in tags:
+                            events["vsharp"].add(t[1])
         elif op.startswith("image_") and len(a) >= 3:
             slots = _sgpr_slots(a[2], 8, exact=False)
             if slots is not None:
@@ -290,7 +318,24 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                             events["ssharp"].add(t[1])
 
     # Track VGPR index scaling (e.g. v_lshlrev_b32 -> v_readfirstlane_b32 -> s_load_dwordx8).
-    if a[0]["k"] == "vgpr" and not op.startswith(NO_SGPR_DST) and not op.startswith("v_cmp"):
+    if op == "v_swap_b32" and len(a) >= 2 and a[0]["k"] == "vgpr" and a[1]["k"] == "vgpr":
+        r0, r1 = a[0]["r"], a[1]["r"]
+        s0, s1 = vscale.get(r0), vscale.get(r1)
+        if s1:
+            vscale[r0] = s1
+        else:
+            vscale.pop(r0, None)
+        if s0:
+            vscale[r1] = s0
+        else:
+            vscale.pop(r1, None)
+    elif op in ("v_movreld_b32", "v_movrelsd_b32", "v_movrelsd_2_b32", "v_swaprel_b32"):
+        bases = [x["r"] for x in (a[:2] if op == "v_swaprel_b32" else a[:1]) if x["k"] == "vgpr"]
+        if bases:
+            lo = min(bases)
+            for r in [r for r in vscale if r >= lo]:
+                vscale.pop(r, None)
+    elif a[0]["k"] == "vgpr" and not op.startswith(NO_SGPR_DST) and not op.startswith("v_cmp"):
         vd = a[0]["r"]
         vn = a[0].get("n", 1)
         new_vs = frozenset()
@@ -371,6 +416,16 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
         if c is not None:
             signed = c - 0x100000000 if c & 0x80000000 else c
             new_sym[a[0]["r"]] = ("const", abs(signed) & 0xFFFFFFFF)  # abs(0x80000000) stays 0x80000000
+    elif op in ("s_sext_i32_i8", "s_sext_i32_i16") and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
+        c = _const_of(sym, a[1])
+        if c is not None:
+            if op == "s_sext_i32_i8":
+                b = c & 0xFF
+                val = ((b ^ 0x80) - 0x80) & 0xFFFFFFFF
+            else:
+                h = c & 0xFFFF
+                val = ((h ^ 0x8000) - 0x8000) & 0xFFFFFFFF
+            new_sym[a[0]["r"]] = ("const", val)
     elif op == "v_readfirstlane_b32" and len(a) >= 2 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         if a[1]["k"] == "vgpr" and a[1].get("n", 1) == 1 and a[1]["r"] in vscale:
             new_scale[a[0]["r"]] = vscale[a[1]["r"]]
@@ -387,7 +442,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             cx, cy = _const_of(sym, a[1]), _const_of(sym, a[2])
             if cx is not None and cy is not None:
                 new_sym[d] = ("const", ((cx << LSHL_ADD_SHIFT[op]) + cy) & 0xFFFFFFFF)
-    elif op in ("s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32") and len(a) >= 3 and a[0]["k"] == "sgpr":
+    elif op in ("s_add_u32", "s_add_i32", "s_sub_u32", "s_sub_i32") and len(a) >= 3 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         d = a[0]["r"]
         cx, cy = _const_of(sym, a[1]), _const_of(sym, a[2])
         if cx is not None and cy is not None:
@@ -396,10 +451,10 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             tx = sym.get(a[1]["r"]) if a[1]["k"] == "sgpr" and a[1].get("n", 1) == 1 else None
             ty = sym.get(a[2]["r"]) if a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1 else None
             ux, uy = _user_of(tx), _user_of(ty)
-            sx = scale.get(a[1]["r"], frozenset()) if a[1]["k"] == "sgpr" else frozenset()
-            sy = scale.get(a[2]["r"], frozenset()) if a[2]["k"] == "sgpr" else frozenset()
-            psx = ptr_stride.get(a[1]["r"], frozenset()) if a[1]["k"] == "sgpr" else frozenset()
-            psy = ptr_stride.get(a[2]["r"], frozenset()) if a[2]["k"] == "sgpr" else frozenset()
+            sx = scale.get(a[1]["r"], frozenset()) if a[1]["k"] == "sgpr" and a[1].get("n", 1) == 1 else frozenset()
+            sy = scale.get(a[2]["r"], frozenset()) if a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1 else frozenset()
+            psx = ptr_stride.get(a[1]["r"], frozenset()) if a[1]["k"] == "sgpr" and a[1].get("n", 1) == 1 else frozenset()
+            psy = ptr_stride.get(a[2]["r"], frozenset()) if a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1 else frozenset()
             if ux is not None and uy is None:
                 new_sym[d] = ("user_off", ux)
                 if psx or sy:
@@ -412,7 +467,7 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
                 new_scale[d] = sx
             elif op.startswith("s_add") and sy and cx is not None:
                 new_scale[d] = sy
-    elif op in ("s_addc_u32", "s_subb_u32") and len(a) >= 3 and a[0]["k"] == "sgpr":
+    elif op in ("s_addc_u32", "s_subb_u32") and len(a) >= 3 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         d = a[0]["r"]
         tx = sym.get(a[1]["r"]) if a[1]["k"] == "sgpr" and a[1].get("n", 1) == 1 else None
         ty = sym.get(a[2]["r"]) if a[2]["k"] == "sgpr" and a[2].get("n", 1) == 1 else None
@@ -426,7 +481,9 @@ def _step_state(sym, scale, ptr_stride, vscale, ins, events=None):
             new_sym[d] = ("const", 0)
     elif op in ("s_lshl_b32", "s_lshr_b32", "s_mul_i32", "s_and_b32", "s_or_b32", "s_xor_b32",
                 "s_andn2_b32", "s_orn2_b32", "s_nand_b32", "s_nor_b32", "s_xnor_b32", "s_ashr_i32",
-                "s_bfm_b32", "s_bfe_u32", "s_min_u32", "s_max_u32") and len(a) >= 3 and a[0]["k"] == "sgpr":
+                "s_bfm_b32", "s_bfe_u32", "s_bfe_i32", "s_min_u32", "s_max_u32",
+                "s_min_i32", "s_max_i32", "s_pack_ll_b32_b16", "s_pack_lh_b32_b16",
+                "s_pack_hh_b32_b16") and len(a) >= 3 and a[0]["k"] == "sgpr" and a[0].get("n", 1) == 1:
         d = a[0]["r"]
         cx, cy = _const_of(sym, a[1]), _const_of(sym, a[2])
         if cx is not None and cy is not None:

@@ -153,8 +153,15 @@ void parse() {
     check(rt::parse_stack_times("180,90,90", t) && t == std::vector<unsigned>{90, 180}, "parse sorts and dedupes");
     check(!rt::parse_stack_times("", t) && t.empty(), "empty text refused");
     check(!rt::parse_stack_times("1,,2", t) && !rt::parse_stack_times("1,", t) && !rt::parse_stack_times("x", t) &&
-              !rt::parse_stack_times("-5", t) && !rt::parse_stack_times("1.5", t),
-          "bad tokens refused");
+              !rt::parse_stack_times("-5", t) && !rt::parse_stack_times("1.5", t) &&
+              !rt::parse_stack_times("4294967296", t),
+          "bad and overflowing tokens refused");
+    check(rt::parse_stack_times("0", t) && t == std::vector<unsigned>{0}, "parse zero");
+
+    rt::StackSampler sampler;
+    std::uint64_t frames[rt::StackSampler::kMaxFrames] = {};
+    check(sampler.sample(nullptr, frames) == 0, "null thread handle returns zero frames");
+    check(sampler.sample(GetCurrentThread(), nullptr) == 0, "null frames buffer returns zero frames");
 }
 
 }  // namespace

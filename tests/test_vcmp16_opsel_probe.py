@@ -182,6 +182,50 @@ class MainAndOracleLifecycleTest(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("hardware oracle unavailable", buf.getvalue())
 
+    def test_main_hw_malformed_batch_non_int_words_and_run_errors(self):
+        exp = self._expected_words()
+        bad_cases = [
+            ("str_batch", "bad", "str"),
+            ("int_batch", 123, "int"),
+            ("extra_batch", [list(exp), list(exp)], "got 2"),
+            ("bool_words", [[True] * len(exp)], "bool"),
+            ("none_words", [[None] * len(exp)], "NoneType"),
+        ]
+        for label, bad_ret, hint in bad_cases:
+            with self.subTest(case=label):
+                fake = self.FakeOracle(lambda _k, r=bad_ret: r)
+                buf = io.StringIO()
+                with mock.patch.object(runner, "open_oracle", return_value=fake), contextlib.redirect_stdout(buf):
+                    rc = p.main(["--oracle", "hw"])
+                self.assertEqual(rc, 2, buf.getvalue())
+                self.assertTrue(fake.closed)
+                self.assertIn("harness error:", buf.getvalue())
+                self.assertIn(hint, buf.getvalue())
+
+        # runner.Unavailable during oracle.run() exits 77 cleanly and closes oracle.
+        def raise_unavail(_k):
+            raise runner.Unavailable("mode unsupported")
+
+        fake = self.FakeOracle(raise_unavail)
+        buf = io.StringIO()
+        with mock.patch.object(runner, "open_oracle", return_value=fake), contextlib.redirect_stdout(buf):
+            rc = p.main(["--oracle", "hw"])
+        self.assertEqual(rc, 77, buf.getvalue())
+        self.assertTrue(fake.closed)
+        self.assertIn("hardware oracle unavailable: mode unsupported", buf.getvalue())
+
+        # RuntimeError during oracle.run() exits 2 cleanly and closes oracle.
+        def raise_runtime(_k):
+            raise RuntimeError("gpu hung")
+
+        fake = self.FakeOracle(raise_runtime)
+        buf = io.StringIO()
+        with mock.patch.object(runner, "open_oracle", return_value=fake), contextlib.redirect_stdout(buf):
+            rc = p.main(["--oracle", "hw"])
+        self.assertEqual(rc, 2, buf.getvalue())
+        self.assertTrue(fake.closed)
+        self.assertIn("harness error: gpu hung", buf.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -90,7 +90,10 @@ def read_before_write(insns):
         elif op == "v_swap_b32" and len(args) >= 2:
             dsts, srcs = args[:2], args[:2]
         elif (op.startswith("v_") and ("_co_" in op or op in DUAL_DST_VALU)
-              and len(args) >= 2 and args[1]["k"] in ("sgpr", "special", "slist")):
+              and len(args) >= 2 and args[1]["k"] in ("sgpr", "special", "slist")
+              # the short form v_add_co_ci_u32 vD, src0, src1 (also sub/subrev): carry out and in are an
+              # implicit VCC, and args[1] is src0, a read
+              and not (op.endswith("_co_ci_u32") and len(args) == 3)):
             dsts, srcs = args[:2], args[2:]          # vdst + scalar carry/scale-out dst
         else:
             dst_read = (

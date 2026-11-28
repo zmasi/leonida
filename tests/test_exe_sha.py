@@ -133,6 +133,54 @@ class ExeShaTests(unittest.TestCase):
         self.assertTrue(size is None or isinstance(size, int))
         self.assertTrue(digest is None or (len(digest) == 64 and digest == digest.lower()))
 
+    def test_expect_64_non_hex_chars_is_rejected_without_hashing(self):
+        code, out, err = run(str(self.exe), "--expect", "z" * 64)
+        self.assertEqual(code, 1)
+        self.assertIn("is not a SHA-256", err)
+        self.assertNotIn("sha256:", out)
+
+    def test_recorded_ignores_non_hex_digest_and_bool_size(self):
+        bad = self.manifest(expected_exe_size=True, expected_exe_sha256="g" * 64)
+        self.assertEqual(exe_sha.recorded(str(bad)), (str(bad), None, None))
+        padded = self.manifest(expected_exe_sha256=f"  {self.sha.upper()} \n")
+        self.assertEqual(exe_sha.recorded(str(padded)), (str(padded), None, self.sha))
+
+    def test_size_only_manifest_match_reports_match(self):
+        manifest = self.manifest(expected_exe_size=self.size)
+        code, out, err = run(str(self.exe), "--manifest", str(manifest))
+        self.assertEqual(code, 0, err)
+        self.assertIn("ok: matches the manifest", out)
+        self.assertNotIn("no recorded size or hash", out)
+        jcode, jout, _ = run(str(self.exe), "--manifest", str(manifest), "--json")
+        self.assertEqual(jcode, 0)
+        self.assertEqual(json.loads(jout)["status"], "match")
+
+    def test_explicit_missing_or_invalid_manifest_exits_2(self):
+        missing = self.root / "missing.json"
+        code, _, err = run(str(self.exe), "--manifest", str(missing))
+        self.assertEqual(code, 2)
+        self.assertIn("missing.json", err)
+
+        broken = self.root / "broken.json"
+        broken.write_bytes(b"{not json")
+        code, _, err = run(str(self.exe), "--manifest", str(broken))
+        self.assertEqual(code, 2)
+        self.assertIn("broken.json", err)
+
+        arr = self.root / "array.json"
+        arr.write_bytes(b"[]")
+        code, _, err = run(str(self.exe), "--manifest", str(arr))
+        self.assertEqual(code, 2)
+        self.assertIn("array.json", err)
+
+    def test_bom_prefixed_manifest_is_read(self):
+        bom_manifest = self.root / "bom.json"
+        payload = {"expected_exe": self.exe.name, "expected_exe_size": self.size, "expected_exe_sha256": self.sha}
+        bom_manifest.write_bytes(b"\xef\xbb\xbf" + json.dumps(payload).encode("utf-8"))
+        code, out, err = run(str(self.exe), "--manifest", str(bom_manifest))
+        self.assertEqual(code, 0, err)
+        self.assertIn("ok: matches the manifest", out)
+
 
 if __name__ == "__main__":
     unittest.main()

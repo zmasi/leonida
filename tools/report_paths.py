@@ -65,8 +65,9 @@ def same_name_on_folding_volume(first, second):
 
     os.path.normcase folds case only on Windows and the `pathconf` probe above answers only on macOS, so a Linux
     mount that ignores case (vfat, exFAT, CIFS) would pass `R.json` and `r.json` as two reports and let the second
-    one overwrite the first. Ask the volume itself: create one spelling in a scratch folder beside the reports and
-    look for the other. Names that differ by more than case are never one file, so that costs nothing.
+    one overwrite the first. Ask the volume itself: reproduce the not-yet-created path under a scratch folder at
+    the nearest existing parent, then look for the other spelling. Names that differ by more than case are never
+    one file, so they need no scratch folder.
     """
     return _same_resolved_name(os.path.realpath(first), os.path.realpath(second))
 
@@ -82,13 +83,35 @@ def _same_resolved_name(first, second):
     first_dir, first_name = os.path.split(first)
     second_dir, second_name = os.path.split(second)
     try:
+        first_dir, first_parts = _existing_parent(first_dir, first_name)
+        second_dir, second_parts = _existing_parent(second_dir, second_name)
+        if tuple(part.casefold() for part in first_parts) != tuple(part.casefold() for part in second_parts):
+            return False
         if not os.path.samefile(first_dir, second_dir):
             return False
+        if first_parts == second_parts:
+            return True
         with tempfile.TemporaryDirectory(prefix=".leonida-report-", dir=first_dir) as probe:
-            with open(os.path.join(probe, first_name), "xb"):
-                return os.path.exists(os.path.join(probe, second_name))
+            candidate = os.path.join(probe, *first_parts)
+            os.makedirs(os.path.dirname(candidate), exist_ok=True)
+            with open(candidate, "xb"):
+                return os.path.exists(os.path.join(probe, *second_parts))
     except OSError:
         return False
+
+
+def _existing_parent(parent, name):
+    """Nearest existing directory and the remaining path components, in order."""
+    parts = [name]
+    while not os.path.isdir(parent):
+        if os.path.lexists(parent):
+            raise NotADirectoryError(parent)
+        ancestor, part = os.path.split(parent)
+        if ancestor == parent:
+            raise FileNotFoundError(parent)
+        parts.append(part)
+        parent = ancestor
+    return parent, tuple(reversed(parts))
 
 
 def same_report_path(first, second):

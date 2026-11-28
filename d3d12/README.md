@@ -383,6 +383,48 @@ Series X profile (sharper, much slower; DLSS there with `-Dlss`); `-Quality` giv
 stretched bodies, slower; `-RayTracing` turns the title's real ray tracing on.
 The fork's own `scripts\play.ps1` is still there for AMD cards.
 
+### Keyboard and mouse
+
+The game itself only knows an Xbox controller, so the keyboard and mouse press that controller's buttons for you,
+laid out as in Grand Theft Auto V on PC. Click in the game's window once to give it the mouse (that click is not a
+shot); Esc pauses and frees the mouse again.
+
+| | on foot | in a vehicle |
+|---|---|---|
+| W A S D | move | W accelerate, S brake and reverse, A D steer |
+| mouse | look around | look around |
+| left mouse button | shoot | shoot from the vehicle |
+| right mouse button | aim | (nothing yet) |
+| Space | jump, climb | handbrake |
+| Left Shift | run | lean forward on a bike (also Num 8) |
+| Left Ctrl | crouch | lean back on a bike (also Num 5) |
+| F | get into a vehicle | get out |
+| E | interact | horn |
+| Q | take cover | radio |
+| R | reload, melee | (the same button) |
+| X, H | | duck, headlights |
+| Tab | weapon wheel (hold) | weapon wheel |
+| C | look behind | look behind |
+| M | map | map |
+| Esc or P | pause | pause |
+| arrow keys | phone (up) and its menus; down, left and right are the HUD, the radio and the partner menu | the same |
+| Enter, Backspace | accept, back (phone and menus) | the same |
+| Z | HUD and objective | the same |
+
+A key you were holding when you got in or out counts again once you have let it go and pressed it again: W held
+while climbing in does not drive off by itself, and a held mouse button does not start to fire.
+
+The runtime reads from the game whether you are in a vehicle. Where it cannot (another version of the game), the
+keys stay the on-foot ones and **Caps Lock** is the switch: press it once you sit in a vehicle for the driving keys,
+and again, or F to get out, for the on-foot keys. Without it a vehicle still drives the old way: left mouse button
+accelerates, right mouse button brakes. Should the runtime get it wrong, `-More @{LEONIDA_PLAYER_VEHICLE_AT='off'}`
+stops it reading and leaves the switch to Caps Lock.
+
+Not bound, because it is not known yet which controller button does it in this game: V (camera), G (grenade), the
+number keys and the mouse wheel (weapons), aiming from a vehicle. A controller keeps working beside the keyboard at
+all times. `LEONIDA_KBM=classic` (with `-More @{LEONIDA_KBM='classic'}`) brings back the keys of before; the
+details, the mouse settings and the other switches are in [docs/gameinput.md](../docs/gameinput.md).
+
 ### Picking a resolution
 
 There is one script per console and resolution in `scripts\`. Each one runs

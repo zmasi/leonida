@@ -484,6 +484,9 @@ def start_server(
 
     addr = ("127.0.0.1", port)
     class ThreadingServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        # On Windows SO_REUSEADDR lets a second gallery bind an already-listening port instead of
+        # failing and falling back to port + 1 (or reporting an occupied port).
+        allow_reuse_address = os.name != "nt"
         daemon_threads = True
 
     try:
@@ -497,23 +500,24 @@ def start_server(
     except OSError as error:
         raise GalleryListenError(f"can't listen on port {addr[1]}: {error}") from error
 
-    url = f"http://localhost:{addr[1]}"
-    print(f"======================================================")
-    print(f"       LEONIDA 3D ASSET STUDIO (VICE CITY EDITION)    ")
-    print(f"======================================================")
-    print(f"Web Studio URL:     {url}")
-    print(f"Models Directory:   {StudioHandler.models_dir}")
-    print(f"Textures Directory: {StudioHandler.textures_dir}")
-    print(f"Viewer Directory:   {StudioHandler.viewer_dir}")
-    print(f"Press Ctrl+C to stop.")
-
-    if open_browser:
-        webbrowser.open(url)
-
     try:
+        url = f"http://localhost:{httpd.server_port}"
+        print(f"======================================================")
+        print(f"       LEONIDA 3D ASSET STUDIO (VICE CITY EDITION)    ")
+        print(f"======================================================")
+        print(f"Web Studio URL:     {url}")
+        print(f"Models Directory:   {StudioHandler.models_dir}")
+        print(f"Textures Directory: {StudioHandler.textures_dir}")
+        print(f"Viewer Directory:   {StudioHandler.viewer_dir}")
+        print(f"Press Ctrl+C to stop.")
+
+        if open_browser:
+            webbrowser.open(url)
+
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nStopping server...")
+    finally:
         httpd.server_close()
 
 

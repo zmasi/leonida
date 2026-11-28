@@ -23,12 +23,15 @@ import os
 import re
 import struct
 import sys
+import tempfile
 from fractions import Fraction
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+from file_mode import published_mode  # noqa: E402
+import replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from spirv_asm_tables import (  # noqa: E402
     BIT_ENUMS, GLSL_STD_450, INSTRUCTIONS, NONSEMANTIC_DEBUGPRINTF,
@@ -683,6 +686,43 @@ def _assemble(instructions, version: int, track_switch_types: bool) -> bytes:
     return words.tobytes()
 
 
+def _check_out_path(out_path: str) -> str:
+    """Validate `--out` upfront before reading or assembling source inputs; return its parent dir."""
+    if not out_path:
+        raise OSError("empty output path")
+    if os.path.isdir(out_path):
+        raise OSError(f"{out_path} is a directory")
+    parent = os.path.dirname(os.path.abspath(out_path))
+    if not os.path.isdir(parent):
+        raise OSError(f"output parent directory does not exist: {parent}")
+    return parent
+
+
+def _write_atomic_bytes(dest: str, parent: str, data: bytes) -> None:
+    """Stage binary output next to `dest` and atomically publish it with destination permissions."""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb",
+            dir=parent,
+            prefix="." + os.path.basename(os.path.abspath(dest)) + ".",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(data)
+            f.flush()
+        os.chmod(tmp_path, published_mode(dest))
+        replace_retry.replace(tmp_path, dest)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Pure-Python SPIR-V binary assembler (no spirv-as required).")
     ap.add_argument("src", help="input .spvasm file")
@@ -693,11 +733,11 @@ def main(argv=None) -> int:
     if same_report_path(args.src, args.out):
         ap.error("output must not overwrite the source")
     try:
-        with open(args.src, encoding="utf-8", newline="") as f:
+        parent = _check_out_path(args.out)
+        with open(args.src, encoding="utf-8-sig", newline="") as f:
             text = f.read()
         data = assemble(text, target_env=args.target_env)
-        with open(args.out, "wb") as f:
-            f.write(data)
+        _write_atomic_bytes(args.out, parent, data)
     except (OSError, ValueError, SpirvAsmError) as exc:    # ValueError: a source file that is not UTF-8
         print(f"ERROR: {args.src}: {exc}" if isinstance(exc, UnicodeDecodeError) else f"ERROR: {exc}", file=sys.stderr)
         return 1

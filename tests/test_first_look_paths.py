@@ -18,6 +18,13 @@ class FirstLookPathTests(unittest.TestCase):
     def test_literal_image_loader_and_report_paths(self):
         source = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as tmp:
+            # Windows PowerShell 5.1 refuses to Set-Location into the 8.3 alias of a folder whose long name is not
+            # ASCII (tempfile gives C:\Users\OUZ~1\... for a user named Oğuz), so use the long name there. Keep the
+            # short one otherwise: an ASCII alias such as CI's RUNNER~1 still exercises the canonical path the
+            # dry-run check below expects.
+            long_name = os.path.realpath(tmp)
+            if not long_name.isascii():
+                tmp = long_name
             repo = Path(tmp, "checkout [1]")
             for folder in ("scripts", "tools", "runtime/build/Release"):
                 (repo / folder).mkdir(parents=True)

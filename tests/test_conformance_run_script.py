@@ -2,8 +2,8 @@
 touching -Output, and refuses (exit 2) an -Output that is a file, a link or junction, or a folder holding anything
 but <scene>.png and manifest.json. Before, `Remove-Item $Output -Recurse -Force` ran first on whatever was passed.
 
-The script runs from a copy of tools/conformance/native in a temporary folder, with where.exe standing in for
-conform_native.exe: it exits at once and writes nothing, which is all these checks need. Windows only."""
+The script runs from a copy of tools/conformance/native in a temporary folder, with a synthetic stub standing in for
+conform_native.exe: it exits 0 at once and writes nothing, which is all these checks need. Windows only."""
 import os
 from pathlib import Path
 import shutil
@@ -13,12 +13,32 @@ import unittest
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "tools" / "conformance" / "native" / "scripts" / "run.ps1"
-STAND_IN = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "where.exe"
 
 
-@unittest.skipUnless(os.name == "nt" and shutil.which("powershell.exe") and STAND_IN.is_file(),
-                     "requires Windows PowerShell")
+@unittest.skipUnless(os.name == "nt" and shutil.which("powershell.exe"), "requires Windows PowerShell")
 class RunScriptTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.stub_dir = tempfile.TemporaryDirectory()
+        cls.stub_exe = Path(cls.stub_dir.name) / "conform_native_stub.exe"
+        env = {**os.environ, "STUB_EXE": str(cls.stub_exe)}
+        env["PSModulePath"] = str(Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32/WindowsPowerShell/v1.0/Modules")
+        compile_cmd = (
+            "$ErrorActionPreference = 'Stop'; "
+            "Add-Type -OutputAssembly $env:STUB_EXE -OutputType ConsoleApplication -TypeDefinition "
+            "'public class Stub { public static int Main() { return 0; } }'"
+        )
+        subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", compile_cmd],
+            env=env,
+            check=True,
+            timeout=60,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.stub_dir.cleanup()
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -31,7 +51,7 @@ class RunScriptTest(unittest.TestCase):
 
     def build(self):
         self.exe.parent.mkdir(parents=True)
-        shutil.copy(STAND_IN, self.exe)
+        shutil.copy(self.stub_exe, self.exe)
 
     def run_script(self, output):
         result = subprocess.run(

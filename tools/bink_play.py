@@ -127,10 +127,11 @@ def pick(names, wanted):
 def find_exe(explicit):
     if explicit:
         return Path(explicit)
-    root = HERE.parent
-    for c in (root / "runtime" / "build" / "bink_play.exe", root / "runtime" / "build" / "Release" / "bink_play.exe"):
-        if c.is_file():
-            return c
+    build = HERE.parent / "runtime" / "build"
+    for config in ("", "Release", "RelWithDebInfo", "Debug", "MinSizeRel"):
+        player = build / config / "bink_play.exe"
+        if player.is_file():
+            return player
     raise SystemExit("bink_play.exe not found; build the runtime (runtime/build) or pass --exe")
 
 

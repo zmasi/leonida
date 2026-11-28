@@ -13,11 +13,13 @@ import struct
 import sys
 import tempfile
 import unittest
+from unittest import mock
 import zlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
+import shader_disasm  # noqa: E402
 import shader_library as sl  # noqa: E402
 import shader_meta  # noqa: E402
 
@@ -712,6 +714,45 @@ class Main(unittest.TestCase):
             self.assertIn("1 of 4 named by a carved shader's HASH digest, 3 not in the carve, "
                           "1 unreadable/corrupt container\n", stdout.getvalue())
             self.assertEqual(stderr.getvalue().splitlines(), ["carve: ZERO.dxbc: not a DXBC container"])
+
+    def test_disasm_auto_falls_back_per_program_without_regressing_clean_programs(self):
+        ps_prog = prog(0x11112222)
+        vs_body = bytes.fromhex("02 1a 28 f4 00 00 00 fa") + ENDPGM
+        vs_code = prologue(0x33334444) + vs_body
+        vs_prog = vs_code + CODE_END * ((-len(vs_code)) % 256 // 4)
+        blobs = [layout_blob(2, D_PS), layout_blob(2, D_VS)]
+        graphics = [(NONE, NONE, {0: (0, 0), 1: (1, 1)})]
+        lib_bytes = build(graphics, [], blobs, [ps_prog, vs_prog])
+
+        def fake_run_mc(code, mcpu, wave32=True):
+            if code == V_MOV * 2 + ENDPGM:
+                return "\t; mocked llvm-mc ps\n\ts_endpgm\n", 0, ""
+            return "\ts_endpgm\n", 2, "<stdin>:1:1: warning: invalid instruction encoding\n"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "lib.bin")
+            with open(src, "wb") as f:
+                f.write(lib_bytes)
+            out = os.path.join(tmp, "out")
+            with mock.patch.object(shader_disasm, "probe") as probe_mock, \
+                 mock.patch.object(shader_disasm, "run_mc", side_effect=fake_run_mc):
+                rc, _ = self.run_main(src, "--out", out, "--disasm", "--jobs", "1")
+            self.assertEqual(rc, 0)
+            probe_mock.assert_called_once_with("gfx1013")
+            with open(os.path.join(out, "disasm", "lib_ps_00000.s"), encoding="utf-8") as f:
+                ps_text = f.read()
+            self.assertIn("; mocked llvm-mc ps", ps_text)
+            self.assertIn("0 invalid words", ps_text)
+            self.assertNotIn("; --- llvm-mc messages ---", ps_text)
+            with open(os.path.join(out, "disasm", "lib_vs_00001.s"), encoding="utf-8") as f:
+                vs_text = f.read()
+            self.assertIn("0 invalid words", vs_text)
+            self.assertIn("[s104,s105,vcc_lo,vcc_hi]", vs_text)
+            self.assertNotIn("; --- llvm-mc messages ---", vs_text)
+            with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
+                by = {e["file"]: e for e in json.load(f)}
+            self.assertEqual(by["lib_ps_00000.dxbc"]["invalid_words"], 0)
+            self.assertEqual(by["lib_vs_00001.dxbc"]["invalid_words"], 0)
 
 
 if __name__ == "__main__":

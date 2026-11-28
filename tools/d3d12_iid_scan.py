@@ -61,12 +61,20 @@ def read_iids(header: str) -> dict[str, uuid.UUID]:
 def d3d12_xs_imports(data: bytes) -> list[str] | None:
     """What the PE image imports from d3d12_xs.dll: names, or "#N" for an import by ordinal (ordinals 23-115 are
     GUID data, docs/d3d12_xs_surface.md section 2). None when the image does not import d3d12_xs.dll at all."""
+    return read_d3d12_xs_imports(data)[0]
+
+
+def read_d3d12_xs_imports(data: bytes) -> tuple[list[str] | None, str | None]:
+    """d3d12_xs_imports, and why the import table could not be read to its end (None when it could).
+
+    A parse error keeps the names read before it, so the caller can say the list may be incomplete."""
+    names: list[str] | None = None
     try:
         if data[:2] != b"MZ":
-            return None
+            return None, None
         pe = struct.unpack_from("<I", data, 0x3C)[0]
         if data[pe:pe + 4] != b"PE\0\0":
-            return None
+            return None, None
         sections, opt_size = struct.unpack_from("<H", data, pe + 6)[0], struct.unpack_from("<H", data, pe + 20)[0]
         opt = pe + 24
         pe32plus = struct.unpack_from("<H", data, opt)[0] == 0x20B
@@ -85,9 +93,11 @@ def d3d12_xs_imports(data: bytes) -> list[str] | None:
             return None
 
         def cstr(at: int) -> bytes:
-            return data[at:data.index(b"\0", at)]
+            end = data.find(b"\0", at)
+            if end < 0:
+                raise ValueError("an import name has no terminating NUL")
+            return data[at:end]
 
-        names: list[str] | None = None
         pos = offset(imp_rva) if imp_rva else None
         while pos is not None and pos + 20 <= len(data):
             lookup_rva, _, _, name_rva, iat_rva = struct.unpack_from("<IIIII", data, pos)
@@ -110,9 +120,9 @@ def d3d12_xs_imports(data: bytes) -> list[str] | None:
                         names.append(cstr(hint + 2).decode("ascii", "replace") if hint is not None else "?")
                     thunk += width
             pos += 20
-        return names
-    except (struct.error, ValueError):
-        return None
+    except (struct.error, ValueError) as e:
+        return names, str(e)
+    return names, None
 
 
 def possible_iid_imports(names: list[str] | None) -> list[str]:
@@ -128,12 +138,13 @@ def scan(path: str, iids: dict[str, uuid.UUID]) -> dict:
     with open(path, "rb") as f:
         data = f.read()
     found = sorted(name for name, guid in iids.items() if guid.bytes_le in data)
-    imports = d3d12_xs_imports(data)
+    imports, import_error = read_d3d12_xs_imports(data)
     return {
         "image": os.path.basename(path),
         "found": found,
         "focus": {name: name in found for name in FOCUS if name in iids},
         "d3d12_xs_imports": imports,
+        "d3d12_xs_import_error": import_error,
         "possible_iid_imports": possible_iid_imports(imports),
     }
 
@@ -160,6 +171,9 @@ def main(argv: list[str] | None = None) -> int:
     except OSError as e:
         print(f"ERROR: cannot read {header}: {e.strerror or e}", file=sys.stderr)
         return 2
+    except ValueError as e:
+        print(f"ERROR: cannot read {header}: a MIDL_INTERFACE GUID is malformed ({e})", file=sys.stderr)
+        return 2
     if not iids:
         print(f"ERROR: no ID3D12 MIDL_INTERFACE declarations in {header}", file=sys.stderr)
         return 2
@@ -181,6 +195,9 @@ def main(argv: list[str] | None = None) -> int:
             if r["possible_iid_imports"]:
                 print("  WARNING: these d3d12_xs.dll imports may be IID data, so an absent IID proves nothing for "
                       "this image: " + ", ".join(r["possible_iid_imports"]))
+        if r["d3d12_xs_import_error"]:
+            print(f"WARNING: {r['image']}: the d3d12_xs.dll import table could not be read to the end "
+                  f"({r['d3d12_xs_import_error']}); imports after that point are not listed", file=sys.stderr)
     if args.json:
         try:
             with open(args.json, "w", encoding="utf-8", newline="\n") as f:

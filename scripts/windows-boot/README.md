@@ -69,9 +69,11 @@ faults:   none
 frames:   14 captured, 0 non-black; last mean rgb 0.00 0.00 0.00; brightest 0.00 0.00 0.00
 ```
 
-`-DigestOnly -Name <name>` writes the summary and digest again for an earlier run. The digest holds counts and
-states only, which is what goes into a RESULT on the board; the logs, traces, captures and dumps can quote the game
-and stay on your machine ([AGENTS.md](../../AGENTS.md), "No game data").
+`-DigestOnly -Name <name>` writes the summary and digest again for an earlier run. The `faults` row reports whether
+the log recorded device loss and counts Vulkan address records by type (for example, `WRITE_INVALID=2`).
+Several records can describe one loss. A driver can also report loss without any address records.
+Share counts and states on the board. Keep paths, logs, traces, captures and dumps on your machine
+([AGENTS.md](../../AGENTS.md), "No game data").
 
 How to read the states: game state goes 1, 2 (init), 3 (running); session state goes 0, 1, 3 (landing
 screen waiting for A), `d` after A.
@@ -83,6 +85,10 @@ Without them the script warns, sets no `LEONIDA_PEEK`, and the `states:` line an
 session=?`. A `LEONIDA_PEEK` of your own still works for the log, but the digest reads only the two RVAs those
 variables name. `docs/linux_proton.md` (the same stages apply natively)
 section 2 has the healthy sequence with times and section 3 "which blank do you have".
+
+To pair scripted presses with state changes after a run, use `python -I tools/stage_timeline.py LOG` with the same
+two environment variables. For a saved log, `--game-state-rva` and `--session-state-rva` override them. If the log
+also records the loading-screen state, pass its hex RVA with `--load-state-rva` to see when the screen ended.
 
 ## One game at a time
 
@@ -99,3 +105,33 @@ game processes on one GPU make both runs meaningless and can take the driver dow
 | `minidump.py PID OUT.dmp` | a minidump through dbghelp's `MiniDumpWriteDump`. Do not use `rundll32 comsvcs.dll MiniDump`: Defender flags it. A dump holds game memory: local only |
 
 Each prints its usage with `-h` (Python) or `Get-Help` (PowerShell).
+
+## Recover a stack from a manually mapped image
+
+When the exception stack stops inside the mapped executable, run `mapped_stack.py` on the existing
+private dump. Supply the exact PE from the crashing build and an x64 CDB from Debugging Tools for
+Windows. If CDB is on your PATH, omit `--cdb`. The optional `--symbols` takes one local directory
+containing the matching runtime images and PDBs.
+
+```powershell
+py -3 -I scripts\windows-boot\mapped_stack.py D:\runs\fault\crash.dmp D:\package\title.exe --symbols D:\build\RelWithDebInfo --cdb "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\cdb.exe"
+```
+
+The command derives the mapping base, including a relocated base, by locating a unique captured
+instruction window in an executable section of the supplied PE. It checks for a file-backed x64
+unwind entry at the exception RIP and compares captured bytes from the first header page and that
+function's unwind metadata when available.
+A small dump can establish a local code match only. Use the original image even if another build
+has the same function. Exit-only snapshots, faults outside the supplied image, leaf functions
+without unwind entries, and missing, patched or ambiguous instruction windows cannot establish
+this stack.
+
+CDB reads the exception context and uses the disk image's unwind data to recover callers. The
+script makes a temporary copy of the PE beside the dump under the debugger alias `leonida_mapped`.
+It disables network symbols and writes private frame rows to a new `mapped-stack.txt` beside the
+dump. Use `--output` for a different new file. A successful walk recovers at least one caller and
+can stop when later stack memory or module information is missing. Keep dumps and reports outside
+the checkout and share only the outcome and frame count.
+
+Run the synthetic regression tests with `py -3 -I tests\test_mapped_stack.py`. To include the
+native CDB walk, put x64 CDB on PATH or set `LEONIDA_TEST_CDB` to its full path.

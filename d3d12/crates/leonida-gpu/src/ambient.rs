@@ -85,6 +85,34 @@ pub(crate) const AIR: (u8, u32) = (1, 32);
 /// the place lepotane/VIctory-leonida measured.
 pub(crate) const REFLECTIONS: (u8, u32) = (1, 40);
 
+/// Where the fork read the depth of the resolve its prison scene runs
+/// (`CS_ScreenProbes_TemporalResolve_ReflectiveCaustics`, `34fb51b8a0312e82`):
+/// that program reads the second channel of the view at [`DEPTH`], the
+/// stencil plane, and tests the view here against 0 for the sky.
+pub(crate) const TRUE_DEPTH: (u8, u32) = (0, 688);
+
+/// Whether the resolve's depth is looked for at [`TRUE_DEPTH`] first
+/// (`LEONIDA_AMBIENT_TRUE_DEPTH=1`; off by default: [`DEPTH`] alone, as
+/// before). With it, a resolve whose view there is a depth plane of the
+/// image's size gives the passes that one; any other keeps [`DEPTH`].
+///
+/// Why: where [`DEPTH`] holds the stencil plane, the fork's passes read no
+/// depth (every point 1,000 m away: no shade in creases, every cell weighed
+/// alike). Here the view must be a depth plane (`draw.rs`, `is_depth_srv`):
+/// a view that names the stencil plane as such (plane 1, or a stencil
+/// format) gets no stand-in at all, and the log says "no stand-in for the
+/// indirect light: missing depth SRV" once; one that does not is read as the
+/// fork read it. Read off one program by the fork, not measured here, and
+/// the fork keeps it off while it is tried (it changes the picture: the
+/// creases' shade starts to act), so it is off here too.
+///
+/// From edsuuu/VI-BR-PORT 783b2e1 (edsuuu; `VICTORY_AMBIENT_TRUE_DEPTH`),
+/// GPL-3.0.
+pub(crate) fn true_depth() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_AMBIENT_TRUE_DEPTH").is_some_and(|v| v == "1"))
+}
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Set {
     Off,

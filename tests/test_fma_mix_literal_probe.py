@@ -97,6 +97,71 @@ class Sides(unittest.TestCase):
         self.assertEqual(code, 77)
         self.assertIn("hardware oracle unavailable", out)
 
+    def test_empty_and_malformed_cli_flags_are_rejected(self):
+        for argv in (
+            ["--oracle", ""],
+            ["--oracle", "   "],
+            ["--oracle", "hw,"],
+            ["--oracle", ",translator"],
+            ["--oracle", "gpu"],
+            ["--hw-arch", ""],
+            ["--hw-arch", "   "],
+        ):
+            with self.subTest(argv=argv), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    probe.main(argv)
+                self.assertEqual(cm.exception.code, 2)
+
+    def test_hw_oracle_malformed_results_unavailable_and_word_masking(self):
+        from hw_oracle import runner
+
+        class StubOracle:
+            arch = "gfx1036"
+            device = "fake gfx1036"
+
+            def __init__(self, run_fn):
+                self._run_fn = run_fn
+                self.closed = False
+
+            def run(self, kernels, words=1):
+                return self._run_fn(kernels)
+
+            def close(self):
+                self.closed = True
+
+        halves_words = [c.expected(probe.HALVES) for c in probe.CASES]
+        for label, bad_fn in (
+            ("short", lambda ks: [[0]] * (len(ks) - 1)),
+            ("long", lambda ks: [[0]] * (len(ks) + 1)),
+            ("empty_words", lambda ks: [[] for _ in ks]),
+            ("none_entry", lambda ks: [None for _ in ks]),
+            ("bool_word", lambda ks: [[True] for _ in ks]),
+        ):
+            with self.subTest(case=label):
+                oracle = StubOracle(bad_fn)
+                with mock.patch.object(runner, "open_oracle", return_value=oracle), \
+                        mock.patch.object(probe, "run_translator", return_value=halves_words):
+                    code, out = self.run_main("--oracle", "hw")
+                self.assertEqual(code, 2, out)
+                self.assertIn("harness error:", out)
+                self.assertTrue(oracle.closed)
+
+        # runner.Unavailable raised inside oracle.run() exits 77 cleanly and closes oracle.
+        def raise_unavail(_ks):
+            raise runner.Unavailable("mode unsupported")
+
+        oracle = StubOracle(raise_unavail)
+        with mock.patch.object(runner, "open_oracle", return_value=oracle), \
+                mock.patch.object(probe, "run_translator", return_value=halves_words):
+            code, out = self.run_main("--oracle", "hw")
+        self.assertEqual(code, 77, out)
+        self.assertIn("hardware oracle unavailable: mode unsupported", out)
+        self.assertTrue(oracle.closed)
+
+        # verdict masks >32-bit values before exact word comparison.
+        reading, _ = probe.verdict([(c, c.expected(probe.HALVES) | (1 << 32)) for c in probe.CASES])
+        self.assertEqual(reading, probe.HALVES)
+
 
 if __name__ == "__main__":
     unittest.main()

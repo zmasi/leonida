@@ -994,6 +994,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--game-dir")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "reports", "pe"))
     a = ap.parse_args(argv)
+    if a.game_dir is not None and not os.path.isdir(a.game_dir):
+        print(f"ERROR: --game-dir {a.game_dir} does not exist or is not a directory", file=sys.stderr)
+        return 2
     missing = [img for img in a.image if not os.path.exists(img)]
     if missing:
         for img in missing:

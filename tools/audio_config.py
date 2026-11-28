@@ -56,7 +56,7 @@ RECORD_BYTES = 46
 MIN_MS = 20_000
 MAX_MS = 2_000_000
 STREAM_MASK = 0x1FFFFFFF
-JOIN_BLOCK_BYTES = 1 << 20   # --join read size; a typical carved part is one read
+JOIN_BLOCK_BYTES = 1 << 20   # scan read size; a typical carved part is one read
 
 
 def joaat(text):
@@ -172,6 +172,12 @@ def paths_in(src):
             yield name, path
 
 
+def _file_chunks(path):
+    with open(path, "rb") as source:
+        while chunk := source.read(JOIN_BLOCK_BYTES):
+            yield chunk
+
+
 def files_in(src):
     """Yield (name, bytes) for a blob or every `.bin` file in a directory, in name order."""
     for name, path in paths_in(src):
@@ -209,10 +215,9 @@ def collect(src, min_ms=MIN_MS, max_ms=MAX_MS, names=None, join=False):
             for name, path in paths_in(src):
                 files.append(name)
                 starts.append(seen)
-                with open(path, "rb") as f:
-                    while chunk := f.read(JOIN_BLOCK_BYTES):
-                        seen += len(chunk)
-                        yield chunk
+                for chunk in _file_chunks(path):
+                    seen += len(chunk)
+                    yield chunk
 
         for record in scan_stream(chunks(), min_ms, max_ms):
             index = bisect_right(starts, record["offset"]) - 1
@@ -220,8 +225,8 @@ def collect(src, min_ms=MIN_MS, max_ms=MAX_MS, names=None, join=False):
             record["file_offset"] = record["offset"] - starts[index]
             records.append(record)
     else:
-        for name, blob in files_in(src):
-            for record in scan(blob, min_ms, max_ms):
+        for name, path in paths_in(src):
+            for record in scan_stream(_file_chunks(path), min_ms, max_ms):
                 record["file"] = name
                 record["file_offset"] = record["offset"]
                 records.append(record)

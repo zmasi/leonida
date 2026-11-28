@@ -137,5 +137,159 @@ class DivisionByZero(unittest.TestCase):
                 self.assertNotEqual(w & 0x007FFFFF, 0)
 
 
+class IeeeDomainAndSignPreservation(unittest.TestCase):
+    def test_fma_negative_zero_and_f64_overflow(self):
+        import math
+
+        res_f32 = word("%f = OpExtInst %float %glsl Fma %fm0 %f1 %fm0\n%r = OpBitcast %uint %f\n")
+        self.assertEqual(res_f32, 0x80000000)
+        self.assertEqual(word("%f = OpExtInst %float %glsl Fma %fm0 %f1 %f0\n%r = OpBitcast %uint %f\n"), 0x00000000)
+
+        spv = """\
+OpCapability Shader
+OpCapability Float64
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main"
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%c1 = OpConstant %uint 1
+%arr = OpTypeArray %uint %c1
+%ptr_arr = OpTypePointer Function %arr
+%null = OpConstantNull %arr
+%vgpr = OpVariable %ptr_arr Function %null
+%sgpr = OpVariable %ptr_arr Function %null
+%double = OpTypeFloat 64
+%ptr_out = OpTypePointer Output %double
+%out_res = OpVariable %ptr_out Output
+%dmax = OpConstant %double 1e308
+%d2 = OpConstant %double 2
+%d0 = OpConstant %double 0
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%r = OpExtInst %double %glsl Fma %dmax %d2 %d0
+OpStore %out_res %r
+OpReturn
+OpFunctionEnd
+"""
+        out_val = si.run(spv).outputs["out_res"]
+        self.assertTrue(math.isinf(out_val) and out_val > 0)
+
+    def test_glsl_domain_and_overflow_ieee(self):
+        import math
+
+        spv = """\
+OpCapability Shader
+%glsl = OpExtInstImport "GLSL.std.450"
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main"
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%float = OpTypeFloat 32
+%c1 = OpConstant %uint 1
+%arr = OpTypeArray %uint %c1
+%ptr_arr = OpTypePointer Function %arr
+%null = OpConstantNull %arr
+%vgpr = OpVariable %ptr_arr Function %null
+%sgpr = OpVariable %ptr_arr Function %null
+%p_out = OpTypePointer Output %float
+%out_sqrt_neg = OpVariable %p_out Output
+%out_sqrt_m0 = OpVariable %p_out Output
+%out_rsqrt_p0 = OpVariable %p_out Output
+%out_rsqrt_m0 = OpVariable %p_out Output
+%out_rsqrt_neg = OpVariable %p_out Output
+%out_log2_0 = OpVariable %p_out Output
+%out_log2_neg = OpVariable %p_out Output
+%out_exp2_hi = OpVariable %p_out Output
+%out_sin_inf = OpVariable %p_out Output
+%out_fract_inf = OpVariable %p_out Output
+%u_pinf = OpConstant %uint 2139095040
+%f0 = OpConstant %float 0
+%fm0 = OpConstant %float -0.0
+%fm1 = OpConstant %float -1
+%f2000 = OpConstant %float 2000
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%pinf = OpBitcast %float %u_pinf
+%s_neg = OpExtInst %float %glsl Sqrt %fm1
+%s_m0 = OpExtInst %float %glsl Sqrt %fm0
+%r_p0 = OpExtInst %float %glsl InverseSqrt %f0
+%r_m0 = OpExtInst %float %glsl InverseSqrt %fm0
+%r_neg = OpExtInst %float %glsl InverseSqrt %fm1
+%l_0 = OpExtInst %float %glsl Log2 %f0
+%l_neg = OpExtInst %float %glsl Log2 %fm1
+%e_hi = OpExtInst %float %glsl Exp2 %f2000
+%sn_inf = OpExtInst %float %glsl Sin %pinf
+%fr_inf = OpExtInst %float %glsl Fract %pinf
+OpStore %out_sqrt_neg %s_neg
+OpStore %out_sqrt_m0 %s_m0
+OpStore %out_rsqrt_p0 %r_p0
+OpStore %out_rsqrt_m0 %r_m0
+OpStore %out_rsqrt_neg %r_neg
+OpStore %out_log2_0 %l_0
+OpStore %out_log2_neg %l_neg
+OpStore %out_exp2_hi %e_hi
+OpStore %out_sin_inf %sn_inf
+OpStore %out_fract_inf %fr_inf
+OpReturn
+OpFunctionEnd
+"""
+        outs = si.run(spv).outputs
+        self.assertTrue(math.isnan(outs["out_sqrt_neg"]))
+        self.assertEqual(si.f2u(outs["out_sqrt_m0"]), 0x80000000)
+        self.assertEqual(si.f2u(outs["out_rsqrt_p0"]), 0x7F800000)
+        self.assertEqual(si.f2u(outs["out_rsqrt_m0"]), 0xFF800000)
+        self.assertTrue(math.isnan(outs["out_rsqrt_neg"]))
+        self.assertEqual(si.f2u(outs["out_log2_0"]), 0xFF800000)
+        self.assertTrue(math.isnan(outs["out_log2_neg"]))
+        self.assertEqual(si.f2u(outs["out_exp2_hi"]), 0x7F800000)
+        self.assertTrue(math.isnan(outs["out_sin_inf"]))
+        self.assertTrue(math.isnan(outs["out_fract_inf"]))
+
+    def test_op_fnegate_preserves_f32_nan_bits_and_vectors(self):
+        snan_bits = 0x7F812345
+        spv = f"""\
+OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint Fragment %main "main"
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%uint = OpTypeInt 32 0
+%float = OpTypeFloat 32
+%v2float = OpTypeVector %float 2
+%c0 = OpConstant %uint 0
+%c1 = OpConstant %uint 1
+%c2 = OpConstant %uint 2
+%arr = OpTypeArray %uint %c2
+%ptr_arr = OpTypePointer Function %arr
+%ptr_u = OpTypePointer Function %uint
+%null = OpConstantNull %arr
+%vgpr = OpVariable %ptr_arr Function %null
+%sgpr = OpVariable %ptr_arr Function %null
+%u_snan = OpConstant %uint {snan_bits}
+%f_two = OpConstant %float 2
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%snan = OpBitcast %float %u_snan
+%neg_snan = OpFNegate %float %snan
+%vec = OpCompositeConstruct %v2float %snan %f_two
+%neg_vec = OpFNegate %v2float %vec
+%v0 = OpCompositeExtract %float %neg_vec 0
+%p0 = OpAccessChain %ptr_u %vgpr %c0
+%u_out = OpBitcast %uint %neg_snan
+OpStore %p0 %u_out
+%p1 = OpAccessChain %ptr_u %vgpr %c1
+%v0_bits = OpBitcast %uint %v0
+OpStore %p1 %v0_bits
+OpReturn
+OpFunctionEnd
+"""
+        state = si.run(spv)
+        self.assertEqual(state.vgpr[0], 0xFF812345)
+        self.assertEqual(state.vgpr[1], 0xFF812345)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <map>
 #include <set>
 #include <utility>
@@ -106,7 +107,7 @@ public:
     }
 
 private:
-    static constexpr Id max_id() { return ~Id(0); }
+    static constexpr Id max_id() { return (std::numeric_limits<Id>::max)(); }
 
     void drop_size(std::uint64_t size) { sizes_.erase(sizes_.find(size)); }  // one copy, not every range of that size
 

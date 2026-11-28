@@ -5,18 +5,24 @@
 Every input is built here (five tiny .s listings, an index.json and FSSM headers with only the magic and the
 wave flag). No game data.
 """
+import io
 import json
 import os
+import posixpath
 import struct
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TOOL = os.path.join(ROOT, "tools", "op_reach.py")
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import op_reach  # noqa: E402
+import replace_retry  # noqa: E402
+import report_paths  # noqa: E402
 
 LISTINGS = {
     # both encodings of one instruction: one shader, two instructions
@@ -167,6 +173,145 @@ class OpReachTests(unittest.TestCase):
         p = run(self.disasm, "--fssm", os.path.join(self._tmp.name, "no-such-fssm"))
         self.assertEqual(p.returncode, 2)
         self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
+
+    def test_stages_of_bom_prefixed_files_and_duplicate_stems(self):
+        bom_index = os.path.join(self._tmp.name, "bom_index.json")
+        rows = [
+            {"file": "dxbc/a_ps.dxbc", "stage": "ps"},
+            {"file": "sub\\b_vs.dxbc", "stage": "vs"},
+            {"file": "sub/b_vs.dxbc", "stage": "vs"},
+            {"file": "c_cs.dxbc", "stage": "cs"},
+            {"file": "c_cs.dxbc", "stage": "ps"},
+            {"file": "d_cs.dxbc", "stage": ""},
+        ]
+        with open(bom_index, "wb") as f:
+            f.write(b"\xef\xbb\xbf" + json.dumps(rows).encode("utf-8"))
+        stages = op_reach.stages_of(bom_index)
+        self.assertEqual(stages, {"a_ps": "ps", "b_vs": "vs"})
+        r = op_reach.census(self.disasm, stages)
+        self.assertEqual(r["listings_by_stage"], {"ps": 1, "unindexed": 3, "vs": 1})
+
+    def test_stages_of_rejects_non_string_stage(self):
+        bad_index = os.path.join(self._tmp.name, "bad_stage.json")
+        with open(bad_index, "w", encoding="utf-8", newline="\n") as f:
+            json.dump([{"file": "a_ps.dxbc", "stage": 123}], f)
+        with self.assertRaises(ValueError):
+            op_reach.stages_of(bad_index)
+        p = run(self.disasm, "--index", bad_index)
+        self.assertEqual(p.returncode, 2)
+        self.assertTrue(p.stderr.startswith("ERROR:"), p.stderr)
+        self.assertNotIn("Traceback", p.stderr)
+
+    def test_census_and_waves_ignore_matching_subdirectories(self):
+        os.makedirs(os.path.join(self.disasm, "nested.s"))
+        fssm = build_fssm(self._tmp.name)
+        os.makedirs(os.path.join(fssm, "e_cs.fssm"))
+        r = op_reach.census(self.disasm, op_reach.stages_of(self.index), fssm)
+        self.assertEqual(r["listings"], 5)
+        self.assertEqual(r["listings_by_wave"], {"w32": 1, "w64": 3, "w?": 1})
+
+    def test_report_deduplicates_base_ops_and_patterns(self):
+        r = op_reach.census(self.disasm, op_reach.stages_of(self.index))
+        rows = op_reach.report(r, ["v_cndmask_b32_e32", "v_cndmask_b32_e64", "*_dpp", "*_dpp"])
+        self.assertEqual([row["op"] for row in rows], ["v_cndmask_b32", "*_dpp"])
+        self.assertEqual(rows[0]["instructions"], 3)
+
+    def test_index_directory_or_empty_is_rejected(self):
+        for bad in (self.disasm, ""):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = op_reach.main([self.disasm, "--index", bad])
+            self.assertEqual(rc, 2)
+            self.assertTrue(err.getvalue().startswith("ERROR:"), err.getvalue())
+
+    def test_json_path_guards_and_nested_atomic_write(self):
+        fssm = build_fssm(self._tmp.name)
+        nested_out = os.path.join(self._tmp.name, "reports", "nested", "out.json")
+        out_s = io.StringIO()
+        err_s = io.StringIO()
+        with redirect_stdout(out_s), redirect_stderr(err_s):
+            rc = op_reach.main([self.disasm, "--index", self.index, "--fssm", fssm, "--json", nested_out])
+        self.assertEqual(rc, 0, err_s.getvalue())
+        with open(nested_out, "rb") as f:
+            raw = f.read()
+        self.assertNotIn(b"\r\n", raw)
+        self.assertTrue(raw.endswith(b"\n"))
+
+        reg_parent = os.path.join(self._tmp.name, "not_a_dir")
+        with open(reg_parent, "w", encoding="utf-8", newline="\n") as f:
+            f.write("x")
+
+        bad_targets = [
+            "",
+            "   ",
+            self._tmp.name,
+            os.path.join(reg_parent, "out.json"),
+            self.index,
+            os.path.join(self.disasm, "out.json"),
+            os.path.join(self.disasm, "sub", "out.json"),
+            os.path.join(fssm, "out.json"),
+            os.path.join(self.disasm, "a_ps.s"),
+            os.path.join(fssm, "a_ps.fssm"),
+        ]
+        for bad in bad_targets:
+            with self.subTest(bad=bad):
+                err = io.StringIO()
+                with redirect_stderr(err):
+                    rc = op_reach.main([self.disasm, "--index", self.index, "--fssm", fssm, "--json", bad])
+                self.assertEqual(rc, 2)
+                self.assertTrue(err.getvalue().startswith("ERROR:"), err.getvalue())
+
+        # Hard-link and symlink aliases to an input listing must also be refused.
+        hard_alias = os.path.join(self._tmp.name, "hard_a.s")
+        try:
+            os.link(os.path.join(self.disasm, "a_ps.s"), hard_alias)
+        except (OSError, NotImplementedError, AttributeError):
+            pass
+        else:
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = op_reach.main([self.disasm, "--json", hard_alias])
+            self.assertEqual(rc, 2)
+            self.assertTrue(err.getvalue().startswith("ERROR:"), err.getvalue())
+
+        sym_alias = os.path.join(self._tmp.name, "sym_a.fssm")
+        try:
+            os.symlink(os.path.join(fssm, "a_ps.fssm"), sym_alias)
+        except (OSError, NotImplementedError, AttributeError):
+            pass
+        else:
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = op_reach.main([self.disasm, "--fssm", fssm, "--json", sym_alias])
+            self.assertEqual(rc, 2)
+            self.assertTrue(err.getvalue().startswith("ERROR:"), err.getvalue())
+
+    def test_json_path_guards_macos_case_insensitive_alias(self):
+        fake_os = mock.Mock(wraps=os, pathconf=mock.Mock(return_value=0))
+        fake_os.path.normcase = posixpath.normcase
+        with mock.patch.multiple(report_paths, sys=mock.Mock(platform="darwin"), os=fake_os):
+            self.assertIsNotNone(
+                op_reach._validate_json_path("/tmp/leonida_op/INDEX.JSON", self.disasm, index_path="/tmp/leonida_op/index.json")
+            )
+            with mock.patch.object(op_reach, "same_report_path", side_effect=lambda a, b: a.casefold() == b.casefold()):
+                self.assertIsNotNone(
+                    op_reach._validate_json_path(
+                        os.path.join(os.path.dirname(self.disasm), "DISASM", "new_sub", "out.json"),
+                        self.disasm,
+                    )
+                )
+
+    def test_atomic_write_cleans_up_temp_file_on_replace_failure(self):
+        out_dir = os.path.join(self._tmp.name, "atomic")
+        os.makedirs(out_dir)
+        target = os.path.join(out_dir, "out.json")
+        with mock.patch.object(replace_retry, "replace", side_effect=OSError("disk full")):
+            err = io.StringIO()
+            with redirect_stderr(err):
+                rc = op_reach.main([self.disasm, "--json", target])
+            self.assertEqual(rc, 2)
+            self.assertTrue(err.getvalue().startswith("ERROR:"), err.getvalue())
+        self.assertEqual(os.listdir(out_dir), [])
 
 
 if __name__ == "__main__":

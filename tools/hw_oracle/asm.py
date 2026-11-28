@@ -318,6 +318,13 @@ VALU_REMOVED = {
     "v_madmk_f32": _MAD_GONE.format("v_fmamk_f32"),
     "v_mad_legacy_f32": _MAD_GONE.format("v_fma_dx9_zero_f32"),
 }
+# GFX12 dropped the always-true and always-false VALU compares. AMD LLVM 23 (rocm-sdk-core 10.0.0) assembles
+# v_cmp_{t,f}_{i32,u32,i64,u64} and the v_cmpx_ forms for gfx1036, gfx1100 and gfx1150 and rejects every one for
+# gfx1201 ("instruction not supported on this GPU"). There is no renamed form to substitute: a program that uses one
+# cannot run there, so it is skipped with this reason rather than counted as an assembler rejection.
+_CMP_TF_GONE = "removed in GFX12 (no always-true/always-false VALU compare there)"
+GFX12_VALU_REMOVED = {f"v_{kind}_{tf}_{ty}": _CMP_TF_GONE
+                      for kind in ("cmp", "cmpx") for tf in ("t", "f") for ty in ("i32", "u32", "i64", "u64")}
 # Same instruction, new mnemonic: the assembler takes the GFX10 spelling for GFX11 and encodes the GFX11 name.
 GFX11_VALU_RENAMED = {
     "v_mul_legacy_f32": "v_mul_dx9_zero_f32",        # DX9 rule: 0 * anything = 0 (the oracle itself checks it)
@@ -396,9 +403,21 @@ def sync_lines(line, arch):
 
 
 def valu_skip_reason(op, arch):
-    """Why an f32 VALU opcode cannot be run on this architecture, or None."""
+    """Why a VALU opcode cannot be run on this architecture, or None. An _e32/_e64 suffix is ignored."""
+    op = re.sub(r"_e(32|64)$", "", op)
     if op in VALU_REMOVED and arch not in ("gfx1010", "gfx1011", "gfx1012", "gfx1013"):
         return f"{op}: {VALU_REMOVED[op]}"
+    if op in GFX12_VALU_REMOVED and family(arch) == "gfx12":
+        return f"{op}: {GFX12_VALU_REMOVED[op]}"
+    return None
+
+
+def program_skip_reason(lines, arch):
+    """The first valu_skip_reason of a program's instruction lines (their first word), or None."""
+    for line in lines:
+        why = valu_skip_reason(line.split(None, 1)[0], arch) if line.strip() else None
+        if why:
+            return why
     return None
 
 

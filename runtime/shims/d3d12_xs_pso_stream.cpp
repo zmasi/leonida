@@ -148,15 +148,10 @@ struct Target {
     std::size_t bytes;
 };
 
+// Tags 0 (depth-stencil) and 1 (rasterizer) are applied by overlay_depth_stencil and overlay_rasterizer, which also
+// convert to the later subobject versions; these tags are copied as they are.
 bool target_of_tag(std::uint32_t tag, Target& out) {
     switch (tag) {
-        case 0:  // D3D12_DEPTH_STENCIL_DESC: DEPTH_STENCIL, or the prefix of DEPTH_STENCIL1
-            out = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1,
-                   sizeof(D3D12_DEPTH_STENCIL_DESC)};
-            return true;
-        case 1:  // D3D12_RASTERIZER_DESC
-            out = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, 0, sizeof(D3D12_RASTERIZER_DESC)};
-            return true;
         case 2:  // D3D12_BLEND_DESC
             out = {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, 0, sizeof(D3D12_BLEND_DESC)};
             return true;
@@ -167,20 +162,110 @@ bool target_of_tag(std::uint32_t tag, Target& out) {
     }
 }
 
-const Subobject* find_subobject(const std::vector<Subobject>& subs, const Target& target);
+// The base's subobject of the first of `types` it holds (a stream holds one version of each), or null.
+const Subobject* find_first_of(const std::vector<Subobject>& subs, std::initializer_list<unsigned> types) {
+    for (const unsigned type : types)
+        for (const Subobject& sub : subs)
+            if (sub.type == type) return &sub;
+    return nullptr;
+}
 
-// Tag 5: the two stencil mask bytes of the record overwrite the base's DEPTH_STENCIL (or DEPTH_STENCIL1) masks; the
-// rest of the record's zeros are not applied. False when the base has no depth-stencil subobject.
-bool overlay_stencil_masks(const std::vector<Subobject>& subs, const unsigned char* record,
+template <class T>
+T read_payload(const unsigned char* bytes) {
+    T value;
+    std::memcpy(&value, bytes, sizeof(T));
+    return value;
+}
+
+template <class T>
+void write_payload(std::vector<unsigned char>& out, const Subobject& sub, const T& value) {
+    std::memcpy(out.data() + sub.payload, &value, sizeof(T));
+}
+
+const Subobject* depth_stencil_of(const std::vector<Subobject>& subs) {
+    return find_first_of(subs, {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL,
+                                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1,
+                                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2});
+}
+
+// Tag 0: a D3D12_DEPTH_STENCIL_DESC. It replaces DEPTH_STENCIL, the prefix of DEPTH_STENCIL1 (whose depth-bounds
+// field stays the base's), or the matching fields of DEPTH_STENCIL2, whose faces each take the one pair of masks.
+// False when the base has no depth-stencil subobject.
+bool overlay_depth_stencil(const std::vector<Subobject>& subs, const unsigned char* record,
                            std::vector<unsigned char>& out) {
-    const Target depth{D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL,
-                       D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, 0};
-    const Subobject* sub = find_subobject(subs, depth);
+    const Subobject* sub = depth_stencil_of(subs);
     if (!sub) return false;
-    for (std::size_t field : {kStencilReadMaskOffset, kStencilWriteMaskOffset})
-        out[sub->payload + field] = record[kDerivedRecordPayload + field];
+    const auto d = read_payload<D3D12_DEPTH_STENCIL_DESC>(record + kDerivedRecordPayload);
+    if (sub->type != D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2) {
+        write_payload(out, *sub, d);
+        return true;
+    }
+    auto d2 = read_payload<D3D12_DEPTH_STENCIL_DESC2>(out.data() + sub->payload);
+    d2.DepthEnable = d.DepthEnable;
+    d2.DepthWriteMask = d.DepthWriteMask;
+    d2.DepthFunc = d.DepthFunc;
+    d2.StencilEnable = d.StencilEnable;
+    const auto face = [&](const D3D12_DEPTH_STENCILOP_DESC& f) {
+        return D3D12_DEPTH_STENCILOP_DESC1{f.StencilFailOp, f.StencilDepthFailOp, f.StencilPassOp, f.StencilFunc,
+                                           d.StencilReadMask, d.StencilWriteMask};
+    };
+    d2.FrontFace = face(d.FrontFace);
+    d2.BackFace = face(d.BackFace);
+    write_payload(out, *sub, d2);
     return true;
 }
+
+// Tag 5: the two stencil mask bytes of the record overwrite the base's depth-stencil masks (both faces' in
+// DEPTH_STENCIL2); the rest of the record's zeros are not applied. False when the base has no depth-stencil subobject.
+bool overlay_stencil_masks(const std::vector<Subobject>& subs, const unsigned char* record,
+                           std::vector<unsigned char>& out) {
+    const Subobject* sub = depth_stencil_of(subs);
+    if (!sub) return false;
+    const unsigned char read = record[kDerivedRecordPayload + kStencilReadMaskOffset];
+    const unsigned char write = record[kDerivedRecordPayload + kStencilWriteMaskOffset];
+    if (sub->type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2) {
+        auto d2 = read_payload<D3D12_DEPTH_STENCIL_DESC2>(out.data() + sub->payload);
+        d2.FrontFace.StencilReadMask = d2.BackFace.StencilReadMask = read;
+        d2.FrontFace.StencilWriteMask = d2.BackFace.StencilWriteMask = write;
+        write_payload(out, *sub, d2);
+        return true;
+    }
+    out[sub->payload + kStencilReadMaskOffset] = read;
+    out[sub->payload + kStencilWriteMaskOffset] = write;
+    return true;
+}
+
+// Tag 1: a D3D12_RASTERIZER_DESC. It replaces RASTERIZER, or RASTERIZER1/2 converted: DepthBias as a float, and for
+// RASTERIZER2 the line mode from MultisampleEnable and AntialiasedLineEnable (as D3D12 maps them). False when the base
+// has no rasterizer subobject.
+bool overlay_rasterizer(const std::vector<Subobject>& subs, const unsigned char* record,
+                        std::vector<unsigned char>& out) {
+    const Subobject* sub = find_first_of(subs, {D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER,
+                                                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1,
+                                                D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2});
+    if (!sub) return false;
+    const auto r = read_payload<D3D12_RASTERIZER_DESC>(record + kDerivedRecordPayload);
+    if (sub->type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER) {
+        write_payload(out, *sub, r);
+    } else if (sub->type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1) {
+        const D3D12_RASTERIZER_DESC1 r1{r.FillMode, r.CullMode, r.FrontCounterClockwise, FLOAT(r.DepthBias),
+                                        r.DepthBiasClamp, r.SlopeScaledDepthBias, r.DepthClipEnable,
+                                        r.MultisampleEnable, r.AntialiasedLineEnable, r.ForcedSampleCount,
+                                        r.ConservativeRaster};
+        write_payload(out, *sub, r1);
+    } else {
+        const D3D12_LINE_RASTERIZATION_MODE line = r.MultisampleEnable       ? D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE
+                                                  : r.AntialiasedLineEnable ? D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED
+                                                                            : D3D12_LINE_RASTERIZATION_MODE_ALIASED;
+        const D3D12_RASTERIZER_DESC2 r2{r.FillMode, r.CullMode, r.FrontCounterClockwise, FLOAT(r.DepthBias),
+                                        r.DepthBiasClamp, r.SlopeScaledDepthBias, r.DepthClipEnable, line,
+                                        r.ForcedSampleCount, r.ConservativeRaster};
+        write_payload(out, *sub, r2);
+    }
+    return true;
+}
+
+const Subobject* find_subobject(const std::vector<Subobject>& subs, const Target& target);
 
 const Subobject* find_subobject(const std::vector<Subobject>& subs, const Target& target) {
     for (const Subobject& sub : subs)
@@ -369,6 +454,11 @@ DeriveStatus derive_stream(const PsoStreamRecord& base, const unsigned char* rec
         std::memcpy(&tag, record, sizeof(tag));
         if (tag == kStencilMaskTag) {
             if (!overlay_stencil_masks(subs, record, out)) return DeriveStatus::missing_state;
+            continue;
+        }
+        if (tag == 0 || tag == 1) {
+            const bool applied = tag == 0 ? overlay_depth_stencil(subs, record, out) : overlay_rasterizer(subs, record, out);
+            if (!applied) return DeriveStatus::missing_state;
             continue;
         }
         Target target{};

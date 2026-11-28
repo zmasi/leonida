@@ -191,6 +191,24 @@ class GlbInspectTests(unittest.TestCase):
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(len(result.stderr.strip().splitlines()), 1, result.stderr)
 
+    def test_inspect_file_skips_bin_and_extension_payloads(self):
+        metadata = json_bytes(triangle_gltf())
+        data = raw_glb([(JSON_CHUNK, metadata), (BIN_CHUNK, bytes(4096)), (EXT_CHUNK, bytes(4096))])
+        expected = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+        bin_start = 12 + 8 + len(metadata) + 8
+        ext_start = bin_start + 4096 + 8
+
+        class MetadataReadsOnly(io.BytesIO):
+            def read(self, size=-1):
+                start = self.tell()
+                for payload in (bin_start, ext_start):
+                    if size < 0 or (start < payload + 4096 and start + size > payload):
+                        raise AssertionError("inspector read a binary payload")
+                return super().read(size)
+
+        with mock.patch("builtins.open", return_value=MetadataReadsOnly(data)):
+            self.assertEqual(glb_inspect.inspect_file("model.glb"), expected)
+
     def test_extension_only_base_color_image(self):
         for extension, uri in (("KHR_texture_basisu", "tile.ktx2"), ("EXT_texture_webp", "tile.webp")):
             with self.subTest(extension=extension):
@@ -245,6 +263,28 @@ class GlbInspectTests(unittest.TestCase):
             self.assertEqual(report["materials"][0]["base_color_texture_index"], 0)
             self.assertEqual(report["position_bbox"], {"min": [0, 0, 0], "max": [1, 1, 0]})
             self.assertTrue(report["position_bbox_complete"])
+
+    def test_skin_reference_diagnostics(self):
+        doc = skinned_gltf()
+        doc["skins"] = [
+            {"joints": [1, 1, False, {}, 9], "skeleton": 99, "inverseBindMatrices": 0},
+            {"inverseBindMatrices": False},
+            {"joints": [1, 2], "skeleton": 0, "inverseBindMatrices": 4},
+        ]
+        doc["accessors"].append({"type": "MAT4", "componentType": 5126, "count": 3})
+        data = glb(doc)
+        report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+        first, second, valid = report["skins"]
+        self.assertEqual(first["issues"], [
+            "joints[1] repeats node 1", "joints[2] does not reference a node",
+            "joints[3] does not reference a node", "joints[4] does not reference a node",
+            "skeleton does not reference a node", "inverseBindMatrices accessor must have type MAT4",
+            "inverseBindMatrices needs at least 5 matrices",
+        ])
+        self.assertEqual(second["issues"], ["joints must be a non-empty array",
+                                            "inverseBindMatrices does not reference an accessor"])
+        self.assertNotIn("issues", valid)
+        self.assertIn("issue: joints[1] repeats node 1", glb_inspect.format_report(report))
 
     def test_skinned_mesh_and_joint_count(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -682,6 +722,30 @@ class GlbInspectTests(unittest.TestCase):
                                                 "images": 0, "skins": 0, "animations": 0})
             self.assertIsNone(report["position_bbox"])
 
+    def test_invalid_bounds_do_not_distort_the_aggregate(self):
+        for lower, upper in (([0, 4, 0], [1, 3, 1]), ([0, 0, 0, 0], [9, 9, 9]),
+                             ([0, 0, 0], [9, 9, 9, 9]), ([0, False, 0], [9, 9, 9])):
+            with self.subTest(lower=lower, upper=upper):
+                doc = triangle_gltf()
+                doc["accessors"].append({"type": "VEC3", "count": 3, "min": lower, "max": upper})
+                doc["meshes"][0]["primitives"].append({"attributes": {"POSITION": 2}})
+                data = glb(doc)
+                report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+                self.assertIsNone(report["meshes"][0]["primitives"][1]["bbox"])
+                self.assertEqual(report["position_bbox"], {"min": [0, 0, 0], "max": [1, 1, 0]})
+                self.assertFalse(report["position_bbox_complete"])
+                self.assertIn("(partial:", glb_inspect.format_report(report))
+
+    def test_overflowed_json_exponent_still_allows_strict_json_report(self):
+        doc = bbox_gltf(with_bounds=True)
+        doc["accessors"][0]["max"][0] = "huge"
+        payload = json_bytes(doc).rstrip(b" ").replace(b'"huge"', b"1e999")
+        data = container(payload + b" " * (-len(payload) % 4))
+        report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+        self.assertIsNone(report["position_bbox"])
+        self.assertFalse(report["position_bbox_complete"])
+        json.dumps(report, allow_nan=False)
+
     def test_position_bbox_from_accessor_bounds(self):
         with tempfile.TemporaryDirectory() as folder:
             path = os.path.join(folder, "bounds.glb")
@@ -698,6 +762,26 @@ class GlbInspectTests(unittest.TestCase):
             self.assertEqual(report["position_bbox"], {"min": [-1.5, -2, -3], "max": [4, 5, 6]})
             self.assertTrue(report["position_bbox_complete"])
             self.assertEqual(report["meshes"][0]["primitives"][0]["bbox"], report["position_bbox"])
+
+    def test_additional_material_textures_resolve_each_declared_binding(self):
+        doc = triangle_gltf()
+        material = doc["materials"][0]
+        material["pbrMetallicRoughness"]["metallicRoughnessTexture"] = {"index": 1}
+        material.update(normalTexture={"index": 0}, occlusionTexture={"index": 1},
+                        emissiveTexture={"index": 99})
+        doc["textures"].append({"extensions": {"EXT_texture_webp": {"source": 1}}})
+        doc["images"].append({"uri": "packed.webp"})
+        doc["materials"].append({"normalTexture": {"index": True}})
+        data = glb(doc)
+        report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+        packed = {"index": 1, "name": "packed.webp"}
+        self.assertEqual(report["materials"][0]["additional_textures"], {
+            "metallicRoughnessTexture": packed, "normalTexture": {"index": 0, "name": "red.png"},
+            "occlusionTexture": packed, "emissiveTexture": {"index": 99, "name": None},
+        })
+        self.assertEqual(report["materials"][1]["additional_textures"],
+                         {"normalTexture": {"index": None, "name": None}})
+        self.assertIn('metallicRoughnessTexture="packed.webp" (index 1)', glb_inspect.format_report(report))
 
     def test_missing_bounds_and_material_fields_are_reported_not_guessed(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -923,6 +1007,18 @@ class GlbInspectTests(unittest.TestCase):
                 issues = json.load(handle)["animations"][0]["issues"]
             self.assertTrue(any("has 5 output values for 2 keys with CUBICSPLINE interpolation" in issue
                                 for issue in issues))
+
+
+    def test_skin_inverse_bind_matrices_require_float_component_type(self):
+        doc = skinned_gltf()
+        doc["skins"] = [{"joints": [1], "inverseBindMatrices": 4}]
+        doc["accessors"].append({"type": "MAT4", "componentType": 5123, "count": 1})
+        data = glb(doc)
+        report = glb_inspect.build_report(glb_inspect.parse_glb(data), len(data))
+        self.assertEqual(
+            report["skins"][0]["issues"],
+            ["inverseBindMatrices accessor must have componentType FLOAT (5126)"],
+        )
 
 
 if __name__ == "__main__":

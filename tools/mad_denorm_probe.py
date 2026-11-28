@@ -225,10 +225,25 @@ def hw_lines(case):
     ]
 
 
+def _extract_hw_words(got, expected_len, label):
+    if not isinstance(got, (list, tuple)) or len(got) != expected_len:
+        got_desc = len(got) if isinstance(got, (list, tuple)) else type(got).__name__
+        raise RuntimeError(f"{label}: hardware oracle returned {got_desc} results for {expected_len} kernels")
+    out = []
+    for idx, w in enumerate(got):
+        if isinstance(w, str):
+            out.append(w)
+        elif isinstance(w, (list, tuple)) and len(w) >= 1 and isinstance(w[0], int) and not isinstance(w[0], bool):
+            out.append(w[0] & 0xFFFFFFFF)
+        else:
+            raise RuntimeError(f"{label}: invalid oracle result at index {idx}: {w!r}")
+    return out
+
+
 def run_hw(oracle, case_list, wave, mode):
     from hw_oracle import asm
     got = oracle.run([asm.Kernel(hw_lines(c), wave, 1, 1, raw=True, mode=mode) for c in case_list], words=1)
-    return [w if isinstance(w, str) else w[0] for w in got]
+    return _extract_hw_words(got, len(case_list), f"wave{wave}")
 
 
 def check_mode_denorm_effect(oracle):
@@ -247,7 +262,7 @@ def check_mode_denorm_effect(oracle):
         asm.Kernel(prog, 32, 1, 1, raw=True, mode=dict(GAME_MODE, denorm32=3)),
     ]
     got = oracle.run(kernels, words=1)
-    return [w if isinstance(w, str) else w[0] for w in got]
+    return _extract_hw_words(got, len(kernels), "MODE denorm32 sanity")
 
 
 def _has_scale_omod(mods):
@@ -259,7 +274,14 @@ def main(argv=None):
     ap.add_argument("--oracle", default="translator", help="translator (default) or translator,hw / hw")
     ap.add_argument("--hw-arch", help="override the hardware architecture (LEONIDA_HW_ARCH)")
     a = ap.parse_args(argv)
-    sides = {s.strip() for s in a.oracle.split(",") if s.strip()} - {"translator"}
+    if a.hw_arch is not None:
+        a.hw_arch = a.hw_arch.strip()
+        if not a.hw_arch:
+            ap.error("--hw-arch must not be empty")
+    oracle_tokens = [s.strip() for s in a.oracle.split(",")]
+    if not any(oracle_tokens) or any(not s for s in oracle_tokens):
+        ap.error("--oracle must be a comma-separated list of sides: translator, hw")
+    sides = set(oracle_tokens) - {"translator"}
     if sides - {"hw"}:
         ap.error(f"unknown --oracle side(s): {', '.join(sorted(sides - {'hw'}))}")
     try:
@@ -285,15 +307,14 @@ def main(argv=None):
     except runner.Unavailable as e:
         print(f"hardware oracle unavailable: {e}")
         return 77
-    # The probe's three opcodes are GFX10.1 only: on gfx1030 and later the assembler rejects every kernel, which is
-    # "this GPU can't run it" (a skip), not a harness error.
-    why = asm.valu_skip_reason("v_mad_f32", oracle.arch)
-    if why:
-        oracle.close()
-        print(f"hardware oracle unavailable: {why}")
-        return 77
     status = 0
     try:
+        # The probe's three opcodes are GFX10.1 only: on gfx1030 and later the assembler rejects every kernel, which is
+        # "this GPU can't run it" (a skip), not a harness error.
+        why = asm.valu_skip_reason("v_mad_f32", oracle.arch)
+        if why:
+            print(f"hardware oracle unavailable: {why}")
+            return 77
         print(f"hardware oracle: {oracle.device} ({oracle.arch})")
         sanity = check_mode_denorm_effect(oracle)
         if any(isinstance(x, str) for x in sanity):
@@ -329,6 +350,12 @@ def main(argv=None):
                     print(f"  DIFF [{c.group}] {c.op} ({c.what}): hw 0x{g:08x}, expected 0x{w:08x}")
                 if diffs:
                     status = 1
+    except runner.Unavailable as e:
+        print(f"hardware oracle unavailable: {e}")
+        return 77
+    except RuntimeError as e:
+        print(f"harness error: {e}")
+        return 2
     finally:
         oracle.close()
     return status

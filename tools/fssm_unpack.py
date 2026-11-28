@@ -37,6 +37,7 @@ from collections import Counter
 
 # `python -I` leaves the script's directory off sys.path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
 from shader_stage_manifest import shader_stages  # noqa: E402
 from replace_retry import replace as replace_retry  # noqa: E402
 
@@ -48,6 +49,8 @@ MAX_FSSM_BYTES = 64 << 20
 def parts(d: bytes) -> dict:
     if len(d) < 32:
         raise ValueError("truncated DXBC header")
+    if d[:4] != b"DXBC":
+        raise ValueError(f"invalid DXBC magic {d[:4]!r}")
     count = struct.unpack_from("<I", d, 28)[0]
     table_end = 32 + 4 * count
     if table_end > len(d):
@@ -97,6 +100,8 @@ def _inflate_xbch(blob: bytes):
     """Decompress one XBCH entry payload to its FSSM blob, or None when it is not XBCH."""
     if not blob or blob[:4] != b"XBCH":
         return None
+    if len(blob) < 24:
+        raise struct.error(f"truncated XBCH header ({len(blob)} bytes, need 24)")
     stored = struct.unpack_from("<I", blob, 8)[0]
     unpacked = struct.unpack_from("<I", blob, 16)[0]
     if unpacked > MAX_FSSM_BYTES:
@@ -135,21 +140,26 @@ def unpack_all(dxbc: bytes):
     return out
 
 
-def unpack(dxbc: bytes, payload: str = "last"):
+def _unpack_with_count(dxbc: bytes, payload: str = "last"):
     p = parts(dxbc)
     dxil = p.get(b"DXIL", b"")
     all_entries = xdat_entries_all(dxil)
     ents = {tag: value for tag, value in all_entries}
     blobs = [value for tag, value in all_entries if tag == 0x0D]
     if not blobs:
-        return None, ents
+        return None, ents, 0
     if payload == "first":
         blob = blobs[0]
     elif payload == "last":
         blob = blobs[-1]
     else:
         raise ValueError(f"payload must be 'first' or 'last', not {payload!r}")
-    return _inflate_xbch(blob), ents
+    return _inflate_xbch(blob), ents, len(blobs)
+
+
+def unpack(dxbc: bytes, payload: str = "last"):
+    data, ents, _ = _unpack_with_count(dxbc, payload=payload)
+    return data, ents
 
 
 def program_counts(rows: list, stages: dict) -> dict:
@@ -181,14 +191,22 @@ def main(argv=None) -> int:
         what = "is not a folder" if os.path.exists(src) else "does not exist"
         print(f"ERROR: {src} {what}. Give the folder with the carved .dxbc files.", file=sys.stderr)
         return 2
+    index_path = os.path.join(src, "fssm_index.json")
+    if os.path.isdir(index_path):
+        print(f"ERROR: cannot write {index_path}: destination is a directory", file=sys.stderr)
+        return 2
     stages = {}
     try:
-        if a.carve_index:
-            stages = shader_stages(a.carve_index, "file", ".dxbc")
+        if a.carve_index is not None:
+            carve_index = a.carve_index.strip()
+            if not carve_index:
+                print("ERROR: --carve-index must not be empty", file=sys.stderr)
+                return 2
+            stages = shader_stages(carve_index, "file", ".dxbc")
             shaders = sorted(os.path.join(src, name + ".dxbc") for name in stages)
             for path in shaders:
                 if not os.path.isfile(path):
-                    raise ValueError(f"{a.carve_index}: declared shader file is missing: {path}")
+                    raise ValueError(f"{carve_index}: declared shader file is missing: {path}")
         else:
             with os.scandir(src) as entries:
                 shaders = sorted(entry.path for entry in entries
@@ -211,7 +229,7 @@ def main(argv=None) -> int:
             print(f"ERROR: cannot read {shader}: {e.strerror or e}", file=sys.stderr)
             return 2
         try:
-            fssm, ents = unpack(d, payload=a.payload)
+            fssm, ents, payloads = _unpack_with_count(d, payload=a.payload)
         except Exception as e:  # noqa: BLE001
             problems[type(e).__name__] += 1
             continue
@@ -219,10 +237,14 @@ def main(argv=None) -> int:
             problems["no XBCH"] += 1
             continue
         stem = os.path.basename(shader)[:-5]
-        with open(os.path.join(out, stem + ".fssm"), "wb") as f:
-            f.write(fssm)
+        fssm_path = os.path.join(out, stem + ".fssm")
+        try:
+            with open(fssm_path, "wb") as f:
+                f.write(fssm)
+        except OSError as e:
+            print(f"ERROR: cannot write {fssm_path}: {e.strerror or e}", file=sys.stderr)
+            return 2
         ends = [i for i in range(0, len(fssm) - 3, 4) if fssm[i:i + 4] == b"\x00\x00\x81\xbf"]
-        payloads = sum(1 for tag, _ in xdat_entries_all(parts(d).get(b"DXIL", b"")) if tag == 0x0D)
         rows.append({"name": stem, "size": len(fssm), "magic": fssm[:4].decode("latin-1"),
                      "version": struct.unpack_from("<H", fssm, 4)[0], "endpgm": ends,
                      "tags": sorted(hex(t) for t in ents), "xbch_payloads": payloads})
@@ -233,13 +255,21 @@ def main(argv=None) -> int:
               "game version.", file=sys.stderr)
         return 1
     # Stage privately and publish only after the index is complete and synced.
-    with tempfile.TemporaryDirectory(dir=src) as staging:
-        tmp = os.path.join(staging, "fssm_index.json")
-        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(rows, f)
-            f.flush()
-            os.fsync(f.fileno())
-        replace_retry(tmp, os.path.join(src, "fssm_index.json"))   # a scanner or sync client may hold tmp briefly on Windows
+    target = os.path.realpath(index_path) if os.path.islink(index_path) else index_path
+    stage_dir = os.path.dirname(target) or "."
+    try:
+        with tempfile.TemporaryDirectory(dir=stage_dir) as staging:
+            tmp = os.path.join(staging, "fssm_index.json")
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                json.dump(rows, f)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, published_mode(target))
+            replace_retry(tmp, target)   # a scanner or sync client may hold tmp briefly on Windows
+    except OSError as e:
+        print(f"ERROR: cannot write {index_path}: {e.strerror or e}", file=sys.stderr)
+        return 2
     print("magic:", dict(Counter(r["magic"] for r in rows)))
     print("s_endpgm per blob:", dict(Counter(len(r["endpgm"]) for r in rows)))
     counts = program_counts(rows, stages)

@@ -51,6 +51,7 @@ inline unsigned reg_reg(uint8_t rex, uint8_t modrm) { return ((modrm >> 3) & 7) 
 // Finds the loops in `code[0, size)`. A CLZERO that is in neither shape is left to the #UD path.
 inline std::vector<Site> find(const uint8_t* code, size_t size) {
     std::vector<Site> sites;
+    if (!code || size < 12) return sites;
     for (size_t k = 0; k + 3 <= size; ++k) {
         if (!clzero_at(code + k)) continue;
         // Shape A: the CLZERO is the loop's first instruction.
@@ -91,8 +92,25 @@ inline std::vector<Site> find(const uint8_t* code, size_t size) {
     return sites;
 }
 
+// Overflow-free check that a rel32 branch from `from_next` to `to` fits in signed 32 bits.
+inline bool rel32_offset(uint64_t from_next, uint64_t to, int32_t& out) {
+    constexpr uint64_t kMaxPos = static_cast<uint64_t>(INT32_MAX);
+    constexpr uint64_t kMaxNeg = static_cast<uint64_t>(INT32_MAX) + 1;
+    if (to >= from_next) {
+        const uint64_t d = to - from_next;
+        if (d > kMaxPos) return false;
+        out = static_cast<int32_t>(d);
+        return true;
+    }
+    const uint64_t d = from_next - to;
+    if (d > kMaxNeg) return false;
+    out = d == kMaxNeg ? INT32_MIN : -static_cast<int32_t>(d);
+    return true;
+}
+
 // The stub for one loop: its instructions before the CLZERO, the zeroing block, its instructions after the CLZERO up
 // to the jb, a jb back to the stub's start, then a jmp to `resume` (the instruction after the original jb).
+// Returns an empty vector if the final jmp rel32 cannot reach `resume`.
 inline std::vector<uint8_t> stub(const uint8_t* loop, const Site& s, uint64_t stub_at, uint64_t resume) {
     std::vector<uint8_t> out(loop, loop + s.clzero);  // shape B: mov rax, CUR; add CUR, 40h
     const uint8_t zero_line[] = {
@@ -116,8 +134,8 @@ inline std::vector<uint8_t> stub(const uint8_t* loop, const Site& s, uint64_t st
     out.push_back(0x72);
     out.push_back(uint8_t(int8_t(back)));
     out.push_back(0xE9);
-    const int64_t rel = int64_t(resume) - int64_t(stub_at + out.size() + 4);
-    const int32_t rel32 = int32_t(rel);
+    int32_t rel32 = 0;
+    if (out.size() + 4 > UINT64_MAX - stub_at || !rel32_offset(stub_at + out.size() + 4, resume, rel32)) return {};
     const auto* b = reinterpret_cast<const uint8_t*>(&rel32);
     out.insert(out.end(), b, b + 4);
     return out;
@@ -125,17 +143,30 @@ inline std::vector<uint8_t> stub(const uint8_t* loop, const Site& s, uint64_t st
 
 // Reserves a page within 2 GiB above or below [lo, hi) for the stubs (the image does not move after this).
 inline uint8_t* stub_page(uint64_t lo, uint64_t hi, size_t size) {
-    SYSTEM_INFO si;
+    if (!size || hi < lo) return nullptr;
+    SYSTEM_INFO si{};
     GetSystemInfo(&si);
-    const uint64_t gran = si.dwAllocationGranularity;
+    const uint64_t gran = si.dwAllocationGranularity ? si.dwAllocationGranularity : 0x10000;
     const uint64_t limit = uint64_t(1) << 31;
-    for (uint64_t at = (hi + gran - 1) & ~(gran - 1); at + size < lo + limit - 0x1000; at += gran) {
-        if (void* p = VirtualAlloc(reinterpret_cast<void*>(at), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
-            return static_cast<uint8_t*>(p);
+    const uint64_t max_span = limit - 0x1000;
+    if (hi - lo < max_span && hi <= UINT64_MAX - (gran - 1)) {
+        const uint64_t start = (hi + gran - 1) & ~(gran - 1);
+        const uint64_t ceiling = lo <= UINT64_MAX - max_span ? lo + max_span : UINT64_MAX;
+        for (uint64_t at = start; size <= ceiling && at <= ceiling - size;) {
+            if (void* p = VirtualAlloc(reinterpret_cast<void*>(at), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+                return static_cast<uint8_t*>(p);
+            if (at > UINT64_MAX - gran) break;
+            at += gran;
+        }
     }
-    for (uint64_t at = (lo - size) & ~(gran - 1); at > gran && hi - at < limit - 0x1000; at -= gran) {
-        if (void* p = VirtualAlloc(reinterpret_cast<void*>(at), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
-            return static_cast<uint8_t*>(p);
+    if (lo >= size) {
+        uint64_t at = (lo - size) & ~(gran - 1);
+        while (at >= gran && hi - at < max_span) {
+            if (void* p = VirtualAlloc(reinterpret_cast<void*>(at), size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE))
+                return static_cast<uint8_t*>(p);
+            if (at < gran) break;
+            at -= gran;
+        }
     }
     return nullptr;
 }
@@ -165,31 +196,50 @@ inline Result patch(const std::vector<std::pair<uint8_t*, size_t>>& ranges, uint
     if (!stubs) return r;
     size_t used = 0;
     std::vector<std::vector<uint8_t>> bodies;
+    std::vector<int32_t> jump_rels;
+    bodies.reserve(all.size());
+    jump_rels.reserve(all.size());
     for (const auto& [code, s] : all) {
         uint8_t* const loop = code + s.head;
-        const uint64_t at = uint64_t(stubs + used);
-        bodies.push_back(stub(loop, s, at, uint64_t(loop + s.length)));
-        used += (bodies.back().size() + 15) & ~size_t(15);
-        if (used > page) {
+        const uint64_t at = reinterpret_cast<uint64_t>(stubs + used);
+        int32_t jmp_rel = 0;
+        if (!rel32_offset(reinterpret_cast<uint64_t>(loop + 5), at, jmp_rel)) {
             VirtualFree(stubs, 0, MEM_RELEASE);
             return r;
         }
+        auto body = stub(loop, s, at, reinterpret_cast<uint64_t>(loop + s.length));
+        if (body.empty()) {
+            VirtualFree(stubs, 0, MEM_RELEASE);
+            return r;
+        }
+        const size_t padded = (body.size() + 15) & ~size_t(15);
+        if (padded > page - used) {
+            VirtualFree(stubs, 0, MEM_RELEASE);
+            return r;
+        }
+        bodies.push_back(std::move(body));
+        jump_rels.push_back(jmp_rel);
+        used += padded;
     }
-    used = 0;
+    size_t offset = 0;
+    for (const auto& body : bodies) {
+        std::memcpy(stubs + offset, body.data(), body.size());
+        offset += (body.size() + 15) & ~size_t(15);
+    }
+    DWORD old = 0;
+    if (!VirtualProtect(stubs, page, PAGE_EXECUTE_READ, &old)) {
+        VirtualFree(stubs, 0, MEM_RELEASE);
+        return r;
+    }
+    FlushInstructionCache(GetCurrentProcess(), stubs, page);
+    // Only overwrite the image loops once the stub page is populated and executable.
     for (size_t i = 0; i < all.size(); ++i) {
         const auto& [code, s] = all[i];
         uint8_t* const loop = code + s.head;
-        uint8_t* const at = stubs + used;
-        std::memcpy(at, bodies[i].data(), bodies[i].size());
-        used += (bodies[i].size() + 15) & ~size_t(15);
-        const int32_t rel = int32_t(int64_t(at) - int64_t(loop + 5));
         loop[0] = 0xE9;
-        std::memcpy(loop + 1, &rel, 4);
+        std::memcpy(loop + 1, &jump_rels[i], 4);
         std::memset(loop + 5, 0xCC, s.length - 5);
     }
-    DWORD old = 0;
-    VirtualProtect(stubs, page, PAGE_EXECUTE_READ, &old);
-    FlushInstructionCache(GetCurrentProcess(), stubs, page);
     r.sites = all.size();
     r.stubs = stubs;
     r.stub_bytes = used;

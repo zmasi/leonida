@@ -264,6 +264,22 @@ def render_targets(forms, name, harness, vs, out, runs, timeout, observed, decla
     return images
 
 
+def _validate_out_dir(out_path, ap):
+    if not out_path.strip():
+        ap.error("out directory must not be empty")
+    for candidate in (os.path.abspath(out_path), os.path.realpath(out_path)):
+        if (os.path.exists(candidate) or os.path.islink(candidate)) and not os.path.isdir(candidate):
+            ap.error(f"cannot create {out_path}: target is not a directory")
+        probe = os.path.dirname(candidate)
+        while probe and not (os.path.exists(probe) or os.path.islink(probe)):
+            nxt = os.path.dirname(probe)
+            if nxt == probe:
+                break
+            probe = nxt
+        if probe and not os.path.isdir(probe):
+            ap.error(f"cannot create {out_path}: {probe} is not a directory")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("repo")
@@ -280,6 +296,11 @@ def main(argv=None):
     ap.add_argument("--runs", type=positive_int, default=1,
                     help="render each form this many times; all must agree")
     a = ap.parse_args(argv)
+    _validate_out_dir(a.out, ap)
+    if a.harness is not None and (not a.harness.strip() or os.path.isdir(a.harness)):
+        ap.error(f"--harness {a.harness!r} must be a non-empty file path, not a directory")
+    if a.names is not None and (not a.names.strip() or not os.path.isfile(a.names)):
+        ap.error(f"--names {a.names!r} is not a file")
     disasm = os.path.join(a.shaders, "dxbc", "disasm")
     old = os.path.join(a.shaders, "spirv")
     # Everything the run reads is checked before anything is created: a mistyped shaders folder or names file
@@ -291,8 +312,6 @@ def main(argv=None):
             index = json.load(f)
     except (OSError, ValueError, RecursionError) as e:
         ap.error(f"cannot read {index_path}: {getattr(e, 'strerror', None) or e}")
-    if a.names and not os.path.isfile(a.names):
-        ap.error(f"--names {a.names} is not a file")
     if not isinstance(index, dict) or any(not valid_metadata(item) for item in index.values()):
         ap.error(f"{index_path}: expected a JSON object mapping shader names to metadata "
                  "(an object whose bindings and features, when present, are lists of numbers or strings)")
@@ -367,9 +386,13 @@ def main(argv=None):
             note(name, "a translation is invalid")
             continue
         targets = []
-        for directory in (loopdir, new):
-            with open(os.path.join(directory, name + ".spvasm"), encoding="utf-8") as assembly:
-                targets.append(set(re.findall(r"%out_mrt(\d+)\b", assembly.read())))
+        try:
+            for directory in (loopdir, new):
+                with open(os.path.join(directory, name + ".spvasm"), encoding="utf-8-sig") as assembly:
+                    targets.append(set(re.findall(r"%out_mrt(\d+)\b", assembly.read())))
+        except OSError as e:
+            note(name, f"cannot read translated assembly: {e.strerror or e}")
+            continue
         if targets[0] != targets[1]:
             note(name, "DIFFERENT colour target declarations")
             differ.append(name)

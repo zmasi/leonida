@@ -462,10 +462,31 @@ $valRx = [regex]'0x([0-9a-f]+)=([0-9a-f?]+)'
 $states = New-Object System.Collections.Generic.List[string]
 $lastPeek = ""; $prevPair = ""
 $presentOk = 0; $presentFailed = 0; $presses = 0
-$shaderLine = ""; $faults = New-Object System.Collections.Generic.List[string]
+$shaderLine = ""
+$deviceLost = $false
+# VkDeviceFaultAddressTypeEXT, in enum order. Keep only counters, including one bucket for newer types.
+$faultNames = @("NONE", "READ_INVALID", "WRITE_INVALID", "EXECUTE_INVALID", "INSTRUCTION_POINTER_UNKNOWN",
+                "INSTRUCTION_POINTER_INVALID", "INSTRUCTION_POINTER_FAULT", "OTHER")
+$faultCounts = New-Object 'long[]' $faultNames.Length
+$faultAddressRx = [regex]'^\s*\[rt\] device-fault: address\[\d+\] type=(-?\d+)\s+address='
 $wrapped = 0
 if (Test-Path -LiteralPath $LogFile) {
     foreach ($line in [System.IO.File]::ReadLines($LogFile)) {
+        if ($line.Contains("[rt] device-fault:")) {
+            if ($line.Contains("[rt] device-fault: VK_ERROR_DEVICE_LOST from ")) { $deviceLost = $true }
+            $m = $faultAddressRx.Match($line)
+            if ($m.Success) {
+                $type = 0
+                if (-not [int]::TryParse($m.Groups[1].Value, [ref]$type) -or $type -lt 0 -or $type -ge ($faultNames.Length - 1)) {
+                    $type = $faultNames.Length - 1
+                }
+                $faultCounts[$type]++
+            }
+            continue
+        }
+        if ($line.Contains("[rt] vulkan: the device was lost (") -or $line.Contains("VK_ERROR_DEVICE_LOST")) {
+            $deviceLost = $true
+        }
         if ($line.Contains("XboxPresentation::PresentX")) {
             if ($line.EndsWith(" ok")) { $presentOk++ } elseif ($line.EndsWith(" failed")) { $presentFailed++ }
             continue
@@ -493,8 +514,6 @@ if (Test-Path -LiteralPath $LogFile) {
             if ($line -notmatch 'gameinput: press [lr]s') { $presses++ }
             continue
         }
-        if ($line.Contains("[rt] device-fault:") -and -not $line.Contains("device-fault: enabled")) { if ($faults.Count -lt 8) { $faults.Add($line.Trim()) }; continue }
-        if ($line.Contains("VK_ERROR_DEVICE_LOST") -and $faults.Count -lt 8) { $faults.Add($line.Trim()); continue }
         if (-not $shaderLine -and $line.Contains(" translated shaders (")) { $shaderLine = $line.Substring([Math]::Max(0, $line.IndexOf("[rt]"))).Trim() }
         if ($line.Contains("wrapped V#")) { $wrapped++ }
     }
@@ -526,8 +545,16 @@ $digest.Add("shaders:  $(if ($shaderLine) { $shaderLine } else { 'no translated-
 $digest.Add("states:   $(if ($states.Count) { $states -join ' | ' } else { 'no peek lines' })")
 $digest.Add("presents: PresentX ok $presentOk, failed $presentFailed")
 $digest.Add("input:    $presses presses logged")
-$digest.Add("faults:   $(if ($faults.Count) { $faults.Count.ToString() + ' device-fault lines' } else { 'none' })")
-foreach ($f in $faults) { $digest.Add("          $f") }
+$faultClasses = @(for ($i = 0; $i -lt $faultNames.Length; $i++) {
+    if ($faultCounts[$i]) { "$($faultNames[$i])=$($faultCounts[$i])" }
+})
+$faultText = "none"
+if ($deviceLost -or $faultClasses.Count) {
+    $loss = if ($deviceLost) { "device loss reported" } else { "no device-loss marker" }
+    $records = if ($faultClasses.Count) { $faultClasses -join ", " } else { "none" }
+    $faultText = "$loss, address records: $records"
+}
+$digest.Add("faults:   $faultText")
 if ($wrapped) { $digest.Add("wrapped:  $wrapped lines mention wrapped V#s") }
 $digest.Add("frames:   $capText")
 $digest.Add("files:    $LogFile, $TraceFile, $SummaryFile")

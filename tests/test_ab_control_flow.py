@@ -1218,6 +1218,78 @@ class HardeningRegressionTest(unittest.TestCase):
                 self.assertEqual(kw.get("encoding"), "utf-8")
                 self.assertEqual(kw.get("errors"), "replace")
 
+    def test_upfront_out_harness_and_names_validation_runs_before_index_json(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            shaders = os.path.join(tmp, "missing_shaders")
+            file_blocker = os.path.join(tmp, "blocker")
+            dir_blocker = os.path.join(tmp, "subdir")
+            os.makedirs(dir_blocker)
+            with open(file_blocker, "wb") as f:
+                f.write(b"x")
+            bad_invocations = (
+                ([tmp, shaders, "", "--names", "n"], "out directory must not be empty"),
+                ([tmp, shaders, "   ", "--names", "n"], "out directory must not be empty"),
+                ([tmp, shaders, file_blocker], "cannot create"),
+                ([tmp, shaders, os.path.join(file_blocker, "nested")], "cannot create"),
+                ([tmp, shaders, os.path.join(tmp, "out"), "--harness", ""], "--harness"),
+                ([tmp, shaders, os.path.join(tmp, "out"), "--harness", dir_blocker], "--harness"),
+                ([tmp, shaders, os.path.join(tmp, "out"), "--names", ""], "--names"),
+                ([tmp, shaders, os.path.join(tmp, "out"), "--names", "   "], "--names"),
+            )
+            for argv, expected in bad_invocations:
+                with self.subTest(argv=argv):
+                    err = io.StringIO()
+                    with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+                        AB.main(argv)
+                    self.assertEqual(cm.exception.code, 2)
+                    self.assertIn(expected, err.getvalue())
+                    self.assertNotIn("index.json", err.getvalue())
+
+    def test_main_handles_spvasm_bom_and_missing_spvasm_oserror(self):
+        import json
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = os.path.join(tmp, "repo")
+            shaders = os.path.join(tmp, "shaders")
+            out = os.path.join(tmp, "out")
+            os.makedirs(os.path.join(repo, "runtime", "build"))
+            os.makedirs(os.path.join(shaders, "dxbc", "disasm"))
+            os.makedirs(os.path.join(shaders, "spirv"))
+            with open(os.path.join(shaders, "spirv", "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"ps_a": {"stage": "ps"}, "ps_b": {"stage": "ps"}}, f)
+            for name in ("ps_a", "ps_b"):
+                with open(os.path.join(shaders, "dxbc", "disasm", f"{name}.s"), "w", encoding="utf-8", newline="\n") as f:
+                    f.write("\ts_cbranch_scc0 10\n\ts_branch 20\n\ts_endpgm\n")
+                with open(os.path.join(shaders, "spirv", f"{name}.spv"), "wb") as f:
+                    f.write(b"stub")
+
+            def side_effect(args, **kwargs):
+                if "spirv-as" in str(args[0]):
+                    with open(args[-1], "wb") as fh:
+                        fh.write(b"vs")
+                    return SimpleNamespace(returncode=0, stdout="ok")
+                if "spirv-val" in str(args[0]):
+                    return SimpleNamespace(returncode=0, stdout="ok")
+                if "rdna2spirv.py" in str(args):
+                    out_dir = args[args.index("--out") + 1]
+                    os.makedirs(out_dir, exist_ok=True)
+                    src_name = os.path.splitext(os.path.basename(args[3]))[0]
+                    if src_name == "ps_a":
+                        with open(os.path.join(out_dir, f"{src_name}.spvasm"), "wb") as fh:
+                            fh.write(b"\xef\xbb\xbf%out_mrt0 = OpVariable %po Output\n")
+                    return SimpleNamespace(returncode=0, stdout="1 pass spirv-val\n")
+                with open(args[3], "wb") as fh:
+                    fh.write(bytes(AB.READBACK_BYTES))
+                return SimpleNamespace(returncode=0, stdout="ok")
+
+            with patch("subprocess.run", side_effect=side_effect), contextlib.redirect_stdout(io.StringIO()):
+                rc = AB.main([repo, shaders, out, "--count", "2", "--harness", "dummy.exe"])
+            self.assertEqual(rc, 0)
+            with open(os.path.join(out, "outcomes.tsv"), encoding="utf-8") as f:
+                tsv = f.read()
+            self.assertIn("ps_a\tidentical MRT0: non-clear\n", tsv)
+            self.assertIn("ps_b\tcannot read translated assembly:", tsv)
+
 
 if __name__ == "__main__":
     unittest.main()

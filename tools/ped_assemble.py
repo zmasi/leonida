@@ -41,12 +41,14 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import json
 import math
 import os
 import re
 import struct
 import sys
+import tempfile
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -55,7 +57,10 @@ TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+import file_mode  # noqa: E402
 import glb_writer  # noqa: E402
+import replace_retry  # noqa: E402
+import report_paths  # noqa: E402
 
 GLB_MAGIC = b"glTF"
 GLB_VERSION = 2
@@ -131,6 +136,119 @@ _RE_HEAD = re.compile(r"(?:^|_)head(?:$|_)", re.I)
 
 class PedAssembleError(ValueError):
     """Raised when a modular ped input, seam spec, or GLB container is invalid."""
+
+
+_VALID_ALPHA_MODES = ("OPAQUE", "MASK", "BLEND")
+
+
+def _require_finite_float(val: object, what: str) -> float:
+    if isinstance(val, bool):
+        raise PedAssembleError(f"{what} must be a finite number, got {val!r}")
+    try:
+        out = float(val)
+    except (TypeError, ValueError):
+        raise PedAssembleError(f"{what} must be a finite number, got {val!r}") from None
+    if not math.isfinite(out):
+        raise PedAssembleError(f"{what} must be a finite number, got {val!r}")
+    return out
+
+
+def _require_non_negative_float(val: object, what: str) -> float:
+    out = _require_finite_float(val, what)
+    if out < 0.0:
+        raise PedAssembleError(f"{what} must be >= 0, got {val!r}")
+    return out
+
+
+def _require_normal_cos(val: object, what: str = "normal_cos_min") -> float:
+    out = _require_finite_float(val, what)
+    if not (-1.0 <= out <= 1.0):
+        raise PedAssembleError(f"{what} must be in [-1, 1], got {val!r}")
+    return out
+
+
+def _require_int_not_bool(val: object, what: str) -> int:
+    if type(val) is not int:
+        raise PedAssembleError(f"{what} must be an integer, got {val!r}")
+    return val
+
+
+def _require_vec(val: object, length: int, what: str) -> tuple[float, ...]:
+    if not isinstance(val, (list, tuple)) or len(val) != length:
+        raise PedAssembleError(f"{what} must be a sequence of {length} finite numbers")
+    return tuple(_require_finite_float(v, f"{what}[{i}]") for i, v in enumerate(val))
+
+
+def _validate_triangles_in_bounds(
+    triangles: list[tuple[int, int, int]],
+    n_verts: int,
+    what: str,
+) -> None:
+    for ti, tri in enumerate(triangles):
+        if not isinstance(tri, (list, tuple)) or len(tri) != 3:
+            raise PedAssembleError(f"{what}: triangle {ti} must have 3 vertex indices")
+        for corner, vi in enumerate(tri):
+            if type(vi) is not int or not (0 <= vi < n_verts):
+                raise PedAssembleError(
+                    f"{what}: triangle {ti}[{corner}] has out-of-range vertex index {vi!r} "
+                    f"(vertex count {n_verts})"
+                )
+
+
+def _validate_part_positions_and_triangles(part: MeshPart) -> None:
+    for vi, p in enumerate(part.positions):
+        if not isinstance(p, (list, tuple)) or len(p) != 3 or not all(
+            not isinstance(c, bool) and isinstance(c, (int, float)) and math.isfinite(c)
+            for c in p
+        ):
+            raise PedAssembleError(f"{part.name}: positions[{vi}] must contain 3 finite numbers")
+    _require_vec(part.translation, 3, f"{part.name}.translation")
+    _validate_triangles_in_bounds(part.triangles, len(part.positions), part.name)
+
+
+def _validate_skeleton(skeleton: SkeletonSpec) -> None:
+    if skeleton.coord_space not in ("z-up", "y-up"):
+        raise PedAssembleError(
+            f"skeleton {skeleton.name!r}: coord_space must be 'z-up' or 'y-up', got {skeleton.coord_space!r}"
+        )
+    if skeleton.standing_offset is not None:
+        _require_finite_float(skeleton.standing_offset, f"skeleton {skeleton.name!r}.standing_offset")
+    n_joints = len(skeleton.joints)
+    for ji, j in enumerate(skeleton.joints):
+        if type(j.parent) is not int or not (j.parent == -1 or 0 <= j.parent < n_joints):
+            raise PedAssembleError(
+                f"skeleton {skeleton.name!r}: joint {ji} ({j.name!r}) has invalid parent {j.parent!r} "
+                f"(expected -1 or 0..{n_joints - 1})"
+            )
+        if j.parent == ji:
+            raise PedAssembleError(
+                f"skeleton {skeleton.name!r}: joint {ji} ({j.name!r}) cannot be its own parent"
+            )
+        _require_vec(j.translation, 3, f"skeleton {skeleton.name!r}.joints[{ji}].translation")
+        _require_vec(j.rotation, 4, f"skeleton {skeleton.name!r}.joints[{ji}].rotation")
+        _require_vec(j.scale, 3, f"skeleton {skeleton.name!r}.joints[{ji}].scale")
+        if j.inverse_bind_matrix is not None:
+            _require_vec(
+                j.inverse_bind_matrix,
+                16,
+                f"skeleton {skeleton.name!r}.joints[{ji}].inverse_bind_matrix",
+            )
+    # Check for multi-joint cycles
+    state = [0] * n_joints  # 0=unvisited, 1=visiting, 2=done
+    for start in range(n_joints):
+        cur = start
+        path_nodes: list[int] = []
+        while cur != -1 and state[cur] == 0:
+            state[cur] = 1
+            path_nodes.append(cur)
+            cur = skeleton.joints[cur].parent
+        if cur != -1 and state[cur] == 1:
+            raise PedAssembleError(
+                f"skeleton {skeleton.name!r}: cyclic joint parent chain involving joint {cur} "
+                f"({skeleton.joints[cur].name!r})"
+            )
+        for node in path_nodes:
+            state[node] = 2
 
 
 @dataclass
@@ -328,10 +446,11 @@ def classify_part_role(name: str) -> str:
 
 def standing_offset_vector(offset_m: float = DEFAULT_STANDING_OFFSET_M, coord_space: str = "z-up") -> tuple[float, float, float]:
     """Return the vertical ``SKEL_ROOT`` standing-space offset vector in the requested space."""
+    off = _require_finite_float(offset_m, "standing_offset")
     if coord_space == "z-up":
-        return (0.0, 0.0, float(offset_m))
+        return (0.0, 0.0, off)
     if coord_space == "y-up":
-        return (0.0, float(offset_m), 0.0)
+        return (0.0, off, 0.0)
     raise PedAssembleError(f"Unsupported coord_space {coord_space!r}; expected 'z-up' or 'y-up'")
 
 
@@ -476,6 +595,15 @@ def find_coplanar_overlap_indices(
        ``feet_*_nude_cull`` / ``bodynipplesgen_*`` / ``bodygenitalsgen_fr1_*``)
        while preserving nearby non-coplanar geometry.
     """
+    centroid_tol = _require_non_negative_float(centroid_tol, "centroid_tol")
+    if plane_tol is not None:
+        plane_tol = _require_non_negative_float(plane_tol, "plane_tol")
+    normal_cos_min = _require_normal_cos(normal_cos_min, "normal_cos_min")
+    vertex_tol = _require_non_negative_float(vertex_tol, "vertex_tol")
+    _validate_part_positions_and_triangles(target)
+    for ref in ref_parts:
+        _validate_part_positions_and_triangles(ref)
+
     if not target.triangles or not ref_parts:
         return set(), {
             "target": target.name,
@@ -752,6 +880,15 @@ def count_mesh_islands(
     449 / 290 / 257 / 264 islands). With ``by_position=True``, vertices within
     ``quant_tol`` are welded before computing components.
     """
+    quant_tol = _require_non_negative_float(quant_tol, "quant_tol")
+    _validate_triangles_in_bounds(triangles, len(positions), "count_mesh_islands")
+    if by_position:
+        for vi, p in enumerate(positions):
+            if not isinstance(p, (list, tuple)) or len(p) != 3 or not all(
+                not isinstance(c, bool) and isinstance(c, (int, float)) and math.isfinite(c)
+                for c in p
+            ):
+                raise PedAssembleError(f"count_mesh_islands: positions[{vi}] must contain 3 finite numbers")
     n_tris = len(triangles)
     if n_tris == 0:
         return {"island_count": 0, "largest_island_triangles": 0, "smallest_island_triangles": 0}
@@ -803,9 +940,11 @@ def analyze_edge_topology(
     double-drawn coplanar overlap bands). Triangles with fewer than three
     distinct welded corners are counted separately; they no longer form faces.
     """
+    weld_tol = _require_non_negative_float(weld_tol, "weld_tol")
     edge_counts: dict[tuple[tuple[int, int, int], tuple[int, int, int]], int] = defaultdict(int)
     collapsed = 0
     for part in parts:
+        _validate_part_positions_and_triangles(part)
         ox, oy, oz = part.translation
         qpts = [
             _quantize_point((p[0] + ox, p[1] + oy, p[2] + oz), weld_tol)
@@ -849,6 +988,11 @@ def inspect_seams(
     normal_cos_min: float = DEFAULT_NORMAL_COS_MIN,
 ) -> dict:
     """Inspect islands, bounding boxes, welded edge topology, and pairwise overlaps."""
+    weld_tol = _require_non_negative_float(weld_tol, "weld_tol")
+    overlap_tol = _require_non_negative_float(overlap_tol, "overlap_tol")
+    if plane_tol is not None:
+        plane_tol = _require_non_negative_float(plane_tol, "plane_tol")
+    normal_cos_min = _require_normal_cos(normal_cos_min, "normal_cos_min")
     part_summaries = []
     for p in parts:
         ox, oy, oz = p.translation
@@ -902,56 +1046,121 @@ def inspect_seams(
 
 # --------------------------------------------------------------------------- I/O (JSON, OBJ, GLB)
 
-def _read_png_spec(val: object, base_dir: str) -> bytes | None:
+def _read_png_spec(
+    val: object,
+    base_dir: str,
+    *,
+    loaded_paths: list[str] | None = None,
+) -> bytes | None:
     if val is None:
         return None
     if isinstance(val, (bytes, bytearray)):
         return bytes(val)
     if isinstance(val, str):
         if val.startswith("base64:"):
-            return base64.b64decode(val[len("base64:"):])
+            payload = re.sub(r"\s+", "", val[len("base64:"):])
+            try:
+                return base64.b64decode(payload, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise PedAssembleError(f"Invalid base64 PNG texture spec: {exc}") from None
         path = val if os.path.isabs(val) else os.path.join(base_dir, val)
+        if loaded_paths is not None:
+            loaded_paths.append(path)
         with open(path, "rb") as f:
             return f.read()
     raise PedAssembleError(f"Unsupported PNG texture spec: {type(val).__name__}")
 
 
-def _parse_material_dict(raw: dict | None, base_dir: str) -> MaterialSpec | None:
+def _parse_material_dict(
+    raw: dict | None,
+    base_dir: str,
+    *,
+    loaded_paths: list[str] | None = None,
+) -> MaterialSpec | None:
     if raw is None:
         return None
     if not isinstance(raw, dict):
         raise PedAssembleError("material must be a JSON object")
     bcf = raw.get("base_color_factor", raw.get("baseColorFactor", (0.8, 0.8, 0.8, 1.0)))
+    if not isinstance(bcf, (list, tuple)):
+        raise PedAssembleError("base_color_factor must be a list of 3 or 4 finite floats")
     if len(bcf) == 3:
-        bcf = (float(bcf[0]), float(bcf[1]), float(bcf[2]), 1.0)
+        bcf = (
+            _require_finite_float(bcf[0], "base_color_factor[0]"),
+            _require_finite_float(bcf[1], "base_color_factor[1]"),
+            _require_finite_float(bcf[2], "base_color_factor[2]"),
+            1.0,
+        )
     elif len(bcf) == 4:
-        bcf = (float(bcf[0]), float(bcf[1]), float(bcf[2]), float(bcf[3]))
+        bcf = (
+            _require_finite_float(bcf[0], "base_color_factor[0]"),
+            _require_finite_float(bcf[1], "base_color_factor[1]"),
+            _require_finite_float(bcf[2], "base_color_factor[2]"),
+            _require_finite_float(bcf[3], "base_color_factor[3]"),
+        )
     else:
         raise PedAssembleError("base_color_factor must have 3 or 4 floats")
+    raw_alpha_mode = raw.get("alpha_mode", raw.get("alphaMode", "OPAQUE"))
+    if not isinstance(raw_alpha_mode, str):
+        raise PedAssembleError(f"alpha_mode must be a string, got {raw_alpha_mode!r}")
+    alpha_mode = raw_alpha_mode.upper()
+    if alpha_mode not in _VALID_ALPHA_MODES:
+        raise PedAssembleError(
+            f"Unsupported alpha_mode {alpha_mode!r}; expected one of {', '.join(_VALID_ALPHA_MODES)}"
+        )
+    raw_cutoff = raw.get("alpha_cutoff", raw.get("alphaCutoff"))
+    alpha_cutoff = _require_finite_float(raw_cutoff, "alpha_cutoff") if raw_cutoff is not None else None
     return MaterialSpec(
         name=str(raw.get("name", "material")),
         base_color_factor=bcf,
-        metallic_factor=float(raw.get("metallic_factor", raw.get("metallicFactor", 0.0))),
-        roughness_factor=float(raw.get("roughness_factor", raw.get("roughnessFactor", 0.85))),
-        alpha_mode=str(raw.get("alpha_mode", raw.get("alphaMode", "OPAQUE"))).upper(),
-        alpha_cutoff=float(raw["alpha_cutoff"]) if "alpha_cutoff" in raw and raw["alpha_cutoff"] is not None else None,
+        metallic_factor=_require_finite_float(
+            raw.get("metallic_factor", raw.get("metallicFactor", 0.0)), "metallic_factor"
+        ),
+        roughness_factor=_require_finite_float(
+            raw.get("roughness_factor", raw.get("roughnessFactor", 0.85)), "roughness_factor"
+        ),
+        alpha_mode=alpha_mode,
+        alpha_cutoff=alpha_cutoff,
         double_sided=bool(raw.get("double_sided", raw.get("doubleSided", False))),
-        base_color_png=_read_png_spec(raw.get("base_color_png", raw.get("baseColorPng")), base_dir),
-        normal_png=_read_png_spec(raw.get("normal_png", raw.get("normalPng")), base_dir),
-        metallic_roughness_png=_read_png_spec(raw.get("metallic_roughness_png", raw.get("metallicRoughnessPng")), base_dir),
+        base_color_png=_read_png_spec(
+            raw.get("base_color_png", raw.get("baseColorPng")), base_dir, loaded_paths=loaded_paths
+        ),
+        normal_png=_read_png_spec(
+            raw.get("normal_png", raw.get("normalPng")), base_dir, loaded_paths=loaded_paths
+        ),
+        metallic_roughness_png=_read_png_spec(
+            raw.get("metallic_roughness_png", raw.get("metallicRoughnessPng")),
+            base_dir,
+            loaded_paths=loaded_paths,
+        ),
     )
 
 
-def _normalize_triangles(raw_indices: list) -> list[tuple[int, int, int]]:
+def _normalize_triangles(raw_indices: object) -> list[tuple[int, int, int]]:
+    if not isinstance(raw_indices, (list, tuple)):
+        raise PedAssembleError(f"triangles/indices must be a list, got {type(raw_indices).__name__}")
     if not raw_indices:
         return []
     first = raw_indices[0]
     if isinstance(first, (list, tuple)):
-        return [(int(t[0]), int(t[1]), int(t[2])) for t in raw_indices]
+        tris: list[tuple[int, int, int]] = []
+        for ti, t in enumerate(raw_indices):
+            if not isinstance(t, (list, tuple)) or len(t) != 3:
+                raise PedAssembleError(f"triangles[{ti}] must contain 3 vertex indices")
+            tris.append((
+                _require_int_not_bool(t[0], f"triangles[{ti}][0]"),
+                _require_int_not_bool(t[1], f"triangles[{ti}][1]"),
+                _require_int_not_bool(t[2], f"triangles[{ti}][2]"),
+            ))
+        return tris
     if len(raw_indices) % 3 != 0:
         raise PedAssembleError(f"Flat index array length {len(raw_indices)} is not a multiple of 3")
     return [
-        (int(raw_indices[i]), int(raw_indices[i + 1]), int(raw_indices[i + 2]))
+        (
+            _require_int_not_bool(raw_indices[i], f"indices[{i}]"),
+            _require_int_not_bool(raw_indices[i + 1], f"indices[{i + 1}]"),
+            _require_int_not_bool(raw_indices[i + 2], f"indices[{i + 2}]"),
+        )
         for i in range(0, len(raw_indices), 3)
     ]
 
@@ -974,40 +1183,105 @@ def _parse_joint_names(raw: object, *, part_name: str) -> list[str] | None:
     return out
 
 
-def _part_from_dict(raw: dict, *, default_name: str, default_space: str, base_dir: str) -> MeshPart:
+def _part_from_dict(
+    raw: dict,
+    *,
+    default_name: str,
+    default_space: str,
+    base_dir: str,
+    loaded_paths: list[str] | None = None,
+) -> MeshPart:
+    if not isinstance(raw, dict):
+        raise PedAssembleError(f"{default_name}: mesh part must be a JSON object")
     name = str(raw.get("name", default_name))
-    positions = [(float(p[0]), float(p[1]), float(p[2])) for p in raw.get("positions", [])]
+    raw_positions = raw.get("positions", [])
+    if not isinstance(raw_positions, list):
+        raise PedAssembleError(f"{name}: positions must be a list")
+    positions = [
+        _require_vec(p, 3, f"{name}.positions[{i}]")
+        for i, p in enumerate(raw_positions)
+    ]
     triangles = _normalize_triangles(raw.get("triangles", raw.get("indices", [])))
-    normals = [(float(n[0]), float(n[1]), float(n[2])) for n in raw["normals"]] if raw.get("normals") else None
-    uvs = [(float(u[0]), float(u[1])) for u in raw["uvs"]] if raw.get("uvs") else None
+    _validate_triangles_in_bounds(triangles, len(positions), name)
+
+    normals = None
+    if raw.get("normals"):
+        raw_normals = raw["normals"]
+        if not isinstance(raw_normals, list):
+            raise PedAssembleError(f"{name}: normals must be a list")
+        normals = [_require_vec(n, 3, f"{name}.normals[{i}]") for i, n in enumerate(raw_normals)]
+
+    uvs = None
+    if raw.get("uvs"):
+        raw_uvs = raw["uvs"]
+        if not isinstance(raw_uvs, list):
+            raise PedAssembleError(f"{name}: uvs must be a list")
+        uvs = [_require_vec(u, 2, f"{name}.uvs[{i}]") for i, u in enumerate(raw_uvs)]
+
     raw_extra = raw.get("uvs_extra", {})
     if not isinstance(raw_extra, dict) or any(
         re.fullmatch(r"[1-9][0-9]{0,8}", str(key)) is None for key in raw_extra
     ):
         raise PedAssembleError(f"{name}: uvs_extra keys must be positive texture coordinate set indices")
-    uvs_extra = {
-        int(key): [(float(u[0]), float(u[1])) for u in values]
-        for key, values in raw_extra.items()
-    }
+    uvs_extra: dict[int, list[tuple[float, float]]] = {}
+    for key, values in raw_extra.items():
+        if not isinstance(values, list):
+            raise PedAssembleError(f"{name}: uvs_extra[{key!r}] must be a list")
+        uvs_extra[int(key)] = [
+            _require_vec(u, 2, f"{name}.uvs_extra[{key!r}][{i}]")
+            for i, u in enumerate(values)
+        ]
+
     colors = None
     if raw.get("colors"):
-        colors = [
-            (float(c[0]), float(c[1]), float(c[2]), float(c[3]) if len(c) > 3 else 1.0)
-            for c in raw["colors"]
-        ]
-    joints_0 = [tuple(int(x) for x in j) for j in raw["joints_0"]] if raw.get("joints_0") else None
-    weights_0 = [tuple(float(x) for x in w) for w in raw["weights_0"]] if raw.get("weights_0") else None
-    joints_1 = [tuple(int(x) for x in j) for j in raw["joints_1"]] if raw.get("joints_1") else None
-    weights_1 = [tuple(float(x) for x in w) for w in raw["weights_1"]] if raw.get("weights_1") else None
+        raw_colors = raw["colors"]
+        if not isinstance(raw_colors, list):
+            raise PedAssembleError(f"{name}: colors must be a list")
+        colors = []
+        for i, c in enumerate(raw_colors):
+            if not isinstance(c, (list, tuple)) or len(c) not in (3, 4):
+                raise PedAssembleError(f"{name}.colors[{i}] must have 3 or 4 finite floats")
+            colors.append((
+                _require_finite_float(c[0], f"{name}.colors[{i}][0]"),
+                _require_finite_float(c[1], f"{name}.colors[{i}][1]"),
+                _require_finite_float(c[2], f"{name}.colors[{i}][2]"),
+                _require_finite_float(c[3], f"{name}.colors[{i}][3]") if len(c) > 3 else 1.0,
+            ))
+
+    def _parse_joints(field_name: str) -> list[tuple[int, int, int, int]] | None:
+        rows = raw.get(field_name)
+        if not rows:
+            return None
+        if not isinstance(rows, list):
+            raise PedAssembleError(f"{name}: {field_name} must be a list")
+        parsed: list[tuple[int, int, int, int]] = []
+        for i, j in enumerate(rows):
+            if not isinstance(j, (list, tuple)) or len(j) != 4:
+                raise PedAssembleError(f"{name}.{field_name}[{i}] must contain 4 integers")
+            parsed.append(tuple(_require_int_not_bool(x, f"{name}.{field_name}[{i}][{c}]") for c, x in enumerate(j)))
+        return parsed
+
+    def _parse_weights(field_name: str) -> list[tuple[float, float, float, float]] | None:
+        rows = raw.get(field_name)
+        if not rows:
+            return None
+        if not isinstance(rows, list):
+            raise PedAssembleError(f"{name}: {field_name} must be a list")
+        return [_require_vec(w, 4, f"{name}.{field_name}[{i}]") for i, w in enumerate(rows)]
+
+    joints_0 = _parse_joints("joints_0")
+    weights_0 = _parse_weights("weights_0")
+    joints_1 = _parse_joints("joints_1")
+    weights_1 = _parse_weights("weights_1")
     joint_names = _parse_joint_names(raw.get("joint_names", raw.get("jointNames")), part_name=name)
-    trans = raw.get("translation", (0.0, 0.0, 0.0))
+    trans = _require_vec(raw.get("translation", (0.0, 0.0, 0.0)), 3, f"{name}.translation")
     return MeshPart(
         name=name,
         positions=positions,
         triangles=triangles,
         role=str(raw.get("role", "")),
         coord_space=str(raw.get("coord_space", default_space)),
-        translation=(float(trans[0]), float(trans[1]), float(trans[2])),
+        translation=trans,
         normals=normals,
         uvs=uvs,
         uvs_extra=uvs_extra,
@@ -1017,33 +1291,51 @@ def _part_from_dict(raw: dict, *, default_name: str, default_space: str, base_di
         joints_1=joints_1,
         weights_1=weights_1,
         joint_names=joint_names,
-        material=_parse_material_dict(raw.get("material"), base_dir),
+        material=_parse_material_dict(raw.get("material"), base_dir, loaded_paths=loaded_paths),
     )
 
 
 def _skeleton_from_dict(raw: dict | None, default_space: str) -> SkeletonSpec | None:
     if raw is None:
         return None
+    if not isinstance(raw, dict):
+        raise PedAssembleError("skeleton must be a JSON object")
+    raw_joints = raw.get("joints", [])
+    if not isinstance(raw_joints, list):
+        raise PedAssembleError("skeleton.joints must be a list")
     joints = []
-    for j in raw.get("joints", []):
-        t = j.get("translation", (0.0, 0.0, 0.0))
-        r = j.get("rotation", (0.0, 0.0, 0.0, 1.0))
-        s = j.get("scale", (1.0, 1.0, 1.0))
+    for ji, j in enumerate(raw_joints):
+        if not isinstance(j, dict):
+            raise PedAssembleError(f"skeleton.joints[{ji}] must be a JSON object")
+        if "name" not in j or not isinstance(j["name"], str):
+            raise PedAssembleError(f"skeleton.joints[{ji}].name must be a string")
+        parent = _require_int_not_bool(j.get("parent", -1), f"skeleton.joints[{ji}].parent")
+        t = _require_vec(j.get("translation", (0.0, 0.0, 0.0)), 3, f"skeleton.joints[{ji}].translation")
+        r = _require_vec(j.get("rotation", (0.0, 0.0, 0.0, 1.0)), 4, f"skeleton.joints[{ji}].rotation")
+        s = _require_vec(j.get("scale", (1.0, 1.0, 1.0)), 3, f"skeleton.joints[{ji}].scale")
         ibm = j.get("inverse_bind_matrix", j.get("inverseBindMatrix"))
+        parsed_ibm = (
+            _require_vec(ibm, 16, f"skeleton.joints[{ji}].inverse_bind_matrix")
+            if ibm is not None
+            else None
+        )
         joints.append(SkeletonJoint(
-            name=str(j["name"]),
-            parent=int(j.get("parent", -1)),
-            translation=(float(t[0]), float(t[1]), float(t[2])),
-            rotation=(float(r[0]), float(r[1]), float(r[2]), float(r[3])),
-            scale=(float(s[0]), float(s[1]), float(s[2])),
-            inverse_bind_matrix=tuple(float(x) for x in ibm) if ibm is not None else None,
+            name=j["name"],
+            parent=parent,
+            translation=t,
+            rotation=r,
+            scale=s,
+            inverse_bind_matrix=parsed_ibm,
         ))
-    return SkeletonSpec(
+    raw_off = raw.get("standing_offset")
+    skel = SkeletonSpec(
         name=str(raw.get("name", "ped_skeleton")),
         joints=joints,
         coord_space=str(raw.get("coord_space", default_space)),
-        standing_offset=float(raw["standing_offset"]) if "standing_offset" in raw and raw["standing_offset"] is not None else None,
+        standing_offset=_require_finite_float(raw_off, "skeleton.standing_offset") if raw_off is not None else None,
     )
+    _validate_skeleton(skel)
+    return skel
 
 
 def part_to_dict(part: MeshPart) -> dict:
@@ -1432,7 +1724,7 @@ def read_glb_parts(path: str) -> list[MeshPart]:
     if len(data) < 20 or data[:4] != GLB_MAGIC:
         raise PedAssembleError(f"{path}: not a valid GLB container")
     version, total_len = struct.unpack_from("<II", data, 4)
-    if version != GLB_VERSION or total_len > len(data):
+    if version != GLB_VERSION or total_len < 20 or total_len > len(data):
         raise PedAssembleError(f"{path}: unsupported GLB version or truncated length")
 
     pos = 12
@@ -1441,6 +1733,10 @@ def read_glb_parts(path: str) -> list[MeshPart]:
     while pos + 8 <= total_len:
         chunk_len, chunk_type = struct.unpack_from("<II", data, pos)
         pos += 8
+        if pos + chunk_len > total_len:
+            raise PedAssembleError(
+                f"{path}: malformed GLB: chunk length {chunk_len} at offset {pos - 8} exceeds GLB length {total_len}"
+            )
         payload = data[pos:pos + chunk_len]
         pos += chunk_len
         if chunk_type == CHUNK_TYPE_JSON:
@@ -1450,6 +1746,8 @@ def read_glb_parts(path: str) -> list[MeshPart]:
                 raise PedAssembleError(f"{path}: malformed GLB: the JSON chunk does not parse ({exc})") from None
         elif chunk_type == CHUNK_TYPE_BIN:
             bin_chunk = payload
+    if pos != total_len:
+        raise PedAssembleError(f"{path}: malformed GLB: trailing {total_len - pos} byte(s) after last chunk")
     if doc is None:
         raise PedAssembleError(f"{path}: GLB has no JSON chunk")
     _check_glb_document(doc, bin_chunk, path)
@@ -1500,6 +1798,7 @@ def read_glb_parts(path: str) -> list[MeshPart]:
             else:
                 raw_idx = list(range(len(positions)))
             triangles = _normalize_triangles(raw_idx)
+            _validate_triangles_in_bounds(triangles, len(positions), f"{path}: {node_name}")
             normals = (
                 [tuple(float(x) for x in n) for n in read_accessor(attrs["NORMAL"])]
                 if "NORMAL" in attrs else None
@@ -1598,8 +1897,12 @@ def load_parts_from_path(
     path: str,
     *,
     source_space: str = "z-up",
+    _loaded_paths: list[str] | None = None,
+    _active_manifests: frozenset[str] = frozenset(),
 ) -> tuple[list[MeshPart], SkeletonSpec | None]:
     """Load one or more ``MeshPart`` objects from a ``.json``, ``.obj``, or ``.glb`` file."""
+    if _loaded_paths is not None:
+        _loaded_paths.append(path)
     ext = os.path.splitext(path)[1].lower()
     stem = os.path.splitext(os.path.basename(path))[0]
     base_dir = os.path.dirname(os.path.abspath(path))
@@ -1609,7 +1912,10 @@ def load_parts_from_path(
 
     if ext == ".obj":
         # Parse OBJ keeping raw coordinates in the declared source_space
-        prims = glb_writer.parse_obj(path, up_axis="y")
+        try:
+            prims = glb_writer.parse_obj(path, up_axis="y")
+        except glb_writer.GlbError as exc:
+            raise PedAssembleError(f"{path}: {exc}") from None
         parts: list[MeshPart] = []
         for idx, prim in enumerate(prims):
             pname = prim.get("name") or (stem if len(prims) == 1 else f"{stem}_{idx}")
@@ -1624,20 +1930,43 @@ def load_parts_from_path(
         return parts, None
 
     if ext == ".json":
-        with open(path, encoding="utf-8-sig") as f:
-            data = json.load(f)
+        manifest_key = report_paths.path_key(path)
+        if manifest_key in _active_manifests:
+            raise PedAssembleError(f"{path}: cyclic manifest reference")
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise PedAssembleError(f"{path}: invalid JSON ({exc})") from None
         if isinstance(data, dict) and "parts" in data:
-            skel = _skeleton_from_dict(data.get("skeleton"), default_space=data.get("coord_space", source_space))
+            raw_parts = data["parts"]
+            if not isinstance(raw_parts, list):
+                raise PedAssembleError(f"{path}: 'parts' must be a list")
             default_sp = str(data.get("coord_space", source_space))
+            skel = _skeleton_from_dict(data.get("skeleton"), default_space=default_sp)
+            next_active = _active_manifests | {manifest_key}
             parts = []
-            for idx, entry in enumerate(data["parts"]):
+            for idx, entry in enumerate(raw_parts):
                 if isinstance(entry, str):
                     sub_path = entry if os.path.isabs(entry) else os.path.join(base_dir, entry)
-                    sub_parts, _ = load_parts_from_path(sub_path, source_space=default_sp)
+                    sub_parts, _ = load_parts_from_path(
+                        sub_path,
+                        source_space=default_sp,
+                        _loaded_paths=_loaded_paths,
+                        _active_manifests=next_active,
+                    )
                     parts.extend(sub_parts)
                 elif isinstance(entry, dict) and "path" in entry and "positions" not in entry:
-                    sub_path = entry["path"] if os.path.isabs(entry["path"]) else os.path.join(base_dir, entry["path"])
-                    sub_parts, _ = load_parts_from_path(sub_path, source_space=entry.get("coord_space", default_sp))
+                    raw_sub = entry["path"]
+                    if not isinstance(raw_sub, str) or not raw_sub:
+                        raise PedAssembleError(f"{path}: parts[{idx}].path must be a non-empty string")
+                    sub_path = raw_sub if os.path.isabs(raw_sub) else os.path.join(base_dir, raw_sub)
+                    sub_parts, _ = load_parts_from_path(
+                        sub_path,
+                        source_space=str(entry.get("coord_space", default_sp)),
+                        _loaded_paths=_loaded_paths,
+                        _active_manifests=next_active,
+                    )
                     for sp in sub_parts:
                         if entry.get("name"):
                             sp.name = str(entry["name"])
@@ -1648,12 +1977,24 @@ def load_parts_from_path(
                             sp.joint_names = _parse_joint_names(raw_jn, part_name=sp.name)
                         parts.append(sp)
                 elif isinstance(entry, dict):
-                    parts.append(_part_from_dict(entry, default_name=f"{stem}_{idx}", default_space=default_sp, base_dir=base_dir))
+                    parts.append(_part_from_dict(
+                        entry,
+                        default_name=f"{stem}_{idx}",
+                        default_space=default_sp,
+                        base_dir=base_dir,
+                        loaded_paths=_loaded_paths,
+                    ))
                 else:
                     raise PedAssembleError(f"{path}: unsupported part entry at index {idx}")
             return parts, skel
         if isinstance(data, dict):
-            return [_part_from_dict(data, default_name=stem, default_space=source_space, base_dir=base_dir)], None
+            return [_part_from_dict(
+                data,
+                default_name=stem,
+                default_space=source_space,
+                base_dir=base_dir,
+                loaded_paths=_loaded_paths,
+            )], None
         raise PedAssembleError(f"{path}: JSON root must be an object")
 
     raise PedAssembleError(f"{path}: unsupported input extension {ext!r} (expected .json, .obj, or .glb)")
@@ -1710,19 +2051,34 @@ def _append_accessor(
     return len(accessors) - 1
 
 
-def _pack_u16_vec4(rows: list[tuple[int, int, int, int]]) -> bytes:
+def _pack_u16_vec4(rows: list[tuple[int, int, int, int]], what: str = "JOINTS") -> bytes:
     buf = bytearray(len(rows) * 8)
-    for i, (a, b, c, d) in enumerate(rows):
+    for i, row in enumerate(rows):
+        if len(row) != 4:
+            raise PedAssembleError(f"{what}[{i}] must have 4 joint indices")
+        a, b, c, d = row
+        for comp, v in enumerate((a, b, c, d)):
+            if type(v) is not int or not (0 <= v <= 65535):
+                raise PedAssembleError(f"{what}[{i}][{comp}] must be in 0..65535, got {v!r}")
         struct.pack_into("<4H", buf, i * 8, a, b, c, d)
     return bytes(buf)
 
 
-def _pack_f32_vec(rows: list[tuple[float, ...]], comps: int) -> bytes:
+def _pack_f32_vec(rows: list[tuple[float, ...]], comps: int, what: str = "attribute") -> bytes:
     fmt = f"<{comps}f"
     stride = comps * 4
     buf = bytearray(len(rows) * stride)
     for i, row in enumerate(rows):
-        struct.pack_into(fmt, buf, i * stride, *row[:comps])
+        vals = row[:comps]
+        if len(vals) != comps:
+            raise PedAssembleError(f"{what}[{i}] must have {comps} components")
+        for c, v in enumerate(vals):
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                raise PedAssembleError(f"{what}[{i}][{c}] must be a finite float, got {v!r}")
+        try:
+            struct.pack_into(fmt, buf, i * stride, *vals)
+        except (struct.error, OverflowError) as exc:
+            raise PedAssembleError(f"{what}[{i}] cannot be packed as float32 ({exc})") from None
     return bytes(buf)
 
 
@@ -1891,9 +2247,12 @@ def build_assembled_glb(
     mesh node. Skinned parts carrying ``joint_names`` have their ``JOINTS_0``
     and ``JOINTS_1`` slots remapped by joint name into ``skeleton.joints`` order.
     """
+    standing_offset = _require_finite_float(standing_offset, "standing_offset")
     non_empty = [p for p in parts if p.positions and p.triangles]
     if not non_empty:
         raise PedAssembleError("No non-empty mesh parts to export")
+    if skeleton is not None:
+        _validate_skeleton(skeleton)
 
     bin_buf = bytearray()
     buffer_views: list[dict] = []
@@ -1923,10 +2282,19 @@ def build_assembled_glb(
 
     def _add_material(spec: MaterialSpec | None, fallback_name: str) -> int:
         ms = spec or MaterialSpec(name=fallback_name)
+        bcf = list(_require_vec(ms.base_color_factor, 4, f"material {ms.name!r}.base_color_factor"))
+        metallic = _require_finite_float(ms.metallic_factor, f"material {ms.name!r}.metallic_factor")
+        roughness = _require_finite_float(ms.roughness_factor, f"material {ms.name!r}.roughness_factor")
+        alpha_mode = ms.alpha_mode.upper() if isinstance(ms.alpha_mode, str) and ms.alpha_mode else "OPAQUE"
+        if alpha_mode not in _VALID_ALPHA_MODES:
+            raise PedAssembleError(
+                f"material {ms.name!r}: unsupported alpha_mode {ms.alpha_mode!r}; "
+                f"expected one of {', '.join(_VALID_ALPHA_MODES)}"
+            )
         pbr: dict = {
-            "baseColorFactor": [float(v) for v in ms.base_color_factor],
-            "metallicFactor": float(ms.metallic_factor),
-            "roughnessFactor": float(ms.roughness_factor),
+            "baseColorFactor": bcf,
+            "metallicFactor": metallic,
+            "roughnessFactor": roughness,
         }
         if ms.base_color_png is not None:
             pbr["baseColorTexture"] = {"index": _add_png_texture(ms.base_color_png)}
@@ -1935,10 +2303,12 @@ def build_assembled_glb(
         mat_obj: dict = {"name": ms.name, "pbrMetallicRoughness": pbr}
         if ms.normal_png is not None:
             mat_obj["normalTexture"] = {"index": _add_png_texture(ms.normal_png)}
-        if ms.alpha_mode and ms.alpha_mode != "OPAQUE":
-            mat_obj["alphaMode"] = ms.alpha_mode
-            if ms.alpha_mode == "MASK" and ms.alpha_cutoff is not None:
-                mat_obj["alphaCutoff"] = float(ms.alpha_cutoff)
+        if alpha_mode != "OPAQUE":
+            mat_obj["alphaMode"] = alpha_mode
+            if alpha_mode == "MASK" and ms.alpha_cutoff is not None:
+                mat_obj["alphaCutoff"] = _require_finite_float(
+                    ms.alpha_cutoff, f"material {ms.name!r}.alpha_cutoff"
+                )
         if ms.double_sided:
             mat_obj["doubleSided"] = True
         materials.append(mat_obj)
@@ -1949,6 +2319,7 @@ def build_assembled_glb(
     total_tris = 0
 
     for part in non_empty:
+        _validate_part_positions_and_triangles(part)
         is_skinned_part = part.joints_0 is not None and part.weights_0 is not None and skeleton is not None
         # For skinned parts with a skeleton, standing offset lives on the skeleton root node
         # (so bind-space vertices match IBMs cleanly); for static parts, bake standing offset into vertices.
@@ -2094,7 +2465,12 @@ def build_assembled_glb(
         nodes.append(rig_root_node)
         scene_nodes.append(rig_root_idx)
 
-        ibm_bytes = struct.pack(f"<{len(ibm_floats)}f", *ibm_floats)
+        try:
+            ibm_bytes = struct.pack(f"<{len(ibm_floats)}f", *ibm_floats)
+        except (struct.error, OverflowError) as exc:
+            raise PedAssembleError(
+                f"skeleton {skeleton.name!r}: inverse_bind_matrix cannot be packed as float32 ({exc})"
+            ) from None
         ibm_bv = _append_bv(bin_buf, buffer_views, ibm_bytes, target=None)
         ibm_acc = _append_accessor(accessors, ibm_bv, COMPONENT_FLOAT, len(skeleton.joints), "MAT4")
 
@@ -2126,7 +2502,11 @@ def build_assembled_glb(
     if skins:
         gltf["skins"] = skins
 
-    json_bytes = bytearray(json.dumps(gltf, separators=(",", ":"), ensure_ascii=True).encode("utf-8"))
+    try:
+        json_text = json.dumps(gltf, separators=(",", ":"), ensure_ascii=True, allow_nan=False)
+    except ValueError as exc:
+        raise PedAssembleError(f"glTF JSON contains non-finite values ({exc})") from None
+    json_bytes = bytearray(json_text.encode("utf-8"))
     _pad4(json_bytes, 0x20)
 
     total_length = 12 + 8 + len(json_bytes) + 8 + len(bin_buf)
@@ -2173,6 +2553,8 @@ def _load_cli_parts(
     inputs: list[str],
     manifest: str | None,
     source_space: str,
+    *,
+    loaded_paths: list[str] | None = None,
 ) -> tuple[list[MeshPart], SkeletonSpec | None]:
     parts: list[MeshPart] = []
     skeleton: SkeletonSpec | None = None
@@ -2180,24 +2562,77 @@ def _load_cli_parts(
     if not paths:
         raise PedAssembleError("Provide at least one input part or --manifest")
     for p in paths:
-        loaded, skel = load_parts_from_path(p, source_space=source_space)
+        loaded, skel = load_parts_from_path(p, source_space=source_space, _loaded_paths=loaded_paths)
         parts.extend(loaded)
         if skel is not None and skeleton is None:
             skeleton = skel
     return parts, skeleton
 
 
+def _check_output_paths(outputs: list[tuple[str, str]], inputs: list[str]) -> None:
+    """Refuse outputs that target an existing directory, overwrite an input, or collide with each other."""
+    for label, out_path in outputs:
+        if os.path.isdir(out_path):
+            raise PedAssembleError(f"{label} path {out_path!r} is an existing directory")
+        for inp in inputs:
+            if report_paths.same_report_path(out_path, inp):
+                raise PedAssembleError(f"{label} path {out_path!r} would overwrite input {inp!r}")
+    for i in range(len(outputs)):
+        for j in range(i + 1, len(outputs)):
+            if report_paths.same_report_path(outputs[i][1], outputs[j][1]):
+                raise PedAssembleError(
+                    f"{outputs[i][0]} and {outputs[j][0]} resolve to the same file: {outputs[i][1]!r}"
+                )
+
+
 def _write_json_report(path: str, data: dict) -> None:
-    parent = os.path.dirname(os.path.abspath(path))
+    if os.path.isdir(path):
+        raise PedAssembleError(f"Output JSON path {path!r} is an existing directory")
+    try:
+        payload = json.dumps(data, indent=2, allow_nan=False) + "\n"
+    except ValueError as exc:
+        raise PedAssembleError(f"JSON report contains non-finite values ({exc})") from None
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            newline="\n",
+            dir=parent or ".",
+            prefix=f".{os.path.basename(abs_path)}.",
+            suffix=".tmp",
+            delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(payload)
+        os.chmod(tmp_path, file_mode.published_mode(abs_path))
+        replace_retry.replace(tmp_path, abs_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def _cmd_assemble(args: argparse.Namespace) -> int:
-    parts, skeleton = _load_cli_parts(args.inputs, args.manifest, args.source_space)
+    outputs: list[tuple[str, str]] = [("--out", args.out)]
+    if args.json:
+        outputs.append(("--json", args.json))
+    initial_inputs = ([args.manifest] if args.manifest else []) + list(args.inputs)
+    _check_output_paths(outputs, initial_inputs)
+
+    loaded_paths: list[str] = []
+    parts, skeleton = _load_cli_parts(
+        args.inputs, args.manifest, args.source_space, loaded_paths=loaded_paths
+    )
+    _check_output_paths(outputs, loaded_paths)
+
     # Normalize all parts into a common coordinate space before overlap culling
     common_space = args.source_space
     aligned_for_cull = [
@@ -2270,7 +2705,21 @@ def _cmd_assemble(args: argparse.Namespace) -> int:
 
 
 def _cmd_cull_overlap(args: argparse.Namespace) -> int:
-    target_parts, _ = load_parts_from_path(args.target, source_space=args.source_space)
+    outputs: list[tuple[str, str]] = []
+    out_ext = ""
+    if args.out:
+        out_ext = os.path.splitext(args.out)[1].lower()
+        if out_ext not in (".glb", ".json"):
+            raise PedAssembleError(f"Unsupported output extension {out_ext!r}; use .glb or .json")
+        outputs.append(("--out", args.out))
+    if args.json:
+        outputs.append(("--json", args.json))
+    _check_output_paths(outputs, [args.target, *args.ref])
+
+    loaded_paths: list[str] = []
+    target_parts, _ = load_parts_from_path(
+        args.target, source_space=args.source_space, _loaded_paths=loaded_paths
+    )
     if len(target_parts) != 1:
         raise PedAssembleError(f"--target must contain exactly 1 mesh part, got {len(target_parts)}")
     target = align_part_to_standing_space(
@@ -2279,11 +2728,14 @@ def _cmd_cull_overlap(args: argparse.Namespace) -> int:
 
     refs: list[MeshPart] = []
     for ref_path in args.ref:
-        loaded, _ = load_parts_from_path(ref_path, source_space=args.source_space)
+        loaded, _ = load_parts_from_path(
+            ref_path, source_space=args.source_space, _loaded_paths=loaded_paths
+        )
         for rp in loaded:
             refs.append(align_part_to_standing_space(
                 rp, standing_offset=0.0, target_space=args.source_space, apply_offset=False
             ))
+    _check_output_paths(outputs, loaded_paths)
 
     culled_part, stats = cull_part_overlap(
         target,
@@ -2296,7 +2748,6 @@ def _cmd_cull_overlap(args: argparse.Namespace) -> int:
     )
 
     if args.out:
-        out_ext = os.path.splitext(args.out)[1].lower()
         if out_ext == ".glb":
             write_assembled_glb(
                 args.out,
@@ -2304,10 +2755,8 @@ def _cmd_cull_overlap(args: argparse.Namespace) -> int:
                 standing_offset=args.standing_offset,
                 apply_standing=not args.no_standing_offset,
             )
-        elif out_ext == ".json":
-            _write_json_report(args.out, part_to_dict(culled_part))
         else:
-            raise PedAssembleError(f"Unsupported output extension {out_ext!r}; use .glb or .json")
+            _write_json_report(args.out, part_to_dict(culled_part))
 
     if args.json:
         _write_json_report(args.json, stats)
@@ -2322,7 +2771,16 @@ def _cmd_cull_overlap(args: argparse.Namespace) -> int:
 
 
 def _cmd_inspect_seams(args: argparse.Namespace) -> int:
-    parts, _ = _load_cli_parts(args.inputs, args.manifest, args.source_space)
+    outputs: list[tuple[str, str]] = [("--json", args.json)] if args.json else []
+    initial_inputs = ([args.manifest] if args.manifest else []) + list(args.inputs)
+    _check_output_paths(outputs, initial_inputs)
+
+    loaded_paths: list[str] = []
+    parts, _ = _load_cli_parts(
+        args.inputs, args.manifest, args.source_space, loaded_paths=loaded_paths
+    )
+    _check_output_paths(outputs, loaded_paths)
+
     normalized = [
         align_part_to_standing_space(p, standing_offset=0.0, target_space=args.source_space, apply_offset=False)
         for p in parts
@@ -2359,6 +2817,27 @@ def _cmd_inspect_seams(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_finite_float(raw: str) -> float:
+    try:
+        return _require_finite_float(raw, "argument")
+    except PedAssembleError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _cli_non_negative_float(raw: str) -> float:
+    try:
+        return _require_non_negative_float(raw, "tolerance")
+    except PedAssembleError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
+def _cli_normal_cos(raw: str) -> float:
+    try:
+        return _require_normal_cos(raw, "--normal-cos")
+    except PedAssembleError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="ped_assemble.py",
@@ -2372,25 +2851,25 @@ def build_parser() -> argparse.ArgumentParser:
     p_asm.add_argument("-o", "--out", required=True, help="Output binary glTF 2.0 (.glb) path.")
     p_asm.add_argument("--source-space", choices=("z-up", "y-up"), default="z-up",
                        help="Coordinate space of JSON/OBJ inputs (default: z-up).")
-    p_asm.add_argument("--standing-offset", type=float, default=DEFAULT_STANDING_OFFSET_M,
+    p_asm.add_argument("--standing-offset", type=_cli_finite_float, default=DEFAULT_STANDING_OFFSET_M,
                        help="Vertical SKEL_ROOT standing offset in meters (default: 1.0).")
     p_asm.add_argument("--no-standing-offset", action="store_true",
                        help="Do not add the +1.0 m standing-space offset.")
     p_asm.add_argument("--no-cull", action="store_true",
                        help="Skip coplanar overlap culling passes.")
-    p_asm.add_argument("--waist-tol", type=float, default=DEFAULT_WAIST_CENTROID_TOL,
+    p_asm.add_argument("--waist-tol", type=_cli_non_negative_float, default=DEFAULT_WAIST_CENTROID_TOL,
                        help="Centroid tolerance (m) for upper/lower waist culling (default: 0.004).")
-    p_asm.add_argument("--nipple-tol", type=float, default=DEFAULT_NIPPLE_CENTROID_TOL,
+    p_asm.add_argument("--nipple-tol", type=_cli_non_negative_float, default=DEFAULT_NIPPLE_CENTROID_TOL,
                        help="Centroid tolerance (m) for upper/nipple culling (default: 0.0025).")
-    p_asm.add_argument("--genital-tol", type=float, default=DEFAULT_GENITAL_CENTROID_TOL,
+    p_asm.add_argument("--genital-tol", type=_cli_non_negative_float, default=DEFAULT_GENITAL_CENTROID_TOL,
                        help="Centroid tolerance (m) for lower/female genital culling (default: 0.0016).")
-    p_asm.add_argument("--plane-tol", type=float, default=None,
+    p_asm.add_argument("--plane-tol", type=_cli_non_negative_float, default=None,
                        help="Optional explicit point-to-plane tolerance (m) for coplanarity check.")
-    p_asm.add_argument("--normal-cos", type=float, default=DEFAULT_NORMAL_COS_MIN,
+    p_asm.add_argument("--normal-cos", type=_cli_normal_cos, default=DEFAULT_NORMAL_COS_MIN,
                        help="Minimum |dot(n_t, n_r)| for coplanar match (default: 0.85).")
-    p_asm.add_argument("--vertex-tol", type=float, default=DEFAULT_VERTEX_QUANT_TOL,
+    p_asm.add_argument("--vertex-tol", type=_cli_non_negative_float, default=DEFAULT_VERTEX_QUANT_TOL,
                        help="Quantization tolerance (m) for exact vertex-key triangle match (default: 1e-4).")
-    p_asm.add_argument("--weld-tol", type=float, default=DEFAULT_WELD_TOL,
+    p_asm.add_argument("--weld-tol", type=_cli_non_negative_float, default=DEFAULT_WELD_TOL,
                        help="Vertex weld tolerance (m) for seam topology inspection (default: 1e-4).")
     p_asm.add_argument("--compact-vertices", action="store_true",
                        help="Drop unreferenced vertices after triangle culling.")
@@ -2403,15 +2882,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_cull.add_argument("-o", "--out", help="Optional output path (.glb or .json).")
     p_cull.add_argument("--source-space", choices=("z-up", "y-up"), default="z-up",
                         help="Coordinate space of JSON/OBJ inputs (default: z-up).")
-    p_cull.add_argument("--tol", type=float, default=DEFAULT_WAIST_CENTROID_TOL,
+    p_cull.add_argument("--tol", type=_cli_non_negative_float, default=DEFAULT_WAIST_CENTROID_TOL,
                         help="Centroid distance tolerance in meters (default: 0.004).")
-    p_cull.add_argument("--plane-tol", type=float, default=None,
+    p_cull.add_argument("--plane-tol", type=_cli_non_negative_float, default=None,
                         help="Optional explicit point-to-plane tolerance in meters.")
-    p_cull.add_argument("--normal-cos", type=float, default=DEFAULT_NORMAL_COS_MIN,
+    p_cull.add_argument("--normal-cos", type=_cli_normal_cos, default=DEFAULT_NORMAL_COS_MIN,
                         help="Minimum |dot(n_t, n_r)| for coplanar match (default: 0.85).")
-    p_cull.add_argument("--vertex-tol", type=float, default=DEFAULT_VERTEX_QUANT_TOL,
+    p_cull.add_argument("--vertex-tol", type=_cli_non_negative_float, default=DEFAULT_VERTEX_QUANT_TOL,
                         help="Quantization tolerance (m) for exact triangle match (default: 1e-4).")
-    p_cull.add_argument("--standing-offset", type=float, default=DEFAULT_STANDING_OFFSET_M,
+    p_cull.add_argument("--standing-offset", type=_cli_finite_float, default=DEFAULT_STANDING_OFFSET_M,
                         help="Standing offset (m) when writing .glb output (default: 1.0).")
     p_cull.add_argument("--no-standing-offset", action="store_true",
                         help="Do not add standing offset when writing .glb output.")
@@ -2425,13 +2904,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_seam.add_argument("--manifest", help="Optional JSON manifest listing parts.")
     p_seam.add_argument("--source-space", choices=("z-up", "y-up"), default="z-up",
                         help="Coordinate space of JSON/OBJ inputs (default: z-up).")
-    p_seam.add_argument("--weld-tol", type=float, default=DEFAULT_WELD_TOL,
+    p_seam.add_argument("--weld-tol", type=_cli_non_negative_float, default=DEFAULT_WELD_TOL,
                         help="Vertex weld tolerance in meters (default: 1e-4).")
-    p_seam.add_argument("--overlap-tol", type=float, default=DEFAULT_WAIST_CENTROID_TOL,
+    p_seam.add_argument("--overlap-tol", type=_cli_non_negative_float, default=DEFAULT_WAIST_CENTROID_TOL,
                         help="Centroid tolerance (m) for overlap detection (default: 0.004).")
-    p_seam.add_argument("--plane-tol", type=float, default=None,
+    p_seam.add_argument("--plane-tol", type=_cli_non_negative_float, default=None,
                         help="Optional explicit point-to-plane tolerance in meters.")
-    p_seam.add_argument("--normal-cos", type=float, default=DEFAULT_NORMAL_COS_MIN,
+    p_seam.add_argument("--normal-cos", type=_cli_normal_cos, default=DEFAULT_NORMAL_COS_MIN,
                         help="Minimum |dot(n_t, n_r)| for coplanar match (default: 0.85).")
     p_seam.add_argument("--json", help="Optional JSON report output path.")
     p_seam.set_defaults(func=_cmd_inspect_seams)
@@ -2444,7 +2923,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         return int(args.func(args))
-    except PedAssembleError as exc:
+    except (PedAssembleError, glb_writer.GlbError, OSError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 

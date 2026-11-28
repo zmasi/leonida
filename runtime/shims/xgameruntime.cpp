@@ -349,6 +349,7 @@ using HintChangedCallback = void(CALLBACK*)(void* context, const ConnectivityHin
 struct NetRegistration {
     bool running = false;
     bool unregistered = false;
+    DWORD thread = 0;  // the thread running its callback: an unregister from inside it must not wait on itself
 };
 std::mutex g_net_mu;
 std::condition_variable g_net_cv;
@@ -378,13 +379,18 @@ template <class Callback> struct InitialNotification {
             const auto it = g_net_registrations.find(n->token);
             if (canceled || it == g_net_registrations.end()) return;
             it->second.running = true;
+            it->second.thread = GetCurrentThreadId();
         }
         notify(n->callback, n->context);
         {
             std::lock_guard lock(g_net_mu);
             const auto it = g_net_registrations.find(n->token);
-            if (it->second.unregistered) g_net_registrations.erase(it);
-            else it->second.running = false;
+            if (it->second.unregistered) {
+                g_net_registrations.erase(it);
+            } else {
+                it->second.running = false;
+                it->second.thread = 0;
+            }
         }
         g_net_cv.notify_all();
     }
@@ -406,9 +412,10 @@ HRESULT STDMETHODCALLTYPE net_register(void*, XTaskQueueHandle queue, void* cont
         g_net_registrations.emplace(id, NetRegistration{});
     }
     token->token = id;
-    auto* initial = new InitialNotification<Callback>{id, context, callback};
-    const HRESULT hr = XTaskQueueSubmitCallback(queue, XTaskQueuePort::Completion, initial,
-                                                &InitialNotification<Callback>::run);
+    auto* initial = new (std::nothrow) InitialNotification<Callback>{id, context, callback};  // nothing may unwind
+    const HRESULT hr = initial ? XTaskQueueSubmitCallback(queue, XTaskQueuePort::Completion, initial,
+                                                          &InitialNotification<Callback>::run)
+                               : E_OUTOFMEMORY;
     if (process_queue) XTaskQueueCloseHandle(process_queue);
     if (FAILED(hr)) {
         delete initial;
@@ -427,6 +434,9 @@ bool STDMETHODCALLTYPE net_unregister(void*, XTaskQueueRegistrationToken token, 
         return true;
     }
     it->second.unregistered = true;
+    // From inside its own callback: the registration ends when the callback returns, which waiting here would never
+    // let happen. As a wait would, report it done.
+    if (it->second.thread == GetCurrentThreadId()) return true;
     if (wait) g_net_cv.wait(lock, [&] { return !g_net_registrations.contains(token.token); });
     return wait;
 }
@@ -1338,12 +1348,31 @@ bool STDMETHODCALLTYPE pkg_unregister_progress(void*, void* monitor, XTaskQueueR
 bool STDMETHODCALLTYPE pkg_unregister_installed(void*, XTaskQueueRegistrationToken, bool) { return true; }
 bool STDMETHODCALLTYPE pkg_uninstall_package(void*, const char*) { return false; }
 
-// Slot 39 (IXPackageImpl3): HRESULT XPackageEnumeratePackages(XPackageKind kind, XPackageEnumerationScope scope,
-// void* context, XPackageEnumerationCallback* callback), the callback a `bool CALLBACK (void* context, const
-// XPackageDetails* details)` that is called once per package. The title enumerates content packages (kind 1) and the
-// offline install has none to list, so this is S_OK without a callback, as VIctory's xpackage.rs answers the same slot
-// (0x138) for this title. Shortcut: a console would also list this installation for kind 0 (Game); no caller seen asks
-// for it. A content package LEONIDA_CONTENT_PACKAGES maps is mounted by its identifier (slots 23, 37), not listed here.
+// Slots 29/36/40 (IXPackageImpl / IXPackageImpl2 / IXPackageImpl3): HRESULT XPackageRegisterPackageInstalled(
+// XTaskQueueHandle queue, void* context, XPackageInstalledCallback* callback, XTaskQueueRegistrationToken* token).
+// Nothing installs offline, so the callback never fires; returns a fresh non-zero token accepted by slot 22.
+HRESULT STDMETHODCALLTYPE pkg_register_installed(void*, XTaskQueueHandle, void*, void* callback,
+                                                 XTaskQueueRegistrationToken* token) {
+    HRESULT hr = S_OK;
+    if (!token) hr = E_POINTER;
+    else if (!callback) hr = E_INVALIDARG;
+    if (token) token->token = SUCCEEDED(hr) ? g_progress_tokens.fetch_add(1) + 1 : 0;
+    static std::atomic<bool> s_logged{false};
+    if (!s_logged.exchange(true))
+        std::fprintf(stderr, "[rt] xgameruntime: XPackage RegisterPackageInstalled first call -> %s (0x%08lx), "
+                             "token %llu, callback never called (offline)\n",
+                     hr_name(hr), static_cast<unsigned long>(hr),
+                     static_cast<unsigned long long>(token ? token->token : 0));
+    return hr;
+}
+
+// Slots 28/35/39 (IXPackageImpl / IXPackageImpl2 / IXPackageImpl3): HRESULT XPackageEnumeratePackages(
+// XPackageKind kind, XPackageEnumerationScope scope, void* context, XPackageEnumerationCallback* callback),
+// the callback a `bool CALLBACK (void* context, const XPackageDetails* details)` that is called once per package.
+// The title enumerates content packages (kind 1) and the offline install has none to list, so this is S_OK without a
+// callback, as VIctory's xpackage.rs answers the same slot (0x138) for this title. Shortcut: a console would also list
+// this installation for kind 0 (Game); no caller seen asks for it. A content package LEONIDA_CONTENT_PACKAGES maps is
+// mounted by its identifier (slots 23, 37), not listed here.
 HRESULT STDMETHODCALLTYPE pkg_enumerate_packages(void*, uint32_t kind, uint32_t scope, void* context, void* callback) {
     const HRESULT hr = callback ? S_OK : E_INVALIDARG;
     static std::atomic<bool> s_logged{false};
@@ -1584,15 +1613,18 @@ const void* const kPackageVtable[] = {
     reinterpret_cast<const void*>(&pkg_mount_path_size),  // 24 XPackageGetMountPathSize
     reinterpret_cast<const void*>(&pkg_mount_path),       // 25 XPackageGetMountPath
     reinterpret_cast<const void*>(&pkg_close_mount),      // 26 XPackageCloseMountHandle
-    PN(27), PN(28), PN(29), PN(30), PN(31),           // 27 _unknown_, 28 EnumeratePackages, 29 RegisterPackageInstalled,
-                                                      // 30 GetWriteStats, 31 _unknown_
+    PN(27),                                           // 27 _unknown_
+    reinterpret_cast<const void*>(&pkg_enumerate_packages),    // 28 XPackageEnumeratePackages (IXPackageImpl)
+    reinterpret_cast<const void*>(&pkg_register_installed),    // 29 XPackageRegisterPackageInstalled (IXPackageImpl)
+    PN(30), PN(31),                                   // 30 GetWriteStats, 31 _unknown_
     PN(32), PN(33),                                   // 32 UninstallUWPInstance, 33 EnumerateFeatures
     reinterpret_cast<const void*>(&pkg_uninstall_package),     // 34 XPackageUninstallPackage (bool)
-    PN(35), PN(36),                                   // IXPackageImpl2: EnumeratePackages, RegisterPackageInstalled,
+    reinterpret_cast<const void*>(&pkg_enumerate_packages),    // 35 XPackageEnumeratePackages (IXPackageImpl2)
+    reinterpret_cast<const void*>(&pkg_register_installed),    // 36 XPackageRegisterPackageInstalled (IXPackageImpl2)
     reinterpret_cast<const void*>(&pkg_mount_with_ui_async),   // 37 XPackageMountWithUiAsync
     reinterpret_cast<const void*>(&pkg_mount_with_ui_result),  // 38 XPackageMountWithUiResult
-    reinterpret_cast<const void*>(&pkg_enumerate_packages),  // 39 XPackageEnumeratePackages (IXPackageImpl3)
-    PN(40),                                           // 40 RegisterPackageInstalled (IXPackageImpl3)
+    reinterpret_cast<const void*>(&pkg_enumerate_packages),    // 39 XPackageEnumeratePackages (IXPackageImpl3)
+    reinterpret_cast<const void*>(&pkg_register_installed),    // 40 XPackageRegisterPackageInstalled (IXPackageImpl3)
     PN(41),                                           // IXPackageImpl4: XPackageGetPackageKind
 };
 #undef PN
@@ -1602,6 +1634,35 @@ static_assert(std::size(kPackageVtable) == 42,
 RuntimeObject& package_object() {
     static RuntimeObject object{kPackageVtable, &kPackageClass, kPackageIids};
     return object;
+}
+
+// Flat C XPackage exports forwarding to the offline COM implementation above.
+HRESULT __stdcall XPackageEnumeratePackages(uint32_t kind, uint32_t scope, void* context, void* callback) {
+    return pkg_enumerate_packages(nullptr, kind, scope, context, callback);
+}
+HRESULT __stdcall XPackageCreateInstallationMonitor(const char* id, uint32_t count, const ChunkSelector* selectors,
+                                                    uint32_t interval_ms, XTaskQueueHandle queue, void** monitor) {
+    return pkg_create_monitor(nullptr, id, count, selectors, interval_ms, queue, monitor);
+}
+void __stdcall XPackageCloseInstallationMonitorHandle(void* handle) { pkg_close_monitor(nullptr, handle); }
+void __stdcall XPackageGetInstallationProgress(void* monitor, InstallationProgress* progress) {
+    pkg_installation_progress(nullptr, monitor, progress);
+}
+bool __stdcall XPackageUpdateInstallationMonitor(void* monitor) { return pkg_update_monitor(nullptr, monitor); }
+HRESULT __stdcall XPackageRegisterInstallationProgressChanged(void* monitor, void* context, void* callback,
+                                                              XTaskQueueRegistrationToken* token) {
+    return pkg_register_progress(nullptr, monitor, context, callback, token);
+}
+bool __stdcall XPackageUnregisterInstallationProgressChanged(void* monitor, XTaskQueueRegistrationToken token,
+                                                             bool wait) {
+    return pkg_unregister_progress(nullptr, monitor, token, wait);
+}
+HRESULT __stdcall XPackageRegisterPackageInstalled(XTaskQueueHandle queue, void* context, void* callback,
+                                                   XTaskQueueRegistrationToken* token) {
+    return pkg_register_installed(nullptr, queue, context, callback, token);
+}
+bool __stdcall XPackageUnregisterPackageInstalled(XTaskQueueRegistrationToken token, bool wait) {
+    return pkg_unregister_installed(nullptr, token, wait);
 }
 
 // ---- XGameImpl (asked for as IXGameImpl3), offline ----
@@ -1820,6 +1881,15 @@ SHIM_TABLE(xgameruntime,
     XGR(XPackageGetMountPathSize),
     XGR(XPackageGetMountPath),
     XGR(XPackageIsPackagedProcess),
+    XGR(XPackageEnumeratePackages),
+    XGR(XPackageCreateInstallationMonitor),
+    XGR(XPackageCloseInstallationMonitorHandle),
+    XGR(XPackageGetInstallationProgress),
+    XGR(XPackageUpdateInstallationMonitor),
+    XGR(XPackageRegisterInstallationProgressChanged),
+    XGR(XPackageUnregisterInstallationProgressChanged),
+    XGR(XPackageRegisterPackageInstalled),
+    XGR(XPackageUnregisterPackageInstalled),
     // XTaskQueue (third_party/xtaskqueue)
     XGR(XTaskQueueCreate),
     XGR(XTaskQueueCreateComposite),

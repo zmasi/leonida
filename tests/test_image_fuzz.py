@@ -325,8 +325,8 @@ def test_unsupported_without_a_reason_line_still_skips(monkeypatch, tmp_path, ca
     assert "SKIP (the device does not support the set)" in capsys.readouterr().out
 
 
-def test_a_harness_error_is_a_failure_not_a_skip(monkeypatch, tmp_path, capsys):
-    assert run_case_with_harness_result(monkeypatch, tmp_path, 1, "device: X\nvkCreateDevice failed\n") is False
+def test_a_harness_error_is_not_a_skip_or_a_mismatch(monkeypatch, tmp_path, capsys):
+    assert run_case_with_harness_result(monkeypatch, tmp_path, 1, "device: X\nvkCreateDevice failed\n") is imf.HARNESS_ERROR
     out = capsys.readouterr().out
     assert "FAIL (vk_image_fuzz exit 1: vkCreateDevice failed)" in out and "SKIP" not in out
     assert "    device: X" in out  # the earlier lines are printed too
@@ -335,7 +335,7 @@ def test_a_harness_error_is_a_failure_not_a_skip(monkeypatch, tmp_path, capsys):
 def test_a_crash_names_the_signal_and_prints_stderr(monkeypatch, tmp_path, capsys):
     # #1429: ANV segfaulted in vkCreateGraphicsPipelines and the fuzzer printed only "FAIL (harness error)".
     stderr = "validation: pipeline layout ok\ncreating graphics pipeline\n"
-    assert run_case_with_harness_result(monkeypatch, tmp_path, -signal.SIGSEGV, "device: X\n", stderr) is False
+    assert run_case_with_harness_result(monkeypatch, tmp_path, -signal.SIGSEGV, "device: X\n", stderr) is imf.HARNESS_ERROR
     out = capsys.readouterr().out
     assert "FAIL (vk_image_fuzz killed by SIGSEGV: creating graphics pipeline)" in out
     assert "  vk_image_fuzz stderr:\n    validation: pipeline layout ok\n    creating graphics pipeline\n" in out
@@ -343,14 +343,66 @@ def test_a_crash_names_the_signal_and_prints_stderr(monkeypatch, tmp_path, capsy
 
 
 def test_a_silent_crash_still_says_how_the_harness_ended(monkeypatch, tmp_path, capsys):
-    assert run_case_with_harness_result(monkeypatch, tmp_path, 0xC0000005, "") is False
+    assert run_case_with_harness_result(monkeypatch, tmp_path, 0xC0000005, "") is imf.HARNESS_ERROR
     out = capsys.readouterr().out
     assert "FAIL (vk_image_fuzz exit 0xc0000005 (access violation), no output)" in out
 
 
+def run_case_with_harness_sequence(monkeypatch, tmp_path, results):
+    """run_case with vk_image_fuzz returning a sequence of (returncode, stdout, stderr) results."""
+    build = tmp_path / "build"
+    build.mkdir()
+    (build / (imf.HARNESS + (".exe" if os.name == "nt" else ""))).touch()
+    monkeypatch.setattr(imf, "assemble", lambda *_args: None)
+    monkeypatch.setattr(imf, "translate", lambda work: str(tmp_path / "spirv"))
+    monkeypatch.setattr(imf, "read_rgba", lambda _path: [])
+    monkeypatch.setattr(imf, "compare", lambda *_args: [])
+    calls = []
+
+    def run(cmd, **_kw):
+        calls.append(cmd)
+        returncode, stdout, stderr = results[min(len(calls) - 1, len(results) - 1)]
+        return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+
+    monkeypatch.setattr(imf.subprocess, "run", run)
+    result = imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(tmp_path), str(build), False, False)
+    return result, calls
+
+
+def test_a_fatal_predevice_startup_crash_is_retried_once(monkeypatch, tmp_path, capsys):
+    result, calls = run_case_with_harness_sequence(
+        monkeypatch, tmp_path, [(0xC000041D, "", "validation: loader startup\n"), (0, "device: X\n", "")])
+    assert result is True
+    assert len(calls) == 2
+    out = capsys.readouterr().out
+    assert "harness startup exit 0xc000041d before device selection; retrying once" in out
+
+
+def test_a_persistent_predevice_startup_crash_remains_a_harness_error(monkeypatch, tmp_path, capsys):
+    result, calls = run_case_with_harness_sequence(
+        monkeypatch, tmp_path, [(0xC000041D, "", "validation: loader startup\n")])
+    assert result is imf.HARNESS_ERROR
+    assert len(calls) == 2
+    out = capsys.readouterr().out
+    assert "retrying once" in out and "FAIL (vk_image_fuzz exit 0xc000041d" in out
+
+
+def test_a_postdevice_crash_is_not_retried(monkeypatch, tmp_path):
+    result, calls = run_case_with_harness_sequence(
+        monkeypatch, tmp_path, [(0xC0000005, "device: X\n", "pipeline compile\n")])
+    assert result is imf.HARNESS_ERROR
+    assert len(calls) == 1
+
+
+def test_an_ordinary_predevice_error_is_not_retried(monkeypatch, tmp_path):
+    result, calls = run_case_with_harness_sequence(monkeypatch, tmp_path, [(1, "", "spec: bad texture\n")])
+    assert result is imf.HARNESS_ERROR
+    assert len(calls) == 1
+
+
 def test_a_long_stderr_prints_only_its_tail(monkeypatch, tmp_path, capsys):
     stderr = "".join(f"line {i}\n" for i in range(50))
-    assert run_case_with_harness_result(monkeypatch, tmp_path, 3, "", stderr) is False
+    assert run_case_with_harness_result(monkeypatch, tmp_path, 3, "", stderr) is imf.HARNESS_ERROR
     out = capsys.readouterr().out
     assert f"stderr (last {imf.STDERR_TAIL} of 50 lines):" in out
     assert "    line 49" in out and f"    line {50 - imf.STDERR_TAIL}\n" in out
@@ -435,6 +487,22 @@ def test_run_case_passes_pc_tail_to_translator_and_harness(monkeypatch, tmp_path
     imf.run_case("R8G8B8A8_UNORM", 4, 4, random.Random(1), str(tmp_path), str(build), False, False, pc_tail=True)
     assert seen_translate == [True]
     assert seen_env[0]["LEONIDA_PC_TAIL_UBO"] == "1"
+
+
+def test_main_reports_a_harness_error_as_exit_2_not_a_mismatch(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(imf, "run_case", lambda *args, **kw: imf.HARNESS_ERROR)
+    monkeypatch.setattr(sys, "argv", ["image_fuzz.py", "--programs", "1", "--work", str(tmp_path)])
+    assert imf.main() == 2
+    out = capsys.readouterr().out
+    assert "1 harness error" in out and "mismatched" not in out
+
+
+def test_main_keeps_a_pixel_mismatch_at_exit_1(monkeypatch, tmp_path, capsys):
+    monkeypatch.setattr(imf, "run_case", lambda *args, **kw: False)
+    monkeypatch.setattr(sys, "argv", ["image_fuzz.py", "--programs", "1", "--work", str(tmp_path)])
+    assert imf.main() == 1
+    out = capsys.readouterr().out
+    assert "1 mismatched" in out and "harness errors" not in out
 
 
 def test_main_enables_pc_tail_ubo_from_flag_or_env(monkeypatch, tmp_path):

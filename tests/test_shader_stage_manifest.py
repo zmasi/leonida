@@ -17,7 +17,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 
 import make_game  # noqa: E402
-from shader_stage_manifest import shader_stems  # noqa: E402
+from shader_stage_manifest import shader_stages, shader_stems  # noqa: E402
 
 FSSM_UNPACK = os.path.join(ROOT, "tools", "fssm_unpack.py")
 SHADER_DISASM = os.path.join(ROOT, "tools", "shader_disasm.py")
@@ -161,6 +161,36 @@ class ShaderStemsTests(unittest.TestCase):
         )
         self.assertEqual(shader_stems(carve, "file", ".dxbc"), {"ps_water"})
         self.assertEqual(shader_stems(unpack, "name"), {"cs_bloom_0"})
+
+    def test_case_insensitive_suffix_matching(self):
+        path = self.write_json("upper_suffix.json", [
+            {"file": "ps_water.DXBC", "stage": "ps"},
+            {"file": "vs_main.DxBc", "stage": "vs"},
+        ])
+        self.assertEqual(shader_stems(path, "file", ".dxbc"), {"ps_water", "vs_main"})
+        self.assertEqual(shader_stages(path, "file", ".dxbc"), {"ps_water": "ps", "vs_main": "vs"})
+
+    def test_shader_stages_marks_conflicting_duplicates_unknown_while_keeping_agreeing_ones(self):
+        path = self.write_json("stages.json", [
+            {"file": "ambig.dxbc", "stage": "ps"},
+            {"file": "ambig.dxbc", "stage": "vs"},
+            {"file": "ambig.dxbc", "stage": "ps"},
+            {"file": "agree.dxbc", "stage": "cs"},
+            {"file": "agree.dxbc", "stage": ""},
+            {"file": "agree.dxbc", "stage": "cs"},
+            {"file": "missing_then_known.dxbc", "stage": None},
+            {"file": "missing_then_known.dxbc", "stage": "gs"},
+            {"file": "unknown_only.dxbc"},
+        ])
+        self.assertEqual(
+            shader_stages(path, "file", ".dxbc"),
+            {
+                "ambig": None,
+                "agree": "cs",
+                "missing_then_known": "gs",
+                "unknown_only": None,
+            },
+        )
 
 
 class CallerIntegrationTests(unittest.TestCase):

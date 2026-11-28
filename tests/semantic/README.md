@@ -196,6 +196,9 @@ instruction family per file; the list below describes some of them, not every fi
   (MoltenVK) would inline it into a short-circuiting `&&`/`||` or a ternary's arm, for 11 DPP16/DPP8 forms with
   and without a lane off in EXEC, using a model of SPIRV-Cross's single-use forwarding (its own tests cover the
   model). It also runs the same programs in `spirv_wave_interp.py` against a plain-Python DPP reference.
+- `test_wave_mask_eager.py` (SHADER-WAVEMASK-EAGER) does the same for the whole-wave mask gather: `v_mbcnt`,
+  `s_bcnt1` and `s_ff1` of a compare mask, of VCC and of EXEC, read while EXEC is narrowed, leave no subgroup op in
+  a ternary's arm, in a compute, a vertex and a pixel shader, and `v_mbcnt` counts the lanes that are off.
 
 Limits: single lane (or lanes in lockstep, one instruction per lane per round, that exchange values only through
 `OpGroupNonUniformShuffle`, `Ballot`, `Any`, `All` and `BitwiseOr` Reduce), control flow followed one branch at a time (the fragment-exit discard test, the compute

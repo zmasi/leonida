@@ -183,6 +183,19 @@ class TestScanAndWrite(unittest.TestCase):
              (60000, 1001, 59.94, 2.002)],
         )
 
+    def test_probe_skips_stream_truncated_after_indexing(self):
+        path = self.rpf(0, b"")
+        rows, _ = bink.scan_target(path)
+        row = rows[0]
+        with open(path, "rb+") as source:
+            source.truncate(row["offset"] + row["size"] - 1)
+        proc = subprocess.CompletedProcess(["ffprobe"], 0, '{"streams":[{"codec_type":"video","codec_name":"bink2"}]}')
+        with mock.patch.object(tempfile, "tempdir", self.dir), mock.patch.object(bink.subprocess, "run", return_value=proc) as run:
+            probed = bink.probe_row(row, "ffprobe")
+        self.assertEqual((probed["decodes"], probed["codec"], probed["probe_duration_s"]), ("no", "", ""))
+        run.assert_not_called()
+        self.assertFalse(any(name.startswith("bink_index_") for name in os.listdir(self.dir)))
+
     def test_probe_handles_failed_or_malformed_results(self):
         rows, _ = bink.scan_target(self.dir)
         valid_info = {"streams": [{"codec_type": "video", "codec_name": "bink2"}],

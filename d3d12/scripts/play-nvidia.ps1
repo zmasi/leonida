@@ -18,7 +18,9 @@
 #                  (LEONIDA_FSR_UPSCALER), which is where DLSS takes over.
 # -FrameGen        DLSS frame generation: 2 (twice the frames shown), up to 6 where the card does more (RTX 40: 2).
 #                  It takes depth and motion vectors from the DLSS upscale, so on Series X it turns -Dlss quality on
-#                  unless a mode is given.
+#                  unless a mode is given; with -Resolution, from the G-buffer pass, and it is then on (2) by
+#                  default on RTX 40 and 50 cards when its files are here.
+# -NoFrameGen      no DLSS frame generation (Smooth Motion instead, if the NVIDIA App has it on for leonida_sm.exe)
 # -Aspect          the window's shape: 21:9, 32:9, 16:9, W:H or auto (the screen's). The game still draws 16:9.
 # -PresentScale    fit (the 16:9 picture centred, black bars beside it: the default with -Aspect) or stretch
 # -Quality         fewer stretched/jumping bodies, slower (relay stage 1, no card steps)
@@ -53,6 +55,7 @@ param(
     [ValidateSet('2160', '1440', '1080', '720', '540', '480')][string]$Resolution,
     [ValidateSet('quality', 'balanced', 'performance', 'ultra')][string]$Dlss,
     [ValidateRange(2, 6)][int]$FrameGen,
+    [switch]$NoFrameGen,
     [ValidatePattern('^(auto|\d+(\.\d+)?([:x/]\d+(\.\d+)?)?)$')][string]$Aspect,
     [ValidateSet('fit', 'stretch')][string]$PresentScale,
     [string]$Adapter,
@@ -111,10 +114,49 @@ $settings = @{
     LEONIDA_JOIN_COPIES = '1'; LEONIDA_INDIRECT_WINDOW = '1'; LEONIDA_RELAY_COPY = '1'
     # Copy-backs caught half-written are fetched again (torn.rs).
     LEONIDA_FETCH_CHECK = '1'
-    # Leonida: indirect batches end at every dispatch (INDIRECT_BATCH=1, not 2). With 2 a batch opened before the
-    # title's culling and tessellation dispatches clamped their arguments before they were written: the sea's surface
-    # and its tiled resolve went missing for a frame (sand or black blocks), 6 times in 271 frames; with 1, none in 441.
-    LEONIDA_INDIRECT_BATCH = '1'; LEONIDA_MAP_THREADS = '1'; LEONIDA_TITLE_PRIORITIES = '0'; LEONIDA_CARD_AWAKE = '1'
+    # Leonida: an indirect batch stays open past a program only if all it can store goes through views its bind
+    # declares, and a record one was bound to since the batch's pass is clamped again behind it (INDIRECT_BATCH=4;
+    # 1 ended a batch at every storing program; 2, ending only at waits and draws, clamped the culling passes'
+    # arguments before they were written: the sea's surface missing for a frame). Waterside save, 1440p, RTX 4060 Ti
+    # (2026-11-28), in turns of 4 s against 1: standing -2.15 ms a frame (+-0.39, of 60 to 82; 2: -3.77), walking
+    # -1.6 (+-1.6); 900 to 1,000 batch passes a frame against 1,150. No sea fault found in 1,116 recorded frames.
+    LEONIDA_INDIRECT_BATCH = '4'; LEONIDA_MAP_THREADS = '1'; LEONIDA_TITLE_PRIORITIES = '0'
+    # Leonida: the card is not kept awake between submissions (it was '1': a small compute loop that keeps the
+    # card's clocks up while it stands idle between submissions, host\awake.rs). Switched in turns of 4 s (LEONIDA_AB)
+    # from one save, Series X, RTX 4060 Ti, Ryzen 5 7600X (2026-11-28), the frame with the loop against without:
+    # standing at 1440 lines +2.1 ms (+-0.3, of 72), standing at 1080 lines +0.4 to +0.6 (+-0.3, of 66), walking and
+    # turning at 1440 lines +0.7 (+-1.2) and +1.8 (+-1.8, of 83 to 87). The card is 86 to 99 % busy in all of them:
+    # there is no idle card to keep awake, and the loop takes its share of a busy one. What is given up: where the
+    # card does stand idle for half of a frame (a faster card behind the same processor) the driver lowers its
+    # clocks and the next submission starts slow (a captured frame of 30 ms took 38 to 40 with waits between its
+    # submissions). '1' in -More: kept awake, as before.
+    LEONIDA_CARD_AWAKE = '0'
+    # Leonida: a store of the title's that faults on a guarded block is done beside the guard (through our own view
+    # of the page) and the block stays read-only, instead of two changes of protection for it (titlewrite.rs; a
+    # store that is not understood, or a block's fifth, opens the block as before). The same save and PC, in turns
+    # of 4 s: standing at 1440 lines -0.6 ms (+-0.3; means -0.9), standing at 1080 lines -2.4 (+-0.3; means -2.2),
+    # walking and turning at 1440 lines -1.9 (+-0.9), -0.9 (+-1.6) and -1.6 (+-1.5) in three runs. 1.4 to 1.7 million
+    # stores a run done so and 56,000 to 75,000 not understood (those open the block); no "title memory not written"
+    # in any run; every frame of the standard moves saved both ways (553 and 571 frames): the frames the scan flags
+    # with it (6 against 2) are a fast turn past a white house and the sky, with nothing missing in them.
+    # '0' in -More: every faulting store opens its block, as before.
+    LEONIDA_STORE_BESIDE = '1'
+    # Leonida: the copy behind an aliased view (an R9G9B9E5 view the title places in an R32_UINT texture shaders
+    # write: 86 copies, 390 MiB a frame) goes from texture to texture, not through a buffer: the same texels, moved
+    # once. Standing at one save, Series X, 1440p, RTX 4060 Ti (2026-11-28): the copies 3.6 -> 1.9 ms of a timing
+    # run's frame; switched in turns of 4 s (LEONIDA_AB) the frame is 2.6 ms shorter with it (+-0.9, of 78); every
+    # frame of the standard moves saved both ways shows the same picture (513 and 547 frames).
+    LEONIDA_ALIAS_DIRECT = '1'
+    # Leonida: the sun's tiled cascade shadows (CS_ShadowRenderTiledCascadesCB and ...AlphaCB) in the paired form
+    # (one host wave of 32 threads for a console wave of 64, no group barriers) instead of the form the chain gives
+    # them (without skips, scalars followed: exact, with group barriers). Same place and card: their two lines of a
+    # timing run 2.5 -> 1.2 to 1.6 ms together (two runs each way); left out in turns of 3.5 s they are 2.9 ms of
+    # the frame as they were (+-0.6) and 1.3 ms paired (+-0.5); the shadows on the deck, the fence and the player
+    # look the same in every frame of the standard moves (526 frames, in daylight). Only those two programs are
+    # translated again. Not here, until a frame with projected decals has been compared: the decals' tile
+    # classification 1f1fbd86759b3da2, which the paired form takes from 2.9 ms to 0.03 (timing runs; 2.3 ms of the
+    # frame to nothing when left out in turns).
+    LEONIDA_PAIRED_FOR = 'be6ce5d849d51127,922e1d0ee1e19a85'
     # Leonida: the light stand-in stays on while the rays are off (below). Off, with every ray missing, shade went
     # black and the sky white (run n1, 453 frames); on, the same view is lit as on the console. What the title left
     # is kept up to 2 times the estimate (ambient.rs).
@@ -166,6 +208,17 @@ $settings = @{
     # pages with a new byte 41 -> 6.6 MB, "copying back" 30-40 -> 10-12 ms. The standard moves captured with it on:
     # 338 frames, one with a one-frame dip or spike, the picture as before (run x36).
     LEONIDA_WC_NO_BACK = '1'
+    # Leonida: the diag build's walk of the whole address space for its "memory map" log line is left out of play:
+    # 285,000 regions asked of Windows one by one took a thread 1.06 s every 30 s (2026-11-27), beside the title's
+    # own mapping calls. -More @{LEONIDA_MEMORY_MAP='1'} has the line again.
+    LEONIDA_MEMORY_MAP = '0'
+    # Leonida: the title's physical pages come in sections of 16 MiB, not one section for each allocation of
+    # gigabytes: unmapping and mapping a page of a small section is far cheaper for Windows (after Trex/Dolores
+    # e5e7120 and El1xr's section_mb.rs, GPL-3.0, which measured the unmap at 99-182 -> 3-11 us). Walking and turning
+    # from one save, 4 minutes each (2026-11-28, RTX 4060 Ti): mean 111.6 -> 94.4 ms a frame, median 105.1 -> 91.7,
+    # p90 139.3 -> 113.9; title memory held for mapping changes 43.2 -> 8.9 ms a frame, the mapping thread 46.2 ->
+    # 20.7. Sections of 2 MiB measured the same (91.7, 91.8, 111.4). '0' in -More: one section, as before.
+    LEONIDA_SECTION_MB = '16'
 }
 $console = if ($SeriesX) { 'series-x' } else { 'series-s' }
 # The render scale of each DLSS mode (rendered lines over output lines; the layer picks DLSS's own mode by it).
@@ -196,6 +249,22 @@ if ($Resolution) {
 }
 if ($Dlss -and -not $dlssOn) { Write-Host "-Dlss ${Dlss}: no DLSS here (its files, or a build with it): the title's picture is not made by DLSS." }
 if ($FrameGen) { $settings.LEONIDA_FRAME_GEN = "$FrameGen" }
+# Leonida: DLSS frame generation twice the frames shown by default on cards that make it (RTX 40 and 50) when its
+# Streamline files are here and the title upscales by itself (-Resolution: its depth and motion vectors are the
+# G-buffer pass's, fg.rs). Series X at -Resolution 1080 on an RTX 4060 Ti (2026-11-28): 15 frames rendered, 29
+# shown. It generates only while the game's window has the focus. -NoFrameGen leaves it off (Smooth Motion then).
+if (-not $FrameGen -and -not $NoFrameGen -and $Resolution -and -not $RayTracing -and $StreamlineDir) {
+    $card = try { (Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object { $_.Name }) -join ';' } catch { '' }
+    if ($card -match 'RTX\s*(40|50)\d\d') {
+        $settings.LEONIDA_FRAME_GEN = '2'
+        # Reflex holds the frames shown to 28 a second (14 rendered, 71.4 ms apart), so that the made frames fall
+        # evenly between the rendered ones (fg.rs, limit_us). Same save, 1080 lines, RTX 4060 Ti (2026-11-28): rendered
+        # frames 70.6 ms mean, 68.8 median, 76.6 p90 without it; 72.5, 71.4, 76.7 with 28 (the spread of a phase's
+        # p90 over its median 7.8 -> 5.3 ms); 26 cost two shown frames a second for no more evenness.
+        # -More @{LEONIDA_FG_LIMIT_FPS='0'}: no limit.
+        $settings.LEONIDA_FG_LIMIT_FPS = '28'
+    }
+}
 if ($Aspect) { $settings.LEONIDA_ASPECT = $Aspect }
 if ($PresentScale) { $settings.LEONIDA_PRESENT_SCALE = $PresentScale }
 if ($StreamlineDir) { $settings.LEONIDA_STREAMLINE_DIR = $StreamlineDir }
@@ -232,7 +301,16 @@ if ($env:LEONIDA_WATER_TRANSMISSION -ne '1') {
     # The whole family (the water's CS_TransmissionVolumetrics, findings.md): another configuration binds another
     # variant (1440p output with render scale 1.0: 5dc3b25986622949, whose paired form left a band of blocks over the
     # lower fifth of the picture, 2026-11-27).
-    $skip = @('6f225b641c5b0708', '5dc3b25986622949', '926c46bab3b86bd6', '2889c21328c69e58', '6871d6e4b3ac9a10', '888af37a584acf98', 'a10179ab7eda0dc3')
+    # Five, not the seven dropped from cef91163b on: 2889c21328c69e58 and 888af37a584acf98 were counted with the
+    # family because they trip on the same thing (findings.md), but by the entry points in their containers they are
+    # CS_GenerateShadowMasks_SampleHairScreenSpace and CS_GenerateShadowMasksHairOnly_SampleHairScreenSpace: the
+    # sun's shadow mask where hair is sampled on screen. Dropped, what they would have written keeps an old mask
+    # (edsuuu/VI-BR-PORT b120167 saw that as blocky, lit hair with another program of that pass out). They run again;
+    # the reason for the drop was the water's blocks, nothing is noted against these two, and they ran until that
+    # commit. Not looked at in a run since:
+    # LEONIDA_HAIR_SHADOW_MASKS=0 in the window's environment drops them as before.
+    $skip = @('6f225b641c5b0708', '5dc3b25986622949', '926c46bab3b86bd6', '6871d6e4b3ac9a10', 'a10179ab7eda0dc3')
+    if ($env:LEONIDA_HAIR_SHADOW_MASKS -eq '0') { $skip += '2889c21328c69e58', '888af37a584acf98' }
     if ($settings.LEONIDA_SKIP_PIPELINES) { $skip = @($settings.LEONIDA_SKIP_PIPELINES) + $skip }
     $settings.LEONIDA_SKIP_PIPELINES = $skip -join ','
 }
@@ -371,9 +449,19 @@ foreach ($k in $settings.Keys) { Set-Item "Env:$k" $settings[$k] }
 # With another output size than the console's (LEONIDA_OUTPUT), the title's settings file is told that size as its
 # UI and fullscreen resolution: left at 0x0 ("as the console") it lays the UI out for 3840x2160 and the weapon wheel
 # and menus come out half again too big in a 2560x1440 picture (2026-11-27).
-if (-not $DryRun -and $env:LEONIDA_DATA_DIR -and "$($settings.LEONIDA_OUTPUT)" -match '^(\d+)x(\d+)$') {
+# The data folder the title's settings file is in: the variable, else `data_dir` of leonida.toml beside the layer
+# (with only the file naming it, neither of the two writers below ran: 2026-11-27).
+$dataDir = $env:LEONIDA_DATA_DIR
+if (-not $dataDir) {
+    $tomlHere = Join-Path $root 'leonida.toml'
+    if ((Test-Path $tomlHere) -and ((Get-Content $tomlHere -Raw) -match "(?m)^\s*data_dir\s*=\s*['""]([^'""]+)['""]")) {
+        # (In a double-quoted TOML string a backslash is written twice.)
+        $dataDir = $Matches[1] -replace '\\\\', '\'
+    }
+}
+if (-not $DryRun -and $dataDir -and "$($settings.LEONIDA_OUTPUT)" -match '^(\d+)x(\d+)$') {
     $outW = $Matches[1]; $outH = $Matches[2]
-    Get-ChildItem (Join-Path $env:LEONIDA_DATA_DIR '*\storage\settings\settings.xml') -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem (Join-Path $dataDir '*\storage\settings\settings.xml') -ErrorAction SilentlyContinue | ForEach-Object {
         $file = $_.FullName
         $text = [IO.File]::ReadAllText($file)
         $new = $text
@@ -388,14 +476,14 @@ if (-not $DryRun -and $env:LEONIDA_DATA_DIR -and "$($settings.LEONIDA_OUTPUT)" -
     }
 }
 $titleGraphics = if ($settings.LEONIDA_TITLE_GRAPHICS) { "$($settings.LEONIDA_TITLE_GRAPHICS)" } else { 'keep' }
-if (-not $DryRun -and $titleGraphics -eq 'performance' -and $env:LEONIDA_DATA_DIR) {
+if (-not $DryRun -and $titleGraphics -eq 'performance' -and $dataDir) {
     $lighter = [ordered]@{
         rtDynamicShadows = 'false'; rtLODLightShadows = 'false'; ssroSampleCount = '0'; motionBlur = 'false'
         shadowParticleShadows = 'false'; sharpenEnabled = 'false'; grassLod = '0.300000'; lodScale = '0.600000'
         vehicleHDCount = '0'; directionalScreenSpaceShadowQuality = '0.000000'; worldHeightShadowQuality = '0.000000'
         anisotropicFiltering = '16'; vSync = '0'
     }
-    Get-ChildItem (Join-Path $env:LEONIDA_DATA_DIR '*\storage\settings\settings.xml') -ErrorAction SilentlyContinue | ForEach-Object {
+    Get-ChildItem (Join-Path $dataDir '*\storage\settings\settings.xml') -ErrorAction SilentlyContinue | ForEach-Object {
         $file = $_.FullName
         $text = [IO.File]::ReadAllText($file)
         $new = $text
@@ -432,8 +520,22 @@ if (-not $NoPrecompile) {
         & $leonida shaders $from | Where-Object { $_ -match 'shaders in the cache|do not translate' } |
             ForEach-Object { Write-Host "  $_" }
         Write-Host 'Precompiling the pipelines earlier runs drew with ...'
+        # The driver keeps what these processes compile in its own files, of at most its "Shader Cache Size" each
+        # (4 GB unless raised). A full one keeps nothing new: every start then compiles in the game again, at a
+        # frame every few seconds and with draws missing (2026-11-27, twice in a day of translator changes).
+        # Which files are this game's is told by which ones the precompile touches.
+        $dxCache = Join-Path $env:LOCALAPPDATA 'NVIDIA\DXCache'
+        $dxBefore = @{}
+        Get-ChildItem $dxCache -Filter '*.nvph' -ErrorAction SilentlyContinue | ForEach-Object { $dxBefore[$_.Name] = $_.LastWriteTimeUtc }
         & $leonida warm --used | Where-Object { $_ -match 'pipelines known|^\d+ of |made in' } |
             ForEach-Object { Write-Host "  $_" }
+        $dxFull = @(Get-ChildItem $dxCache -Filter '*.nvph' -ErrorAction SilentlyContinue | Where-Object {
+                $_.Length -ge 4GB -and $dxBefore[$_.Name] -ne $_.LastWriteTimeUtc })
+        if ($dxFull.Count) {
+            Write-Warning ("NVIDIA's shader cache for this game is full ($($dxFull[0].FullName), 4 GB): what was compiled just now " +
+                "is not kept, and the game will compile it again while it runs. Set 'Shader Cache Size' to Unlimited in the " +
+                "NVIDIA Control Panel (Manage 3D settings), or delete that file while the game is closed.")
+        }
     } finally {
         $ErrorActionPreference = $stopWas
         if ($null -eq $logWas) { Remove-Item Env:LEONIDA_LOG -ErrorAction SilentlyContinue } else { $env:LEONIDA_LOG = $logWas }

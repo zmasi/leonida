@@ -75,7 +75,10 @@ struct XdxrLayout {
         const std::uint64_t n_off = e_off + std::uint64_t(count) * element_size;
         const std::uint64_t end = n_off + std::uint64_t(nodes) * node_size + pad;
         // node pointers hold the 64-byte unit index in 29 bits
-        if (end > (std::uint64_t(1) << 32) - 64 || (end >> 6) >= (std::uint64_t(1) << 29)) return false;
+        if (end > (std::uint64_t(1) << 32) - 64 || (end >> 6) >= (std::uint64_t(1) << 29)) {
+            *this = XdxrLayout{};
+            return false;
+        }
         elements_off = std::uint32_t(e_off);
         nodes_off = std::uint32_t(n_off);
         size = std::uint32_t(end);
@@ -89,9 +92,12 @@ struct XdxrLayout {
                   20ull * inner() + 8ull * kept_tiles() + 4ull * count;
         return true;
     }
-    std::uint32_t tiles() const { return (sort_size + radix_tile - 1) / radix_tile; }
+    std::uint32_t tiles() const { return sort_size ? 1u + (sort_size - 1u) / radix_tile : 0u; }
     std::uint32_t inner() const { return elements > 1 ? elements - 1 : 0; }   // binary tree inner nodes
-    std::uint32_t kept_tiles() const { return (inner() + radix_tile - 1) / radix_tile; }
+    std::uint32_t kept_tiles() const {
+        const std::uint32_t n = inner();
+        return n ? 1u + (n - 1u) / radix_tile : 0u;
+    }
 };
 
 // One geometry of a bottom-level build, as D3D12_RAYTRACING_GEOMETRY_TRIANGLES_DESC gives it.
@@ -151,7 +157,7 @@ public:
     // update ignores `pair`.
     bool record_blas(VkCommandBuffer cb, const XdxrLayout& layout, const std::vector<XdxrTriangles>& geometries,
                      std::uint64_t dst, std::uint64_t scratch, std::uint64_t update_from = 0, bool pair = false) {
-        if (!loaded_ || layout.tlas || !layout.size || !dst || !scratch) return false;
+        if (!loaded_ || !cb || layout.tlas || !layout.size || !dst || !scratch) return false;
         std::uint64_t total = 0;
         for (const auto& geo : geometries) {
             total += geo.triangle_count;
@@ -190,7 +196,7 @@ public:
     bool record_tlas(VkCommandBuffer cb, const XdxrLayout& layout, std::uint64_t instances, std::uint64_t dst,
                      std::uint64_t scratch, std::uint64_t bias = 0, std::uint64_t update_from = 0,
                      const XdxrBlasTable* blases = nullptr) {
-        if (!loaded_ || !layout.tlas || !layout.size || !dst || !scratch || (layout.elements && !instances))
+        if (!loaded_ || !cb || !layout.tlas || !layout.size || !dst || !scratch || (layout.elements && !instances))
             return false;
         Push p = base(layout, dst, scratch);
         p.bias = split(bias);
@@ -215,7 +221,7 @@ public:
     // CopyRaytracingAccelerationStructure CLONE or COMPACT: the structure at `src` to `dst`, as many bytes as its
     // header says, at most `max_bytes` (the room the destination has). The structures are position-independent.
     bool record_copy(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst, std::uint64_t max_bytes) {
-        if (!loaded_ || !src || !dst || max_bytes < XdxrLayout::header_size) return false;
+        if (!loaded_ || !cb || !src || !dst || max_bytes < XdxrLayout::header_size) return false;
         if (src == dst) return true;
         vk_.vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline_);
         Push p{};
@@ -230,7 +236,7 @@ public:
     // One postbuild value (COMPACTED_SIZE or CURRENT_SIZE, the same for these builds): 8 bytes at `dst` for the
     // structure at `src`. A barrier first: a build or copy recorded just before writes the header it reads.
     bool record_postbuild(VkCommandBuffer cb, std::uint64_t src, std::uint64_t dst) {
-        if (!loaded_ || !src || !dst) return false;
+        if (!loaded_ || !cb || !src || !dst) return false;
         VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT,
                           VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
         vk_.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
@@ -351,44 +357,48 @@ private:
     }
 
     void finish(VkCommandBuffer cb, const XdxrLayout& l, const Push& p) {
-        Push m = p;
-        m.mode = mode_morton;
-        m.count = l.sort_size;
-        dispatch(cb, m, m.count);
+        if (l.sort_size) {
+            Push m = p;
+            m.mode = mode_morton;
+            m.count = l.sort_size;
+            dispatch(cb, m, m.count);
+        }
         // stable LSD radix sort, 4 bits a pass; an even pass count leaves the result where the keys started
         static_assert(XdxrLayout::radix_passes % 2 == 0, "the sorted keys must end in the first buffer");
         if (l.sort_size > 1 && l.sort_size <= XdxrLayout::small_sort_max) {
             Push s = p;
             s.mode = mode_small_sort;
-            dispatch(cb, s, 64);                       // one workgroup, shared memory
+            dispatch_groups(cb, s, 1);                  // one workgroup, shared memory
         } else if (l.sort_size > 1) {
+            const std::uint32_t sort_tiles = l.tiles();
             for (std::uint32_t pass = 0; pass < XdxrLayout::radix_passes; ++pass) {
                 Push s = p;
                 s.first = pass;
                 s.mode = mode_radix_count;
-                dispatch(cb, s, 64 * l.tiles());       // one workgroup of 64 per tile
+                dispatch_groups(cb, s, sort_tiles);     // one workgroup of 64 per tile
                 s.mode = mode_radix_scan;
-                dispatch(cb, s, 64);                   // one workgroup
+                dispatch_groups(cb, s, 1);              // one workgroup
                 s.mode = mode_radix_scatter;
-                dispatch(cb, s, 64 * l.tiles());
+                dispatch_groups(cb, s, sort_tiles);
             }
         }
         // the binary radix tree, which of its inner nodes become BOX32 nodes, and their indices
         if (l.inner()) {
+            const std::uint32_t inner_tiles = l.kept_tiles();
             Push t = p;
             t.mode = mode_karras;
             t.count = l.inner();
             dispatch(cb, t, t.count);
             t.mode = mode_kept;
-            dispatch(cb, t, 64 * l.kept_tiles());      // one workgroup of 64 per tile
+            dispatch_groups(cb, t, inner_tiles);        // one workgroup of 64 per tile
             t.mode = mode_kept_scan;
-            dispatch(cb, t, 64);                       // one workgroup
+            dispatch_groups(cb, t, 1);                  // one workgroup
             t.mode = mode_kept_index;
-            dispatch(cb, t, 64 * l.kept_tiles());
+            dispatch_groups(cb, t, inner_tiles);
         }
         Push n = p;
         n.mode = mode_nodes;
-        n.count = l.inner() ? l.inner() : 1;          // one root of its own for zero or one element
+        n.count = l.inner() ? l.inner() : 1;            // one root of its own for zero or one element
         dispatch(cb, n, n.count);
         propagate(cb, l, p);
         Push h = p;
@@ -399,15 +409,21 @@ private:
 
     // One dispatch, then a compute-to-compute dependency so the next step sees its writes. The last step leaves the
     // dependency on its results to the caller's barrier (the application's UAV or AS barrier).
-    void dispatch(VkCommandBuffer cb, const Push& p, std::uint32_t threads, bool barrier = true) {
+    void dispatch_groups(VkCommandBuffer cb, const Push& p, std::uint32_t groups, bool barrier = true) {
+        if (!groups) return;
         vk_.vkCmdPushConstants(cb, layout_, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(Push), &p);
-        vk_.vkCmdDispatch(cb, std::uint32_t((std::uint64_t(threads) + 63u) / 64u), 1, 1);
+        vk_.vkCmdDispatch(cb, groups, 1, 1);
         if (!barrier) return;
         VkMemoryBarrier b{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
         b.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
         b.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
         vk_.vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
                                  &b, 0, nullptr, 0, nullptr);
+    }
+
+    void dispatch(VkCommandBuffer cb, const Push& p, std::uint32_t threads, bool barrier = true) {
+        if (!threads) return;
+        dispatch_groups(cb, p, std::uint32_t((std::uint64_t(threads) + 63u) / 64u), barrier);
     }
 
     struct Functions {
@@ -437,20 +453,33 @@ private:
         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         layout_info.pushConstantRangeCount = 1;
         layout_info.pPushConstantRanges = &push;
-        if (vk_.vkCreatePipelineLayout(device_, &layout_info, nullptr, &layout_) != VK_SUCCESS) return false;
+        VkPipelineLayout layout = VK_NULL_HANDLE;
+        if (vk_.vkCreatePipelineLayout(device_, &layout_info, nullptr, &layout) != VK_SUCCESS || !layout) return false;
         VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
         module_info.codeSize = sizeof(xdxr_build_spirv);
         module_info.pCode = xdxr_build_spirv;
         VkShaderModule module = VK_NULL_HANDLE;
         const aftermath::ShaderName aftermath_name("(runtime) xdxr_build.comp");
-        if (vk_.vkCreateShaderModule(device_, &module_info, nullptr, &module) != VK_SUCCESS) return false;
+        if (vk_.vkCreateShaderModule(device_, &module_info, nullptr, &module) != VK_SUCCESS || !module) {
+            vk_.vkDestroyPipelineLayout(device_, layout, nullptr);
+            return false;
+        }
         VkComputePipelineCreateInfo info{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
         info.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_COMPUTE_BIT,
                       module, "main", nullptr};
-        info.layout = layout_;
-        const bool ok = vk_.vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline_) == VK_SUCCESS;
+        info.layout = layout;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        const bool ok =
+            vk_.vkCreateComputePipelines(device_, VK_NULL_HANDLE, 1, &info, nullptr, &pipeline) == VK_SUCCESS &&
+            pipeline != VK_NULL_HANDLE;
         vk_.vkDestroyShaderModule(device_, module, nullptr);
-        return ok;
+        if (!ok) {
+            vk_.vkDestroyPipelineLayout(device_, layout, nullptr);
+            return false;
+        }
+        layout_ = layout;
+        pipeline_ = pipeline;
+        return true;
     }
 
     VkDevice device_ = VK_NULL_HANDLE;

@@ -747,6 +747,45 @@ class OperandClassificationTests(unittest.TestCase):
         struct.pack_into("<I", alias, 32, 4)
         self.assertEqual(M.read_dxbc_meta(bytes(alias)), {})
 
+    def test_signed_minmax_bfe_sext_and_pack_fold_into_literal_sampler(self):
+        cases = [
+            (["s_min_i32 s13, s8, s9"], 0x80000000),             # signed: 0x80000000 < 0x000000f0
+            (["s_max_i32 s13, s8, s9"], 0x000000F0),
+            (["s_min_i32 s13, -5, 3"], 0xFFFFFFFB),
+            (["s_max_i32 s13, -5, -9"], 0xFFFFFFFB),
+            (["s_bfe_i32 s13, s9, 0x40004"], 0xFFFFFFFF),        # (0xf0 >> 4) & 0xf == 0xf -> -1
+            (["s_bfe_i32 s13, 0x800, 0x80004"], 0xFFFFFF80),     # (0x800 >> 4) & 0xff == 0x80 -> -128
+            (["s_bfe_i32 s13, 0x35, 0x40004"], 0x00000003),      # (0x35 >> 4) & 0xf == 3 -> positive
+            (["s_bfe_i32 s13, s8, 0x20001f"], 0xFFFFFFFF),       # width clamped to 1 at off=31 -> bit31=1 -> -1
+            (["s_bfe_i32 s13, s9, 0x4"], 0x00000000),            # width 0 -> 0
+            (["s_sext_i32_i8 s13, 0x80"], 0xFFFFFF80),
+            (["s_sext_i32_i8 s13, 0x7f"], 0x0000007F),
+            (["s_sext_i32_i8 s13, 0x180"], 0xFFFFFF80),
+            (["s_sext_i32_i16 s13, 0x8000"], 0xFFFF8000),
+            (["s_sext_i32_i16 s13, 0x7fff"], 0x00007FFF),
+            (["s_pack_ll_b32_b16 s13, 0x12345678, 0xabcd9ef0"], 0x9EF05678),
+            (["s_pack_lh_b32_b16 s13, 0x12345678, 0xabcd9ef0"], 0xABCD5678),
+            (["s_pack_hh_b32_b16 s13, 0x12345678, 0xabcd9ef0"], 0xABCD1234),
+        ]
+        for build, want in cases:
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [[0x92, want, 0, 0]])
+
+    def test_signed_sext_and_pack_of_unknown_source_is_not_a_literal(self):
+        for build in (
+            ["s_min_i32 s13, s3, s9"],
+            ["s_max_i32 s13, s9, s3"],
+            ["s_bfe_i32 s13, s3, 0x80004"],
+            ["s_bfe_i32 s13, s9, s3"],
+            ["s_mov_b32 s13, 0", "s_sext_i32_i8 s13, s3"],
+            ["s_mov_b32 s13, 0", "s_sext_i32_i16 s13, s3"],
+            ["s_pack_ll_b32_b16 s13, s3, 0x1234"],
+            ["s_pack_lh_b32_b16 s13, 0x1234, s3"],
+            ["s_pack_hh_b32_b16 s13, s3, 0x12340000"],
+        ):
+            with self.subTest(build=build):
+                self.assertEqual(self._literal_samplers_with(build), [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -70,3 +70,21 @@ the newest-picture search.
   replacing a whole blob with a file you changed yourself (export, change, import), with the backup and the new
   version described above; a changed size no longer matches the header blob, which the page warns about.
 - Nothing from a real save is in the repository: `tests/test_leonida_saves.py` builds its own fake trees.
+
+## The HTML launcher (`launcher/`, in progress)
+
+`launcher/index.html` is a second front end in the layout of a publisher's game launcher (a slim rail with the
+game's tile, a picture over the whole window, the sections top right, the logo with a large PLAY button), and
+`launcher/serve.py` the small server behind it. `python -I launcher/serve.py` serves it on 127.0.0.1 only and opens
+it in a window of its own (Edge or Chrome in app mode, else the default browser). `--no-run` only looks: PLAY and the
+tools print the command they would run. `Launcher.bat` still opens the Tkinter window above.
+
+- Who may ask: a request must name this machine in Host and carry the token written into the page for that run (a
+  header for `/api`, a cookie for pictures and the event stream). Mods, saves and captures are named by folder, name
+  or index, never by path.
+- The picture behind PLAY: the one chosen in Settings, else the newest `background.webp`, `.png` or `.jpg` in the
+  launcher's settings folder (`%APPDATA%\Leonida`), else the newest capture, else art the page draws. When there is
+  none, the server fetches the game's key art from rockstargames.com once and keeps it there as `background.jpg` (or
+  `.webp`, by what comes back); `--no-art` leaves it. The request names a plain browser and nothing about you or the
+  project. The picture is never part of the repository. That download is the launcher's only internet access.
+- `python -I tests/test_launcher_serve.py` covers the above without a browser or the internet.

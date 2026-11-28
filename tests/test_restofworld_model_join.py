@@ -504,6 +504,98 @@ class ModelJoinTests(unittest.TestCase):
         _, rejected = joiner.scan_rpf(rpf)
         self.assertEqual(rejected["joined_resources"], 0)
 
+    def test_joins_page_map_slot_array_straddling_system_page_boundary(self):
+        # Place the 16-byte datResourceMap header at 65536 - 24 so its 3x8-byte slot array
+        # straddles from page 0 into a short (< 64-byte) second system page.
+        system, graphics = make_standalone_drawable_1x1()
+        first = bytearray(system[0].ljust(65536, b"\0"))
+        pm_off = 65536 - 24
+        struct.pack_into("<Q", first, 8, SYS_BASE + pm_off)
+        struct.pack_into("<IIBBHI", first, pm_off, 0, 0, 2, 1, 0, 0)
+        struct.pack_into("<Q", first, pm_off + 16, 0)  # slot 0 in page 0
+        # Slots 1 and 2 (16 bytes) land at the start of page 1, followed by the name cstring.
+        struct.pack_into("<Q", first, 168, SYS_BASE + 65536 + 16)
+        last = b"\0" * 16 + b"synth_straddle\0".ljust(32, b"\0")
+        archive, recorded = pack_synthetic_rpf([[bytes(first), last, *graphics]])
+        rpf = os.path.join(self.root, "straddle.rpf")
+        with open(rpf, "wb") as fh:
+            fh.write(archive)
+
+        resources, summary = joiner.scan_rpf(rpf)
+        self.assertEqual(summary["joined_resources"], 1)
+        self.assertEqual(summary["unjoined_candidates"], 0)
+        self.assertEqual([s["offset"] for s in resources[0]["system_streams"]], recorded[0][0][:2])
+        self.assertEqual(resources[0]["page_map_offset"], pm_off)
+
+        # A non-zero slot word across the boundary must still be rejected cleanly.
+        bad_last = bytearray(last)
+        bad_last[8] = 1
+        bad_archive, _ = pack_synthetic_rpf([[bytes(first), bytes(bad_last), *graphics]])
+        bad_rpf = os.path.join(self.root, "straddle_bad_slot.rpf")
+        with open(bad_rpf, "wb") as fh:
+            fh.write(bad_archive)
+        bad_res, bad_sum = joiner.scan_rpf(bad_rpf)
+        self.assertEqual(bad_sum["joined_resources"], 0)
+        self.assertEqual(bad_sum["unjoined_candidates"], 1)
+        self.assertIn("non-zero reserved or runtime slot", bad_res[0]["error"])
+
+    def test_loose_directory_sorts_hex_offsets_numerically_and_case_insensitively(self):
+        sys1, gfx1 = make_standalone_drawable_1x1()
+        loose_dir = os.path.join(self.root, "loose_hex")
+        os.makedirs(loose_dir)
+        # Lexicographic sort would put "0000000B0010.BIN" before "0000000a0010.bin" and "1000010.bin" before "100010.bin".
+        with open(os.path.join(loose_dir, "0000000a0010.bin"), "wb") as fh:
+            fh.write(sys1[0])
+        with open(os.path.join(loose_dir, "0000000B0010.BIN"), "wb") as fh:
+            fh.write(gfx1[0])
+        with open(os.path.join(loose_dir, "100010.bin"), "wb") as fh:
+            fh.write(sys1[0])
+        with open(os.path.join(loose_dir, "1000010.bin"), "wb") as fh:
+            fh.write(gfx1[0])
+
+        resources, summary = joiner.scan_dir(loose_dir)
+        self.assertEqual(summary["joined_resources"], 2)
+        self.assertEqual([r["offset"] for r in resources], [0x0A0010, 0x100010])
+
+    def test_carve_index_accepts_utf8_bom_and_handles_deep_nesting(self):
+        sys1, gfx1 = make_standalone_drawable_1x1()
+        bom_dir = os.path.join(self.root, "bom_dir")
+        os.makedirs(bom_dir)
+        s_off = 0x1010
+        g_off = 0x2000
+        with open(os.path.join(bom_dir, f"{s_off:012x}.bin"), "wb") as fh:
+            fh.write(sys1[0])
+        with open(os.path.join(bom_dir, f"{g_off:012x}.bin"), "wb") as fh:
+            fh.write(gfx1[0])
+        index_obj = {
+            "files": [
+                {"off": s_off, "size": len(sys1[0]), "stored": g_off - s_off, "pre": "00" * 16},
+                {"off": g_off, "size": len(gfx1[0]), "stored": 64, "pre": "00" * 16},
+            ]
+        }
+        with open(os.path.join(bom_dir, "index.json"), "wb") as fh:
+            fh.write(b"\xef\xbb\xbf" + json.dumps(index_obj).encode("utf-8"))
+
+        _, summary = joiner.scan_dir(bom_dir)
+        self.assertEqual(summary["joined_resources"], 1)
+
+        deep_dir = os.path.join(self.root, "deep_dir")
+        os.makedirs(deep_dir)
+        with open(os.path.join(deep_dir, "index.json"), "wb") as fh:
+            fh.write(b"{}")
+        out_json = os.path.join(self.root, "deep_out.json")
+        import contextlib
+        import io
+        err = io.StringIO()
+        with unittest.mock.patch.object(joiner.json, "load", side_effect=RecursionError):
+            with self.assertRaisesRegex(ValueError, "nesting is too deep"):
+                joiner.scan_dir(deep_dir)
+            with contextlib.redirect_stderr(err):
+                rc = joiner.main([deep_dir, out_json, "--quiet"])
+        self.assertEqual(rc, 1)
+        self.assertIn("nesting is too deep", err.getvalue())
+        self.assertFalse(os.path.exists(out_json))
+
     def test_joins_1x1_drawable_1x2_dict_and_2x2_fragment_in_rpf(self):
         archive_bytes, recorded = pack_synthetic_rpf(self._build_full_corpus_entries())
         rpf_path = os.path.join(self.root, "models.rpf")

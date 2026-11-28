@@ -193,6 +193,137 @@ class PsinPschTests(unittest.TestCase):
             self.assertEqual(p2.returncode, 2)
             self.assertIn("overwrite", p2.stderr)
 
+    def test_pmap_exact_end_handles_trailing_empty_and_out_of_order_last_block(self):
+        # 1. Trailing empty block (length == 0) after block covering 0x10..0x30
+        pmap_hdr = struct.pack(">IHHH6s", 1, 0, 0, 2, b"pppppp")
+        rows_empty_tail = (
+            struct.pack(">4I", 0x11111111, 0x10, 0, 0x20)
+            + struct.pack(">4I", 0x22222222, 0x10, 0, 0)
+        )
+        blob_30 = b"PSIN" + struct.pack(">I", 0x30) + b"pppppppp" + bytes(0x20)
+        dec1 = psin_psch.decode_pmap(pmap_hdr + rows_empty_tail, blob_30, 0x30)
+        self.assertTrue(dec1["exact_end"])
+
+        # 2. Out-of-order final row where block 2 ends at first_section (0x50) and block 3 sits at 0x20..0x30
+        pmap_hdr3 = struct.pack(">IHHH6s", 1, 0, 0, 3, b"pppppp")
+        rows_ooo = (
+            struct.pack(">4I", 0x11111111, 0x10, 0, 0x10)
+            + struct.pack(">4I", 0x22222222, 0x30, 0, 0x20)
+            + struct.pack(">4I", 0x33333333, 0x20, 0, 0x10)
+        )
+        blob_50 = b"PSIN" + struct.pack(">I", 0x50) + b"pppppppp" + bytes(0x40)
+        dec2 = psin_psch.decode_pmap(pmap_hdr3 + rows_ooo, blob_50, 0x50)
+        self.assertTrue(dec2["exact_end"])
+
+    def test_schema_detects_self_referencing_descriptors_and_duplicate_hashes(self):
+        pmap = {"root_block_id": 1, "blocks": [{"id": 1, "hash": 0x11111111, "offset": 0x10, "length": 16}]}
+        psch = {
+            "structs": [
+                {
+                    "hash": 0x11111111,
+                    "size": 16,
+                    "members": [
+                        {"hash": psin_psch.ARRAY_ELEMENT, "type": psin_psch.PSCH_TYPE_ARRAY, "sub": 0, "offset": 0, "ref": 0},
+                        {"hash": psin_psch.ARRAY_ELEMENT, "type": psin_psch.PSCH_TYPE_MAP, "sub": 0, "offset": 0, "ref": (1 << 16) | 1},
+                    ],
+                },
+                {"hash": 0x11111111, "size": 16, "members": []},
+            ],
+            "enums": [
+                {"hash": 0x33333333, "values": []},
+                {"hash": 0x33333333, "values": []},
+            ],
+        }
+        errs = psin_psch.check_psch_schema(pmap, psch)
+        self.assertTrue(any("duplicate PSCH struct hash" in e for e in errs), errs)
+        self.assertTrue(any("duplicate PSCH enum hash" in e for e in errs), errs)
+        self.assertTrue(any("array member 0 bad descriptor 0" in e for e in errs), errs)
+        self.assertTrue(any("map member 1 bad key descriptor 1" in e for e in errs), errs)
+        self.assertTrue(any("map member 1 bad value descriptor 1" in e for e in errs), errs)
+
+    def test_scan_target_handles_non_string_and_uppercase_head_values(self):
+        psch_blob = build_synthetic_psch_psin(with_stdn=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            with open(os.path.join(carve, "000000002000.bin"), "wb") as f:
+                f.write(psch_blob)
+            rows = [
+                {"off": 0x1000, "stored": 16, "size": 16, "head": None},
+                {"off": 0x1800, "stored": 16, "size": 16, "head": 12345},
+                {"off": 0x2000, "stored": len(psch_blob), "size": len(psch_blob), "head": psch_blob[:16].hex().upper()},
+            ]
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": {"archive": "synthetic", "files": len(rows)}, "files": rows}, f)
+            summary = psin_psch.scan_target(carve)
+            self.assertEqual(summary["containers"], 1)
+            self.assertEqual(summary["valid_containers"], 1)
+
+    def test_carve_dir_bin_overwrite_guard_and_malformed_index_guard(self):
+        psch_blob = build_synthetic_psch_psin(with_stdn=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.makedirs(carve)
+            bin_path = os.path.join(carve, "000000002000.bin")
+            with open(bin_path, "wb") as f:
+                f.write(psch_blob)
+            rows = [{"off": 0x2000, "stored": len(psch_blob), "size": len(psch_blob), "head": psch_blob[:16].hex()}]
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": {"archive": "synthetic", "files": 1}, "files": rows}, f)
+
+            fake_rpf = os.path.join(tmp, "fake.rpf")
+            with open(fake_rpf, "wb") as f:
+                f.write(b"9FPR" + b"\x00" * 60)
+
+            p1 = subprocess.run(
+                [sys.executable, "-I", TOOL, fake_rpf, "--carve-dir", carve, "--json", bin_path],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertEqual(p1.returncode, 2, p1.stderr)
+            self.assertIn("overwrite", p1.stderr)
+            with open(bin_path, "rb") as f:
+                self.assertEqual(f.read(), psch_blob)
+
+            # Even when index.json is malformed, --json targeting index.json is refused with exit 2
+            bad_carve = os.path.join(tmp, "bad_carve")
+            os.makedirs(bad_carve)
+            bad_idx = os.path.join(bad_carve, "index.json")
+            with open(bad_idx, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{broken")
+            p2 = subprocess.run(
+                [sys.executable, "-I", TOOL, bad_carve, "--json", bad_idx],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertEqual(p2.returncode, 2, p2.stderr)
+            self.assertIn("overwrite", p2.stderr)
+            with open(bad_idx, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "{broken")
+
+    def test_atomic_json_write_trailing_lf_and_rejects_nan(self):
+        psch_blob = build_synthetic_psch_psin(with_stdn=False)
+        with tempfile.TemporaryDirectory() as tmp:
+            in_bin = os.path.join(tmp, "one.bin")
+            out_json = os.path.join(tmp, "out.json")
+            with open(in_bin, "wb") as f:
+                f.write(psch_blob)
+            p = subprocess.run(
+                [sys.executable, "-I", TOOL, in_bin, "--json", out_json],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertEqual(p.returncode, 0, p.stderr)
+            with open(out_json, "rb") as f:
+                written = f.read()
+            self.assertTrue(written.endswith(b"\n"))
+
+            sentinel = '{"keep": true}\n'
+            with open(out_json, "w", encoding="utf-8", newline="\n") as f:
+                f.write(sentinel)
+            with self.assertRaises(ValueError):
+                psin_psch._write_json(out_json, {"bad": float("nan")})
+            with open(out_json, encoding="utf-8") as f:
+                self.assertEqual(f.read(), sentinel)
+            self.assertEqual(sorted(os.listdir(tmp)), ["one.bin", "out.json"])
+
 
 if __name__ == "__main__":
     unittest.main()

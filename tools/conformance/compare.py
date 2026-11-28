@@ -23,6 +23,7 @@ import os
 import shutil
 import sys
 import tempfile
+import traceback
 import zlib
 from dataclasses import dataclass
 
@@ -283,6 +284,26 @@ def read_png(path):
     file_bytes = read_file_bytes(path, "PNG image")
     chunks = split_png_chunks(file_bytes, path)
     width, height, colour_type = parse_image_header(chunks, path)
+    # PNG sections 5.6 and 11.2 define the critical chunk ordering and lengths.
+    seen = set()
+    idat_finished = False
+    for kind, data in chunks:
+        if not kind.isalpha():
+            raise ToolError(f"'{path}': invalid PNG chunk type {kind!r}; expected four ASCII letters")
+        if not (kind[0] & 32) and kind not in (b"IHDR", b"PLTE", b"IDAT", b"IEND"):
+            raise ToolError(f"'{path}': unknown critical chunk {kind!r}")
+        if kind in (b"IHDR", b"PLTE") and kind in seen:
+            raise ToolError(f"'{path}': duplicate {kind.decode('ascii')} chunk")
+        if kind == b"PLTE" and (b"IDAT" in seen or not 0 < len(data) <= 768 or len(data) % 3):
+            raise ToolError(f"'{path}': invalid PLTE length or position")
+        if kind == b"IDAT":
+            if idat_finished:
+                raise ToolError(f"'{path}': IDAT chunks must be consecutive")
+        elif b"IDAT" in seen:
+            idat_finished = True
+        if kind == b"IEND" and data:
+            raise ToolError(f"'{path}': IEND must be empty")
+        seen.add(kind)
     if any(chunk_type == b"tRNS" for chunk_type, _ in chunks):
         if colour_type == PNG_COLOUR_TYPE_RGBA:
             raise ToolError(f"'{path}': tRNS is forbidden in an RGBA PNG; re-export a valid RGBA image")

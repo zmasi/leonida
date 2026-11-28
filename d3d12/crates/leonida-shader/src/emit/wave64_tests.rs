@@ -1838,3 +1838,88 @@ fn a_first_lane_read_of_a_uniform_srv_load_needs_no_exchange() {
     assert_eq!(uav_on, uav_off, "a view the program may write is not one value in every lane");
     eprintln!("group barriers: {srv_on} against {srv_off} for a view only read; {uav_on} either way for a UAV");
 }
+
+/// A console wave64 program of one wave (64 threads) whose lanes leave a loop one by one (lane
+/// t after (t >> 4) + 1 rounds: `v_cmpx_gt_u32` and `s_cbranch_execnz` back), with a read of
+/// lane 63 behind the loop.
+fn loop_left_lane_by_lane() -> NativeProgram {
+    native(&[
+        0x3402_0082, // v_lshlrev_b32 v1, 2, v0: this lane's dword of the UAV
+        0x2C0E_0084, // v_lshrrev_b32 v7, 4, v0
+        0x4A0E_0E81, // v_add_nc_u32 v7, 1, v7: rounds (t >> 4) + 1
+        0x7E0A_0280, // v_mov_b32 v5, 0
+        0x4A04_0000, // v_add_nc_u32 v2, s0, v0: the sum starts at s0 + t
+        0xBE8E_047E, // s_mov_b64 s[14:15], exec
+        0x4A04_0B02, // loop: v_add_nc_u32 v2, v2, v5
+        0x4A0A_0A81, // v_add_nc_u32 v5, 1, v5
+        0x7DA8_0B07, // v_cmpx_gt_u32 exec, v7, v5: the lanes with rounds left
+        0xBF89_FFFC, // s_cbranch_execnz loop
+        0xBEFE_040E, // s_mov_b64 exec, s[14:15]
+        0xD760_0007,
+        0x0201_7F02, // v_readlane_b32 s7, v2, 63
+        0x4A04_0407, // v_add_nc_u32 v2, s7, v2
+        0xE070_1000,
+        0x8002_0201, // buffer_store_dword v2, v1, s[8:11], 0 offen
+    ])
+}
+
+/// `LEONIDA_LOOPS_WAVE` (`emit`'s `loops_wave`): unset, [`loop_left_lane_by_lane`] translates
+/// as it did; with `1` the branch that closes its loop is taken by each host wave together
+/// ([`structure::structure_wide_host`]), so that a host wave's lanes are still one wave where
+/// the lane read stands. Lowered and validated only: what a card makes of either form is not
+/// tried here. (After trustno1-coder/VIctory-NVIDIA 64d4931, GPL-3.0, which has no test of it.)
+#[test]
+fn a_loop_the_lanes_leave_one_by_one_is_left_by_each_host_wave_together_when_asked() {
+    let native = loop_left_lane_by_lane();
+    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+    let back = (0..p.blocks.len())
+        .find(|&b| p.blocks[b].insts.last().is_some_and(|i| i.name() == "s_cbranch_execnz"))
+        .expect("the back edge");
+    let st = structure::structure(&p).expect("structure");
+    // the back edge is per lane, and the console takes it while some lane has rounds left
+    assert_eq!(st.wave_any[back], Some(true));
+    let loops = lower::loop_branches(&p, &st);
+    assert_eq!(loops, HashSet::from([back]));
+    assert!(st.host_wide.is_empty());
+    // taken by each host wave: the wave's, but not the console wave's (the loop's blocks are
+    // not ones every lane of the console wave runs), and no longer a branch to ask for
+    let host = structure::structure_wide_host(&p, &HashSet::new(), &loops).expect("structure");
+    assert_eq!((&host.wide, &host.host_wide), (&loops, &loops));
+    assert!(lower::loop_branches(&p, &host).is_empty());
+    // (one the whole console wave takes is not also the host wave's)
+    let console = structure::structure_wide_host(&p, &loops, &loops).expect("structure");
+    assert!(console.host_wide.is_empty() && console.wide == loops);
+    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
+    let io = io::raise(&p, &native).expect("io::raise");
+    let bytes = crate::dxbc::build(&[]);
+    let c = crate::dxbc::Container::parse(&bytes).expect("container");
+    let was = lower::TEST_HOST_WAVE.replace(Some(32));
+    let translate = |mode: u8| {
+        let was_mode = super::TEST_LOOPS_WAVE.replace(Some(mode));
+        let taken = super::TEST_LOOPS_TAKEN.get();
+        lower::take_needs();
+        let r = super::emit(&c, &native, &p, &st, &io, &res).map(|s| s.dxil);
+        super::TEST_LOOPS_WAVE.set(was_mode);
+        (r, super::TEST_LOOPS_TAKEN.get() - taken)
+    };
+    let (off, off_taken) = translate(0);
+    let (on, on_taken) = translate(1);
+    let (again, _) = translate(0);
+    lower::TEST_HOST_WAVE.set(was);
+    assert_eq!(off_taken, 0, "unset: no loop is touched");
+    let off = off.expect("the program as it translated before");
+    assert_eq!(again.expect("again"), off, "the switch off gives the same bytes again");
+    let on = on.expect("the program with its loop left by each host wave together");
+    assert!(on_taken >= 1, "the loop's branch is taken by each host wave together");
+    assert_ne!(on, off);
+    match validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        Ok(mut v) => {
+            for dxil in [&off, &on] {
+                let mut copy = dxil.clone();
+                v.validate(&mut copy).expect("DXIL validation failed");
+            }
+            eprintln!("both forms validated by dxil.dll; neither run on a card");
+        }
+        Err(_) => eprintln!("no dxil.dll: neither form validated"),
+    }
+}

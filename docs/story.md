@@ -278,7 +278,7 @@ Deliberately wrong reads of the first 300 streams don't hold up:
 - **The low bytes swapped between `a` and `b`:** the same at 25°, but fewer neighbours within 0.1° than with no low
   bytes at all. Within 0.1° the counts are 7.56% swapped, 8.59% with the high 16 bits only, and 9.19% with the rule.
 
-The 4-byte attribute streams (tags 0x21, 0x26, 0x27, 0x28) are still not decoded.
+The 4-byte attribute streams (`0x21` and `0x27` normals and tangents) are decoded below; `0x26` (colour/skin weights) and `0x28` (`int16` UVs) are measured across the full corpus in [restofworld.md](restofworld.md).
 
 With these blocks sized, the archive walk accepts 1,569 streams and leaves 0 unparsed:
 
@@ -406,7 +406,6 @@ chunks on a 256-byte boundary behind zero padding; the walk stops there (`stoppe
 | positions finite | all |
 | positions within 300 m | 29,572,450 (99.9%) |
 | shared edges with neighbouring faces within ~25° | 33,342,470 of 36,707,506 (90.8%); 1.4% opposed |
-| normals within 8° / 25° of their faces | 76.5% / 94.6% of 20,801,089; 2.1% opposed |
 | normals within 8° / 25° of their faces | 76.5% / 94.5% of 20,801,089; 2.1% opposed |
 | tangents perpendicular to the normal | 30,473,135 of 30,569,246 (99.7%) |
 | radius covers the farthest vertex from the stored centre | 257,091 of 275,832 meshlets (93.2%); 94.8% within rounding |
@@ -571,10 +570,12 @@ was found in the inflated sample.
    headers in `story000`; a decoder needs their spans and TOCs to group resources.
 3. An `RSC8` decoder for version 8001: done. `tools/rsc8_audio.py` decodes the header and the
    facial/lip-sync clip payload ([rsc8_audio.md](rsc8_audio.md)).
-4. A `PSIN` section walker. The tag/length chain is measured; `LSCH`, `LENM`, `LSNS`, `LGID`,
-   `LRSC` and `CHKS` semantics are still open.
-5. `0DRP` page grouping. The page count at +0x20 is the only measured grouping field; a decoder
-   still needs the following stream boundaries.
+4. A `PSIN` section and instance decoder: `tools/psin_index.py`, `tools/psin_data.py` and
+   `tools/odrp_7a.py` decode `LSCH`, `LENM`, `LRSC`, `CHKS`, the `LSNS` block layout and instance
+   data ([psin.md](psin.md)); `LSNS` 16-byte record contents and unhashed schema names remain open.
+5. `0DRP` page grouping: `tools/page_index.py` and `tools/odrp_7a.py` derive resource stream
+   boundaries from the `q38` table (`+0x20` was tested on `story000.rpf` and does not mark stream
+   boundaries; see [page_directory.md](page_directory.md#the-0x20-count-does-not-mark-stream-boundaries)).
 6. Bink 2 decoding for the 264 story streams and 7 restofworld streams (see `docs/movies.md`).
 7. The existing model exporter for drawables; texture identification needs a real container
    signature, which this pass did not find.
@@ -592,7 +593,7 @@ sizes, signatures and header fields; it does not write resource payloads or carv
 python -I tools/story_index.py <archive.rpf> <out.csv|out.json> [--start N] [--limit BYTES]
 python -I tools/rpf9_carve.py <archive.rpf> <out_dir> --index-only [--start N] [--limit BYTES]
 python -I tests/test_story_index.py
-python -I tools/meshlet_page.py <archive.rpf | carved-dir | page.bin> [...] [--json out.json] [--quiet]
+python -I tools/meshlet_page.py <archive.rpf | carved-dir | page.bin> [...] [--faces] [--normals] [--cones] [--centres] [--json out.json] [--quiet]
 python -I tests/test_meshlet_page.py
 ```
 

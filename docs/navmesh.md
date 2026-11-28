@@ -116,10 +116,21 @@ Across all **9,603 / 9,603** pages (`0` exceptions), `u16@0x4e` is either `0` or
   `u16@0x4e == pg` on **100%** of pages.
 - When `pg * 4096 > stream_end` (Stream 1 holds `data_end` without reaching the next 4 KiB multiple) or on single-stream
   pages where `pg * 4096 == len(stream0)`: `u16@0x4e == 0` on **100%** of pages.
-- On the **307** two-stream pages where `data_end <= len(stream0)` and `pg * 4096 == len(stream0)` (runtime data ends
-  in the last 4 KiB of Stream 0 while `q28`/`q30`/`q40` spill into Stream 1): `93` have `u16@0x4e == pg` and `214` have
-  `u16@0x4e == 0`. What breaks the tie on that exact 4 KiB boundary is **open** (likely the virtual page split in the
-  encrypted TOC).
+- On the **307** two-stream pages where `data_end <= len(stream0)` and `pg * 4096 == len(stream0)`, **93** store
+  `pg` and **214** store zero. The three pages with a continuation shorter than 64 bytes all belong to the 93.
+  Excluding those three resources leaves 90 counts and 214 zeros at the boundary.
+
+The two inflated stream lengths and the block map do not determine which value is stored. Grouping the 307 pages
+by their ordered pair of stream lengths gives 282 groups. Two pages in one group have the same 24-byte block map
+and store different values. The runtime data ends 16 bytes farther into Stream 0
+on the page that stores `pg`. Grouping by the distance from `data_end` to the end of Stream 0 alone also gives
+both values at three distances. Even among the 95 boundary pages where all three tables (`q28`, `q30`, `q40`)
+start in Stream 1, 23 store `pg` and 72 store zero. The selection rule remains open.
+
+To repeat the length comparison, run `python -I tools/navmesh_decode.py navmeshes.rpf --csv pages.csv`.
+Select complete `0drp` rows with two streams and a populated `runtime_data_end`. Keep rows where
+`((runtime_data_end + 4095) // 4096) * 4096 == first_stream_bytes`. Group `pages_4k` by
+`(first_stream_bytes, inflated - first_stream_bytes)`. Both lengths are in bytes after decompression.
 
 ### Schema tables (`q28`, `q30`, `q38`, `q40`)
 

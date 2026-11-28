@@ -14,6 +14,8 @@ mod replay;
 mod game_actions;
 #[cfg(windows)]
 mod player;
+#[cfg(windows)]
+mod player_context;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod player_find;
 mod run;

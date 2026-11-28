@@ -46,10 +46,14 @@ _LIT = re.compile(r"lit\((-?(?:0x[0-9a-fA-F]+|\d+(?:\.\d+(?:e[+-]?\d+)?)?))\)")
 def operand(tok):
     t = tok.strip()
     if "lit(" in t:
-        # lit(V) is the constant V. A leading '-' on it is the VOP3 neg modifier, as neg(V) (not integer negation).
+        # lit(V) is the constant V. A leading '-' before lit(...) itself is the VOP3 neg modifier,
+        # as neg(V) (not integer negation); a '-' inside lit(-V) belongs to V itself.
+        outer_neg = t.startswith("-")
+        if outer_neg:
+            t = t[1:]
         t = _LIT.sub(r"\1", t)
-        if t.startswith("-"):
-            t = "neg(" + t[1:] + ")"
+        if outer_neg:
+            t = "neg(" + t + ")"
     neg = t.startswith("-")
     core = t[1:] if neg else t
     absm = len(core) > 2 and core.startswith("|") and core.endswith("|")

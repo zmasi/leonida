@@ -73,9 +73,58 @@ int main() {
     }
     Words not_spirv{1, 2, 3, 4, 5, 6};
     check(!leonida::dual_source::remap(not_spirv), "not SPIR-V");
+    Words short_mod{0x07230203, 0x00010000, 0, 20};
+    check(!leonida::dual_source::remap(short_mod), "header shorter than 5 words");
     Words truncated = module(1);
     truncated[5] = (40u << 16) | kDecorate;
     check(!leonida::dual_source::remap(truncated), "an instruction past the end");
+    Words zero_len = module(1);
+    zero_len[5] = kDecorate;
+    check(!leonida::dual_source::remap(zero_len), "zero-word instruction rejected");
+
+    // Re-running on an already-remapped module refuses cleanly (Index decoration is now present).
+    {
+        Words copy = w;
+        check(!leonida::dual_source::remap(copy) && copy == w, "already-remapped module refused unchanged");
+    }
+
+    // Two distinct Output variables both at Location 1 must be refused without mutating words.
+    {
+        Words dup_out = module(1, {{14, kLocation, 1}});
+        op(dup_out, kVariable, {4, 14, kOutput});
+        Words copy = dup_out;
+        check(!leonida::dual_source::remap(copy) && copy == dup_out,
+              "two Output variables at Location 1 refused unchanged");
+    }
+
+    // Duplicate Location decorations on the same Output variable must be refused without mutating words.
+    {
+        Words dup_loc = module(1, {{11, kLocation, 1}});
+        Words copy = dup_loc;
+        check(!leonida::dual_source::remap(copy) && copy == dup_loc,
+              "duplicate Location decoration on Output refused unchanged");
+    }
+
+    // Preamble scan stops at OpFunction and preserves the function body verbatim.
+    {
+        constexpr std::uint32_t kOpFunction = 54, kOpLabel = 248, kOpReturn = 253, kOpFunctionEnd = 56;
+        constexpr std::uint32_t kOpNop = 0;
+        Words with_body = module(1);
+        const std::size_t body_start = with_body.size();
+        op(with_body, kOpFunction, {1, 15, 0, 1});
+        op(with_body, kOpLabel, {16});
+        for (int i = 0; i < 64; ++i) op(with_body, kOpNop, {});
+        op(with_body, kOpReturn, {});
+        op(with_body, kOpFunctionEnd, {});
+        const Words expected_body(with_body.begin() + static_cast<std::ptrdiff_t>(body_start), with_body.end());
+        const std::size_t before_body = with_body.size();
+        check(leonida::dual_source::remap(with_body), "module with function body rewritten");
+        check(with_body.size() == before_body + 4, "function body module gained exactly 4 words");
+        check(decoration(with_body, 11, kLocation) == 0 && decoration(with_body, 11, kIndex) == 1,
+              "function body module SV_Target1 moved to Location 0, Index 1");
+        const Words actual_body(with_body.begin() + static_cast<std::ptrdiff_t>(body_start + 4), with_body.end());
+        check(actual_body == expected_body, "function body preserved verbatim");
+    }
 
     std::printf("%s\n", g_failures ? "FAILED" : "all passed");
     return g_failures ? 1 : 0;

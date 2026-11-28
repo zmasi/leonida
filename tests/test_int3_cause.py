@@ -377,5 +377,155 @@ class Int3CauseTest(unittest.TestCase):
                 self.assertEqual(int3_cause.main([os.path.join(tmp, "bad.exe"), "0x1000"]), 2)
 
 
+class Int3CauseEdgeFixesTest(unittest.TestCase):
+    """Regression tests for load widths, high-byte regs, global writers, --returns args, int 29h, and flags."""
+
+    @staticmethod
+    def _build_custom(funcs):
+        buf = bytearray(build_image([]))
+        entries = sorted(funcs.items())
+        for start, code in entries:
+            buf[start:start + len(code)] = code
+        for i, (start, code) in enumerate(entries):
+            struct.pack_into("<III", buf, PDATA_RVA + i * 12, start, start + len(code), 0)
+        struct.pack_into("<II", buf, 0x58 + 112 + 3 * 8, PDATA_RVA, len(entries) * 12)
+        return bytes(buf)
+
+    def test_load_ops_report_true_memory_width(self):
+        cases = (
+            (b"\x8a\x41\x10", "byte [rcx+0x10]"),          # mov al, byte [rcx+0x10]
+            (b"\x0f\xb6\x41\x10", "byte [rcx+0x10]"),      # movzx eax, byte [rcx+0x10]
+            (b"\x48\x0f\xb6\x41\x10", "byte [rcx+0x10]"),  # movzx rax, byte [rcx+0x10]
+            (b"\x0f\xbe\x41\x10", "byte [rcx+0x10]"),      # movsx eax, byte [rcx+0x10]
+            (b"\x0f\xb7\x41\x10", "word [rcx+0x10]"),      # movzx eax, word [rcx+0x10]
+            (b"\x0f\xbf\x41\x10", "word [rcx+0x10]"),      # movsx eax, word [rcx+0x10]
+            (b"\x66\x8b\x41\x10", "word [rcx+0x10]"),      # mov ax, word [rcx+0x10]
+            (b"\x48\x63\x41\x10", "dword [rcx+0x10]"),     # movsxd rax, dword [rcx+0x10]
+            (b"\x48\x8b\x41\x10", "qword [rcx+0x10]"),     # mov rax, qword [rcx+0x10]
+        )
+        for code, expected in cases:
+            with self.subTest(code=code.hex()):
+                fn = 0x1100
+                body = code + b"\x85\xc0\x75\x01\xcc\xc3"  # load; test eax, eax; jne ok; int3; ok: ret
+                data = self._build_custom({fn: body})
+                stop = fn + len(code) + 4
+                r = int3_cause.cause(data, [hex(stop)])[hex(stop)]
+                self.assertEqual(r["guards"][0]["registers"][0]["from"], expected)
+
+    def test_high_byte_registers_trace_to_parent_gpr(self):
+        # 1. movzx ecx, ah after call XMemFoo must follow ah -> rax, not rsp.
+        f1 = 0x1100
+        code1 = call(f1, THUNK_FOO) + b"\x0f\xb6\xcc\x85\xc9\x75\x01\xcc\xc3"
+        # 2. mov cl, ah (0x88 E1) after call XMemFoo must follow ah -> rax, not rsp.
+        f2 = 0x1200
+        code2 = call(f2, THUNK_FOO) + b"\x88\xe1\x84\xc9\x75\x01\xcc\xc3"
+        # 3. mov ah, byte [rcx+0x10] (8A 61 10) writes rax (not rsp), so test ah, 1 traces to the load.
+        f3 = 0x1300
+        code3 = b"\x8a\x61\x10\xf6\xc4\x01\x75\x01\xcc\xc3"
+        # 4. mov byte [rip+GLOBAL_FLAG], ah (88 25 disp32) traces ah -> rax (XMemFoo), not rsp.
+        f4 = 0x1400
+        code4 = call(f4, THUNK_FOO) + b"\x88\x25" + rip(f4 + 5, 6, GLOBAL_FLAG) + b"\xc3"
+        # 5. movzx eax, spl (40 0F B6 C4, WITH REX) still reads rsp, not rax.
+        f5 = 0x1500
+        code5 = call(f5, THUNK_FOO) + b"\x40\x0f\xb6\xc4\x85\xc0\x75\x01\xcc\xc3"
+
+        data = self._build_custom({f1: code1, f2: code2, f3: code3, f4: code4, f5: code5})
+        r1 = int3_cause.cause(data, [hex(f1 + 12)])[hex(f1 + 12)]
+        self.assertEqual(r1["guards"][0]["registers"][0]["import"], "xmem.dll!XMemFoo")
+        self.assertTrue(r1["guards"][0]["registers"][0].get("copied"))
+
+        r2 = int3_cause.cause(data, [hex(f2 + 11)])[hex(f2 + 11)]
+        self.assertEqual(r2["guards"][0]["registers"][0]["import"], "xmem.dll!XMemFoo")
+
+        r3 = int3_cause.cause(data, [hex(f3 + 8)])[hex(f3 + 8)]
+        self.assertEqual(r3["guards"][0]["registers"][0]["value"], "loaded from memory")
+        self.assertEqual(r3["guards"][0]["registers"][0]["from"], "byte [rcx+0x10]")
+
+        gw = int3_cause.global_writers(int3_cause.Image(data), GLOBAL_FLAG)
+        self.assertEqual(len(gw["writers"]), 1)
+        self.assertEqual(gw["writers"][0]["source"]["import"], "xmem.dll!XMemFoo")
+
+        r5 = int3_cause.cause(data, [hex(f5 + 13)])[hex(f5 + 13)]
+        self.assertEqual(r5["guards"][0]["registers"][0]["value"], "set before the function is entered")
+
+    def test_global_writers_handles_16bit_imm_and_rejects_false_byte_pattern(self):
+        target = GLOBAL_PTR
+        # Real writer: 66 C7 05 disp32 imm16 -> mov word [rip+target], 0x1234 (9 bytes total)
+        f_real = 0x1100
+        code_real = b"\x66\xc7\x05" + rip(f_real, 9, target) + struct.pack("<H", 0x1234) + b"\xc3"
+        # False byte pattern: `48 BA` (mov rdx, imm64) whose payload begins with `89 05 <disp32>` pointing to target,
+        # so `at - 2` lands cleanly on `48 BA` (start of a real instruction that is NOT a RIP store!).
+        f_decoy = 0x1200
+        fake_disp = struct.pack("<i", target - (f_decoy + 2 + 6))
+        code_decoy = b"\x48\xba" + b"\x89\x05" + fake_disp + b"\x00\x00" + b"\xc3"
+
+        data = self._build_custom({f_real: code_real, f_decoy: code_decoy})
+        gw = int3_cause.global_writers(int3_cause.Image(data), target)
+        self.assertEqual([w["at"] for w in gw["writers"]], [f_real])
+        self.assertEqual((gw["writers"][0]["source"]["value"], gw["writers"][0]["source"]["constant"]),
+                         ("a constant", 0x1234))
+
+    def test_returns_keeps_distinct_arguments(self):
+        # test r8d, r8d; je take_rdx; mov rax, rcx; ret; take_rdx: mov rax, rdx; ret
+        fn = 0x1100
+        code = b"\x45\x85\xc0\x74\x04\x48\x89\xc8\xc3\x48\x89\xd0\xc3"
+        data = self._build_custom({fn: code})
+        rep = int3_cause.cause(data, [hex(fn)], returned=True)[hex(fn)]
+        args = sorted(x["argument"] for x in rep["returns"] if x.get("value") == "argument")
+        self.assertEqual(args, [1, 2])
+
+    def test_falls_into_does_not_cross_int_29h(self):
+        # call XMemFoo; test eax, eax; jns ok; mov eax, 0x77; int 29h; ok: test eax, eax; je fail; ret; fail: int3
+        fn = 0x1100
+        code = (call(fn, THUNK_FOO)
+                + b"\x85\xc0\x79\x07"            # test eax, eax; jns ok (+7 past mov+int29h)
+                + b"\xb8\x77\x00\x00\x00"        # mov eax, 0x77 (5 bytes)
+                + b"\xcd\x29"                    # int 29h (2 bytes)
+                + b"\x85\xc0\x74\x01\xc3\xcc")   # ok: test eax, eax; je fail; ret; fail: int3
+        data = self._build_custom({fn: code})
+        stop = fn + len(code) - 1
+        r = int3_cause.cause(data, [hex(stop)])[hex(stop)]
+        # The guard at ok (`je fail`) must trace eax across jns ok back to XMemFoo, NOT fall back into mov eax, 0x77.
+        by_branch = {g["branch"]: g for g in r["guards"]}
+        ok_je = fn + 5 + 4 + 5 + 2 + 2
+        self.assertIn(ok_je, by_branch)
+        self.assertEqual(by_branch[ok_je]["registers"][0]["import"], "xmem.dll!XMemFoo")
+
+    def test_flags_setter_skips_push_xchg_bswap_and_read_test_aliases(self):
+        fn = 0x1100
+        # call XMemFoo; test eax, eax; push 0; push qword [rsp]; bswap edx; js fail; ret; fail: int3
+        code = (call(fn, THUNK_FOO)
+                + b"\x85\xc0"                    # test eax, eax
+                + b"\x6a\x00"                    # push 0
+                + b"\xff\x34\x24"                # push qword [rsp] (FF /6)
+                + b"\x0f\xca"                    # bswap edx
+                + b"\x78\x01\xc3\xcc")           # js fail; ret; fail: int3
+        data = self._build_custom({fn: code})
+        stop = fn + len(code) - 1
+        r = int3_cause.cause(data, [hex(stop)])[hex(stop)]
+        self.assertEqual(r["guards"][0]["condition"], "eax < 0")
+        self.assertEqual(r["guards"][0]["registers"][0]["import"], "xmem.dll!XMemFoo")
+
+        # F6 /1 and F7 /1 (TEST r/m, imm alias) and unsigned bt imm8.
+        t_f6 = int3_cause.read_test(decode(b"\xf6\xc8\x04", 0, 0), b"\xf6\xc8\x04")
+        self.assertEqual(int3_cause.condition(t_f6, 0x5), "(al & 0x4) != 0")
+        t_f7 = int3_cause.read_test(decode(b"\xf7\xc8\x10\x00\x00\x00", 0, 0), b"\xf7\xc8\x10\x00\x00\x00")
+        self.assertEqual(int3_cause.condition(t_f7, 0x4), "(eax & 0x10) == 0")
+        t_bt = int3_cause.read_test(decode(b"\x0f\xba\xe0\x80", 0, 0), b"\x0f\xba\xe0\x80")
+        self.assertEqual(t_bt["right"], 128)
+        self.assertEqual(int3_cause.condition(t_bt, 0x2), "bit 128 of eax is set")
+
+    def test_parse_address_uppercase_0x_and_large_image_pack(self):
+        self.assertEqual(int3_cause.parse_address(f"exe+0X{IMPORT_STOP:x}", IMAGE_BASE), IMPORT_STOP)
+        self.assertEqual(int3_cause.parse_address(f"0X{IMAGE_BASE + IMPORT_STOP:X}", IMAGE_BASE), IMPORT_STOP)
+
+        image = int3_cause.Image(self._build_custom({0x1100: b"\xc3"}))
+        image._shift = 34  # simulates size_of_image >= 2^31 (2*34 - 2 = 66 bits > uint64)
+        target = 0x90000000
+        packed = image._pack([target << image._shift | 0x1100])
+        self.assertIsInstance(packed, list)
+        self.assertEqual(image._lookup(packed, target), [target << image._shift | 0x1100])
+
+
 if __name__ == "__main__":
     unittest.main()

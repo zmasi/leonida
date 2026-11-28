@@ -202,6 +202,78 @@ class OracleLifecycleTest(unittest.TestCase):
         self.assertIn("cannot build", out)
         self.assertIn("gfx1200", out)
 
+    def test_hw_closes_on_malformed_results_and_run_errors(self):
+        import struct
+        import runner
+
+        def expected_for(dim):
+            rows = [r for r in p.ROWS if r[1] == dim]
+            return [struct.unpack("<I", struct.pack("<f", p.expected(dim, s, o)))[0] for _n, _d, s, o in rows]
+
+        n2d = len(expected_for("2d"))
+
+        class StubOracle:
+            device = "fake-gpu"
+            arch = "gfx1036"
+
+            def __init__(self, run_fn):
+                self._run_fn = run_fn
+                self.closed = False
+
+            def run(self, kernels):
+                return self._run_fn(kernels)
+
+            def close(self):
+                self.closed = True
+
+        bad_cases = [
+            ("empty_batch", [], "expected 1"),
+            ("none_batch", None, "NoneType"),
+            ("str_batch", "bad", "str"),
+            ("extra_batch", [expected_for("2d"), expected_for("2d")], "got 2"),
+            ("none_words", [None], "NoneType"),
+            ("short_words", [[0] * 2], f"expected {n2d} words, got 2"),
+            ("overlong_words", [[0] * (n2d + 1)], f"expected {n2d} words, got {n2d + 1}"),
+            ("bool_word", [[True] * n2d], "bool"),
+            ("none_word", [[None] * n2d], "NoneType"),
+        ]
+        for label, bad_ret, hint in bad_cases:
+            for fail_wave in (32, 64):
+                with self.subTest(case=label, wave=fail_wave):
+                    def run_fn(ks, fw=fail_wave, br=bad_ret):
+                        k = ks[0]
+                        dim = "2d" if "SQ_RSRC_IMG_2D" in "\n".join(k.lines) else "3d"
+                        if dim == "2d" and k.wave == fw:
+                            return br
+                        return [expected_for(dim)]
+
+                    fake = StubOracle(run_fn)
+                    rc, out = self._run_hw(fake)
+                    self.assertEqual(rc, 2, out)
+                    self.assertTrue(fake.closed)
+                    self.assertIn(f"2d wave{fail_wave}:", out)
+                    self.assertIn(hint, out)
+
+        # runner.Unavailable during oracle.run() exits 77 cleanly and closes oracle.
+        def raise_unavail(_ks):
+            raise runner.Unavailable("mode unsupported")
+
+        fake = StubOracle(raise_unavail)
+        rc, out = self._run_hw(fake)
+        self.assertEqual(rc, 77, out)
+        self.assertTrue(fake.closed)
+        self.assertIn("hardware oracle unavailable: mode unsupported", out)
+
+        # RuntimeError during oracle.run() exits 2 cleanly and closes oracle.
+        def raise_runtime(_ks):
+            raise RuntimeError("gpu hung")
+
+        fake = StubOracle(raise_runtime)
+        rc, out = self._run_hw(fake)
+        self.assertEqual(rc, 2, out)
+        self.assertTrue(fake.closed)
+        self.assertIn("harness error: gpu hung", out)
+
 
 if __name__ == "__main__":
     unittest.main()

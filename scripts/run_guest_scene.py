@@ -256,12 +256,13 @@ def negative_controls(session: Session, out: Path) -> dict:
 
 
 def execute(args: argparse.Namespace, out: Path, temporary: bool) -> int:
+    session = Session(args, out)
     try:
         out.mkdir(parents=True, exist_ok=True)  # parse_args has checked that it is new or empty
+        session.logs.mkdir()  # Reserve the output even if another run passed the same check.
     except OSError as exc:
         print(f"error: could not create output directory {out}: {exc}", file=sys.stderr)
         return 1
-    session = Session(args, out)
     report: dict = {"status": "fail", "frames": FRAMES, "headless": True, "wine": args.wine, "temporary": temporary,
                     "audio_mode": "winmm" if args.play_audio else "offline", "report": str(out / "report.json")}
     try:
@@ -271,7 +272,7 @@ def execute(args: argparse.Namespace, out: Path, temporary: bool) -> int:
             "guest": {"path": str(args.guest), "sha256": sha256(args.guest.read_bytes())},
             "shaders": {"path": str(args.shaders), "files": len(shader_files), "tree_sha256": tree_hash(shader_files)},
             "scene.bin": sha256(scene_bytes())}
-        for sub in ("logs", "package", *MODES):
+        for sub in ("package", *MODES):
             (out / sub).mkdir()
         package = out / "package"
         write_new(package / "scene.bin", scene_bytes())

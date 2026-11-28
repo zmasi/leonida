@@ -79,7 +79,10 @@ M32 = 0xFFFFFFFF
 # --- float32 / half helpers -------------------------------------------------------------------------------------
 
 def f32(x):
-    return struct.unpack("<f", struct.pack("<f", x))[0]
+    try:
+        return struct.unpack("<f", struct.pack("<f", x))[0]
+    except OverflowError:
+        return math.copysign(math.inf, x)
 
 
 def bits32(x):
@@ -303,6 +306,8 @@ def write_leaves(src, dst, hdr, geometries, frame):
             j = g.triangle(prim1)
             fourth = frame.apply(g.vertex(j[0] if order & 0x20 else j[1] if order & 0x80 else j[2]))
         a, b = order & 3, (order >> 2) & 3
+        if a == 3 or b == 3 or a == b:
+            raise ValueError("leaf at offset %#x has invalid vertex order 0x%02x" % (out, order))
         slots = [None, None, None, fourth]
         for which, value in zip((a, b, (a ^ 3) - b), tri):
             slots[SLOT_OF_ORDER[which]] = value
@@ -381,6 +386,8 @@ def write_box_groups(src, dst, hdr, start, count, wide):
         value_at = base + 4 * (n + total_children)
         for t, word in enumerate(words):
             kids, mask = word >> 24, word & 0xFFFFFF
+            if kids > 4:
+                raise ValueError("box node at offset %#x has %d children (maximum 4)" % (base + t * node_size, kids))
             children = list(struct.unpack_from("<%dI" % kids, src, child_at)) + [INVALID] * (4 - kids)
             child_at += 4 * kids
             comps = []
@@ -510,6 +517,8 @@ def main(argv=None):
         geometries = []
         for spec in a.geom:
             parts = spec.split(",")
+            if len(parts) > 2 or not parts[0]:
+                raise ValueError("--geom expects VB[,IB], got %r" % spec)
             with open(parts[0], "rb") as f:
                 vb = f.read()
             ib = None

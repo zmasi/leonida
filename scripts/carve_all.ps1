@@ -3,6 +3,14 @@
 param([Parameter(Mandatory)][string]$Game, [Parameter(Mandatory)][string]$Out)
 $root = Split-Path $PSScriptRoot -Parent
 $tool = Join-Path $root "tools\rpf9_carve.py"
+if (-not (Test-Path -LiteralPath $Game -PathType Container)) {
+    throw "Game folder '$Game' does not exist or is not a directory."
+}
+$outFull = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Out))
+if (Test-Path -LiteralPath $outFull -PathType Leaf) {
+    throw "Output path '$Out' is a file, not a directory."
+}
+[System.IO.Directory]::CreateDirectory($outFull) | Out-Null
 # -Game may be relative or end in a separator; archive names are cut from a separator-ended prefix.
 $Game = (Resolve-Path -LiteralPath $Game).ProviderPath
 # Resolve-Path preserves 8.3 short components (e.g. RUNNER~1), while Get-ChildItem emits canonical
@@ -11,14 +19,14 @@ $Game = (Resolve-Path -LiteralPath $Game).ProviderPath
 $prefix = (Get-Item -LiteralPath $Game).FullName.TrimEnd('\') + '\'
 $destinations = [System.Collections.Generic.Dictionary[string, string]]::new([StringComparer]::OrdinalIgnoreCase)
 # Validate every destination before accepting any cached index or starting a carve.
-$archives = foreach ($f in Get-ChildItem -LiteralPath $Game -Recurse -Filter *.rpf | Sort-Object Length) {
+$archives = foreach ($f in Get-ChildItem -LiteralPath $Game -Recurse -File -Filter *.rpf | Sort-Object Length) {
     $rel = $f.FullName.Substring($prefix.Length)
     $name = [IO.Path]::GetFileNameWithoutExtension(($rel -replace "[\\/]", "_"))
     if ($destinations.ContainsKey($name)) {
         throw ("Archives '{0}' and '{1}' both map to '{2}'." -f $destinations[$name], $rel, $name)
     }
     $destinations.Add($name, $rel)
-    [pscustomobject]@{ file = $f; relative = $rel; destination = Join-Path $Out $name }
+    [pscustomobject]@{ file = $f; relative = $rel; destination = Join-Path $outFull $name }
 }
 
 $rows = @()
@@ -59,5 +67,15 @@ foreach ($archive in $archives) {
                                readable = [math]::Round($s.compressed_bytes / $denominator, 4)
                                unread = [math]::Round($s.unread_bytes / $denominator, 4); inflated = $s.inflated_bytes }
 }
-$rows | ConvertTo-Json | Set-Content -Encoding utf8 -LiteralPath (Join-Path $Out "coverage.json")
-$rows | Format-Table archive, files, bink2, @{n = "GiB"; e = { [math]::Round($_.span / 1GB, 2) } }, readable, unread -AutoSize | Out-String -Width 200
+$coverageJson = if ($rows.Count -eq 0) { "[]" } else { $rows | ConvertTo-Json }
+$coveragePath = Join-Path $outFull "coverage.json"
+$tmpCoverage = Join-Path $outFull (".coverage.{0}.{1}.tmp" -f $PID, [guid]::NewGuid().ToString("N"))
+try {
+    [System.IO.File]::WriteAllText($tmpCoverage, $coverageJson + "`n", [System.Text.UTF8Encoding]::new($false))
+    Move-Item -LiteralPath $tmpCoverage -Destination $coveragePath -Force
+} finally {
+    if (Test-Path -LiteralPath $tmpCoverage) { Remove-Item -LiteralPath $tmpCoverage -Force -ErrorAction SilentlyContinue }
+}
+if ($rows.Count -gt 0) {
+    $rows | Format-Table archive, files, bink2, @{n = "GiB"; e = { [math]::Round($_.span / 1GB, 2) } }, readable, unread -AutoSize | Out-String -Width 200
+}

@@ -161,7 +161,7 @@ translate it.
 
 - `apps/victory/src/native_1440p.rs`, `fsr_preset.rs`: the title told a 1440p
   display with FSR at Quality: the display-mode lever (`port/present`).
-- `crates/victory-hle/src/modules/fidelityfx.rs` (+ `tests/fidelityfx.rs`): the
+- `crates/victory-hle/src/modules/fidelityfx.rs` (+ `crates/victory-hle/tests/fidelityfx.rs`): the
   title's `amd_fidelityfx_upscaler_xbox.dll` served on the host; Leonida's
   shader stage translates only 18 of the 29 FidelityFX programs.
 - `crates/victory-gpu/src/texture/ahead.rs`, `texture/upload.rs`, `tiles.rs`,

@@ -215,8 +215,9 @@ def stroke(points, width, closed=False, miter=2.2):
 # ---------------------------------------------------------------- shape characters
 
 
-def contour_bytes(contours, color):
-    """The DefineShape3 body after the id (bounds, one solid fill, the contours)."""
+def contour_bytes(contours, color, compact=False):
+    """The DefineShape3 body after the id (bounds, one solid fill, the contours). `compact` writes a level or
+    upright edge as the short record SWF has for it and leaves out an edge of no length."""
     xs, ys = [], []
     rounded = []
     for start, segs in contours:
@@ -249,6 +250,17 @@ def contour_bytes(contours, color):
             if s[0] == "L":
                 (nx, ny) = s[1]
                 dx, dy = nx - x, ny - y
+                if compact and (dx == 0 or dy == 0):
+                    if dx or dy:
+                        n = max(sbits(dx or dy), 2)
+                        b.ub(1, 1)
+                        b.ub(1, 1)
+                        b.ub(n - 2, 4)
+                        b.ub(0, 1)  # not a general line
+                        b.ub(1 if dx == 0 else 0, 1)  # upright, or level
+                        b.sb(dx or dy, n)
+                    x, y = nx, ny
+                    continue
                 n = max(sbits(dx, dy), 2)
                 b.ub(1, 1)
                 b.ub(1, 1)
@@ -273,10 +285,11 @@ def contour_bytes(contours, color):
 
 
 class Movie:
-    def __init__(self):
+    def __init__(self, compact=False):
         self.shapes = {}  # key -> (id, body)
         self.order = []
         self.next_id = 1
+        self.compact = compact  # see `contour_bytes`
 
     def shape(self, contours, color):
         """Returns (character id, tx, ty): the shape is stored relative to its own top left."""
@@ -289,7 +302,7 @@ class Movie:
                          [(s[0],) + tuple((round(p[0]) - ox, round(p[1]) - oy) for p in s[1:]) for s in segs]))
         key = (repr(norm), tuple(color))
         if key not in self.shapes:
-            body = struct.pack("<H", self.next_id) + contour_bytes(norm, color)
+            body = struct.pack("<H", self.next_id) + contour_bytes(norm, color, self.compact)
             self.shapes[key] = (self.next_id, body)
             self.order.append(key)
             self.next_id += 1
@@ -671,10 +684,11 @@ def exports_of(tags):
     return found
 
 
-def build_over(base):
+def build_over(base, build_sprite=build_sprite, movie=None):
     """The title's own movie `base` with each exported sprite's drawing swapped for ours: same character ids, so its
     ExportAssets, SymbolClass and DoABC tags (the ActionScript) stay exactly as they are; its shapes are dropped and
-    ours take their place before the first sprite. Padded to the length of `base`."""
+    ours take their place before the first sprite. Padded to the length of `base`. Another set of drawings
+    (tools/pc_prompt_glyphs.py) passes its own `build_sprite(movie, n)` and `Movie`."""
     if base[:3] not in (b"GFX", b"FWS"):
         raise ValueError("not an uncompressed movie")
     tags, start = read_tags(base)
@@ -682,7 +696,7 @@ def build_over(base):
     unknown = sorted(n for n in ids.values() if n not in GLYPHS)
     if unknown or not ids:
         raise ValueError("the movie's exports are not the ones this tool draws: %s" % (unknown or "none found"))
-    movie = Movie()
+    movie = movie or Movie()
     movie.next_id = 1 + max(struct.unpack_from("<H", body, 0)[0] for code, body in tags if code in (2, 22, 32, 39, 83))
     sprites = {cid: sprite_tag(cid, build_sprite(movie, n)) for cid, n in ids.items()}
     out, placed = [], False
@@ -714,8 +728,9 @@ def read_archive_movie(path, offset=0x117D7000, size=28148):
     return data
 
 
-def build():
-    movie = Movie()
+def build(build_sprite=build_sprite, movie=None):
+    """The standalone movie: our drawings (or another set's, as in `build_over`) and our own ActionScript block."""
+    movie = movie or Movie()
     sprites = []  # (n, character id placeholder, glyph)
     for n in sorted(GLYPHS):
         sprites.append((n, build_sprite(movie, n)))
@@ -793,4 +808,5 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    sys.stdout.reconfigure(errors="replace")
     main(sys.argv[1:])

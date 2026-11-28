@@ -334,8 +334,13 @@ The same body with 40 randomly chosen female clip dictionaries (240 clips) expor
 The Khronos glTF Validator reports no errors, warnings or infos on any of the 40 files, and the
 three.js checks above pass on all 240 clips.
 
-No textures are exported. A part binds to the one skeleton given, so clothing whose cloth bones
-are not in it does not bind (see the table).
+No textures are exported. A weighted bone that the skeleton given does not name (the cloth and
+accessory bones of the 3,212 clothing drawables in the table, which have no skeleton of their own to read)
+is exported as an extra joint named `bone_0x<hash>`, as `skinned_glb.py` names an unresolved palette hash.
+It is a child of the skeleton's first root with an identity local transform and that root's inverse bind
+matrix, so a vertex bound to it stays at its stored position at rest; its parent and transform are not
+read from the game, and a clip track whose hash names it still drives it. Bones with zero weight add no
+joint. A hash the skeleton lists twice is still refused. The tests build their own skeleton and parts.
 ## Skinned GLB export
 
 `tools/skinned_glb.py` writes one skinned glTF 2.0 binary from a decoded ped skeleton
@@ -394,9 +399,9 @@ the report carries.
 skinning data and which are static, `JOINTS_n`/`WEIGHTS_n` pairing, every vertex's weight sum
 as FLOAT or normalized `UNSIGNED_BYTE`/`UNSIGNED_SHORT`, the joint-index range and the POSITION
 bounds computed from the accessor. A malformed container, a file with no skin, or a skin whose
-`inverseBindMatrices` count differs from its joint count exits nonzero; `--json report.json`
-writes the same report as LF-only JSON. `python -I tests/test_glb_skinning.py` runs its 17
-synthetic tests and needs no game files.
+accessor has fewer inverse bind matrices than joints exits nonzero. Extra matrices are allowed.
+`--json report.json` writes the same report as LF-only JSON. Run `python -I tests/test_glb_skinning.py`
+to check it with synthetic inputs.
 
 ## Texture parameter split
 

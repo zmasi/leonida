@@ -1011,7 +1011,9 @@ impl View {
 /// resource objects (freed with the resource), samplers (as many as there
 /// are sampler states), and the shapes of placed views (their descriptions
 /// without the address: as many as the title has kinds of textures and
-/// buffers, however often it moves them).
+/// buffers, however often it moves them; without the padding the title
+/// leaves unwritten, which made nearly every view a shape of its own:
+/// [`normal_placed`]).
 /// `LEONIDA_VIEW_INLINE=0`: every view is an entry, as before.
 struct Views {
     /// Each entry's view and generation.
@@ -1591,6 +1593,7 @@ pub(crate) extern "system" fn create_placed_srv(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        let (resource, desc) = if placed_normal() { normal_placed(false, resource, desc) } else { (resource, desc) };
         record(handle, View::Placed(false, resource, desc));
     }
 }
@@ -1602,8 +1605,81 @@ pub(crate) extern "system" fn create_placed_uav(
     handle: u64,
 ) {
     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+        let (resource, desc) = if placed_normal() { normal_placed(true, resource, desc) } else { (resource, desc) };
         record(handle, View::Placed(true, resource, desc));
     }
+}
+
+/// Whether a placed view is kept without the bytes of its descriptions that no view reads
+/// ([`normal_placed`]). On by default; `LEONIDA_PLACED_NORMAL=0` keeps them as the title gave
+/// them, as before.
+fn placed_normal() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("LEONIDA_PLACED_NORMAL").is_none_or(|v| v != "0"))
+}
+
+/// A placed view's two descriptions with the words no view reads set to zero: the padding of
+/// the resource description (word 1, before the 64-bit alignment, and word 13, after the
+/// flags), the padding of a shader resource view's description (word 3: the union that
+/// follows starts on 8 bytes), and the union's words past the member of the view's dimension
+/// (`D3D12_BUFFER_SRV`, `D3D12_TEX2D_SRV` and the like say how many words each uses; an
+/// unknown dimension keeps them all). Words 10 and on (the address and the console's own
+/// fields) are kept.
+///
+/// The title leaves those words as its stack held them, so the same view was a shape of its
+/// own nearly every time it was written ([`Shape`], which the [`Views`] were meant to hold as
+/// many of as the title has kinds of textures and buffers), and a record of its own, which
+/// the host takes for another view and makes its slot again. Measured in the fork this is
+/// from, not here: of a million shapes word 3 held 131,392 values and word 9 36,413 (its run
+/// vt-shapes); the 4,194,304 shapes the records can name were full after 20 minutes on the
+/// water, every placed view written after that was a table entry that nothing lets go (5.6
+/// million, 3.3 GB), and the frame time doubled (its run leak1).
+///
+/// From trustno1-coder/VIctory-NVIDIA 64d4931 (trustno1-coder, GPL-3.0), which has it from
+/// its pull request 58 (regiumlepidi: 4eead67, 144aca0, 8bff6c2). Not taken: its fold of a
+/// buffer view's first element into the address (`VICTORY_PLACED_FOLD`, off there: clothing
+/// changed to other variants for single frames with it), and its cap on the table entries of
+/// views without a resource (`VICTORY_OWNERLESS_VIEWS`).
+fn normal_placed(unordered: bool, mut resource: [u32; 14], mut desc: [u32; 16]) -> ([u32; 14], [u32; 16]) {
+    resource[1] = 0;
+    resource[13] = 0;
+    // Where the union starts, and the words of it the dimension's member uses.
+    let (start, used) = if unordered {
+        // D3D12_UAV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS, 2D MS array, 3D.
+        let used = match desc[1] {
+            1 => 7,
+            2 => 1,
+            3 => 3,
+            4 => 2,
+            5 => 4,
+            6 => 1,
+            7 => 2,
+            8 => 3,
+            _ => 8,
+        };
+        (2, used)
+    } else {
+        desc[3] = 0;
+        // D3D12_SRV_DIMENSION: buffer, 1D, 1D array, 2D, 2D array, 2D MS, 2D MS array, 3D,
+        // cube, cube array, acceleration structure.
+        let used = match desc[1] {
+            1 => 5,
+            2 => 3,
+            3 => 5,
+            4 => 4,
+            5 => 6,
+            6 => 1,
+            7 => 2,
+            8 => 3,
+            9 => 3,
+            10 => 5,
+            11 => 2,
+            _ => 6,
+        };
+        (4, used)
+    };
+    desc[(start + used).min(10)..10].fill(0);
+    (resource, desc)
 }
 
 /// Device method.
@@ -2106,13 +2182,19 @@ mod tests {
         // A resource description and a view no other test uses.
         let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
+        // (As a placed view is kept: without its padding, `normal_placed`.)
+        let kept = |unordered: bool, desc: [u32; 16]| {
+            let (r, d) = if placed_normal() { normal_placed(unordered, resource, desc) } else { (resource, desc) };
+            View::Placed(unordered, r, d)
+        };
+        let View::Placed(_, kept_resource, _) = kept(false, desc) else { unreachable!() };
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
-            View::Placed(_, r, _) => *r == resource,
+            View::Placed(_, r, _) => *r == kept_resource,
             _ => false,
         };
         let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == kept_resource).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
@@ -2120,18 +2202,18 @@ mod tests {
             let placed = 0xd_4940_0000 + n * 0x1_0000;
             (desc[10], desc[11]) = (placed as u32, (placed >> 32) as u32);
             create_placed_srv(null, &resource, &desc, at);
-            assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+            assert_eq!(view(at), Some(kept(false, desc)));
         }
         assert_eq!(entries(), 0, "no table entries");
         assert_eq!(shapes(), 1, "one shape for 20,000 placed views");
         // The same shape, unordered: another shape.
         create_placed_uav(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
+        assert_eq!(view(at), Some(kept(true, desc)));
         assert_eq!(shapes(), 2);
         // Placed memory past 1 TiB (not title memory) is a table entry.
         (desc[10], desc[11]) = (0, 0x100);
         create_placed_srv(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        assert_eq!(view(at), Some(kept(false, desc)));
         assert_eq!(entries(), 1);
         // A record's words are the same for the same view (the host knows
         // a slot's view by them), and differ with the address.
@@ -2143,6 +2225,64 @@ mod tests {
         assert_eq!(words(at), words(other.as_ptr() as u64));
         create_cbv(null, &[0x140, 6, 512, 0], other.as_ptr() as u64);
         assert_ne!(words(at), words(other.as_ptr() as u64));
+    }
+
+    /// Placed views that differ only in words no view reads (the resource description's
+    /// padding, a shader resource view's padding word, the union's words past the member of
+    /// the view's dimension) are one shape and one record; a word the view's kind uses still
+    /// tells them apart (`normal_placed`). After the tests of trustno1-coder/VIctory-NVIDIA
+    /// 64d4931 and its pull request 58 (GPL-3.0).
+    #[test]
+    fn placed_views_that_differ_in_padding_alone_are_one_record() {
+        if !inline() || !placed_normal() {
+            return;
+        }
+        let null = std::ptr::null();
+        let slots = [0u64; 4];
+        let at = slots.as_ptr() as u64;
+        // SAFETY: the handle is a slot of 32 bytes above.
+        let words = |handle: u64| unsafe { *(handle as *const [u32; 3]) };
+        // A raw buffer view of 17 dwords (format 0x27, the raw flag) of a buffer 0x1_0000
+        // bytes wide, at one of seven first elements; padding as a stack might leave it.
+        let buffer = |junk: u32| -> [u32; 14] { [1, junk, 0, 0, 0x1_0000, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, junk ^ 0x5a5a] };
+        let view_of = |junk: u32, first: u32| -> [u32; 16] {
+            let mut d = [0u32; 16];
+            d[..10].copy_from_slice(&[0x27, 1, 0x1688, junk, first, 0, 17, 0, 1, junk.rotate_left(7)]);
+            (d[10], d[11], d[12]) = (0x7771_0000, 0xd, 0x16);
+            d
+        };
+        let kept: [u32; 14] = [1, 0, 0, 0, 0x1_0000, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        let mut seen = Vec::new();
+        for n in 0..500u32 {
+            let junk = n.wrapping_mul(0x9e37_79b9) | 1;
+            create_placed_srv(null, &buffer(junk), &view_of(junk.wrapping_mul(0x85eb_ca6b), n % 7), at);
+            let Some(View::Placed(false, r, d)) = view(at) else { panic!("a placed view") };
+            assert_eq!((r, d[3], d[4], d[6], d[8], d[9]), (kept, 0, n % 7, 17, 1, 0));
+            assert_eq!((d[10], d[11], d[12]), (0x7771_0000, 0xd, 0x16), "the address and the console's words stay");
+            seen.push(words(at));
+        }
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), 7, "one record for each first element, whatever the padding");
+        // An unordered buffer view uses seven words of its union (2 to 8): word 9 goes; word
+        // 3 is the high half of its first element and stays.
+        let mut unordered = [0u32; 16];
+        unordered[..10].copy_from_slice(&[0, 1, 16, 5, 64, 16, 0, 0, 0, 0xdead_beef]);
+        (unordered[10], unordered[11]) = (0x7772_0000, 0xd);
+        create_placed_uav(null, &buffer(3), &unordered, at);
+        unordered[9] = 0;
+        assert_eq!(view(at), Some(View::Placed(true, kept, unordered)));
+        // A 2D texture's shader resource view uses four (4 to 7): words 3, 8 and 9 go.
+        let texture = |junk: u32| -> [u32; 14] { [3, junk, 0, 0, 8, 0, 8, 0x1_0001, 28, 1, 0, 0, 0, junk] };
+        let mut sampled = [28, 4, 0x1688, 0x77, 0, 1, 0, 0, 0x55, 0x66, 0x7773_0000, 0xd, 0, 0, 0, 0];
+        create_placed_srv(null, &texture(9), &sampled, at);
+        (sampled[3], sampled[8], sampled[9]) = (0, 0, 0);
+        assert_eq!(view(at), Some(View::Placed(false, texture(0), sampled)));
+        // A dimension not known here keeps every word of the union.
+        let mut odd = [28, 99, 0x1688, 0x77, 1, 2, 3, 4, 5, 6, 0x7774_0000, 0xd, 0, 0, 0, 0];
+        create_placed_srv(null, &texture(9), &odd, at);
+        odd[3] = 0;
+        assert_eq!(view(at), Some(View::Placed(false, texture(0), odd)));
     }
 
     /// A released resource's views go stale; the same view of a new

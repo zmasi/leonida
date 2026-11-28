@@ -300,6 +300,29 @@ class SkeletonAndPartTest(unittest.TestCase):
         with self.assertRaisesRegex(anim_glb.ExportError, "0x12345678"):
             anim_glb.bind_part(anim_glb.read_part(sys_page, gfx, 0), joints)
 
+    def test_extra_bones_of_a_part_become_joints_that_keep_the_rest_pose(self):
+        joints, _ = anim_glb.read_skeleton(skeleton_resource(), 0)
+        before = [dict(j) for j in joints]
+        palette = [joaat32("skel_b"), 0x22222222, 0x11111111, 0x33333333]
+        skin = [[(0, 100), (1, 100), (2, 55)], [(2, 255)], [(1, 255)], [(0, 255), (3, 0)]]
+        sys_page, gfx = part_resource(palette, "u8x4", skin)
+        raw = anim_glb.read_part(sys_page, gfx, 0)
+        extended = anim_glb.extend_joints(raw, joints)
+        self.assertEqual(joints, before)                      # the skeleton given is not changed
+        # one joint per weighted unknown hash, sorted by hash; the zero-weight bone 0x33333333 adds none
+        self.assertEqual([j["hash"] for j in extended[3:]], [0x11111111, 0x22222222])
+        for extra in extended[3:]:
+            self.assertEqual((extra["parent"], extra["rotation"], extra["translation"], extra["scale"]),
+                             (0, (0.0, 0.0, 0.0, 1.0), (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)))
+            self.assertEqual(extra["inverse_bind"], joints[0]["inverse_bind"])
+            self.assertEqual(extra["name"], f"bone_0x{extra['hash']:08x}")
+        mesh = anim_glb.bind_part(raw, extended)[0]
+        self.assertEqual(mesh["joints"][0][:3], [1, 4, 3])    # SKEL_B, 0x22222222, 0x11111111
+        self.assertEqual(mesh["joints"][1][:1], [3])
+        # a part that needs no extra joint gets the same list back
+        known = anim_glb.read_part(*part_resource([joaat32("skel_a")], "u8x4", [[(0, 255)]] * 4), 0)
+        self.assertIs(anim_glb.extend_joints(known, joints), joints)
+
     def test_an_unweighted_bone_missing_from_the_skeleton_is_fine(self):
         joints, _ = anim_glb.read_skeleton(skeleton_resource(), 0)
         sys_page, gfx = part_resource([joaat32("skel_a"), 0x12345678], "u8x4", [[(0, 255), (1, 0)]] * 4)
@@ -469,6 +492,40 @@ class ExportTest(unittest.TestCase):
         for got, want in zip(values, tracks[0]):
             for a, b in zip(got, want):
                 self.assertAlmostEqual(a, b, places=5)
+
+    def test_cloth_bones_outside_the_skeleton_export_as_extra_joints(self):
+        # Two clothing parts share one unknown cloth bone; the second also has one of its own.
+        cloth, own = 0x12345678, 0x0BADF00D
+        part_a = list(part_resource([joaat32("skel_c"), cloth], "u8x4", [[(0, 100), (1, 155)]] * 4))
+        part_b = list(part_resource([cloth, own], "u8x4", [[(0, 128), (1, 127)]] * 4))
+        packs = os.path.join(self.tmp.name, "cloth.rpf")
+        offsets = write_archive(packs, [[skeleton_resource()], part_a, part_b])
+        out, report_path = os.path.join(self.tmp.name, "cloth.glb"), os.path.join(self.tmp.name, "cloth.json")
+        r = self.run_tool(packs, out, "--skeleton", hex(offsets[0]), "--part", hex(offsets[1]),
+                          "--part", hex(offsets[2]), "--report", report_path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        gltf, binary = read_glb(out)
+        with open(report_path, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["counts"]["extra_joints"], 2)
+        (skin,) = gltf["skins"]
+        names = [gltf["nodes"][i]["name"] for i in skin["joints"]]
+        self.assertEqual(names, [*NAMES, f"bone_0x{cloth:08x}", f"bone_0x{own:08x}"])
+        ibm = accessor_values(gltf, binary, skin["inverseBindMatrices"])
+        self.assertEqual(len(ibm), 5)
+        children = {n["name"]: n.get("children", []) for n in gltf["nodes"] if "name" in n}
+        for k in (3, 4):
+            node = gltf["nodes"][skin["joints"][k]]
+            self.assertEqual((node["rotation"], node["translation"]), ([0.0, 0.0, 0.0, 1.0], [0.0, 0.0, 0.0]))
+            self.assertIn(skin["joints"][k], children["SKEL_A"])    # a child of the skeleton root
+            for a, b in zip(ibm[k], ibm[0]):                        # the root's inverse bind: the rest pose holds
+                self.assertAlmostEqual(a, b, places=6)
+        for mesh, expected in zip(gltf["meshes"], ((2, 3), (3, 4))):
+            attributes = mesh["primitives"][0]["attributes"]
+            joints = accessor_values(gltf, binary, attributes["JOINTS_0"])
+            self.assertEqual({v for row in joints for v in row[:2]}, set(expected))
+        check = subprocess.run([sys.executable, "-I", os.path.join(ROOT, "tools", "glb_skinning.py"), out],
+                               capture_output=True, text=True)
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
 
     def test_dictionary_lookup_stops_before_adjacent_resource(self):
         data = clips_fixture.two_sequence_dictionary()

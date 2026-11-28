@@ -179,6 +179,8 @@ fn take(device: &ID3D12Device, count: u32) -> Option<(ID3D12Heap, usize, Vec<(u3
                 heap: made?,
                 free: vec![(0, HEAP_TILES)],
             };
+            #[cfg(feature = "diagnostics")]
+            crate::census::block(&fresh.heap, "blocks of texture levels given on demand");
             STATS[3].fetch_add(u64::from(HEAP_TILES) * TILE, Ordering::Relaxed);
             match pool.iter().position(Option::is_none) {
                 Some(index) => {
@@ -647,10 +649,35 @@ impl Drop for Tiled {
 
 /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
 /// before `first` of a texture of `levels` levels: it starts at `first` if
-/// it started before it, shows as many levels fewer (clamped to the
-/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
-/// the effective minimum LOD stays at the same resource level.
+/// it started before it and shows as many levels fewer (clamped to the
+/// remaining levels). `ResourceMinLODClamp` stays as the title wrote it
+/// ([`min_lod_kept`]).
 pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
+    show_from_with(desc, first, levels, min_lod_kept());
+}
+
+/// Whether [`show_from`] leaves a view's `ResourceMinLODClamp` alone: yes;
+/// `LEONIDA_MIN_LOD_KEPT=0`: reduced by as many levels as the view's start
+/// moved, as before (`LEONIDA_AB` can flip it for the views made from then on).
+///
+/// The clamp is counted from the resource's level 0, not from the view's
+/// first level, and the texture is the same one, so a view that starts later
+/// needs the same value (unlike `descriptor::host`'s `from_base`, whose host
+/// texture begins at a later level). Reduced, a view moved to level 3 with
+/// the title's clamp of 3.5 let level 3 be sampled, and one with a clamp of 6
+/// moved by 2 let levels 4 and 5: levels that have tiles and that the title
+/// did not want read yet.
+///
+/// From trustno1-coder/VIctory-NVIDIA d8b258a (fxceless; fxceless/victory-fork
+/// 41f9857, its pull request #1210), GPL-3.0, which has it with no switch and
+/// a GPU test (a minimum of 3.0 reads the same level through the moved view
+/// and the title's). Not run in the game here.
+fn min_lod_kept() -> bool {
+    crate::toggled!("LEONIDA_MIN_LOD_KEPT")
+}
+
+/// [`show_from`], with [`min_lod_kept`]'s answer given.
+fn show_from_with(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32, min_lod_kept: bool) {
     if first >= levels {
         return;
     }
@@ -663,7 +690,7 @@ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, 
         if *mips != u32::MAX {
             *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
         }
-        if *min_lod > 0.0 {
+        if !min_lod_kept && *min_lod > 0.0 {
             *min_lod = (*min_lod - fewer as f32).max(0.0);
         }
     };
@@ -1481,7 +1508,14 @@ void look() {
     }
 
     #[test]
-    fn show_from_clamps_2d_and_2d_array_and_adjusts_min_lod() {
+    fn show_from_clamps_2d_and_2d_array_and_keeps_min_lod() {
+        for kept in [true, false] {
+            show_from_clamps(kept);
+        }
+    }
+
+    /// `kept`: `min_lod_kept`'s answer (`false`: `LEONIDA_MIN_LOD_KEPT=0`).
+    fn show_from_clamps(kept: bool) {
         let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -1495,13 +1529,13 @@ void look() {
                 },
             },
         };
-        show_from(&mut srv2d, 3, 11);
+        show_from_with(&mut srv2d, 3, 11, kept);
         // SAFETY: `ViewDimension` is `TEXTURE2D`.
         let v2d = unsafe { srv2d.Anonymous.Texture2D };
         assert_eq!(v2d.MostDetailedMip, 3);
         // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
         assert_eq!(v2d.MipLevels, 8);
-        assert_eq!(v2d.ResourceMinLODClamp, 0.5);
+        assert_eq!(v2d.ResourceMinLODClamp, if kept { 3.5 } else { 0.5 });
 
         let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
@@ -1518,12 +1552,12 @@ void look() {
                 },
             },
         };
-        show_from(&mut srv_arr, 2, 11);
+        show_from_with(&mut srv_arr, 2, 11, kept);
         // SAFETY: `ViewDimension` is `TEXTURE2DARRAY`.
         let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
         assert_eq!(varr.MostDetailedMip, 2);
         assert_eq!(varr.MipLevels, 4);
-        assert_eq!(varr.ResourceMinLODClamp, 0.0);
+        assert_eq!(varr.ResourceMinLODClamp, if kept { 1.5 } else { 0.0 });
     }
 
     #[test]

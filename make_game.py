@@ -37,8 +37,8 @@ vk_pipeline_check (a checker already on disk is enough only when runtime is not 
 the rest of assets. When shaders and assets share the machine, --jobs is split between them and passed to
 rpf9dump; a solo assets run still lets rpf9dump use every core.
 
-Long steps log percent and a rough ETA (shader translation shards, asset exports, XMA decode, and overall
-weighted stage completion while they overlap).
+Long steps log percent and a rough ETA (shader translation shards, asset exports, XMA decode, pipeline batches
+weighted by module size, and overall weighted stage completion while they overlap).
 
 On an interactive terminal, a LEONIDA setup screen asks for --jobs and whether to overlap stages, then a
 key-switchable per-stage log view (1-4 / Tab) keeps parallel output demuxed; full logs land in <work>/logs/.
@@ -1393,8 +1393,8 @@ def shaders(game: str, work: str, jobs: int, emulate: bool = False, keep_emulate
             "translating again")
         drop(translated)
     # The translation also depends on the fallback flags (--no-float-controls, --bary-fallback,
-    # --texel-offset-fallback, --mesh-compute), so they are kept beside it like the wave64 mode. A folder from
-    # before the file existed was translated without them.
+    # --texel-offset-fallback, --mesh-compute, --mesh-serial-waves, ...), so they are kept beside it like the wave64
+    # mode. A folder from before the file existed was translated without them.
     flags_file = os.path.join(spirv, "translator_flags.txt")
     want_flags = translator_flags_setting(fallbacks)
     had_flags = read_shader_setting(flags_file)
@@ -1866,7 +1866,7 @@ WAVE64_MODES = ("auto", "on", "off")
 FALLBACK_FLAGS = (("--no-float-controls", "no_float_controls"), ("--bary-fallback", "bary_fallback"),
                   ("--texel-offset-fallback", "texel_offset_fallback"), ("--mesh-compute", "mesh_compute"),
                   ("--f16-interp-fallback", "f16_interp_fallback"), ("--pc-tail-ubo", "pc_tail_ubo"),
-                  ("--compact-spirv", "compact_spirv"))
+                  ("--compact-spirv", "compact_spirv"), ("--mesh-serial-waves", "mesh_serial_waves"))
 
 
 def fallback_flags(a) -> tuple[str, ...]:
@@ -2582,6 +2582,19 @@ def wine_launcher(out: str, work: str, image: str) -> str:
     return f"""#!/bin/sh
 # Starts the Windows build of the loader with Wine. WINE picks another one, e.g. a Proton build's bin/wine.
 here=$(dirname "$(readlink -f "$0")")
+cx_wine=
+if [ -n "${{LEONIDA_CX_BOTTLE:-}}" ]; then
+    cx_default='/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/bin/wine'
+    cx_wine=$(command -v "${{WINE:-$cx_default}}") || {{
+        printf 'CrossOver Wine not found: %s. Set WINE to its bin/wine.\\n' "${{WINE:-$cx_default}}" >&2
+        exit 1
+    }}
+    # Resolve a relative WINE before changing to the package directory.
+    case $cx_wine in
+        /*) ;;
+        *) cx_wine="$PWD/$cx_wine" ;;
+    esac
+fi
 if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --run ]; }}; then
     game=$(cat "$here/game_path.txt" && printf .) || exit 1
     cd "${{game%.}}" || exit 1
@@ -2593,6 +2606,13 @@ if [ "$#" -eq 1 ] && {{ [ "$1" = --dry-run ] || [ "$1" = --init ] || [ "$1" = --
     # Wine maps the Unix filesystem root to Z:. The game reads from its package and writes to the port's overlay.
 {moved_catalog}    export LEONIDA_D3D12="${{LEONIDA_D3D12:-vulkan}}"
     set -- "$1" "./$image" --overlay "Z:$here/overlay"
+fi
+if [ -n "$cx_wine" ]; then
+    # CrossOver's --cx-app expects a Windows path, even when the executable lives outside the bottle.
+    cx_exe="Z:$(printf '%s' "$here/gta6rt.exe" | tr '/' '\\\\')"
+    export ROSETTA_ADVERTISE_AVX="${{ROSETTA_ADVERTISE_AVX:-1}}"
+    workdir=$(pwd -P) || exit 1
+    exec "$cx_wine" --bottle "$LEONIDA_CX_BOTTLE" --cx-app "$cx_exe" --workdir "$workdir" --no-gui -- "$@"
 fi
 exec "${{WINE:-wine}}" "$here/gta6rt.exe" "$@"
 """
@@ -2642,6 +2662,109 @@ def build_pipeline_check(jobs: int) -> None:
                 "or VULKAN_SDK); the CMake output above says which is missing.")
 
 
+def install_runtime(game: str, out: str, artifacts: list, work: str | None = None,
+                    launcher: str | None = None) -> None:
+    """Puts the runtime files, game_path.txt, shader_path.txt (with `work`) and (off Windows) gta6rt.sh in `out`,
+    staged first (RT-249). `launcher` is gta6rt.sh's text (wine_launcher()); None writes no launcher.
+
+    Everything is written to a staging folder inside `out` (same filesystem), and only once all of it is there is
+    it published (publish(): all files or none). A failure while copying (disk full, an interrupt) or while
+    publishing (a destination file held open) leaves the previous install untouched and no staging folder behind,
+    instead of a new gta6rt.exe next to an old gta6rt_tls_host.dll. The one exception is a rollback that is itself
+    blocked (IncompleteRollback): the staging folder, which then holds the old files, is kept for recovery."""
+    os.makedirs(out, exist_ok=True)
+    # A run that kept its staging folder (IncompleteRollback), or that could not delete the old gta6rt.exe it moved
+    # there because the game was still running, leaves one behind.
+    for stale in glob.glob(os.path.join(glob.escape(out), ".runtime-staging-*")):
+        shutil.rmtree(stale, ignore_errors=True)
+    stage = tempfile.mkdtemp(prefix=".runtime-staging-", dir=out)
+    try:
+        staged = []
+        for built in artifacts:
+            name = os.path.basename(built)
+            target = os.path.join(out, name)
+            # --runtime-build may be the output folder itself (a runtime build unpacked where the port goes): the
+            # file is in place then, and copying it onto itself raises SameFileError.
+            if os.path.exists(target) and os.path.samefile(built, target):
+                continue
+            shutil.copy2(built, os.path.join(stage, name))
+            staged.append(name)
+        with open(os.path.join(stage, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(os.path.abspath(game))
+        staged.append("game_path.txt")
+        if work is not None:
+            shader_dir = os.path.join(os.path.abspath(work), "shaders", "spirv")
+            # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.
+            encoded = shader_dir.encode("utf-8") if os.name == "nt" else os.fsencode(shader_dir)
+            with open(os.path.join(stage, "shader_path.txt"), "wb") as f:
+                f.write(encoded)
+            staged.append("shader_path.txt")
+        if launcher is not None:
+            script = os.path.join(stage, "gta6rt.sh")
+            with open(script, "w", encoding="utf-8", newline="\n") as f:
+                f.write(launcher)
+            os.chmod(script, os.stat(script).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            staged.append("gta6rt.sh")
+        publish(stage, out, staged)
+    except IncompleteRollback:
+        raise                               # the staging folder holds old files that are not back in place
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    shutil.rmtree(stage, ignore_errors=True)
+
+
+class IncompleteRollback(OSError):
+    """publish() failed, and putting the previous files back failed too (on Windows, another process opened a file
+    already published, so it cannot be renamed back). `stage` holds the old copies (<name>.old) not restored."""
+
+    def __init__(self, cause: BaseException, stage: str, failures: list):
+        self.cause, self.stage, self.failures = cause, stage, failures
+        detail = "; ".join(f"{name}: {e}" for name, e in failures)
+        super().__init__(f"{cause}; restoring the previous files failed too ({detail}). The old copies not put back "
+                         f"are in {stage} as <name>.old")
+
+
+def publish(stage: str, out: str, names: list) -> None:
+    """Moves each staged file over its copy in `out`, all or none (RT-249, #5278).
+
+    Each old file is first moved aside into the staging folder, then the new one takes its place. If any step fails
+    (on Windows, a destination another process holds open without delete sharing cannot be renamed: error 5), the files
+    already published are taken back out and the old ones restored, and the error is raised, so `out` never mixes a
+    new gta6rt.exe with an old gta6rt_tls_host.dll."""
+    done = []  # (name, whether an old copy was moved aside), in publish order
+    failures = []  # (name, error) for every old file that could not be put back
+    try:
+        for name in names:
+            target, backup = os.path.join(out, name), os.path.join(stage, name + ".old")
+            had_old = os.path.lexists(target)
+            if had_old:
+                os.replace(target, backup)
+            try:
+                os.replace(os.path.join(stage, name), target)
+            except BaseException:
+                if had_old:
+                    try:
+                        os.replace(backup, target)
+                    except OSError as e:     # the old copy is then only in `stage`: keep it (IncompleteRollback)
+                        failures.append((name, e))
+                raise
+            done.append((name, had_old))
+    except BaseException as cause:          # every step is tried, so one blocked file does not stop the rest
+        for name, had_old in reversed(done):
+            target, backup = os.path.join(out, name), os.path.join(stage, name + ".old")
+            try:
+                if had_old:
+                    os.replace(backup, target)
+                else:
+                    os.remove(target)
+            except OSError as e:
+                failures.append((name, e))
+        if failures:
+            raise IncompleteRollback(cause, os.path.abspath(stage), failures) from cause
+        raise
+
+
 def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs: int = 1,
             *, work: str | None = None) -> None:
     destinations = [*RUNTIME_FILES, "game_path.txt"]
@@ -2670,39 +2793,24 @@ def runtime(game: str, out: str, v: dict, runtime_build: str | None = None, jobs
     for built in artifacts:
         if not os.path.isfile(built):
             fail(f"runtime: {'build did not produce' if not runtime_build else 'no'} {built}")
-    os.makedirs(out, exist_ok=True)
-    for built in artifacts:
-        # --runtime-build may be the output folder itself (a runtime build unpacked where the port goes): the
-        # files are in place then, and copying a file onto itself raises SameFileError.
-        if not os.path.exists(os.path.join(out, os.path.basename(built))) or \
-                not os.path.samefile(built, os.path.join(out, os.path.basename(built))):
-            shutil.copy2(built, out)
-    with open(os.path.join(out, "game_path.txt"), "w", encoding="utf-8", newline="\n") as f:
-        f.write(os.path.abspath(game))
     if work is not None:
-        shader_dir = os.path.join(os.path.abspath(work), "shaders", "spirv")
         from ttpf_mips import find_pools
         if find_pools(game):
-            profile = os.path.join(os.path.dirname(shader_dir), "bcpack", "history.bcph")
+            profile = os.path.join(os.path.abspath(work), "shaders", "bcpack", "history.bcph")
             native = os.path.join(build, "bcpack_history_train.exe")
             trainer = ["--trainer", native] if os.name == "nt" and os.path.isfile(native) else []
             py("build_dstorage_history.py", game, "--out", profile, "--if-needed", *trainer)
-        # Wine's path converter takes the original Unix filename bytes. The Windows reader expects UTF-8.
-        encoded = shader_dir.encode("utf-8") if os.name == "nt" else os.fsencode(shader_dir)
-        pending = tempfile.NamedTemporaryFile(dir=out, delete=False)
-        try:
-            with pending:
-                pending.write(encoded)
-            os.replace(pending.name, os.path.join(out, "shader_path.txt"))
-        finally:
-            if os.path.exists(pending.name):
-                os.unlink(pending.name)
-    start = os.path.join(out, "gta6rt.exe")
-    if os.name != "nt":
-        start = os.path.join(out, "gta6rt.sh")
-        with open(start, "w", encoding="utf-8", newline="\n") as f:
-            f.write(wine_launcher(out, work or os.path.join(out, "work"), v["expected_exe"]))
-        os.chmod(start, os.stat(start).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    try:
+        launcher = wine_launcher(out, work or os.path.join(out, "work"), v["expected_exe"]) if os.name != "nt" else None
+        install_runtime(game, out, artifacts, work, launcher)
+    except IncompleteRollback as e:
+        fail(f"runtime: could not install into {out}, and the previous files could not all be put back: {e}. "
+             "Close the programs holding them, then move each <name>.old from there back into place (or run the stage "
+             "again, which installs the new files).")
+    except OSError as e:
+        fail(f"runtime: could not install into {out} ({e}); the previous files there are unchanged. If a program has "
+             "one of them open without allowing it to be renamed (an antivirus scan, another program), close it and run the stage again.")
+    start = os.path.join(out, "gta6rt.exe" if os.name == "nt" else "gta6rt.sh")
     image = os.path.join(game, v["expected_exe"])
     if not os.path.isfile(image):
         log(f"runtime: built, but {v['expected_exe']} is missing from your copy, so there is nothing to run yet.")
@@ -2881,6 +2989,8 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
     code = 0
     ranges = [(s, min(PIPELINE_BATCH_SIZE, len(names) - s))
               for s in range(0, len(names), PIPELINE_BATCH_SIZE)] if names else [(0, None)]
+    costs = pipeline_costs(spirv, names)
+    total_cost, done_cost, t0 = sum(costs), 0.0, time.monotonic()
     for start, count in ranges:
         if count is not None:
             log(f"pipelines: checking shaders {start + 1}-{start + count} of {len(names)} in a fresh process")
@@ -2889,6 +2999,9 @@ def pipelines(work: str, out: str, jobs: "int | None" = None, *, runtime_build: 
             code = result   # a later successful batch must not erase an earlier validation failure
         if result == 2 or interrupted(result):
             break
+        if count is not None and total_cost > 0:
+            done_cost += sum(costs[start:start + count])
+            log(pipelines_progress(start + count, len(names), done_cost / total_cost, time.monotonic() - t0))
     if crashed and not code:
         code = 1
     report_written = bool(crashed) and record_crashes(out, spirv, crashed)
@@ -2928,6 +3041,35 @@ def record_crashes(out: str, spirv: str, crashed: "list[str]") -> bool:
 # 10 minutes since the last cache checkpoint, plus loading the cache). Looked up when pipelines() runs.
 PIPELINE_CRASH_RETRIES = 5
 PIPELINE_BATCH_SIZE = 500   # fresh compiler process and cache checkpoint after at most this many index entries
+# A module's share of the stage's time is taken as its SPIR-V size in MB to this power: a large module compiles
+# disproportionately slower. On one full-corpus run (RTX 5070 Ti, driver 621.24, wave64-emulated translation; 41
+# batches of 500 taking 16 s to 26 min, 2.8 h in all) the batch times ranked with their bytes at Spearman 0.93, and
+# the time left after 5 to 38 batches was 55-85% under the actual by batch count, 33-50% under by bytes, 6-25%
+# under with 1.5, and 3-41% over with 2.
+PIPELINE_COST_EXPONENT = 1.5
+
+
+def pipeline_costs(spirv: str, names: "list[str]") -> "list[float]":
+    """The estimated compile cost of each module, in index order (0 for a module without its .spv): only for the
+    percent and time left the pipelines stage logs, never to choose what runs."""
+    costs = []
+    for name in names:
+        try:
+            size = os.path.getsize(os.path.join(spirv, name + ".spv"))
+        except OSError:
+            size = 0
+        costs.append((size / 1e6) ** PIPELINE_COST_EXPONENT)
+    return costs
+
+
+def pipelines_progress(done: int, total: int, share: float, elapsed: float) -> str:
+    """The line after each batch: shaders checked, the share of the estimated compile cost behind them, and the time
+    left at the pace so far (the elapsed time once the last batch is done)."""
+    pct = min(100, int(100 * share))
+    if share >= 1 or done >= total:
+        return f"pipelines: {done}/{total} shaders checked, {fmt_duration(elapsed)} elapsed"
+    left = f", ~{fmt_duration(elapsed * (1 - share) / share)} left" if share > 0 else ""
+    return f"pipelines: {done}/{total} shaders checked, {pct}% of the estimated compile time{left}"
 
 
 def interrupted(code: int) -> bool:
@@ -3188,6 +3330,12 @@ def main() -> int:
                     help="translate mesh shaders to compute shaders writing an output buffer, for devices "
                          "without VK_EXT_mesh_shader; on by itself on Intel's Windows Vulkan driver, whose mesh "
                          "draws crash on the corpus' mesh shaders (BUILD-2202)")
+    ap.add_argument("--mesh-serial-waves", action="store_true",
+                    help="with wave64 emulation, run the waves of a mesh shader one after the other in 64 "
+                         "invocations instead of side by side (the translator's --mesh-serial-waves, #2435). "
+                         "Only wave64 mesh shaders of more than 64 threads, a multiple of 64, with no LDS "
+                         "instruction, store or atomic take that form; the others, and every shader translated "
+                         "natively or with --mesh-compute, come out as before. Off by default")
     ap.add_argument("--native-mesh", action="store_true",
                     help="keep native mesh shaders on Intel's Windows Vulkan driver instead of turning on "
                          "--mesh-compute (for a driver that fixes BUILD-2202's crash)")

@@ -23,6 +23,7 @@ import sys
 import tempfile
 import time
 import zlib
+from contextlib import suppress
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -199,19 +200,28 @@ def publish_report(path, rows, summary):
     """Write the report at ``path`` atomically, creating missing parent directories.
 
     The full JSON is staged next to the destination so an interrupted run leaves only the old report or no report,
-    never a truncated one. Raised OSError carries a clear description of the staging/destination problem for
-    ``main`` to turn into a named nonzero diagnostic.
+    never a truncated one; the stage is made deletable before the cleanup deletes it, so a read-only report on
+    Windows cannot strand the stage or mask the error with a cleanup failure. Raised OSError carries a clear
+    description of the staging/destination problem for ``main`` to turn into a named nonzero diagnostic.
     """
     path = os.path.abspath(path)
     directory = os.path.dirname(path)
     os.makedirs(directory, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=directory, prefix=".rpf9_names-") as stage_dir:
-        temp = os.path.join(stage_dir, "report.json")
+    stage_dir = tempfile.TemporaryDirectory(dir=directory, prefix=".rpf9_names-")
+    try:
+        temp = os.path.join(stage_dir.name, "report.json")
         with open(temp, "w", encoding="utf-8", newline="\n") as f:
             json.dump({"summary": summary, "files": rows}, f, indent=1)
             f.write("\n")
         os.chmod(temp, published_mode(path))
         os.replace(temp, path)
+    finally:
+        # On a failed replace the staged file carries the destination's bits, which a read-only report
+        # makes read-only: Windows then refuses the delete and the cleanup error masks the real one.
+        # Make it deletable first and let one delete failure go, so the caller reports the replace.
+        with suppress(OSError):
+            os.chmod(temp, 0o600)
+        stage_dir.cleanup()
 
 
 def _int_arg(text):

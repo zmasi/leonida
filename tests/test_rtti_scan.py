@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
 import rtti_scan
@@ -699,6 +700,28 @@ class RttiScanCoreTest(unittest.TestCase):
         p = self.run_tool(bad_path)
         self.assertEqual(p.returncode, 1)
         self.assertIn("ERROR:", p.stderr)
+
+    def test_write_report_cleans_up_staged_file_when_replace_fails_even_if_readonly(self):
+        report = os.path.join(self.tmp.name, "report.json")
+        with open(report, "w", encoding="utf-8") as f:
+            f.write('{"initial": 1}\n')
+        os.chmod(report, 0o444)
+
+        real_remove = os.remove
+
+        def windows_strict_remove(p):
+            mode = os.stat(p).st_mode
+            if not (mode & 0o200):
+                raise PermissionError(13, f"Access is denied: {p}")
+            return real_remove(p)
+
+        with mock.patch("os.replace", side_effect=OSError(13, "Permission denied")), \
+             mock.patch("os.remove", side_effect=windows_strict_remove):
+            with self.assertRaises(OSError):
+                rtti_scan.write_report(report, "{}")
+
+        leftover = [f for f in os.listdir(self.tmp.name) if f.startswith(".rtti-")]
+        self.assertEqual(leftover, [])
 
 
 if __name__ == "__main__":

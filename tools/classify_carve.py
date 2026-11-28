@@ -30,7 +30,7 @@ from file_mode import published_mode  # noqa: E402
 def classify(r):
     if r.get("type") == "bink2":
         return "bink2"
-    h = r["head"]
+    h = r["head"].lower()
     if h.startswith("52424630"):
         return "rbf0"
     if h.startswith("42400000"):
@@ -66,21 +66,28 @@ def entry(v):
 USAGE = "usage: python -I tools/classify_carve.py <work>\\carve"
 
 
-def main():
-    if sys.argv[1:] in (["-h"], ["--help"]):
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv in (["-h"], ["--help"]):
         print(USAGE)
         return 0
-    if len(sys.argv) != 2:
+    if len(argv) != 1:
         print(USAGE, file=sys.stderr)
         return 2
-    root = sys.argv[1]
+    root = argv[0]
     if not os.path.isdir(root):
         what = "is not a folder" if os.path.exists(root) else "does not exist"
         print(f"{root}: {what}; give the carve folder (the one with an index.json per archive)", file=sys.stderr)
         return 2
     report = os.path.join(root, "types.json")
-    if os.path.isdir(report):
+    dest = os.path.realpath(report)
+    dest_dir = os.path.dirname(dest) or root
+    if os.path.isdir(report) or os.path.isdir(dest):
         print(f"{report}: is a directory; remove or rename that directory before rerun", file=sys.stderr)
+        return 2
+    if not os.path.isdir(dest_dir):
+        what = "is not a folder" if os.path.exists(dest_dir) else "does not exist"
+        print(f"{dest_dir}: {what}; cannot write {report}", file=sys.stderr)
         return 2
     per = {}
     total = defaultdict(lambda: [0, 0, []])
@@ -109,8 +116,6 @@ def main():
         per[name] = {k: entry(v) for k, v in sorted(c.items(), key=lambda kv: -kv[1][1])}
     top = sorted(total.items(), key=lambda kv: -kv[1][1])
     out = {"overall": {k: entry(v) for k, v in top}, "per_archive": per}
-    dest = os.path.realpath(report)
-    dest_dir = os.path.dirname(dest) or root
     fd, temp = tempfile.mkstemp(dir=dest_dir, prefix=".types-", suffix=".tmp")
     try:
         try:
@@ -120,6 +125,7 @@ def main():
             raise
         with f:
             json.dump(out, f, indent=1)
+            f.write("\n")
             f.flush()
             os.fsync(f.fileno())
         os.chmod(temp, published_mode(dest))                               # mkstemp creates 0600

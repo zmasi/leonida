@@ -142,6 +142,7 @@ def verdict(results):
         if word is None:
             got, tag = "no result", "missing"
         else:
+            word &= 0xFFFFFFFF
             got = f"{f(word):g}"
             tag = [r for r in (HALVES, LOW) if want[r] == word]
             tag = ("both (control)" if is_control(case) else tag[0]) if tag else "neither"
@@ -218,7 +219,19 @@ def hw_lines(case):
 def run_hw(oracle, cases=CASES):
     from hw_oracle import asm
     got = oracle.run([asm.Kernel(hw_lines(c), 32, 1, 1, raw=True, mode=HW_MODE) for c in cases], words=1)
-    return [None if isinstance(w, str) else w[0] for w in got], [w for w in got if isinstance(w, str)]
+    if not isinstance(got, (list, tuple)) or len(got) != len(cases):
+        got_desc = len(got) if isinstance(got, (list, tuple)) else type(got).__name__
+        raise RuntimeError(f"hardware oracle returned {got_desc} results for {len(cases)} cases")
+    words, rejected = [], []
+    for case, w in zip(cases, got):
+        if isinstance(w, str):
+            words.append(None)
+            rejected.append(w)
+        elif isinstance(w, (list, tuple)) and len(w) >= 1 and isinstance(w[0], int) and not isinstance(w[0], bool):
+            words.append(w[0] & 0xFFFFFFFF)
+        else:
+            raise RuntimeError(f"hardware oracle returned invalid result for case {case.name}: {w!r}")
+    return words, rejected
 
 
 # ---- driver ----
@@ -236,7 +249,14 @@ def main(argv=None):
     ap.add_argument("--oracle", default="translator", help="comma-separated sides besides the translator: hw")
     ap.add_argument("--hw-arch", help="GPU architecture to assemble for (default: detected; LEONIDA_HW_ARCH)")
     a = ap.parse_args(argv)
-    sides = {s.strip() for s in a.oracle.split(",") if s.strip()} - {"translator"}
+    if a.hw_arch is not None:
+        a.hw_arch = a.hw_arch.strip()
+        if not a.hw_arch:
+            ap.error("--hw-arch must not be empty")
+    oracle_tokens = [s.strip() for s in a.oracle.split(",")]
+    if not any(oracle_tokens) or any(not s for s in oracle_tokens):
+        ap.error("--oracle must be a comma-separated list of sides: translator, hw")
+    sides = set(oracle_tokens) - {"translator"}
     if sides - {"hw"}:
         ap.error(f"unknown --oracle side(s): {', '.join(sorted(sides - {'hw'}))}")
     for case in CASES:                  # the table itself: three cases that tell the readings apart, two that don't
@@ -256,6 +276,9 @@ def main(argv=None):
             try:
                 print(f"hardware oracle: {oracle.device}")
                 words, rejected = run_hw(oracle)
+            except runner.Unavailable as e:
+                print(f"hardware oracle unavailable: {e}")
+                return 77
             finally:
                 oracle.close()
             for why in rejected:

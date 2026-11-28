@@ -30,7 +30,7 @@ Leonida 是一个把 Xbox Series 版 Grand Theft Auto VI **静态重编译**到 
   （wave64 着色器以模拟方式运行），以及 MoltenVK 的浮点处理；详见 [`docs/testing.md`](../../testing.md)。
 - **AMD RDNA1（RX 5000）**：受支持的目标，接近主机的 RDNA2；它的 64 宽子组可原生运行 wave64 着色器。
 
-所有平台的 GPU 结果都汇总在 [issue #166](https://github.com/ItsNotRexed/Leonida/issues/166)。
+所有平台的 GPU 结果都通过 pull request 提交，向 [gpu-test-results/](../../../gpu-test-results) 添加文件。
 
 ## 前置条件
 
@@ -61,7 +61,7 @@ Leonida 是一个把 Xbox Series 版 Grand Theft Auto VI **静态重编译**到 
 2. **带子模块**克隆仓库：
 
    ```powershell
-   git clone --recursive https://github.com/ItsNotRexed/Leonida
+   git clone --recursive https://github.com/ubiquitarianism/leonida
    ```
 
    用 GitHub 的 “Download ZIP” 下载会缺少 `third_party/rpf9-explorer`：装了 `git` 时构建会自动获取，否则会告诉你该怎么做。

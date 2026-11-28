@@ -671,6 +671,108 @@ class Rdna2DecodeUnitTests(unittest.TestCase):
         self.assertEqual(rdna2_decode._mimg_addr_count("image_get_lod", 2, True), 2)          # 3D a16
         self.assertEqual(rdna2_decode._mimg_data_count("image_atomic_fcmpswap", 1, False, True), 3)
 
+    def test_vop16_int_inline_constants_match_llvm_and_translate(self):
+        # Codes 240..248 on scalar 16-bit integer operands carry binary16 bit patterns
+        # (AMD RDNA2 ISA + LLVM AMDGPUDisassembler::getInlineImmValF16 / printImmediateInt16).
+        expected_hex16 = {
+            240: 0x3800, 241: 0xB800, 242: 0x3C00, 243: 0xBC00,
+            244: 0x4000, 245: 0xC000, 246: 0x4400, 247: 0xC400, 248: 0x3118,
+        }
+        # 1. All 9 inline codes on VOP1 (v_cvt_f16_i16_e32 / v_cvt_f16_u16_e32)
+        for opc, name in ((0x50, "v_cvt_f16_u16_e32"), (0x51, "v_cvt_f16_i16_e32")):
+            for code_id, val16 in expected_hex16.items():
+                with self.subTest(op=name, code=code_id):
+                    raw = words((0x3F << 25) | (5 << 17) | (opc << 9) | code_id)
+                    (ins,) = rdna2_decode.decode_bytes(raw)["insns"]
+                    self.assertEqual(ins["op"], name)
+                    self.assertEqual(ins["args"][1], {"k": "imm", "v": val16})
+                    line = rdna2_decode.format_insn(ins).split(";", 1)[0].strip()
+                    self.assertEqual(line, f"{name} v5, 0x{val16:x}")
+                    self.assertEqual(shader_ir.parse_line(line)["args"], ins["args"])
+
+        # 2. VOPC (_e32), VOP3 (_e64 / 2-op / 3-op), mixed-width VOP3, and negative controls
+        cases = (
+            # VOPC _e32 (v_cmp_eq_i16_e32, v_cmp_lt_u16_e32, v_cmpx_ge_i16_e32)
+            ("f004147d", "v_cmp_eq_i16_e32 vcc_lo, 0x3800, v2"),
+            ("f704527d", "v_cmp_lt_u16_e32 vcc_lo, 0xc400, v2"),
+            ("f0043c7d", "v_cmpx_ge_i16_e32 0x3800, v2"),
+            # VOP3 1-op, 2-op, 3-op scalar 16-bit integer ops (including VOPC _e64)
+            ("0500d1d5f0000000", "v_cvt_f16_i16_e64 v5, 0x3800"),
+            ("05008ad4f0ee0100", "v_cmp_eq_i16_e64 s5, 0x3800, 0xc400"),
+            ("05000dd7f0040200", "v_add_nc_i16 v5, 0x3800, v2"),
+            ("050003d701ef0100", "v_add_nc_u16 v5, v1, 0xc400"),
+            ("05000ed7f7040200", "v_sub_nc_i16 v5, 0xc400, v2"),
+            ("050004d701e10100", "v_sub_nc_u16 v5, v1, 0x3800"),
+            ("050005d7f0040200", "v_mul_lo_u16 v5, 0x3800, v2"),
+            ("050014d7f7040200", "v_lshlrev_b16 v5, 0xc400, v2"),
+            ("050007d701e10100", "v_lshrrev_b16 v5, v1, 0x3800"),
+            ("050008d7f0040200", "v_ashrrev_i16 v5, 0x3800, v2"),
+            ("05000ad7f7040200", "v_max_i16 v5, 0xc400, v2"),
+            ("05000bd701e10100", "v_min_u16 v5, v1, 0x3800"),
+            ("050055d7f0040e04", "v_max3_i16 v5, 0x3800, v2, v3"),
+            ("050053d70105de03", "v_min3_u16 v5, v1, v2, 0xc400"),
+            ("050058d701ef0d04", "v_med3_i16 v5, v1, 0xc400, v3"),
+            ("05005ed70105de03", "v_mad_i16 v5, v1, v2, 0xc400"),
+            ("050040d70105c203", "v_mad_u16 v5, v1, v2, 0x3800"),
+            # Mixed-width VOP3: SRC0/SRC1 are 16-bit (hex), SRC2 is 32-bit (float inline)
+            ("050075d7f0040e04", "v_mad_i32_i16 v5, 0x3800, v2, v3"),
+            ("050075d701ef0d04", "v_mad_i32_i16 v5, v1, 0xc400, v3"),
+            ("050075d70105de03", "v_mad_i32_i16 v5, v1, v2, -4.0"),
+            ("050073d7f7040e04", "v_mad_u32_u16 v5, 0xc400, v2, v3"),
+            ("050073d70105c203", "v_mad_u32_u16 v5, v1, v2, 0.5"),
+            # Negative controls: f16, 32-bit-src0, packed V2INT16/VOP3P, SDWA, and scalar ops stay float inline
+            ("f0a60a7e", "v_cvt_i16_f16_e32 v5, 0.5"),
+            ("f0c40a7e", "v_sat_pk_u8_i16_e32 v5, 0.5"),
+            ("05005cd5f0040e04", "v_sad_u16 v5, 0.5, v2, v3"),
+            ("05006bd7f0040200", "v_cvt_pk_i16_i32 v5, 0.5, v2"),
+            ("05003bd501e10100", "v_ldexp_f16_e64 v5, v1, 0.5"),
+            ("050002ccf0040218", "v_pk_add_i16 v5, 0.5, v2"),
+            ("05000accf0040218", "v_pk_add_u16 v5, 0.5, v2"),
+            ("050004ccf0040218", "v_pk_lshlrev_b16 v5, 0.5, v2"),
+            ("054014ccf0040e1c", "v_dot2_i32_i16 v5, 0.5, v2, v3"),
+            ("f01a80be", "s_sext_i32_i16 s0, 0.5"),
+        )
+        for hexcode, exp_asm in cases:
+            with self.subTest(hexcode=hexcode, exp_asm=exp_asm):
+                raw = bytes.fromhex(hexcode)
+                dec = rdna2_decode.decode_bytes(raw, wave32=True)
+                self.assertEqual(dec["invalid"], 0)
+                (ins,) = dec["insns"]
+                got_asm = re.sub(r"\s+", " ", rdna2_decode.format_insn(ins).split(";", 1)[0].strip())
+                self.assertEqual(got_asm, exp_asm)
+                self.assertEqual(shader_ir.parse_line(got_asm)["args"], ins["args"])
+
+        # 3. End-to-end semantic round-trip: raw binary -> rdna2_decode -> rdna2spirv -> spirv_mini_interp.
+        # Verifies 16-bit integer inline constants preserve binary16 bits (not truncated binary32 low-half 0):
+        #   v0 = v_add_nc_u16(0x3800, 1)            -> 0x3801
+        #   v1 = v_cvt_f16_u16_e32(0x3800)          -> f16(14336.0) = 0x7300
+        #   v2 = v_mad_i32_i16(0x3800, 2, 0.5)      -> 14336 * 2 + 0x3f000000 = 0x3f007000
+        prog = words(
+            (0x3F << 25) | (0 << 17) | (1 << 9) | 128,                      # v_mov_b32_e32 v0, 0 (clear hi half)
+            (0x3F << 25) | (1 << 17) | (1 << 9) | 128,                      # v_mov_b32_e32 v1, 0 (clear hi half)
+            (0x35 << 26) | (0x303 << 16) | 0, (129 << 9) | 240,             # v_add_nc_u16 v0, 0x3800, 1
+            (0x3F << 25) | (1 << 17) | (0x50 << 9) | 240,                   # v_cvt_f16_u16_e32 v1, 0x3800
+            (0x35 << 26) | (0x375 << 16) | 2, (240 << 18) | (130 << 9) | 240,  # v_mad_i32_i16 v2, 0x3800, 2, 0.5
+            (0x3E << 26) | (1 << 12) | (1 << 11) | 0xF,                     # exp mrt0 v0, v1, v2, v0 done vm
+            (0 << 24) | (2 << 16) | (1 << 8) | 0,
+            0xBF810000,                                                     # s_endpgm
+        )
+        asm, bad = rdna2_decode.disasm_bytes(prog, wave32=True)
+        self.assertEqual(bad, 0)
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm_dir = os.path.join(tmp, "disasm")
+            os.mkdir(disasm_dir)
+            with open(os.path.join(tmp, "ps_vop16_inline.dxbc"), "wb") as f:
+                f.write(b"DXBC" + bytes(28))
+            src = os.path.join(disasm_dir, "ps_vop16_inline.s")
+            with open(src, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; ps_vop16_inline  code 0x0..0x0 (synthetic), gfx1013, 0 invalid words\n" + asm)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                spv = rdna2spirv.translate(src)
+        out = si.run_fragment(spv)["%out_mrt0"]
+        self.assertEqual(list(out), [0x00003801, 0x00007300, 0x3F007000, 0x00003801])
+
 
 if __name__ == "__main__":
     unittest.main()

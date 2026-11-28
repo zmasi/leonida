@@ -285,5 +285,44 @@ class IndexEncodingTest(unittest.TestCase):
             self.assertEqual(os.listdir(os.path.join(tmp, "stubs")), ["vs_0.spv"])
 
 
+class CliAndDirectoryGuardTest(unittest.TestCase):
+    def test_unknown_flag_and_blank_dir_fail_with_error(self):
+        tool = os.path.join(ROOT, "tools", "spirv_stubs.py")
+        for bad, expected in (("-x", "unknown option"), ("--bogus", "unknown option"), ("", "empty spirv dir"), ("   ", "empty spirv dir")):
+            with self.subTest(arg=bad):
+                p = subprocess.run([sys.executable, "-I", tool, bad], capture_output=True, text=True)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn(expected, p.stderr)
+                self.assertNotIn("Traceback", p.stderr)
+
+    def test_recursion_error_in_index_is_one_error_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            idx = os.path.join(tmp, "index.json")
+            with open(idx, "w", encoding="utf-8", newline="\n") as f:
+                f.write("{}")
+            with patch.object(spirv_stubs.json, "load", side_effect=RecursionError("too deep")):
+                with self.assertRaises(SystemExit) as cm:
+                    spirv_stubs.main([tmp])
+            msg = str(cm.exception)
+            self.assertIn("cannot read", msg)
+            self.assertIn("too deep", msg)
+
+    def test_preexisting_target_directory_aborts_before_writing_other_stubs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stubs_dir = os.path.join(tmp, "stubs")
+            os.makedirs(os.path.join(stubs_dir, "vs_0.spv"))
+            index = {"ps_a": {"stage": "ps", "inputs": [0]}, "vs_a": {"stage": "vs", "outputs": [0]}}
+            with self.assertRaises(IsADirectoryError):
+                spirv_stubs.generate_for_index(tmp, index)
+            self.assertEqual(os.listdir(stubs_dir), ["vs_0.spv"])
+
+    def test_stubs_path_as_regular_file_raises_not_a_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "stubs"), "wb") as f:
+                f.write(b"not a dir")
+            with self.assertRaises(NotADirectoryError):
+                spirv_stubs.generate_for_index(tmp, {"ps_a": {"stage": "ps", "inputs": [0]}})
+
+
 if __name__ == "__main__":
     unittest.main()

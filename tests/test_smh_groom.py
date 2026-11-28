@@ -5,7 +5,10 @@ Run with:
 """
 from __future__ import annotations
 
+import argparse
+import contextlib
 import gc
+import io
 import json
 import math
 import os
@@ -1042,6 +1045,296 @@ class CliTests(unittest.TestCase):
                     self.assertEqual(proc.returncode, 2)
                     self.assertIn("--limit", proc.stderr)
                     self.assertIn("at least 1", proc.stderr)
+
+
+class ValidationHardeningTests(unittest.TestCase):
+    def test_inflate_stream_bounds_decompression_and_rejects_bad_offsets(self):
+        # Single-chunk zlib bomb: 2 MiB of zeros compresses to ~2 KiB.
+        bomb = zlib.compress(b"\x00" * (2 << 20))
+        self.assertLess(len(bomb), 65536)
+
+        calls: list[tuple[int, int | None]] = []
+        real_decompressobj = zlib.decompressobj
+
+        class _SpyDecoder:
+            def __init__(self) -> None:
+                self._inner = real_decompressobj()
+
+            @property
+            def eof(self) -> bool:
+                return self._inner.eof
+
+            @property
+            def unused_data(self) -> bytes:
+                return self._inner.unused_data
+
+            @property
+            def unconsumed_tail(self) -> bytes:
+                return self._inner.unconsumed_tail
+
+            def decompress(self, data: bytes, max_length: int = 0) -> bytes:
+                out = self._inner.decompress(data, max_length)
+                calls.append((len(out), max_length))
+                return out
+
+        with mock.patch.object(smh_groom, "MAX_INFLATE_BYTES", 8192):
+            with mock.patch.object(smh_groom.zlib, "decompressobj", side_effect=_SpyDecoder):
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.inflate_stream(bomb, 0)
+        # Decompression must stop at cap + 1 bytes instead of expanding the whole 2 MiB chunk.
+        self.assertTrue(calls)
+        self.assertLessEqual(max(n for n, _ in calls), 8193)
+        self.assertTrue(all(ml and ml <= 8193 for _, ml in calls))
+
+        # Exact boundary succeeds; one byte over fails.
+        exact = zlib.compress(b"A" * 1024)
+        over = zlib.compress(b"A" * 1025)
+        with mock.patch.object(smh_groom, "MAX_INFLATE_BYTES", 1024):
+            raw, _ = smh_groom.inflate_stream(exact, 0)
+            self.assertEqual(raw, b"A" * 1024)
+            with self.assertRaises(smh_groom.GroomError):
+                smh_groom.inflate_stream(over, 0)
+
+        # Negative and bool offsets are rejected.
+        for bad_pos in (-1, True, False):
+            with self.subTest(pos=bad_pos):
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.inflate_stream(exact, bad_pos)
+        for bad_off in (-1, True, False):
+            with self.subTest(offset=bad_off):
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.read_resource(b"\x00" * 16 + exact, bad_off)
+
+    def test_read_zlib_resource_caps_gpu_size_and_empty_chunks(self):
+        sysd, gpu = build_synthetic_groom_buffers()
+
+        # Declared GPU size exceeding MAX_INFLATE_BYTES is rejected before GPU inflation.
+        huge_sys = bytearray(sysd)
+        desc = struct.unpack_from("<Q", huge_sys, 0x70)[0] - smh_groom.SYS_BASE
+        struct.pack_into("<I", huge_sys, desc + 8, (smh_groom.MAX_INFLATE_BYTES // 4) + 1)
+        huge_res = b"\x00" * 16 + _align16(zlib.compress(bytes(huge_sys)))
+        with self.assertRaisesRegex(smh_groom.GroomError, "exceeds"):
+            smh_groom.read_resource(huge_res, 0)
+
+        # Multi-chunk GPU stream whose combined bytes exceed MAX_INFLATE_BYTES is rejected.
+        small_cap = 2048
+        big_sys = bytearray(sysd)
+        desc = struct.unpack_from("<Q", big_sys, 0x70)[0] - smh_groom.SYS_BASE
+        struct.pack_into("<I", big_sys, desc + 8, (small_cap // 4) - 1)
+        chunk1 = _align16(zlib.compress(b"\x00" * 1200))
+        chunk2 = _align16(zlib.compress(b"\x00" * 1200))
+        multi_res = b"\x00" * 16 + _align16(zlib.compress(bytes(big_sys))) + chunk1 + chunk2
+        with mock.patch.object(smh_groom, "MAX_INFLATE_BYTES", small_cap):
+            with self.assertRaisesRegex(smh_groom.GroomError, "exceeds"):
+                smh_groom.read_resource(multi_res, 0)
+
+        # Empty GPU zlib chunk makes no progress and raises instead of spinning.
+        empty_chunk = _align16(zlib.compress(b""))
+        empty_res = b"\x00" * 16 + _align16(zlib.compress(sysd)) + empty_chunk * 4 + _align16(zlib.compress(gpu))
+        with self.assertRaisesRegex(smh_groom.GroomError, "no progress"):
+            smh_groom.read_resource(empty_res, 0)
+
+    def test_parse_system_page_rejects_nonfinite_box(self):
+        sysd, gpu = build_synthetic_groom_buffers(unset_rig_floats=True)
+        # Finite +FLT_MAX/-FLT_MAX in +0x50..+0x6f still passes.
+        ok = smh_groom.parse(sysd, gpu)
+        self.assertTrue(ok.has_unset_rig_floats)
+
+        for label, off, val in (
+            ("min_nan", 0x30, float("nan")),
+            ("min_inf", 0x34, float("inf")),
+            ("max_ninf", 0x48, float("-inf")),
+            ("max_nan", 0x40, float("nan")),
+        ):
+            with self.subTest(case=label):
+                bad_sys = bytearray(sysd)
+                struct.pack_into("<f", bad_sys, off, val)
+                with self.assertRaisesRegex(smh_groom.GroomError, "bounding box"):
+                    smh_groom.parse_system_page(bytes(bad_sys))
+
+    def test_scatter_and_seed_validate_bool_and_density_scale(self):
+        sysd, gpu = build_synthetic_groom_buffers()
+        groom = smh_groom.parse(sysd, gpu)
+
+        for bad_cls in (False, True):
+            with self.subTest(seed_class=bad_cls):
+                with self.assertRaises(smh_groom.GroomError):
+                    groom.seed(bad_cls)
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.scatter(groom, count=4, strand_class=bad_cls)
+
+        for bad_count in (True, False):
+            with self.assertRaises(smh_groom.GroomError):
+                smh_groom.scatter(groom, count=bad_count)
+        for bad_cap in (True, False):
+            with self.assertRaises(smh_groom.GroomError):
+                smh_groom.scatter(groom, count=4, max_accepted=bad_cap)
+
+        for bad_ds in (float("nan"), float("inf"), float("-inf"), -0.1, True, False):
+            with self.subTest(density_scale=bad_ds):
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.scatter(groom, count=4, density_scale=bad_ds)
+                # Invalid density_scale is caught even when count=0 or max_accepted=0.
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.scatter(groom, count=0, density_scale=bad_ds)
+
+        # Very large finite density_scale must saturate to 1.0 instead of raising OverflowError in _f32.
+        for huge_ds in (1e37, 1e100):
+            with self.subTest(huge_ds=huge_ds):
+                res = smh_groom.scatter(groom, count=8, strand_class=0, density_scale=huge_ds)
+                self.assertEqual(len(res["tri"]), 8)
+
+    def test_polyline_builders_reject_ragged_and_mismatched_live(self):
+        p3 = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.1), (0.0, 0.0, 0.2)]
+        p2 = [(0.1, 0.0, 0.0), (0.1, 0.0, 0.1)]
+        ragged = [p3, p2]
+        uniform = [p3, p3]
+
+        for builder in (smh_groom.build_tubes, smh_groom.build_ribbons, smh_groom.build_lines):
+            with self.subTest(builder=builder.__name__, case="ragged"):
+                with self.assertRaisesRegex(smh_groom.GroomError, "uniform length"):
+                    builder(ragged)
+            with self.subTest(builder=builder.__name__, case="live_mismatch"):
+                with self.assertRaisesRegex(smh_groom.GroomError, "live length"):
+                    builder(uniform, live=[3])
+
+        for bad in (-0.001, float("nan"), float("inf"), True):
+            with self.assertRaises(smh_groom.GroomError):
+                smh_groom.build_tubes(uniform, radius=bad)
+            with self.assertRaises(smh_groom.GroomError):
+                smh_groom.build_ribbons(uniform, width=bad)
+        with self.assertRaises(smh_groom.GroomError):
+            smh_groom.build_tubes(uniform, sides=True)
+
+    def test_to_glb_validates_radii_budgets_bool_classes_and_deduplicates(self):
+        sysd, gpu = build_synthetic_groom_buffers()
+        groom = smh_groom.parse(sysd, gpu)
+
+        blob_dup, meta_dup = smh_groom.to_glb(
+            groom, scalp=False, guides=False, classes=(0, 0), max_strands=4, geometry="curves",
+        )
+        blob_one, meta_one = smh_groom.to_glb(
+            groom, scalp=False, guides=False, classes=(0,), max_strands=4, geometry="curves",
+        )
+        self.assertEqual(blob_dup, blob_one)
+        self.assertEqual(meta_dup, meta_one)
+        prims = glb_writer.read_glb_summary(blob_dup)["json"]["meshes"][0]["primitives"]
+        self.assertEqual(len(prims), 1)
+
+        for bad_kwargs in (
+            {"classes": (False,)},
+            {"classes": (True,)},
+            {"guide_radius": 0.0},
+            {"guide_radius": -0.001},
+            {"guide_radius": float("nan")},
+            {"guide_radius": float("inf")},
+            {"guide_radius": True},
+            {"strand_radius": 0.0},
+            {"strand_radius": -0.001},
+            {"strand_radius": float("nan")},
+            {"strand_radius": False},
+            {"max_strands": -1},
+            {"max_strands": True},
+            {"vertex_budget": 0},
+            {"vertex_budget": -10},
+            {"vertex_budget": True},
+            {"up_axis": 123},
+        ):
+            with self.subTest(kwargs=bad_kwargs):
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.to_glb(groom, **bad_kwargs)
+
+    def test_run_census_validates_limit_and_survives_struct_error(self):
+        for bad_limit in (0, -5, False, True):
+            with self.subTest(limit=bad_limit):
+                with self.assertRaises(smh_groom.GroomError):
+                    smh_groom.run_census([], limit=bad_limit)
+
+        sysd, gpu = build_synthetic_groom_buffers()
+        native = pack_native_resource(sysd, gpu)
+        with tempfile.TemporaryDirectory() as tmp:
+            ok_smh = os.path.join(tmp, "a_ok.smh")
+            bad_smh = os.path.join(tmp, "b_bad.smh")
+            with open(ok_smh, "wb") as f:
+                f.write(native)
+            with open(bad_smh, "wb") as f:
+                f.write(native)
+
+            real_load = smh_groom.load_groom
+
+            def _flaky_load(path: str, offset: int | None = None):
+                if os.path.basename(path) == "b_bad.smh":
+                    raise struct.error("corrupt unpack")
+                return real_load(path, offset=offset)
+
+            with mock.patch.object(smh_groom, "load_groom", side_effect=_flaky_load):
+                report = smh_groom.run_census([tmp])
+            self.assertEqual(report["totals"]["lods"], 1)
+            self.assertEqual(report["totals"]["errors"], 1)
+
+    def test_cli_validation_overwrite_guard_directory_and_strict_json(self):
+        for bad_cls in ("foo", "0,", "1,x"):
+            with self.subTest(classes=bad_cls):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    smh_groom._parse_classes(bad_cls)
+
+        sysd, gpu = build_synthetic_groom_buffers()
+        native = pack_native_resource(sysd, gpu)
+        with tempfile.TemporaryDirectory() as tmp:
+            smh_path = os.path.join(tmp, "sample.smh")
+            with open(smh_path, "wb") as f:
+                f.write(native)
+
+            # load_groom on directory raises GroomError.
+            with self.assertRaisesRegex(smh_groom.GroomError, "directory"):
+                smh_groom.load_groom(tmp)
+
+            # Invalid CLI flags rejected with argparse exit 2.
+            for extra in (
+                ["--classes", "foo"],
+                ["--classes", "0,"],
+                ["--guide-radius", "0"],
+                ["--guide-radius", "-0.1"],
+                ["--guide-radius", "nan"],
+                ["--strand-radius", "inf"],
+            ):
+                with self.subTest(extra=extra):
+                    proc = subprocess.run(
+                        [
+                            sys.executable, "-I", os.path.join(TOOLS, "smh_groom.py"),
+                            "export-glb", smh_path, os.path.join(tmp, "out.glb"), *extra,
+                        ],
+                        capture_output=True, text=True,
+                    )
+                    self.assertEqual(proc.returncode, 2)
+
+            # export-glb refuses an output directory before loading the input.
+            err_buf = io.StringIO()
+            with mock.patch.object(smh_groom, "load_groom", side_effect=AssertionError("should not load")):
+                with contextlib.redirect_stderr(err_buf):
+                    rc = smh_groom.main(["export-glb", smh_path, tmp])
+            self.assertEqual(rc, 1)
+            self.assertIn("directory", err_buf.getvalue())
+
+            # export-glb delegates input-overwrite check to report_paths.same_report_path
+            # even when the output path does not exist yet (e.g. case-folded alias).
+            missing_alias = os.path.join(tmp, "NONEXISTENT_ALIAS.SMH")
+            err_buf = io.StringIO()
+            with mock.patch.object(smh_groom.report_paths, "same_report_path", return_value=True) as spy:
+                with mock.patch.object(smh_groom, "load_groom", side_effect=AssertionError("should not load")):
+                    with contextlib.redirect_stderr(err_buf):
+                        rc = smh_groom.main(["export-glb", smh_path, missing_alias])
+            self.assertEqual(rc, 1)
+            self.assertIn("must not overwrite", err_buf.getvalue())
+            spy.assert_called_once_with(smh_path, missing_alias)
+
+            # Strict RFC 8259 JSON rejects NaN in inspect --json and census --json.
+            with mock.patch.object(smh_groom.Groom, "summary", return_value={"bad": float("nan")}):
+                with self.assertRaises(ValueError):
+                    smh_groom.main(["inspect", smh_path, "--json"])
+            with mock.patch.object(smh_groom, "run_census", return_value={"bad": float("inf")}):
+                with self.assertRaises(ValueError):
+                    smh_groom.main(["census", smh_path, "--json"])
 
 
 if __name__ == "__main__":

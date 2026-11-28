@@ -195,6 +195,29 @@ Not confirmed:
 So the statement above stands for the config, and for the mixes without markers. For the five marked mixes a
 runtime can read the track boundaries and track numbers from the bank.
 
+#### Title and artist label keys
+
+For a `trackid` marker with flags zero and track number N, hash the decimal number followed by `s` for
+the title label or `a` for the artist label. For example, track number 7 gives `joaat("7s")` and
+`joaat("7a")`, using the lowercase Jenkins one-at-a-time hash. These keys are independent of the
+stream-name hash. Matching against the archive and a static trace support key construction. The runtime
+lookup order and precedence between text tables remain unverified.
+
+On Xbox Series 1.0.2.1, the five long mixes have 137 marker rows and 101 distinct track numbers.
+In the English credits table (1,703 entries), 99 of those numbers have a nonempty title, one has an
+empty title, and one has no title entry. There are 100 nonempty artists and one empty artist entry.
+These counts describe the selected table only.
+
+Run the counts-only checker on the five local AWC banks and a logical resource containing exactly
+one text table. Join the resource's parts before passing it to `--table` if it spans multiple
+carved files (see [String tables](text.md#string-tables)). The checker counts repeated marker rows
+separately from distinct track numbers. Label counts are per distinct number. An invalid input
+produces a fixed message without a file path.
+
+```sh
+python -I tools/track_labels.py mix-1.awc mix-2.awc mix-3.awc mix-4.awc mix-5.awc --table english-credits.bin
+```
+
 ### Other banks
 
 The 419,223 tags outside the music banks are the ones [rsc8_audio.md](rsc8_audio.md#the-0xbd-cue-records)

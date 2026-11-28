@@ -254,6 +254,12 @@ def generate_for_index(spirv_dir, index):
     if not needed:
         return []
     stubs_dir = os.path.join(spirv_dir, "stubs")
+    if os.path.exists(stubs_dir) and not os.path.isdir(stubs_dir):
+        raise NotADirectoryError(f"stubs output path is not a directory: {stubs_dir}")
+    for kind, locs in sorted(needed):
+        target = os.path.join(stubs_dir, stub_name(kind, locs))
+        if os.path.isdir(target):
+            raise IsADirectoryError(f"stub target is a directory: {target}")
     os.makedirs(stubs_dir, exist_ok=True)
     written = []
     for kind, locs in sorted(needed):
@@ -290,13 +296,17 @@ def main(argv=None):
     if len(argv) != 1:
         sys.exit(__doc__)
     spirv_dir = argv[0]
+    if spirv_dir.startswith("-"):
+        sys.exit(f"unknown option: {spirv_dir}\n{__doc__}")
+    if not spirv_dir.strip():
+        sys.exit(f"empty spirv dir\n{__doc__}")
     idx_path = os.path.join(spirv_dir, "index.json")
     if not os.path.isfile(idx_path):
         sys.exit(f"missing {idx_path}")
     try:
         with open(idx_path, encoding="utf-8-sig") as f:
             index = json.load(f)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, RecursionError) as e:
         sys.exit(f"cannot read {idx_path}: {e}")
     if not isinstance(index, dict):
         sys.exit(f"cannot read {idx_path}: expected a JSON object of shader -> metadata entries")

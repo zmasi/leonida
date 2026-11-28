@@ -213,6 +213,67 @@ class Cli(unittest.TestCase):
         finally:
             d.translated = real
 
+    def test_empty_and_malformed_ops_tokens_rejected_and_duplicates_deduped(self):
+        for bad in ("", "   ", ",", " , ", "v_swap_b32,", ",v_swap_b32", "v_swap_b32,,v_movrels_b32"):
+            with self.subTest(ops=bad):
+                rc, out = self.main("--programs", "1", "--ops", bad)
+                self.assertEqual(rc, 2, (bad, out))
+                self.assertNotIn("programs match", out)
+
+        from unittest import mock
+        seen_ops = []
+        real_run_suite = d.run_suite
+
+        def spy(programs, seed, max_ops=8, ops=None, waves=(32,), run=None):
+            seen_ops.append(ops)
+            return real_run_suite(programs, seed, max_ops, ops, waves, run)
+
+        with mock.patch.object(d, "run_suite", spy):
+            rc, out = self.main("--programs", "1", "--seed", "1", "--ops", "v_swap_b32,v_swap_b32")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(seen_ops, [["v_swap_b32"]])
+
+    def test_compare_rejects_mismatched_lane_and_word_counts(self):
+        want = [tuple(range(d.WINDOW)) for _ in range(32)]
+        self.assertIn("lane count mismatch", d.compare(want, []))
+        self.assertIn("lane count mismatch", d.compare(want, want[:31]))
+        self.assertIn("expected 32 words", d.compare(want, [want[0][:4]] + want[1:]))
+
+    def test_run_suite_handles_skip_on_final_shrunk_recheck(self):
+        calls = {"n": 0}
+
+        def flaky(lines, wave):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [tuple(w ^ 1 for w in lane) for lane in d.reference(lines, wave)]
+            raise d.Skip("transient skip")
+
+        counts, failure = d.run_suite(1, 1, 1, ["v_swap_b32"], (32,), run=flaky)
+        self.assertEqual(counts["mismatch"], 1)
+        self.assertIsNotNone(failure)
+        self.assertIn("lane 0", failure[3])
+
+    def test_reference_and_events_raise_ref_error_on_malformed_inputs(self):
+        bad_bodies = (
+            ["s_mov_b32 m0"],
+            ["s_add_u32 m0, m0"],
+            ["v_mov_b32 v1"],
+            ["v_add_nc_u32 v1, v2"],
+            ["v_writelane_b32 v1, s4, nope"],
+            ["v_movrels_b32 v1"],
+            ["v_movrels_b32 v1, "],
+            ["v_movreld_b32 , v1"],
+        )
+        for body in bad_bodies:
+            with self.subTest(body=body):
+                with self.assertRaises(d.RefError):
+                    run(body)
+
+        # events() with uninitialized m0 on a two-field op raises RefError instead of TypeError.
+        prog_no_m0 = d.Program([], ["v_movrelsd_2_b32 v5, v7"], 32)
+        with self.assertRaises(d.RefError):
+            d.events(prog_no_m0)
+
 
 if __name__ == "__main__":
     unittest.main()

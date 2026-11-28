@@ -346,7 +346,8 @@ inline std::uint8_t d3d12_stencil_op(std::uint32_t op, std::uint32_t operand) {
 
 // Empty for a state D3D12 cannot express here: clip space other than D3D's, only one of the near/far z clips off,
 // a polygon mode, culling both faces, depth bounds, the colour-write-on-depth flags, a stencil op without a D3D12 op,
-// or front and back stencil masks that differ (D3D12_DEPTH_STENCIL_DESC has one pair).
+// or two-sided stencil (BACKFACE_ENABLE) with front and back masks that differ (D3D12_DEPTH_STENCIL_DESC has one
+// pair).
 //   PA_CL_CLIP_CNTL: DX_CLIP_SPACE_DEF [19], ZCLIP_NEAR_DISABLE [26], ZCLIP_FAR_DISABLE [27].
 //   PA_SU_SC_MODE_CNTL: CULL_FRONT [0], CULL_BACK [1], FACE [2] (1: clockwise is front), POLY_MODE [4:3].
 //   DB_DEPTH_CONTROL: STENCIL_ENABLE [0], Z_ENABLE [1], Z_WRITE_ENABLE [2], DEPTH_BOUNDS_ENABLE [3], ZFUNC [6:4],
@@ -368,7 +369,10 @@ inline std::optional<DepthRaster> d3d12_depth_raster(const DepthRasterRegisters&
     s.depth_func = static_cast<std::uint8_t>((d >> 4 & 7) + 1);
     s.stencil_enable = d & 1;
     if (!s.stencil_enable) return s;
-    if ((r.stencil_ref_mask & 0x00ffff00) != (r.stencil_ref_mask_bf & 0x00ffff00)) return std::nullopt;
+    // Without BACKFACE_ENABLE the back face uses the front registers and DB_STENCILREFMASK_BF is ignored, as the
+    // back face's ops and function are below.
+    const bool two_sided = d >> 7 & 1;
+    if (two_sided && (r.stencil_ref_mask & 0x00ffff00) != (r.stencil_ref_mask_bf & 0x00ffff00)) return std::nullopt;
     s.read_mask = static_cast<std::uint8_t>(r.stencil_ref_mask >> 8);
     s.write_mask = static_cast<std::uint8_t>(r.stencil_ref_mask >> 16);
     const auto face = [&](std::uint32_t ops, std::uint32_t func, std::uint32_t operand) -> std::optional<StencilFace> {
@@ -381,7 +385,7 @@ inline std::optional<DepthRaster> d3d12_depth_raster(const DepthRasterRegisters&
         return f;
     };
     const auto front = face(r.stencil_control, d >> 8 & 7, r.stencil_ref_mask >> 24);
-    const auto back = (d >> 7 & 1) ? face(r.stencil_control >> 12, d >> 20 & 7, r.stencil_ref_mask_bf >> 24) : front;
+    const auto back = two_sided ? face(r.stencil_control >> 12, d >> 20 & 7, r.stencil_ref_mask_bf >> 24) : front;
     if (!front || !back) return std::nullopt;
     s.front = *front;
     s.back = *back;

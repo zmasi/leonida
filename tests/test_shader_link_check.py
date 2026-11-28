@@ -577,6 +577,55 @@ class CommandLineTest(unittest.TestCase):
         self.assertEqual(result, 0)
         self.assertEqual(reflect.call_count, 2)
 
+    def _restore_writable_tree(self):
+        for entry in self.directory.iterdir():
+            try:
+                os.chmod(entry, 0o600)
+            except OSError:
+                pass
+
+    def test_failed_replace_over_readonly_report_preserves_error_and_cleans_staging_file(self):
+        previous = '{"previous": true}\n'
+        self.report.write_text(previous, encoding="utf-8", newline="\n")
+        os.chmod(self.report, 0o444)
+        self.addCleanup(self._restore_writable_tree)
+        with patch.object(link.os, "replace", side_effect=PermissionError("replace failed")):
+            with self.assertRaisesRegex(PermissionError, "replace failed") as ctx:
+                link.write_report(self.report, {"new": True})
+        self.assertIsNone(ctx.exception.__context__)
+        self.assertEqual(self.report.read_text(encoding="utf-8"), previous)
+        self.assertEqual([p.name for p in self.directory.iterdir() if p.name.startswith(".shader-link-")], [])
+
+    @unittest.skipUnless(os.name == "nt", "Windows enforces read-only file replace and unlink")
+    def test_windows_readonly_report_failure_does_not_leak_staging_file(self):
+        previous = '{"previous": true}\n'
+        self.report.write_text(previous, encoding="utf-8", newline="\n")
+        os.chmod(self.report, 0o444)
+        self.addCleanup(self._restore_writable_tree)
+        with self.assertRaises(PermissionError) as ctx:
+            link.write_report(self.report, {"new": True})
+        self.assertIsNone(ctx.exception.__context__)
+        self.assertEqual(self.report.read_text(encoding="utf-8"), previous)
+        self.assertEqual([p.name for p in self.directory.iterdir() if p.name.startswith(".shader-link-")], [])
+        
+class PublishTest(unittest.TestCase):
+    def test_write_report_publishes_json_and_cleans_temp_on_failure(self):
+        payload = {"pipelines": [{"name": "synthetic-pair", "status": "compatible"}]}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "nested" / "report.json"
+            report_path.parent.mkdir(parents=True, exist_ok=True)
+
+            link.write_report(report_path, payload)
+            self.assertTrue(report_path.is_file())
+            self.assertEqual(json.loads(report_path.read_text(encoding="utf-8")), payload)
+            leftover_temps = list(report_path.parent.glob(".shader-link-*.tmp"))
+            self.assertEqual(leftover_temps, [])
+
+            with patch.object(link.os, "replace", side_effect=OSError("simulated replace failure")):
+                with self.assertRaises(OSError):
+                    link.write_report(report_path, {"pipelines": []})
+            self.assertEqual(list(report_path.parent.glob(".shader-link-*.tmp")), [])
+            self.assertEqual(json.loads(report_path.read_text(encoding="utf-8")), payload)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

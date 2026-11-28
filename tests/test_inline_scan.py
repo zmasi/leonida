@@ -186,6 +186,87 @@ class InlineScanCliTests(unittest.TestCase):
         self.assertIn("instructions scanned: 2", proc.stdout)
         self.assertIn("checked 0, UNCHECKED 0", proc.stdout)
 
+    def test_utf8_bom_on_line_1_is_scanned(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "bom.txt")
+            text = "".join(listing("ret"))
+            with open(path, "wb") as f:
+                f.write(b"\xef\xbb\xbf" + text.encode("utf-8"))
+            out, err = io.StringIO(), io.StringIO()
+            with redirect_stdout(out), redirect_stderr(err):
+                rc = inline_scan.main([path])
+            self.assertEqual(rc, 0, err.getvalue())
+            self.assertIn("instructions scanned: 1", out.getvalue())
+            self.assertEqual([ln.strip() for ln in inline_scan.read_lines(Path(path))], [text.strip()])
+
+    def test_dumpbin_early_close_terminates_process_and_uses_utf8(self):
+        import io
+        from pathlib import Path
+        from unittest import mock
+
+        events = []
+
+        class FakeStdout(io.StringIO):
+            def close(self):
+                events.append("stdout.close")
+                super().close()
+
+        class FakeProc:
+            def __init__(self):
+                self.stdout = FakeStdout("line1\nline2\n")
+                self.returncode = None
+
+            def poll(self):
+                return self.returncode
+
+            def terminate(self):
+                events.append("proc.terminate")
+                self.returncode = -15
+
+            def wait(self):
+                events.append("proc.wait")
+                return self.returncode or 0
+
+        fake_proc = FakeProc()
+        with mock.patch.object(inline_scan.shutil, "which", return_value="dumpbin.exe"), \
+                mock.patch.object(inline_scan.subprocess, "Popen", return_value=fake_proc) as mpopen:
+            gen = inline_scan.read_lines(Path("sample.dll"))
+            self.assertEqual(next(gen), "line1\n")
+            gen.close()
+        self.assertEqual(mpopen.call_args.kwargs.get("encoding"), "utf-8")
+        self.assertIn("stdout.close", events)
+        self.assertIn("proc.terminate", events)
+        self.assertIn("proc.wait", events)
+
+    def test_negative_base_and_oserror_return_2(self):
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "ok.txt")
+            with open(path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("".join(listing("ret")))
+            for bad_args in ([path, "--base=-0x1000"], [path, "--base", "-16"]):
+                with self.subTest(args=bad_args):
+                    err = io.StringIO()
+                    with redirect_stderr(err), self.assertRaises(SystemExit) as ctx:
+                        inline_scan.main(bad_args)
+                    self.assertEqual(ctx.exception.code, 2)
+                    self.assertIn("non-negative", err.getvalue())
+
+            out, err = io.StringIO(), io.StringIO()
+            with mock.patch.object(inline_scan, "read_lines", side_effect=PermissionError("denied")), \
+                    redirect_stdout(out), redirect_stderr(err):
+                rc = inline_scan.main([path])
+            self.assertEqual(rc, 2)
+            self.assertEqual(out.getvalue(), "")
+            self.assertIn("denied", err.getvalue())
+
 
 if __name__ == "__main__":
     unittest.main()

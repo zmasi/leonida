@@ -74,6 +74,7 @@ class FakeDevice:
     driver_id: int = 1      # VK_DRIVER_ID_AMD_PROPRIETARY
     vendor_id: int = 0
     device_id: int = 0
+    driver_version: int = 0  # VkPhysicalDeviceProperties.driverVersion; 0 = not reported
 
 
 class FakeVulkan:
@@ -189,6 +190,7 @@ class FakeVulkan:
         ctypes.c_uint32.from_address(base + vk_info.PROPS_DEVICE_TYPE).value = dev.device_type
         ctypes.c_uint32.from_address(base + vk_info.PROPS_VENDOR_ID).value = dev.vendor_id
         ctypes.c_uint32.from_address(base + vk_info.PROPS_DEVICE_ID).value = dev.device_id
+        ctypes.c_uint32.from_address(base + vk_info.PROPS_DRIVER_VERSION).value = dev.driver_version
         ctypes.c_uint32.from_address(base + vk_info.PROPS_MAX_PUSH_CONSTANTS_SIZE).value = dev.max_push_constants_size
         raw_name = dev.name.encode("utf-8") if isinstance(dev.name, str) else dev.name
         name_bytes = raw_name[:256].ljust(256, b"\x00")
@@ -373,6 +375,7 @@ class ConstantsAndLayoutTest(unittest.TestCase):
         self.assertEqual(vk_info.F13_SYNCHRONIZATION2, 16 + 4 * 9)
         self.assertEqual(vk_info.F13_DYNAMIC_RENDERING, 16 + 4 * 12)
         self.assertEqual(vk_info.PROPS_API_VERSION, 0)
+        self.assertEqual(vk_info.PROPS_DRIVER_VERSION, 4)
         self.assertEqual(vk_info.PROPS_VENDOR_ID, 8)
         self.assertEqual(vk_info.PROPS_DEVICE_ID, 12)
         self.assertEqual(vk_info.PROPS_DEVICE_TYPE, 16)
@@ -905,6 +908,40 @@ class QueryTest(unittest.TestCase):
                 self.assertIs(vk_info.gfx90c_amd_windows(vendor, device, driver), want and driver == 1)
                 res, _vk = self._run_query(FakeDevice(vendor_id=vendor, device_id=device, driver_id=driver))
                 self.assertEqual((res["vendor_id"], res["device_id"], res["driver_id"]), (vendor, device, driver))
+                self.assertIs(res["barycentric_fallback"], want)
+
+    def test_barycentric_fallback_raphael_old_amd_driver(self):
+        """Raphael iGPU (PCI 1002:164E) under AMD's proprietary driver up to driverVersion 2.0.283 (31.0.22044.1,
+        compiler 23.20.44) returns a wrong third BaryCoordKHR. The bound is inclusive; unknown (None or 0) is no
+        fallback from this rule. Literal IDs, so a changed constant or table fails here."""
+        ver = vk_info.RAPHAEL_OLD_AMD_DRIVER_VERSION
+        self.assertEqual(ver, (2 << 22) | (0 << 12) | 283)
+        amd, prop, anv = vk_info.AMD_VENDOR_ID, vk_info.VK_DRIVER_ID_AMD_PROPRIETARY, vk_info.VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA
+        cases = (("exact_2.0.283", amd, 0x164E, prop, ver, True),
+                 ("one_patch_lower_2.0.282", amd, 0x164E, prop, ver - 1, True),
+                 ("patch_2.0.284", amd, 0x164E, prop, ver + 1, False),
+                 ("unknown_none", amd, 0x164E, prop, None, False),
+                 ("unreported_zero", amd, 0x164E, prop, 0, False),
+                 ("other_rdna2_0x13C0_same_version", amd, 0x13C0, prop, ver, False),
+                 ("radv", amd, 0x164E, 3, ver, False),
+                 ("amdvlk_open", amd, 0x164E, 2, ver, False),
+                 ("other_vendor_same_id", 0x10DE, 0x164E, prop, ver, False),
+                 ("gfx90c_unchanged_old", amd, 0x15E7, prop, ver, True),
+                 ("gfx90c_unchanged_newer", amd, 0x15E7, prop, ver + 1, True),
+                 ("anv_unchanged", 0x8086, 0xE20B, anv, None, True))
+        for label, vendor, device, driver, version, want in cases:
+            with self.subTest(case=label):
+                self.assertIs(vk_info.barycentric_fallback(vendor, device, driver, version), want)
+
+    def test_barycentric_fallback_raphael_old_amd_driver_reaches_the_query(self):
+        """The real device path passes the driverVersion read from VkPhysicalDeviceProperties."""
+        ver = vk_info.RAPHAEL_OLD_AMD_DRIVER_VERSION
+        for label, version, want in (("2.0.283", ver, True), ("2.0.282", ver - 1, True),
+                                     ("2.0.284", ver + 1, False), ("unreported", 0, False)):
+            with self.subTest(case=label):
+                res, _vk = self._run_query(FakeDevice(name="AMD Radeon(TM) Graphics", vendor_id=0x1002,
+                                                       device_id=0x164E, driver_id=1, driver_version=version))
+                self.assertEqual(res["device_id"], 0x164E)
                 self.assertIs(res["barycentric_fallback"], want)
 
     def test_barycentric_fallback_answer_is_for_the_runtime_gpu(self):

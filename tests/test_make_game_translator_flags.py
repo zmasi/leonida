@@ -37,6 +37,13 @@ class FallbackFlagsTest(unittest.TestCase):
     def test_all_flags_in_record_order(self):
         self.assertEqual(make_game.fallback_flags(self.args_with(*reversed(ALL_FLAGS))), ALL_FLAGS)
 
+    def test_every_forwarded_flag_is_a_translator_option(self):
+        # The flags go to rdna2spirv.py verbatim: one it does not define would end every translation with a usage error.
+        with open(os.path.join(ROOT, "tools", "rdna2spirv.py"), encoding="utf-8") as f:
+            translator = f.read()
+        for flag, _attr in make_game.FALLBACK_FLAGS:
+            self.assertIn(f'ap.add_argument("{flag}"', translator, flag)
+
 
 class TranslateFallbacksTest(unittest.TestCase):
     """translate() passes the fallback flags to every shard, and re-plans when they change."""
@@ -221,6 +228,18 @@ class MainWiringTest(unittest.TestCase):
         pre, sh = self.run_main()
         self.assertEqual(pre, ())
         self.assertEqual(sh, ())
+
+    def test_mesh_serial_waves_is_opt_in_and_forwarded(self):
+        # #2435's translator switch: nothing passes it unless asked, and asking forwards it like the other flags.
+        pre, sh = self.run_main("--mesh-serial-waves")
+        self.assertEqual(pre, ("--mesh-serial-waves",))
+        self.assertEqual(sh, pre)
+
+    def test_mesh_serial_waves_is_recorded_after_the_older_flags(self):
+        # Appended to FALLBACK_FLAGS, so the settings recorded for existing folders keep their spelling.
+        pre, _sh = self.run_main("--mesh-serial-waves", "--mesh-compute", "--no-float-controls")
+        self.assertEqual(pre, ("--no-float-controls", "--mesh-compute", "--mesh-serial-waves"))
+        self.assertEqual(make_game.translator_flags_setting(pre), "--no-float-controls --mesh-compute --mesh-serial-waves")
 
     def test_f16_interp_fallback_follows_the_device(self):
         """On by itself where vk_subgroup_info says the GPU can't take PerVertexKHR inputs (MoltenVK), not where

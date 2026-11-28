@@ -268,6 +268,26 @@ class TestConversations(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
+    def test_incomplete_bank_walk_preserves_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            banks = os.path.join(tmp, "banks")
+            os.mkdir(banks)
+            write(os.path.join(banks, "ok.awc"), make_bank(["sample_name"]))
+            words = write(os.path.join(tmp, "words.txt"), "sample_name\n")
+            out = write(os.path.join(tmp, "report.json"), "previous report")
+            def partial_walk(path, *, onerror=None):
+                yield banks, [], ["ok.awc"]
+                if onerror:
+                    onerror(PermissionError("blocked subtree"))
+            err = io.StringIO()
+            with mock.patch.object(A.os, "walk", partial_walk), contextlib.redirect_stdout(io.StringIO()), \
+                    contextlib.redirect_stderr(err):
+                rc = A.main([banks, "--words", words, "--out", out])
+            self.assertEqual(rc, 2)
+            self.assertIn("blocked subtree", err.getvalue())
+            with open(out, encoding="utf-8") as fh:
+                self.assertEqual(fh.read(), "previous report")
+
     def test_sources_with_same_basename_keep_separate_summaries_and_streams(self):
         with tempfile.TemporaryDirectory() as tmp:
             sources = []
@@ -474,6 +494,18 @@ class TestCli(unittest.TestCase):
                     self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
                     self.assertIn("awc_names: error: cannot read", err.getvalue())
                     self.assertFalse(os.path.exists(out))
+
+    def test_word_dictionary_preambles(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = [
+                ("hashdict", "\ufeff" + " " * 8192 + '\n{"123": "voice_a"}', ["voice_a"]),
+                ("words.json", '\ufeff ["voice_b"]', ["voice_b"]),
+                ("words.txt", "\ufeffvoice_c\nvoice_d\n", ["voice_c", "voice_d"]),
+            ]
+            for filename, contents, expected in cases:
+                with self.subTest(filename=filename):
+                    path = write(os.path.join(tmp, filename), contents.encode("utf-8"))
+                    self.assertEqual(A.read_words(path), expected)
 
     def test_json_word_list_still_reads(self):
         with tempfile.TemporaryDirectory() as tmp:
