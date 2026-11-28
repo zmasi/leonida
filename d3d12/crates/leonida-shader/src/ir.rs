@@ -275,21 +275,17 @@ fn unspill(
     vgprs: u16,
 ) -> Vec<(usize, u8, u8)> {
     /// `v_writelane_b32 vN, sX, K` / `v_readlane_b32 sX, vN, K`: (save, N, X, K).
-    fn parked(inst: &gfx10::Instruction, fields: &Fields) -> Option<(bool, u8, u8, u32)> {
+    fn parked(inst: &gfx10::Instruction, fields: &Fields, wave64: bool) -> Option<(bool, u8, u8, u32)> {
         let Fields::Valu(v) = fields else { return None };
         if v.abs != 0 || v.neg != 0 || v.opsel != 0 || v.clamp || v.omod != 0 || v.sdwa.is_some() || v.dpp.is_some() {
             return None;
         }
-        let lane = |op: &Operand| match *op {
-            Operand::Const(c @ 128..=191) => Some(u32::from(c) - 128),
-            _ => None,
-        };
         match (inst.name()?, v.dst?, v.src.as_slice()) {
             ("v_writelane_b32", Operand::Vector { reg, .. }, [Operand::Scalar { code, .. }, k]) if *code < 105 => {
-                Some((true, reg, *code, lane(k)?))
+                Some((true, reg, *code, crate::resource::lane_of(*k, wave64)?))
             }
             ("v_readlane_b32", Operand::Scalar { code, .. }, [Operand::Vector { reg, .. }, k]) if code < 105 => {
-                Some((false, *reg, code, lane(k)?))
+                Some((false, *reg, code, crate::resource::lane_of(*k, wave64)?))
             }
             _ => None,
         }
@@ -305,7 +301,7 @@ fn unspill(
     for inst in list.iter() {
         let Some(name) = inst.name() else { return Vec::new() };
         let fields = inst.fields(wave64);
-        let park = parked(inst, &fields);
+        let park = parked(inst, &fields, wave64);
         let Ok(effects) = effects(inst, &fields, name, lanes, vgprs) else {
             return Vec::new();
         };

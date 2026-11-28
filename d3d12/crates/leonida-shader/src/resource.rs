@@ -2336,10 +2336,7 @@ impl Tracer<'_> {
         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
             return None;
         };
-        let lane = lane_of(lane)?;
-        if lane >= if self.p.wave64 { 64 } else { 32 } {
-            return None;
-        }
+        let lane = lane_of(lane, self.p.wave64)?;
         self.spilled(inst.read(Reg::V(reg))?, lane, block, &mut Vec::new())
             .ok()
             .flatten()
@@ -2387,10 +2384,7 @@ impl Tracer<'_> {
         if inst.name() != "v_writelane_b32" || !plain_lane(w) {
             return Err(());
         }
-        let written = lane_of(*at).ok_or(())?;
-        if written >= if self.p.wave64 { 64 } else { 32 } {
-            return Err(());
-        }
+        let written = lane_of(*at, self.p.wave64).ok_or(())?;
         if written != lane {
             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, block, seen);
         }
@@ -2407,13 +2401,14 @@ impl Tracer<'_> {
     }
 }
 
-/// A lane select given as a constant.
-fn lane_of(op: Operand) -> Option<u32> {
-    match op {
-        Operand::Const(c) => inline(c),
-        Operand::Literal(x) => Some(x),
-        _ => None,
-    }
+/// A lane select given as a constant, masked to the wave's lanes.
+pub(crate) fn lane_of(op: Operand, wave64: bool) -> Option<u32> {
+    let lane = match op {
+        Operand::Const(c) => inline(c)?,
+        Operand::Literal(x) => x,
+        _ => return None,
+    };
+    Some(lane & if wave64 { 63 } else { 31 })
 }
 
 /// What dword `k` of a move's result copies.
@@ -2655,6 +2650,45 @@ pub(crate) mod tests {
             HwStage::Ps,
         );
         assert_eq!(r.scalar, [((0, 3), at(0, 0x20))]);
+    }
+
+    #[test]
+    fn spilled_sgprs_mask_constant_lane_selects_to_wave_width() {
+        let writelane = |src0: u32, lane_op: u32| [0xD761_0000, src0 | (lane_op << 9)];
+        let readlane = |sdst: u32, lane_op: u32| [0xD760_0000 | sdst, 256 | (lane_op << 9)];
+        let check = |wave64: bool, w_op: u32, r_op: u32, keep_vgpr: bool| {
+            let mut words = Vec::new();
+            words.extend(writelane(9, w_op));
+            words.extend(readlane(2, r_op));
+            if keep_vgpr {
+                words.push(0x7E02_0300); // v_mov_b32 v1, v0: exercises Tracer::restored directly
+            }
+            words.extend([
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0001,
+                0xFA00_0020, // s_load_dwordx8 s[0:7], s[2:3], 0x20
+                S_ENDPGM,
+            ]);
+            let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, wave64, 8).unwrap();
+            let r = track(&p, &[param(Table, 9, 1)], HwStage::Ps, lanes(&p).as_ref()).unwrap();
+            assert_eq!(
+                r.scalar.len(),
+                1,
+                "wave64={wave64} w_op={w_op} r_op={r_op} keep_vgpr={keep_vgpr}"
+            );
+            assert_eq!(r.scalar[0].1, at(0, 0x20));
+        };
+        for keep_vgpr in [false, true] {
+            // Wave32 masks lane selects to 5 bits: 35 -> 3, 64 -> 0, -1 -> 31.
+            check(false, 128 + 35, 128 + 3, keep_vgpr);
+            check(false, 128 + 3, 128 + 35, keep_vgpr);
+            check(false, 192, 128, keep_vgpr);
+            check(false, 193, 128 + 31, keep_vgpr);
+            // Wave64 masks lane selects to 6 bits: 64 -> 0, -1 -> 63 (not 35 -> 3).
+            check(true, 192, 128, keep_vgpr);
+            check(true, 193, 128 + 63, keep_vgpr);
+        }
     }
 
     /// A VGPR a wave reduction used is free again after it: from the first

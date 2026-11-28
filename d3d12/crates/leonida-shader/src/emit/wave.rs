@@ -192,7 +192,7 @@ pub(crate) fn sections(p: &Program, block: usize) -> HashMap<usize, Section> {
                     (v.dst, &v.src[..])
                 && let Some(left) = later.read(Reg::V(*reg)).and_then(|x| vec.get(&x))
                 && let Some(w) = later.write(Reg::S(code))
-                && let Some(l) = lane_number(lane)
+                && let Some(l) = crate::resource::lane_of(*lane, wave == 64)
                 && let Some(&sym) = left.get(l as usize)
                 // (a lane's own value stays a lane read)
                 && !matches!(sym, Sym::Own(_))
@@ -286,15 +286,6 @@ fn combine(op: Op, a: Sym, b: Sym) -> Sym {
             }
         }
         _ => Sym::Unknown,
-    }
-}
-
-/// The lane a `v_readlane_b32` names.
-fn lane_number(op: &Operand) -> Option<u32> {
-    match *op {
-        Operand::Const(c) => crate::resource::inline(c),
-        Operand::Literal(x) => Some(x),
-        _ => None,
     }
 }
 
@@ -404,7 +395,7 @@ fn simulate(insts: &[Inst], wave: u32, saved: Value) -> Left {
             else {
                 continue;
             };
-            let l = lane_number(lane);
+            let l = crate::resource::lane_of(*lane, wave == 64);
             let x = lanes(src, &vec, &uni);
             if let Some(w) = inst.write(Reg::S(code)) {
                 let s = l
@@ -1110,7 +1101,7 @@ mod tests {
     /// upscaler's programs).
     #[test]
     fn one_lane_of_what_a_section_leaves_is_read_after_it() {
-        let words = |lane: u32| {
+        let words = |src1: u32| {
             let mut w = WAVE_OR_V7_TO_S7[..14].to_vec(); // .. v_or_b32 v1, v2, v1
             w.extend([
                 0xD760_0007,
@@ -1118,13 +1109,13 @@ mod tests {
                 0x3802_0207, // v_or_b32 v1, s7, v1
                 0xBEFE_0404, // s_mov_b64 exec, s[4:5]
                 0xD760_0006,
-                0x0001_0101 | lane << 9, // v_readlane_b32 s6, v1, lane
+                0x0000_0101 | src1 << 9, // v_readlane_b32 s6, v1, src1
                 S_ENDPGM,
             ]);
             w
         };
-        let read = |lane: u32| {
-            let p = build(&words(lane), true);
+        let read = |src1: u32| {
+            let p = build(&words(src1), true);
             let insts = &p.blocks[0].insts;
             let saved = insts[0].write(Reg::S(4)).unwrap();
             let v7 = p.inputs.iter().find_map(|&(r, v)| (r == Reg::V(7)).then_some(v)).unwrap();
@@ -1132,10 +1123,13 @@ mod tests {
             let sec = &sections(&p, 0)[&0];
             (sec.reads.get(&got).copied(), Shape::Active(Op::Or, v7, saved, 0))
         };
-        let (found, whole) = read(63);
+        let (found, whole) = read(128 + 63);
         assert_eq!(found, Some(whole));
+        // Inline -1 (code 193) masks to lane 63; inline 64 (code 192) wraps to lane 0.
+        assert_eq!(read(193).0, Some(whole));
+        assert_eq!(read(192).0, None);
         // Lane 0 has the first half's alone: still a lane read.
-        assert_eq!(read(0).0, None);
+        assert_eq!(read(128).0, None);
     }
 
     /// `WaveActiveSum` of 16-bit floats, as compiled in

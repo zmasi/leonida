@@ -10106,11 +10106,14 @@ impl<'a> Lower<'a> {
                 let (a, lane) = (s(self, 0)?, s(self, 1)?);
                 // A computed lane in a pixel or vertex program is a host lane
                 // (from a mask or `v_mbcnt`); a constant one is the console's.
-                if self.mask_data == MaskData::Host && !matches!(lane, V::Const(_)) {
+                let host_lane = self.mask_data == MaskData::Host && !matches!(lane, V::Const(_));
+                if host_lane {
                     self.s.flags |= flags::WAVE_OPS;
                 } else {
                     self.cross_lane(false)?;
                 }
+                let width_mask = self.s.m.i32(if self.x.native.wave64 { 63 } else { 31 });
+                let lane = self.s.m.bin(self.cur, Bin::And, lane, width_mask);
                 if let Some(slot) = self.exchange.as_ref().map(|e| e.0) {
                     if self.local && self.local_any {
                         // this host wave's lane of that number (lanes 32..63 are 0..31 here)
@@ -10123,8 +10126,13 @@ impl<'a> Lower<'a> {
                         return Err("a lane read in a half-wave");
                     }
                     if self.exchange.as_ref().is_some_and(|e| e.1) {
-                        // a group of 32 or fewer: the lane is in this host wave
-                        let r = self.read_lane(a, lane);
+                        // a group of 32 or fewer: lanes 0..31 are in this host wave;
+                        // lanes 32..63 of the wave64 never run and read as 0.
+                        let (k31, k32, z) = (self.s.m.i32(31), self.s.m.i32(32), self.s.m.i32(0));
+                        let safe = self.s.m.bin(self.cur, Bin::And, lane, k31);
+                        let r = self.read_lane(a, safe);
+                        let in_wave = self.s.m.cmp(self.cur, pred::IULT, lane, k32);
+                        let r = self.s.m.select(self.cur, in_wave, r, z);
                         return int(self, r);
                     }
                     // the lane that holds it may be in the other host wave: it gives it through LDS
@@ -10155,6 +10163,21 @@ impl<'a> Lower<'a> {
                     }
                     return int(self, r);
                 }
+                let lane = if host_lane {
+                    let count = self.s.op(
+                        self.cur,
+                        "waveGetLaneCount",
+                        Attr::ReadNone,
+                        self.s.t.i32,
+                        112,
+                        &[],
+                    );
+                    let one = self.s.m.i32(1);
+                    let host_mask = self.s.m.bin(self.cur, Bin::Sub, count, one);
+                    self.s.m.bin(self.cur, Bin::And, lane, host_mask)
+                } else {
+                    lane
+                };
                 let r = self.read_lane(a, lane);
                 int(self, r)
             }
@@ -10172,15 +10195,13 @@ impl<'a> Lower<'a> {
                 if self.local && !self.local_any {
                     return Err("a lane write in a half-wave");
                 }
-                let me = self.console_lane();
-                // (the paired form: a wave64 lane select takes the low six bits)
-                let lane = match self.twin {
-                    Some(_) => {
-                        let k63 = self.s.m.i32(63);
-                        self.s.m.bin(c, Bin::And, lane, k63)
-                    }
-                    None => lane,
+                let (me, mask) = if self.local && self.local_any {
+                    (self.lane_index(), 31)
+                } else {
+                    (self.console_lane(), if self.x.native.wave64 { 63 } else { 31 })
                 };
+                let m = self.s.m.i32(mask);
+                let lane = self.s.m.bin(c, Bin::And, lane, m);
                 let is = self.s.m.cmp(c, pred::EQ, me, lane);
                 let r = self.s.m.select(c, is, a, old);
                 int(self, r)
