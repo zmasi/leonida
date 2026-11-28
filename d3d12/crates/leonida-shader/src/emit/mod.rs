@@ -84,6 +84,9 @@ mod bitcode;
 mod container;
 #[cfg(all(test, windows))]
 mod cube_lod_tests;
+mod cvt_flr_rpi;
+#[cfg(all(test, windows))]
+mod cvt_flr_rpi_tests;
 #[cfg(all(test, windows))]
 mod diff_tests;
 #[cfg(all(test, windows))]

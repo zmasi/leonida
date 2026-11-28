@@ -4639,6 +4639,33 @@ impl<'a> Lower<'a> {
         Ok(f)
     }
 
+    /// A float source as its 32-bit pattern, with abs/neg applied to bit 31 so
+    /// negated NaNs keep their sign where the hardware inspects it.
+    fn fsrc_bits(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let mut x = match Self::sdwa_src(inst, k) {
+            Some((sel, sext)) => {
+                let x = self.operand(inst, &op)?;
+                self.select_bits(x, sel, sext)
+            }
+            None if k == 0 && self.src0.is_some() => self.src0.expect("checked"),
+            None => self.operand(inst, &op)?,
+        };
+        let c = self.cur;
+        if v.abs >> k & 1 != 0 {
+            let mask = self.s.m.i32(0x7FFF_FFFF);
+            x = self.s.m.bin(c, Bin::And, x, mask);
+        }
+        if v.neg >> k & 1 != 0 {
+            let sign = self.s.m.i32(0x8000_0000);
+            x = self.s.m.bin(c, Bin::Xor, x, sign);
+        }
+        Ok(x)
+    }
+
     fn src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -9784,15 +9811,8 @@ impl<'a> Lower<'a> {
                 };
                 float(self, r)
             }
-            "v_cvt_i32_f32" | "v_cvt_u32_f32" | "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
-                let mut a = f(self, 0)?;
-                if name == "v_cvt_rpi_i32_f32" {
-                    let h = self.s.m.f32(0.5f32.to_bits());
-                    a = self.s.m.bin(c, Bin::Add, a, h);
-                }
-                if name != "v_cvt_i32_f32" && name != "v_cvt_u32_f32" {
-                    a = self.unary(27, a);
-                }
+            "v_cvt_i32_f32" | "v_cvt_u32_f32" => {
+                let a = f(self, 0)?;
                 // D3D's conversions saturate and give 0 for NaN, as the
                 // hardware does (checked on the RX 6700 XT and WARP).
                 let op = if name == "v_cvt_u32_f32" {
@@ -9801,6 +9821,12 @@ impl<'a> Lower<'a> {
                     Cast::FpToSi
                 };
                 let r = self.s.m.cast(c, op, a, self.s.t.i32);
+                int(self, r)
+            }
+            "v_cvt_flr_i32_f32" | "v_cvt_rpi_i32_f32" => {
+                let bits = self.fsrc_bits(inst, 0)?;
+                let r =
+                    super::cvt_flr_rpi::emit(&mut self.s.m, c, bits, name == "v_cvt_rpi_i32_f32");
                 int(self, r)
             }
             "v_cvt_f32_f64" => {
