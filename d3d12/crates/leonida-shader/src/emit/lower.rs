@@ -12523,27 +12523,6 @@ impl<'a> Lower<'a> {
                     *slot = self.s.m.bin(c, Bin::SDiv, *slot, n);
                 }
             }
-            if op == 81 {
-                // The clamped then the unclamped level of detail.
-                let Operand::Vector { reg, .. } = *data else {
-                    return Err("an image result");
-                };
-                let f32t = self.s.t.f32;
-                for (k, ch) in (0..2u32).filter(|ch| dmask >> ch & 1 != 0).enumerate() {
-                    let clamped = self.s.m.bool(ch == 0);
-                    let lod = self.s.op(
-                        c,
-                        "calculateLOD.f32",
-                        Attr::ReadOnly,
-                        f32t,
-                        81,
-                        &[h, sh, cs[0], cs[1], cs[2], clamped],
-                    );
-                    let x = self.as_int(lod);
-                    self.write(inst, Reg::V(reg + k as u8), x, guard);
-                }
-                return Ok(());
-            }
             let offsets = if kind == 5 {
                 0
             } else {
@@ -12555,13 +12534,29 @@ impl<'a> Lower<'a> {
                 *o = zero;
             }
             if offset_word && offsets > 0 {
+                // DXIL wants immediate offsets in -8..=7 for Sample*; a
+                // constant word in range becomes immediates (upstream PR #634).
                 let w = addr_val(self, 0)?;
-                for (k, at) in [(0, 26), (1, 18)].into_iter().take(offsets.min(2)) {
-                    // Bits at..at+5 sign-extended: shift up, then down.
-                    let left = self.s.m.i32(at);
-                    let t = self.s.m.bin(c, Bin::Shl, w, left);
-                    let k26 = self.s.m.i32(26);
-                    os[k] = self.s.m.bin(c, Bin::AShr, t, k26);
+                let imm = self.s.m.int_value(w).map(|v| v as u32).filter(|&w| {
+                    (0..offsets).all(|k| {
+                        let x = (w >> (8 * k) & 0x3F) as i32;
+                        (-8..=7).contains(&if x >= 32 { x - 64 } else { x })
+                    })
+                });
+                for (k, at) in [(0, 26), (1, 18), (2, 10)].into_iter().take(offsets) {
+                    os[k] = match imm {
+                        Some(w) => {
+                            let x = (w >> (8 * k) & 0x3F) as i32;
+                            self.s.m.i32(if x >= 32 { x - 64 } else { x } as u32)
+                        }
+                        None => {
+                            // Bits at..at+5 sign-extended: shift up, then down.
+                            let left = self.s.m.i32(at);
+                            let t = self.s.m.bin(c, Bin::Shl, w, left);
+                            let k26 = self.s.m.i32(26);
+                            self.s.m.bin(c, Bin::AShr, t, k26)
+                        }
+                    };
                 }
             }
             let mut args = vec![h, sh];
@@ -12642,30 +12637,28 @@ impl<'a> Lower<'a> {
                     call_sample(self, "sampleLevel.f32", 62, &args, &mut gathered)
                 }
                 60 => {
-                    if offset_word {
-                        // DXIL wants immediate offsets in -8..=7 here; the
-                        // console's are 6-bit and may be computed. A
-                        // constant word in range becomes immediates
-                        // (upstream PR #634); anything else keeps the
-                        // offsets computed above (upstream refuses those).
-                        let w = addr_val(self, 0)?;
-                        if let Some(w) = self.s.m.int_value(w) {
-                            let w = w as u32;
-                            let field = |k: usize| {
-                                let x = (w >> (8 * k) & 0x3F) as i32;
-                                if x >= 32 { x - 64 } else { x }
-                            };
-                            let n = offsets.min(2);
-                            if (0..n).all(|k| (-8..=7).contains(&field(k))) {
-                                for (k, o) in os.iter_mut().enumerate().take(n) {
-                                    *o = self.s.m.i32(field(k) as u32);
-                                }
-                            }
-                        }
-                    }
                     args.extend(&os);
                     args.push(clamp);
                     call_sample(self, "sample.f32", 60, &args, &mut gathered)
+                }
+                81 => {
+                    // The clamped then the unclamped level of detail; Z and W are 0.
+                    let f32t = self.s.t.f32;
+                    let fz = self.s.m.f32(0);
+                    let mut g = [fu, fu, fz, fz];
+                    for ch in (0..2usize).filter(|&ch| dmask >> ch & 1 != 0) {
+                        let clamped = self.s.m.bool(ch == 0);
+                        g[ch] = self.s.op(
+                            c,
+                            "calculateLOD.f32",
+                            Attr::ReadOnly,
+                            f32t,
+                            81,
+                            &[h, sh, cs[0], cs[1], cs[2], clamped],
+                        );
+                    }
+                    gathered = Some(g);
+                    fu
                 }
                 61 => {
                     // With a16 the bias is an f16 in the low half of its

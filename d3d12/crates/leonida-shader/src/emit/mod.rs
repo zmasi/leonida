@@ -98,6 +98,8 @@ mod own_bits;
 #[cfg(all(test, windows))]
 mod permlane_tests;
 mod rect;
+#[cfg(all(test, windows))]
+mod sample_offset_3d_tests;
 mod sampler;
 mod shader;
 mod threading;

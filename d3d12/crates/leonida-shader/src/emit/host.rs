@@ -996,6 +996,8 @@ fn transition(
 pub enum View<'a> {
     /// An RGBA32F texture SRV (width, height, texels).
     Texture(u32, u32, &'a [[f32; 4]]),
+    /// An RGBA32F 3D volume texture SRV (width, height, depth, texels in z-major row order).
+    Volume(u32, u32, u32, &'a [[f32; 4]]),
     /// An RGBA32F cube SRV (face size, mip count, texels in D3D subresource order).
     Cube(u32, u16, &'a [[f32; 4]]),
     /// A 2D texture SRV of nothing: the null view of a slot that shows no texture.
@@ -1192,6 +1194,53 @@ impl Host {
                             },
                         };
                         dev.CreateShaderResourceView(None::<&ID3D12Resource>, Some(&desc), at);
+                    }
+                    View::Volume(w, h, depth, texels) => {
+                        let desc = D3D12_RESOURCE_DESC {
+                            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+                            Width: u64::from(w),
+                            Height: h,
+                            DepthOrArraySize: depth as u16,
+                            MipLevels: 1,
+                            Format: DXGI_FORMAT_R32G32B32A32_FLOAT,
+                            SampleDesc: sample,
+                            Flags: D3D12_RESOURCE_FLAG_NONE,
+                            ..Default::default()
+                        };
+                        let tex = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &desc,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        let pitch = (w as usize * 16).next_multiple_of(256);
+                        let rows = (h * depth) as usize;
+                        let up = make(
+                            D3D12_HEAP_TYPE_UPLOAD,
+                            &buffer((pitch * rows) as u64, D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_GENERIC_READ,
+                        )?;
+                        let mut p = std::ptr::null_mut();
+                        up.Map(0, None, Some(&mut p)).map_err(err)?;
+                        for r in 0..rows {
+                            let row = &texels[r * w as usize..(r + 1) * w as usize];
+                            std::ptr::copy_nonoverlapping(
+                                row.as_ptr().cast::<u8>(),
+                                p.cast::<u8>().add(r * pitch),
+                                row.len() * 16,
+                            );
+                        }
+                        up.Unmap(0, None);
+                        let mut src = footprint(&up, w, h);
+                        src.Anonymous.PlacedFootprint.Footprint.Depth = depth;
+                        list.CopyTextureRegion(&subresource(&tex), 0, 0, 0, &src, None);
+                        keep.push(up);
+                        list.ResourceBarrier(&[transition(
+                            &tex,
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                        )]);
+                        dev.CreateShaderResourceView(&tex, None, at);
+                        keep.push(tex);
                     }
                     View::Texture(..) | View::Cube(..) => {
                         let (w, h, mut texels, faces, mips) = match *v {
