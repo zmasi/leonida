@@ -1855,7 +1855,7 @@ mod tests {
         assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_OK);
         assert_eq!(size, expected.len());
         assert_eq!(CALLBACKS.load(Ordering::SeqCst), 0);
-        assert!(XTaskQueueDispatch(q, COMPLETION, 0));
+        assert!(XTaskQueueDispatch(q, COMPLETION, 1000));
         assert_eq!(CALLBACKS.load(Ordering::SeqCst), 1);
 
         let mut got = vec![0u8; expected.len()];
@@ -1886,7 +1886,7 @@ mod tests {
             S_OK
         );
         assert_eq!(XAsyncGetStatus(&mut err_block, true), E_INVALIDARG);
-        assert!(XTaskQueueDispatch(q, COMPLETION, 0));
+        assert!(XTaskQueueDispatch(q, COMPLETION, 1000));
         assert_eq!(CALLBACKS.load(Ordering::SeqCst), 2);
         assert!(call(&mut err_block).is_none());
 
