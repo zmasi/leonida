@@ -107,6 +107,34 @@ const VERBATIM: [u16; 4] = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u1
 /// host's MAX_PATH limit (248 characters for a directory, 260 for a file).
 const LONG: usize = 248;
 
+/// Resolves `.`, `..` (stopping at the virtual drive root), and repeated
+/// separators in `tail`, keeping each remaining segment's leading separator
+/// (`\` when `tail` begins with a relative segment such as `X:name`).
+fn clean_parts(tail: &[u16]) -> Vec<(u16, &[u16])> {
+    let backslash = u16::from(b'\\');
+    let dot = u16::from(b'.');
+    let mut parts: Vec<(u16, &[u16])> = Vec::new();
+    let mut i = 0;
+    while i < tail.len() {
+        let mut sep = backslash;
+        while i < tail.len() && SEPARATORS.contains(&tail[i]) {
+            sep = tail[i];
+            i += 1;
+        }
+        let start = i;
+        while i < tail.len() && !SEPARATORS.contains(&tail[i]) {
+            i += 1;
+        }
+        match &tail[start..i] {
+            [] => {}
+            [d] if *d == dot => {}
+            [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
+            part => parts.push((sep, part)),
+        }
+    }
+    parts
+}
+
 /// `root` and the title's `tail` as a `\\?\` path. That form turns off the
 /// host's own clean-up, so `/` becomes `\` and `.` and `..` are resolved
 /// here (`..` stops at the root).
@@ -122,20 +150,19 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     } else {
         [&VERBATIM[..], root].concat()
     };
-    while out.last() == Some(&backslash) {
+    while out.last().is_some_and(|c| SEPARATORS.contains(c)) {
         out.pop();
     }
-    let dot = u16::from(b'.');
-    let mut parts: Vec<&[u16]> = Vec::new();
-    for part in tail.split(|c| SEPARATORS.contains(c)) {
-        match part {
-            [] => {}
-            [d] if *d == dot => {}
-            [d, e] if [*d, *e] == [dot; 2] => drop(parts.pop()),
-            _ => parts.push(part),
-        }
+    let parts = clean_parts(tail);
+    if parts.is_empty()
+        && out.len() == 6
+        && out.starts_with(&VERBATIM)
+        && out[5] == u16::from(b':')
+    {
+        out.push(backslash);
+        return out;
     }
-    for part in parts {
+    for (_, part) in parts {
         out.push(backslash);
         out.extend_from_slice(part);
     }
@@ -160,25 +187,36 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
-    if prefix.is_empty() && root.len() + tail.len() >= LONG {
+    if !prefix.is_empty() || root.starts_with(&VERBATIM) {
         let mut out = verbatim(root, tail);
         out.push(0);
         return Some(out);
     }
-    let mut out = prefix.to_vec();
-    out.extend_from_slice(root);
-    // `X:` and `X:name` are relative to the root.
-    if !tail.first().is_some_and(|c| SEPARATORS.contains(c)) {
-        out.push(b'\\'.into());
+    let mut base = root.as_slice();
+    while base.len() > 2 && base.last().is_some_and(|c| SEPARATORS.contains(c)) {
+        base = &base[..base.len() - 1];
     }
-    let verbatim = !prefix.is_empty();
-    out.extend(tail.iter().map(|&c| {
-        if verbatim && c == u16::from(b'/') {
-            b'\\'.into()
-        } else {
-            c
+    let parts = clean_parts(tail);
+    let len = if parts.is_empty() {
+        base.len() + 1
+    } else {
+        base.len() + parts.iter().map(|(_, p)| 1 + p.len()).sum::<usize>()
+    };
+    if len >= LONG {
+        let mut out = verbatim(root, tail);
+        out.push(0);
+        return Some(out);
+    }
+    let mut out = Vec::with_capacity(len + 1);
+    out.extend_from_slice(base);
+    if parts.is_empty() {
+        out.push(b'\\'.into());
+    } else {
+        for (sep, part) in parts {
+            out.push(sep);
+            out.extend_from_slice(part);
         }
-    }));
+    }
     out.push(0);
     Some(out)
 }
@@ -430,7 +468,7 @@ pub extern "system" fn GetDiskFreeSpaceW(
 ) -> i32 {
     let mut p = wide(root);
     if let Some(host) = &mut p.1
-        && let [letter, colon, sep, ..] = host[..]
+        && let &[letter, colon, sep, ..] = host.strip_prefix(&VERBATIM).unwrap_or(host)
         && colon == u16::from(b':')
         && SEPARATORS.contains(&sep)
     {
@@ -1016,5 +1054,120 @@ mod tests {
             .map(|e| e.unwrap().file_name())
             .collect();
         assert_eq!(names, ["present.txt"]);
+    }
+
+    #[test]
+    fn parent_segments_clamp_at_the_virtual_drive_root() {
+        let outer = tempfile::tempdir().unwrap();
+        let mounted = outer.path().join("mounted");
+        std::fs::create_dir(&mounted).unwrap();
+        std::fs::write(outer.path().join("outside.txt"), b"host").unwrap();
+
+        let letter = mount(&mounted).unwrap();
+        let root = mounted.to_string_lossy().into_owned();
+        let tr = |s: String| translate(&w(&s)[..s.encode_utf16().count()]).map(|v| text(&v));
+
+        assert_eq!(
+            tr(format!(r"{letter}:\..\outside.txt")),
+            Some(format!(r"{root}\outside.txt"))
+        );
+        assert_eq!(
+            tr(format!("{letter}:/a/../../b/./c.txt")),
+            Some(format!("{root}/b/c.txt"))
+        );
+        assert_eq!(
+            tr(format!(r"{letter}:..\rel.txt")),
+            Some(format!(r"{root}\rel.txt"))
+        );
+        assert_eq!(tr(format!(r"{letter}:\..")), Some(format!(r"{root}\")));
+
+        const INVALID_FILE_ATTRIBUTES: u32 = u32::MAX;
+        assert_eq!(
+            GetFileAttributesW(w(&format!(r"{letter}:\..\outside.txt")).as_ptr()),
+            INVALID_FILE_ATTRIBUTES
+        );
+        let escaped = format!("{letter}:/../outside.txt\0");
+        assert!(fopen(escaped.as_ptr().cast(), c"rb".as_ptr()).is_null());
+
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const CREATE_ALWAYS: u32 = 2;
+        let close = host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32);
+        let null = std::ptr::null_mut();
+        let h = CreateFileW(
+            w(&format!(r"{letter}:\..\..\clamped.bin")).as_ptr(),
+            GENERIC_WRITE,
+            0,
+            null,
+            CREATE_ALWAYS,
+            0,
+            null,
+        );
+        assert_ne!(h as isize, -1);
+        close(h);
+        assert!(mounted.join("clamped.bin").is_file());
+        assert!(!outer.path().join("clamped.bin").exists());
+    }
+
+    #[test]
+    fn explicit_verbatim_and_drive_root_mounts_normalize_cleanly() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let letter = mount(dir.path()).unwrap();
+        let tr = |s: String| translate(&w(&s)[..s.encode_utf16().count()]).map(|v| text(&v));
+
+        assert_eq!(
+            tr(format!(r"\\?\{letter}:\a\.\b\..\c.txt")),
+            Some(format!(r"\\?\{root}\a\c.txt"))
+        );
+        assert_eq!(
+            tr(format!(r"\\?\{letter}:/../../clamped.txt")),
+            Some(format!(r"\\?\{root}\clamped.txt"))
+        );
+
+        let close = host!("kernel32.dll", "CloseHandle": extern "system" fn(Handle) -> i32);
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const CREATE_ALWAYS: u32 = 2;
+        let null = std::ptr::null_mut();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let h = CreateFileW(
+            w(&format!(r"\\?\{letter}:\sub\..\verbatim_ok.bin")).as_ptr(),
+            GENERIC_WRITE,
+            0,
+            null,
+            CREATE_ALWAYS,
+            0,
+            null,
+        );
+        assert_ne!(h as isize, -1);
+        close(h);
+        assert!(dir.path().join("verbatim_ok.bin").is_file());
+
+        let (mut spc, mut bps, mut free_c, mut total_c) = (0, 0, 0, 0);
+        assert_ne!(
+            GetDiskFreeSpaceW(
+                w(&format!(r"\\?\{letter}:\")).as_ptr(),
+                &mut spc,
+                &mut bps,
+                &mut free_c,
+                &mut total_c,
+            ),
+            0
+        );
+        assert!(bps > 0);
+
+        // Letters 'A' and 'B' are outside `mount()`'s 'D'..='Z' pool.
+        mount_at('A', Path::new(r"\\server\share\folder"));
+        assert_eq!(
+            tr(r"\\?\A:/x/../y/file.bin".into()),
+            Some(r"\\?\UNC\server\share\folder\y\file.bin".into())
+        );
+
+        mount_at('B', Path::new(r"C:\"));
+        assert_eq!(tr("B:".into()), Some(r"C:\".into()));
+        assert_eq!(tr("B:sub\\file.bin".into()), Some(r"C:\sub\file.bin".into()));
+        assert_eq!(tr(r"\\?\B:".into()), Some(r"\\?\C:\".into()));
+        assert_eq!(tr(r"\\?\B:\..".into()), Some(r"\\?\C:\".into()));
+        drives().retain(|(l, _)| *l != u16::from(b'A') && *l != u16::from(b'B'));
     }
 }
