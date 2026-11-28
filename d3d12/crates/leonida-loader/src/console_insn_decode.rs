@@ -122,6 +122,8 @@ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
                 && code[i + 3..i + 7] == [0x48, 0x83, 0xC0, 0x40]
                 && (code[i + 7] == 0x48 || code[i + 7] == 0x4C)
                 && code[i + 8] == 0x39
+                && (code[i + 9] & 0xC7) == 0xC0
+                && !(code[i + 7] == 0x48 && code[i + 9] == 0xC0)
                 && code[i + 10..i + 12] == [0x72, 0xF4]
             {
                 let rex_r = code[i + 7] == 0x4C;
@@ -229,5 +231,23 @@ mod tests {
         assert_eq!(decode(&[0x48, 0x8B, 0x01]), None);
         assert_eq!(decode(&[0x66, 0x0F, 0xAE, 0x74, 0x24]), None);
         assert_eq!(decode(&[0x0F]), None);
+    }
+
+    #[test]
+    fn clzero_loop_requires_cmp_against_rax_with_distinct_end_register() {
+        // `cmp rdx, rax` (`48 39 C2`), `cmp [rbx], rax` (`48 39 03`), and
+        // `cmp rax, rax` (`48 39 C0`) after `clzero; add rax, 0x40` must step
+        // the leading `clzero` alone rather than misdecoding as `ClzeroLoop`.
+        for cmp in [[0x48, 0x39, 0xC2], [0x48, 0x39, 0x03], [0x48, 0x39, 0xC0]] {
+            let code = [
+                0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, cmp[0], cmp[1], cmp[2], 0x72, 0xF4,
+            ];
+            assert_eq!(decode(&code), Some((ConsoleOnly::Clzero, 3)), "{cmp:02x?}");
+        }
+        // `cmp rax, r8` (`4C 39 C0`, REX.R = 1 -> `end_reg = 8`) IS a valid loop.
+        assert_eq!(
+            decode(&[0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x4C, 0x39, 0xC0, 0x72, 0xF4]),
+            Some((ConsoleOnly::ClzeroLoop { end_reg: 8 }, 12))
+        );
     }
 }
