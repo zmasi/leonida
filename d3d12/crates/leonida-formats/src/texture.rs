@@ -264,7 +264,7 @@ fn shared_pattern(kind: usize, element_log2: u32, block_log2: u32) -> &'static S
         .get_or_init(|| pattern(kind, element_log2, block_log2).map(|bits| spread(&bits)))
 }
 
-const MAX_MIPS: u32 = 16;
+const MAX_MIPS: u32 = 15;
 
 /// The largest width, height and depth (or array size) accepted, in texels.
 /// GFX10's image descriptors hold at most 16384 texels per side, so no
@@ -282,18 +282,35 @@ impl Layout {
     pub fn new(desc: &Desc) -> Result<Layout, Error> {
         let d = *desc;
         let block_log2 = d.swizzle.block_log2().ok_or(Error::Invalid)?;
+        let extent = d
+            .width
+            .max(d.height)
+            .max(if d.dimension == Dimension::Tex3d { d.depth } else { 1 });
+        // Callers that describe a block-compressed chain directly in 4x4
+        // elements (`block == 1` with 8- or 16-byte elements) may include the
+        // two sub-block 2x2 and 1x1 texel mips, capped at `MAX_MIPS`.
+        let mip_extent = if d.block == 1 && matches!(d.element_bytes, 8 | 16) {
+            extent.saturating_mul(4)
+        } else {
+            extent
+        };
+        let max_mips = (32 - mip_extent.max(1).leading_zeros()).min(MAX_MIPS);
         let valid = (1..=MAX_EXTENT).contains(&d.width)
             && (1..=MAX_EXTENT).contains(&d.height)
             && (1..=MAX_EXTENT).contains(&d.depth)
-            && (1..=MAX_MIPS).contains(&d.mips)
+            && (1..=max_mips).contains(&d.mips)
             && d.element_bytes.is_power_of_two()
             && d.element_bytes <= 16
             && matches!(d.block, 1 | 4)
             && d.samples.is_power_of_two()
             && d.samples <= 8
             && (d.samples == 1
-                || (d.dimension == Dimension::Tex2d && d.mips == 1 && d.swizzle != Swizzle::LINEAR))
-            && (d.dimension != Dimension::Tex1d || d.height == 1)
+                || (d.dimension == Dimension::Tex2d
+                    && d.mips == 1
+                    && d.block == 1
+                    && block_log2 >= 12))
+            && (d.dimension != Dimension::Tex1d
+                || (d.height == 1 && d.block == 1 && d.swizzle == Swizzle::LINEAR))
             && (d.dimension != Dimension::Tex3d
                 || matches!(d.swizzle.0, 0 | 5 | 9 | 17 | 21 | 24..=27));
         if !valid {
@@ -703,8 +720,9 @@ impl Layout {
         } else {
             (dst.len(), src.len())
         };
-        let tiled_need = if DETILE { self.bytes_from(mip) } else { self.size };
-        if tiled_len < tiled_need as usize || linear_len < need || row_pitch < bytes {
+        let tiled_need = usize::try_from(if DETILE { self.bytes_from(mip) } else { self.size })
+            .map_err(|_| Error::TooSmall)?;
+        if tiled_len < tiled_need || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
         let linear = self.desc.swizzle == Swizzle::LINEAR;
@@ -890,9 +908,11 @@ impl Texture {
         } else {
             1
         };
+        let max_mips = 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros();
         let mips = match desc.mips {
-            0 => 32 - desc.width.max(desc.height).max(depth3d).max(1).leading_zeros(),
-            n => n,
+            0 => max_mips,
+            n if n <= max_mips => n,
+            _ => return Err(Error::Invalid),
         };
         let plane = |bytes| Desc {
             dimension: desc.dimension,
@@ -902,7 +922,7 @@ impl Texture {
             mips,
             element_bytes: bytes,
             block: f.block,
-            samples: desc.samples.max(1),
+            samples: desc.samples,
             swizzle: desc.swizzle,
         };
         let mut planes = vec![Plane {
@@ -1509,5 +1529,162 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    #[test]
+    fn mip_chains_past_the_extent_limit_are_refused() {
+        assert_eq!(
+            Layout::new(&desc(MAX_EXTENT, MAX_EXTENT, 16, 4, Swizzle::SW_64KB_S)),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            Layout::new(&desc(4, 4, 4, 4, Swizzle::SW_4KB_S)),
+            Err(Error::Invalid)
+        );
+        assert!(Layout::new(&Desc {
+            block: 4,
+            ..desc(16, 16, 5, 16, Swizzle::SW_4KB_S)
+        })
+        .is_ok());
+        assert_eq!(
+            Layout::new(&Desc {
+                block: 4,
+                ..desc(16, 16, 6, 16, Swizzle::SW_4KB_S)
+            }),
+            Err(Error::Invalid)
+        );
+        let rgba32f = TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 4,
+            height: 4,
+            depth_or_array: 1,
+            mips: 3,
+            format: 2,
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        };
+        assert_eq!(Texture::new(&rgba32f).unwrap().planes[0].layout.mips.len(), 3);
+        assert_eq!(
+            Texture::new(&TextureDesc { mips: 4, ..rgba32f }),
+            Err(Error::Invalid)
+        );
+        let array2d = TextureDesc {
+            width: 2,
+            height: 2,
+            depth_or_array: 8,
+            mips: 3,
+            format: 28,
+            ..rgba32f
+        };
+        assert_eq!(Texture::new(&array2d), Err(Error::Invalid));
+        let volume = TextureDesc {
+            dimension: Dimension::Tex3d,
+            mips: 4,
+            ..array2d
+        };
+        assert_eq!(Texture::new(&volume).unwrap().planes[0].layout.mips.len(), 4);
+        assert_eq!(
+            Texture::new(&TextureDesc { mips: 5, ..volume }),
+            Err(Error::Invalid)
+        );
+    }
+
+    #[test]
+    fn texture_new_refuses_zero_samples() {
+        for swizzle in [Swizzle::LINEAR, Swizzle::SW_64KB_R_X] {
+            let zero_samples = TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 64,
+                height: 64,
+                depth_or_array: 1,
+                mips: 1,
+                format: 28,
+                samples: 0,
+                swizzle,
+            };
+            assert_eq!(Texture::new(&zero_samples), Err(Error::Invalid));
+        }
+    }
+
+    #[test]
+    fn tex1d_refuses_tiled_and_block_compressed_layouts() {
+        assert!(Layout::new(&Desc {
+            dimension: Dimension::Tex1d,
+            ..desc(64, 1, 6, 4, Swizzle::LINEAR)
+        })
+        .is_ok());
+        for swizzle in [Swizzle::SW_256B_S, Swizzle::SW_4KB_S, Swizzle::SW_64KB_D] {
+            assert_eq!(
+                Layout::new(&Desc {
+                    dimension: Dimension::Tex1d,
+                    ..desc(64, 1, 1, 4, swizzle)
+                }),
+                Err(Error::Invalid),
+                "{swizzle:?}"
+            );
+        }
+        assert_eq!(
+            Layout::new(&Desc {
+                dimension: Dimension::Tex1d,
+                block: 4,
+                ..desc(64, 1, 1, 16, Swizzle::LINEAR)
+            }),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            Texture::new(&TextureDesc {
+                dimension: Dimension::Tex1d,
+                width: 64,
+                height: 1,
+                depth_or_array: 1,
+                mips: 1,
+                format: 98,
+                samples: 1,
+                swizzle: Swizzle::LINEAR,
+            }),
+            Err(Error::Invalid)
+        );
+    }
+
+    #[test]
+    fn multisampled_layouts_refuse_block_compression_and_micro_tiling() {
+        for swizzle in [Swizzle::SW_4KB_R_X, Swizzle::SW_64KB_R_X, Swizzle::SW_64KB_Z_X] {
+            assert!(Layout::new(&Desc {
+                samples: 4,
+                ..desc(64, 64, 1, 4, swizzle)
+            })
+            .is_ok());
+        }
+        assert_eq!(
+            Layout::new(&Desc {
+                block: 4,
+                samples: 4,
+                ..desc(64, 64, 1, 16, Swizzle::SW_64KB_R_X)
+            }),
+            Err(Error::Invalid)
+        );
+        assert_eq!(
+            Texture::new(&TextureDesc {
+                dimension: Dimension::Tex2d,
+                width: 64,
+                height: 64,
+                depth_or_array: 1,
+                mips: 1,
+                format: 98,
+                samples: 4,
+                swizzle: Swizzle::SW_64KB_R_X,
+            }),
+            Err(Error::Invalid)
+        );
+        for swizzle in [Swizzle::SW_256B_S, Swizzle::SW_256B_D] {
+            assert_eq!(
+                Layout::new(&Desc {
+                    samples: 4,
+                    ..desc(64, 64, 1, 4, swizzle)
+                }),
+                Err(Error::Invalid),
+                "{swizzle:?}"
+            );
+        }
     }
 }
