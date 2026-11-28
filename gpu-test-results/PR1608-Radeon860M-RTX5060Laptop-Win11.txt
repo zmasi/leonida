@@ -1,0 +1,82 @@
+PR1608 — Leonida Continued, native Windows 11 GPU test
+Date: 2026-11-26 (Pacific/Auckland)
+Claim: https://github.com/ubiquitarianism/leonida/issues/1608#issuecomment-7169912441
+Claims covered: GPU-RADEON860M-WIN11, GPU-RTX5060L-WIN11
+Commit: db1a22d290f5e86fff9282fce3d4e02e788b05b4, shared by both JoeY54 test branches
+OS: Windows 11 Home 26300.9974. Physical adapters tested locally.
+CPU: AMD Ryzen AI 7 H 350. RAM: 32 GiB (MT62F2G32D4DS-023 WT).
+NVIDIA dedicated VRAM: 8151 MiB as reported by nvidia-smi.
+AMD Radeon 860M: driver 26.11.2, Vulkan 1.4.359, subgroup 32–64.
+NVIDIA RTX 5060 Laptop GPU: driver 621.24, Vulkan 1.4.357, subgroup 32.
+Toolchain: Python 3.13.14, CMake 4.4.5, Ninja 1.13.2, llvm-mingw Clang and AMDGPU llvm-mc 23.1.6, Vulkan SDK 1.4.363.1, SPIRV-Tools v2026.4.
+Adapter selection: LEONIDA_VK_DEVICE=860M or RTX 5060 Laptop. A separate cs_store check logged the selected device for each, and an unmatched filter failed.
+Profile selection: LEONIDA_W64_EMULATE=0 or 1.
+Command: python -u -I scripts/run_gpu_tests.py --build <test-root>/build --work <test-root>/work-<adapter>-<profile> --require-pass
+Build: standalone Windows Vulkan executables, LEONIDA_BUILD_WINDOWS_RUNTIME=OFF. The broader MinGW build hit unsupported MSVC SEH syntax. The matching commit had no Runtime CI artifact. The d3d12_texture_uav_test.exe prerequisite is absent, so cs_texture_uav was reported as a failed setup case. Harness-delegated rows were not run separately.
+Failures: the two failures are the same in all four runs. cs_imgatomic_ext is the known fixture issue that open PR #1518 (GPU-IMG-ATOMIC-EXT-VOLUME-TAG) fixes. cs_texture_uav is a setup failure: its D3D12 test executable was not built here, so the case is unverified, not a GPU result.
+
+radeon860m-native — 243 passed, 2 failed, 19 skipped (exit=1 seconds=165.4655759)
+274 shaders: 274 translated, 274 pass spirv-val
+  FAIL  cs_imgatomic_ext      6 of 64 sint words differ; first word 32: got 0x0badf00d, expected 0x00000101
+  FAIL  cs_texture_uav        missing d3d12_texture_uav_test.exe
+Skip reasons:
+  4 × SKIP (run by d3d12_m2_textured_test)
+  4 × SKIP (run by d3d12_m3_frame_test)
+  3 × SKIP (run by d3d12_translated_draw_test)
+  2 × SKIP (run by d3d12_buffer_uav_test)
+  2 × SKIP (run by d3d12_m4_compute_test)
+  2 × SKIP (run by d3d12_quad_index_test)
+  1 × SKIP (run by d3d12_m2_formats_test)
+  1 × SKIP (run by w64_graphics.py)
+
+radeon860m-emulated — 243 passed, 2 failed, 19 skipped (exit=1 seconds=143.7456425)
+274 shaders: 274 translated, 274 pass spirv-val
+  FAIL  cs_imgatomic_ext      6 of 64 sint words differ; first word 32: got 0x0badf00d, expected 0x00000101
+  FAIL  cs_texture_uav        missing d3d12_texture_uav_test.exe
+Skip reasons:
+  4 × SKIP (run by d3d12_m2_textured_test)
+  4 × SKIP (run by d3d12_m3_frame_test)
+  3 × SKIP (run by d3d12_translated_draw_test)
+  2 × SKIP (run by d3d12_buffer_uav_test)
+  2 × SKIP (run by d3d12_m4_compute_test)
+  2 × SKIP (run by d3d12_quad_index_test)
+  1 × SKIP (run by d3d12_m2_formats_test)
+  1 × SKIP (run by w64_graphics.py)
+
+rtx5060l-native — 208 passed, 2 failed, 54 skipped (exit=1 seconds=155.685497)
+274 shaders: 274 translated, 274 pass spirv-val
+  FAIL  cs_imgatomic_ext      6 of 64 sint words differ; first word 32: got 0x0badf00d, expected 0x00000101
+  FAIL  cs_texture_uav        missing d3d12_texture_uav_test.exe
+Skip reasons:
+  33 × SKIP (no 64-wide compute subgroup on this device)
+  4 × SKIP (run by d3d12_m2_textured_test)
+  4 × SKIP (run by d3d12_m3_frame_test)
+  3 × SKIP (run by d3d12_translated_draw_test)
+  2 × SKIP (run by d3d12_buffer_uav_test)
+  2 × SKIP (run by d3d12_m4_compute_test)
+  2 × SKIP (run by d3d12_quad_index_test)
+  1 × SKIP (no 64-wide subgroup on this device)
+  1 × SKIP (run by d3d12_m2_formats_test)
+  1 × SKIP (run by w64_graphics.py)
+  1 × SKIP (this device cannot require a 64-wide fragment subgroup: subgroup 32..32)
+
+rtx5060l-emulated — 242 passed, 2 failed, 20 skipped (exit=1 seconds=153.5402793)
+274 shaders: 274 translated, 274 pass spirv-val
+  FAIL  cs_imgatomic_ext      6 of 64 sint words differ; first word 32: got 0x0badf00d, expected 0x00000101
+  FAIL  cs_texture_uav        missing d3d12_texture_uav_test.exe
+Skip reasons:
+  4 × SKIP (run by d3d12_m2_textured_test)
+  4 × SKIP (run by d3d12_m3_frame_test)
+  3 × SKIP (run by d3d12_translated_draw_test)
+  2 × SKIP (run by d3d12_buffer_uav_test)
+  2 × SKIP (run by d3d12_m4_compute_test)
+  2 × SKIP (run by d3d12_quad_index_test)
+  1 × SKIP (run by d3d12_m2_formats_test)
+  1 × SKIP (run by w64_graphics.py)
+  1 × SKIP (this device cannot require a 64-wide fragment subgroup: subgroup 32..32)
+
+Check of PR #1518, separate from the baseline results
+Both adapters reproduce the cs_imgatomic_ext mismatch already reported in #1608 and #14 and fixed by open PR #1518 (PierreEbele). The 3D texture kept its fill values.
+#1518 changes the fixture's volume T# words to s12 = 0x80000055 and s15 = 0xd7801800, the key vk_store_test expects since db19bbd34. With those two values applied in a separate worktree, cs_imgatomic_ext passed 1/1 on both adapters in both profiles. This confirms #1518 on Radeon 860M and RTX 5060 Laptop. It is not a separate fix. The baseline checkout is clean.
+AI-assisted with Codex for setup, execution, diagnosis, and reporting.
+

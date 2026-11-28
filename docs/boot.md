@@ -103,11 +103,19 @@ Useful switches:
   Diagnostic only: a correct run reaches none, so each skipped address is a finding, not a fix. A failed guest file
   open is always traced as `file_open_failed` (path, error, caller) when `--trace` is on.
 * `LEONIDA_STUB_PIPELINES=1` creates a pipeline whose translated shader is missing (no shader library, or no entry
-  for its program) as a no-op stub instead of failing `CreateGraphicsPipelineState` / `CreateComputePipelineState`.
-  The stub is never registered, so `SetPipelineState` binds no PSO and its draws and dispatches are no-ops (D3D-482).
-  Diagnostic only, like `LEONIDA_SKIP_INT3`: it follows a boot past every pipeline the title creates without
-  translating or running a game shader, so nothing the title draws reaches the screen. Each stub is logged with a
-  power-of-two count.
+  for its program) as a stub instead of failing `CreateGraphicsPipelineState` / `CreateComputePipelineState`.
+  A graphics pipeline with a vertex stage (MVP-GPU-04) is a real Vulkan pipeline built from the built-in stages in
+  `runtime/src/stub_pipeline.h` and registered like any other, so its draws run through replay (render targets,
+  layouts, push constants) and the validation layer. Its vertex stage puts every vertex outside the clip volume, so
+  the draw changes no pixel. `LEONIDA_STUB_PIPELINES=color` makes every three vertices a triangle over the viewport
+  and writes magenta (1 to an integer target) to each render target, so the passes that are stubbed show on screen.
+  The cover needs a triangle topology (a point or line draw marks only its points or lines) and stays inside the
+  scissor rectangle; the title's culling, wireframe fill, sample mask, depth and stencil tests, blending and logic op
+  are off for it, and its write mask is kept. A compute or mesh stub is never registered: `SetPipelineState` binds no
+  executable pipeline and its dispatches and mesh draws are not recorded (D3D-482). A mesh draw with another device's
+  stub, and a draw with another implementation's PSO, are still recording errors. Diagnostic only, like `LEONIDA_SKIP_INT3`: it follows a boot past every pipeline the title
+  creates without translating or running a game shader. Each stub is logged with a power-of-two count.
+  `d3d12_stub_pipelines_test` and `d3d12_stub_draw_test` cover it.
 * During `--run` on Vulkan, the runtime paints the package shell splash when the title shows its window. The first
   direct queue presents it on the window's swapchain. Startup clears keep the splash visible until the first
   non-black output replaces it. The runtime reads `ShellVisuals/SplashScreenImage` from
