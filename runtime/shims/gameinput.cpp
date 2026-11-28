@@ -933,9 +933,9 @@ bool deliver() {
         std::lock_guard lock(s.mu);
         events.swap(s.queue);
     }
-    s.delivering_thread = GetCurrentThreadId();
+    const DWORD outer = s.delivering_thread.exchange(GetCurrentThreadId());
     for (const Event& e : events) deliver_event(e);
-    s.delivering_thread = 0;
+    s.delivering_thread = outer;
     std::lock_guard lock(s.mu);
     return !s.queue.empty();
 }
@@ -954,7 +954,7 @@ bool deliver_within(uint64_t quota_us) {
         std::lock_guard lock(s.mu);
         batch.swap(s.queue);
     }
-    s.delivering_thread = GetCurrentThreadId();
+    const DWORD outer = s.delivering_thread.exchange(GetCurrentThreadId());
     size_t next = 0;
     while (next < batch.size()) {
         if (next > 0) {
@@ -963,7 +963,7 @@ bool deliver_within(uint64_t quota_us) {
         }
         deliver_event(batch[next++]);
     }
-    s.delivering_thread = 0;
+    s.delivering_thread = outer;
     std::lock_guard lock(s.mu);
     if (next < batch.size()) s.queue.insert(s.queue.begin(), batch.begin() + static_cast<std::ptrdiff_t>(next), batch.end());
     const bool remaining = !s.queue.empty();
@@ -2652,10 +2652,14 @@ public:
             }
         }
         if (token) *token = t;
-        // Blocking enumeration: every connected device is reported before this returns, on the caller's thread.
-        for (const Event& e : now) {
-            fn(t, context, e.device, e.timestamp, e.current, e.previous);
-            e.device->Release();
+        // Blocking enumeration: every connected device is reported before this returns, on the caller's thread. Under
+        // deliver_mu and marked as delivering, through deliver_event, so an UnregisterCallback on another thread waits
+        // for it to return, one from inside it does not wait on itself, and stopping or unregistering skips the rest.
+        if (!now.empty()) {
+            std::lock_guard dl(s.deliver_mu);
+            const DWORD outer = s.delivering_thread.exchange(GetCurrentThreadId());
+            for (const Event& e : now) deliver_event(e);
+            s.delivering_thread = outer;
         }
         return S_OK;
     }

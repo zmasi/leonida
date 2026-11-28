@@ -2153,6 +2153,94 @@ int main(int argc, char** argv) {
                                   nullptr, on_device, &blocking_token);
     check(g_device_events.size() == before.size() + 2, "blocking enumeration reports both pads before returning");
 
+    // Blocking enumeration synchronization: UnregisterCallback from another thread waits for the running blocking
+    // callback and skips remaining connected pads; self-UnregisterCallback / StopCallback inside the first pad's
+    // callback skips the second connected pad without deadlocking.
+    {
+        struct BlockingSync {
+            IGameInput* input = nullptr;
+            HANDLE entered = nullptr;
+            HANDLE release = nullptr;
+            std::atomic<GameInputCallbackToken> token{0};
+            std::atomic<int> calls{0};
+        } sync;
+        sync.input = input;
+        sync.entered = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        sync.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        HANDLE registrar = CreateThread(
+            nullptr, 0,
+            [](void* p) -> DWORD {
+                auto* s = static_cast<BlockingSync*>(p);
+                GameInputCallbackToken t = 0;
+                s->input->RegisterDeviceCallback(
+                    nullptr, GameInputKindGamepad, GameInputDeviceConnected, GameInputBlockingEnumeration, s,
+                    [](GameInputCallbackToken tok, void* ctx, IGameInputDevice*, uint64_t, uint32_t, uint32_t) {
+                        auto* st = static_cast<BlockingSync*>(ctx);
+                        if (st->calls.fetch_add(1) == 0) {
+                            st->token.store(tok);
+                            SetEvent(st->entered);
+                            WaitForSingleObject(st->release, 3000);
+                        }
+                    },
+                    &t);
+                return 0;
+            },
+            &sync, 0, nullptr);
+        check(WaitForSingleObject(sync.entered, 3000) == WAIT_OBJECT_0,
+              "blocking sync: first pad's blocking enumeration callback is running");
+        HANDLE unregistrar = CreateThread(
+            nullptr, 0,
+            [](void* p) -> DWORD {
+                auto* s = static_cast<BlockingSync*>(p);
+                return s->input->UnregisterCallback(s->token.load(), 0) ? 1 : 0;
+            },
+            &sync, 0, nullptr);
+        const bool waited = WaitForSingleObject(unregistrar, 150) == WAIT_TIMEOUT;
+        check(waited, "blocking sync: UnregisterCallback from another thread waits for the running blocking callback");
+        SetEvent(sync.release);
+        DWORD unreg_rc = 0;
+        check(WaitForSingleObject(unregistrar, 3000) == WAIT_OBJECT_0 &&
+                  GetExitCodeThread(unregistrar, &unreg_rc) && unreg_rc == 1,
+              "blocking sync: UnregisterCallback returns true once the blocking callback finishes");
+        check(WaitForSingleObject(registrar, 3000) == WAIT_OBJECT_0 && sync.calls.load() == 1,
+              "blocking sync: unregistering during the first pad skips the second connected pad");
+        if (registrar) CloseHandle(registrar);
+        if (unregistrar) CloseHandle(unregistrar);
+        if (sync.entered) CloseHandle(sync.entered);
+        if (sync.release) CloseHandle(sync.release);
+
+        struct SelfCancel {
+            IGameInput* input = nullptr;
+            int calls = 0;
+            bool unregistered = false;
+        } self{input, 0, false};
+        GameInputCallbackToken self_tok = 0;
+        check(input->RegisterDeviceCallback(
+                  nullptr, GameInputKindGamepad, GameInputDeviceConnected, GameInputBlockingEnumeration, &self,
+                  [](GameInputCallbackToken tok, void* ctx, IGameInputDevice*, uint64_t, uint32_t, uint32_t) {
+                      auto* s = static_cast<SelfCancel*>(ctx);
+                      if (++s->calls == 1) s->unregistered = s->input->UnregisterCallback(tok, 0);
+                  },
+                  &self_tok) == S_OK &&
+                  self.unregistered && self.calls == 1 && !input->UnregisterCallback(self_tok, 0),
+              "blocking sync: self-UnregisterCallback returns true and skips the second connected pad");
+
+        struct SelfStop {
+            IGameInput* input = nullptr;
+            int calls = 0;
+        } stopped{input, 0};
+        GameInputCallbackToken stop_tok = 0;
+        check(input->RegisterDeviceCallback(
+                  nullptr, GameInputKindGamepad, GameInputDeviceConnected, GameInputBlockingEnumeration, &stopped,
+                  [](GameInputCallbackToken tok, void* ctx, IGameInputDevice*, uint64_t, uint32_t, uint32_t) {
+                      auto* s = static_cast<SelfStop*>(ctx);
+                      if (++s->calls == 1) s->input->StopCallback(tok);
+                  },
+                  &stop_tok) == S_OK &&
+                  stopped.calls == 1 && input->UnregisterCallback(stop_tok, 0),
+              "blocking sync: self-StopCallback skips the second connected pad while keeping the token registered");
+    }
+
     // ---- reading history: GetNextReading and GetPreviousReading ----
     // A tap of A on the Xbox pad, pressed and released before the title reads again.
     SDL_SetJoystickVirtualButton(xbox2.js, SDL_GAMEPAD_BUTTON_WEST, false);
