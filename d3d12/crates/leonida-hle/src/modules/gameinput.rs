@@ -52,6 +52,31 @@ pub const DEVICE_NOT_FOUND: HRESULT = 0x838A_0002_u32 as i32;
 pub const READING_NOT_FOUND: HRESULT = 0x838A_0003_u32 as i32;
 pub const REFERENCE_TOO_OLD: HRESULT = 0x838A_0004_u32 as i32;
 const E_NOINTERFACE: HRESULT = 0x8000_4002_u32 as i32;
+const E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Guid(u32, u16, u16, [u8; 8]);
+
+const IID_IUNKNOWN: Guid = Guid(0, 0, 0, [0xC0, 0, 0, 0, 0, 0, 0, 0x46]);
+const IID_IGAMEINPUT: Guid = Guid(
+    0x11BE_2A7E,
+    0x4254,
+    0x445A,
+    [0x9C, 0x09, 0xFF, 0xC4, 0x0F, 0x00, 0x69, 0x18],
+);
+const IID_IGAMEINPUT_READING: Guid = Guid(
+    0x2156_947A,
+    0xE1FA,
+    0x4DE0,
+    [0xA3, 0x0B, 0xD8, 0x12, 0x93, 0x1D, 0xBD, 0x8D],
+);
+const IID_IGAMEINPUT_DEVICE: Guid = Guid(
+    0x31DD_86FB,
+    0x4C1B,
+    0x408A,
+    [0x86, 0x8F, 0x43, 0x9B, 0x3C, 0xD4, 0x71, 0x25],
+);
 
 /// Input kinds (bits) our devices have.
 const KEYBOARD_KIND: u32 = 0x10;
@@ -60,6 +85,7 @@ const GAMEPAD_KIND: u32 = 0x4_0000;
 /// Device status of a connected device: connected, input enabled.
 const STATUS_CONNECTED: u32 = 0x3;
 const ASYNC_ENUMERATION: u32 = 1;
+const BLOCKING_ENUMERATION: u32 = 2;
 
 /// Gamepad buttons; the title maps each bit to one of its pad buttons.
 const MENU: u32 = 0x1;
@@ -699,7 +725,7 @@ impl State {
         }
         if was != slot.connected {
             tracing::info!(device = index, kind = kind(index), connected = !was, "input device");
-            if index == MOUSE && !slot.connected {
+            if !slot.connected {
                 slot.history.clear();
             }
             let (current, previous) = if was {
@@ -762,7 +788,7 @@ fn hub(this: This) -> &'static Hub {
 fn fail(out: Out, hr: HRESULT) -> HRESULT {
     if !out.is_null() {
         // SAFETY: checked non-null; the title passes room for a pointer.
-        unsafe { out.write(std::ptr::null()) };
+        unsafe { out.write_unaligned(std::ptr::null()) };
     }
     hr
 }
@@ -773,16 +799,62 @@ fn hand(out: Out, reading: Option<&Ref>) -> HRESULT {
         _ if out.is_null() => E_INVALIDARG,
         Some(reading) => {
             // SAFETY: checked non-null; the title passes room for a pointer.
-            unsafe { out.write(reading.share().cast()) };
+            unsafe { out.write_unaligned(reading.share().cast()) };
             S_OK
         }
         None => fail(out, READING_NOT_FOUND),
     }
 }
 
-extern "system" fn no_interface(_: *const c_void, _iid: *const c_void, out: Out) -> HRESULT {
-    tracing::warn!("input QueryInterface not implemented");
-    fail(out, E_NOINTERFACE)
+fn query_interface(
+    this: *const c_void,
+    iid: *const c_void,
+    out: Out,
+    own: Guid,
+    on_hit: fn(*const c_void),
+) -> HRESULT {
+    if out.is_null() {
+        return E_POINTER;
+    }
+    if this.is_null() || iid.is_null() {
+        return fail(out, E_INVALIDARG);
+    }
+    // SAFETY: `iid` is non-null; read the 16-byte GUID unaligned.
+    let requested = unsafe { iid.cast::<Guid>().read_unaligned() };
+    if requested == IID_IUNKNOWN || requested == own {
+        on_hit(this);
+        // SAFETY: `out` is non-null; write unaligned.
+        unsafe { out.write_unaligned(this) };
+        S_OK
+    } else {
+        fail(out, E_NOINTERFACE)
+    }
+}
+
+extern "system" fn input_query_interface(
+    this: *const c_void,
+    iid: *const c_void,
+    out: Out,
+) -> HRESULT {
+    query_interface(this, iid, out, IID_IGAMEINPUT, |_| {})
+}
+
+extern "system" fn device_query_interface(
+    this: *const c_void,
+    iid: *const c_void,
+    out: Out,
+) -> HRESULT {
+    query_interface(this, iid, out, IID_IGAMEINPUT_DEVICE, |_| {})
+}
+
+extern "system" fn reading_query_interface(
+    this: *const c_void,
+    iid: *const c_void,
+    out: Out,
+) -> HRESULT {
+    query_interface(this, iid, out, IID_IGAMEINPUT_READING, |p| {
+        reading_add_ref(p.cast());
+    })
 }
 /// The input object and devices live as long as the process.
 extern "system" fn add_ref(_: *const c_void) -> u32 {
@@ -853,6 +925,9 @@ fn relative(
         return fail(out, E_INVALIDARG);
     }
     let state = hub.state();
+    if !device.is_null() && !state.slots[index].connected {
+        return fail(out, DEVICE_DISCONNECTED);
+    }
     let history = &state.slots[index].history;
     if history
         .front()
@@ -905,16 +980,26 @@ extern "system" fn temporal_reading(
         return fail(out, E_INVALIDARG);
     };
     let state = hub.state();
+    if !state.slots[index].connected {
+        return fail(out, DEVICE_DISCONNECTED);
+    }
     let history = &state.slots[index].history;
     hand(out, history.iter().rev().find(|r| r.timestamp <= time))
 }
 
 static NEXT_TOKEN: AtomicU64 = AtomicU64::new(1);
 
+fn clear_token(out: *mut u64) {
+    if !out.is_null() {
+        // SAFETY: checked non-null; write unaligned.
+        unsafe { out.write_unaligned(0) };
+    }
+}
+
 fn token(out: *mut u64) -> HRESULT {
     if !out.is_null() {
-        // SAFETY: checked non-null.
-        unsafe { out.write(NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)) };
+        // SAFETY: checked non-null; write unaligned.
+        unsafe { out.write_unaligned(NEXT_TOKEN.fetch_add(1, Ordering::Relaxed)) };
     }
     S_OK
 }
@@ -922,14 +1007,18 @@ fn token(out: *mut u64) -> HRESULT {
 // shortcut: reading callbacks never run; the title registers none
 // (it polls).
 extern "system" fn register_reading(
-    _: This,
-    _device: *const c_void,
+    this: This,
+    device: *const c_void,
     _kind: u32,
     _threshold: f32,
     _context: *mut c_void,
-    _callback: *const c_void,
+    callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
+    clear_token(out);
+    if callback.is_null() || (!device.is_null() && hub(this).index(device.cast()).is_none()) {
+        return E_INVALIDARG;
+    }
     tracing::warn!("input reading callbacks are never called");
     token(out)
 }
@@ -948,10 +1037,16 @@ extern "system" fn register_device(
     callback: Option<DeviceCallback>,
     out: *mut u64,
 ) -> HRESULT {
+    clear_token(out);
+    let hub = hub(this);
     let Some(callback) = callback else {
         return E_INVALIDARG;
     };
-    let hub = hub(this);
+    if enumeration > BLOCKING_ENUMERATION
+        || (!device.is_null() && hub.index(device).is_none())
+    {
+        return E_INVALIDARG;
+    }
     let registration = Registration {
         token: NEXT_TOKEN.fetch_add(1, Ordering::Relaxed),
         device: device as usize,
@@ -982,20 +1077,24 @@ extern "system" fn register_device(
         }
     }
     if !out.is_null() {
-        // SAFETY: checked non-null.
-        unsafe { out.write(registration.token) };
+        // SAFETY: checked non-null; write unaligned.
+        unsafe { out.write_unaligned(registration.token) };
     }
     hub.deliver(found);
     S_OK
 }
 /// Guide button and keyboard layout callbacks: neither ever changes here.
 extern "system" fn register_other(
-    _: This,
-    _device: *const c_void,
+    this: This,
+    device: *const c_void,
     _context: *mut c_void,
-    _callback: *const c_void,
+    callback: *const c_void,
     out: *mut u64,
 ) -> HRESULT {
+    clear_token(out);
+    if callback.is_null() || (!device.is_null() && hub(this).index(device.cast()).is_none()) {
+        return E_INVALIDARG;
+    }
     token(out)
 }
 
@@ -1011,6 +1110,9 @@ extern "system" fn stop_callback(this: This, token: u64) {
 /// is running; false on time-out, or from inside that callback (it cannot
 /// wait for itself), as documented. Either way it is never called again.
 extern "system" fn unregister_callback(this: This, token: u64, timeout: u64) -> bool {
+    if token == 0 {
+        return false;
+    }
     forget(this, token);
     let hub = hub(this);
     let me = std::thread::current().id();
@@ -1081,7 +1183,7 @@ extern "system" fn enable_oem_device(
 extern "system" fn set_focus_policy(_: This, _policy: u32) {}
 
 static INPUT: Table<22> = Table([
-    no_interface as *const (),        // 0x00
+    input_query_interface as *const (), // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
     timestamp as *const (),           // 0x18
@@ -1157,7 +1259,7 @@ extern "system" fn unsupported<const SLOT: usize>(_: *const c_void) -> HRESULT {
 }
 
 static DEVICE: Table<21> = Table([
-    no_interface as *const (),        // 0x00
+    device_query_interface as *const (), // 0x00
     add_ref as *const (),             // 0x08 AddRef
     add_ref as *const (),             // 0x10 Release
     device_info as *const (),         // 0x18
@@ -1259,7 +1361,7 @@ extern "system" fn nothing(_: *const c_void) -> usize {
 }
 
 static READING: Table<25> = Table([
-    no_interface as *const (),      // 0x00
+    reading_query_interface as *const (), // 0x00
     reading_add_ref as *const (),   // 0x08
     reading_release as *const (),   // 0x10
     input_kind as *const (),        // 0x18
@@ -2374,5 +2476,298 @@ mod tests {
         rumble(&hub.devices[FALLBACK], &[1.0; 4]);
         rumble(device, std::ptr::null());
         assert_eq!(host.lock().unwrap().rumble, [(2, 32767, 65535), (2, 0, 0)]);
+    }
+
+    #[test]
+    fn query_interface_supports_iunknown_and_v0_iids_and_addrefs_readings() {
+        const TEST_E_POINTER: HRESULT = 0x8000_4003_u32 as i32;
+        const IID_UNKNOWN: [u8; 16] = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x46,
+        ];
+        const IID_INPUT: [u8; 16] = [
+            0x7E, 0x2A, 0xBE, 0x11, 0x54, 0x42, 0x5A, 0x44, 0x9C, 0x09, 0xFF, 0xC4, 0x0F, 0x00,
+            0x69, 0x18,
+        ];
+        const IID_READING: [u8; 16] = [
+            0x7A, 0x94, 0x56, 0x21, 0xFA, 0xE1, 0xE0, 0x4D, 0xA3, 0x0B, 0xD8, 0x12, 0x93, 0x1D,
+            0xBD, 0x8D,
+        ];
+        const IID_DEVICE: [u8; 16] = [
+            0xFB, 0x86, 0xDD, 0x31, 0x1B, 0x4C, 0x8A, 0x40, 0x86, 0x8F, 0x43, 0x9B, 0x3C, 0xD4,
+            0x71, 0x25,
+        ];
+        type Qi = extern "system" fn(*const c_void, *const c_void, Out) -> HRESULT;
+
+        let (hub, _) = fake();
+        let obj_ptr = (&raw const hub.object).cast::<c_void>();
+        let dev_ptr = (&raw const hub.devices[FALLBACK]).cast::<c_void>();
+        let r_ptr = current(hub, GAMEPAD_KIND, FALLBACK).unwrap();
+
+        let qi_obj = slot::<Qi, _>(&hub.object, 0x00);
+        assert_eq!(
+            qi_obj(obj_ptr, IID_UNKNOWN.as_ptr().cast(), std::ptr::null_mut()),
+            TEST_E_POINTER
+        );
+        let mut out: *const c_void = std::ptr::dangling();
+        assert_eq!(qi_obj(obj_ptr, std::ptr::null(), &mut out), E_INVALIDARG);
+        assert!(out.is_null());
+
+        out = std::ptr::dangling();
+        assert_eq!(
+            qi_obj(obj_ptr, IID_DEVICE.as_ptr().cast(), &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+
+        // Odd-byte-aligned REFIID works too.
+        let mut unaligned_iid = [0u8; 17];
+        unaligned_iid[1..17].copy_from_slice(&IID_INPUT);
+        assert_eq!(
+            qi_obj(obj_ptr, unsafe { unaligned_iid.as_ptr().add(1).cast() }, &mut out),
+            S_OK
+        );
+        assert_eq!(out, obj_ptr);
+        assert_eq!(
+            qi_obj(obj_ptr, IID_UNKNOWN.as_ptr().cast(), &mut out),
+            S_OK
+        );
+        assert_eq!(out, obj_ptr);
+
+        let qi_dev = slot::<Qi, _>(&hub.devices[FALLBACK], 0x00);
+        assert_eq!(qi_dev(dev_ptr, IID_DEVICE.as_ptr().cast(), &mut out), S_OK);
+        assert_eq!(out, dev_ptr);
+        assert_eq!(qi_dev(dev_ptr, IID_UNKNOWN.as_ptr().cast(), &mut out), S_OK);
+        assert_eq!(out, dev_ptr);
+        assert_eq!(
+            qi_dev(dev_ptr, IID_READING.as_ptr().cast(), &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+
+        // `Reading::QueryInterface` increments the reading's reference count.
+        let qi_read = slot::<Qi, _>(r_ptr, 0x00);
+        let rel = slot::<extern "system" fn(*const Reading) -> u32, _>(r_ptr, 0x10);
+        assert_eq!(
+            qi_read(r_ptr.cast(), IID_UNKNOWN.as_ptr().cast(), &mut out),
+            S_OK
+        );
+        assert_eq!(out, r_ptr.cast());
+        assert_eq!(
+            qi_read(r_ptr.cast(), IID_READING.as_ptr().cast(), &mut out),
+            S_OK
+        );
+        assert_eq!(out, r_ptr.cast());
+        assert_eq!(
+            qi_read(r_ptr.cast(), IID_INPUT.as_ptr().cast(), &mut out),
+            E_NOINTERFACE
+        );
+        assert!(out.is_null());
+        // `hub`'s history holds 1 ref, `current` gave 1, and two `QueryInterface` calls added 2 -> 4 total.
+        assert_eq!(rel(r_ptr), 3);
+        assert_eq!(rel(r_ptr), 2);
+        assert_eq!(rel(r_ptr), 1);
+    }
+
+    #[test]
+    fn disconnect_clears_pad_history_and_temporal_and_relative_honour_connection() {
+        type Temporal = extern "system" fn(This, u64, *const Device, Out) -> HRESULT;
+        type Walk = extern "system" fn(This, *const Reading, u32, *const Device, Out) -> HRESULT;
+
+        let (hub, host) = fake();
+        let temporal = slot::<Temporal, _>(&hub.object, 0x38);
+        let next_fn = slot::<Walk, _>(&hub.object, 0x28);
+        let prev_fn = slot::<Walk, _>(&hub.object, 0x30);
+
+        std::thread::sleep(Duration::from_millis(2));
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: A,
+            ..Default::default()
+        });
+        hub.poll();
+        let r1 = current(hub, GAMEPAD_KIND, 1).unwrap();
+        let (t1, _) = stamp(r1);
+        assert!(t1 > 0);
+
+        std::thread::sleep(Duration::from_millis(2));
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: B,
+            ..Default::default()
+        });
+        hub.poll();
+        let r2 = current(hub, GAMEPAD_KIND, 1).unwrap();
+        let (t2, _) = stamp(r2);
+
+        let mut out: *const c_void = std::ptr::dangling();
+        assert_eq!(temporal(&hub.object, t2, &hub.devices[1], &mut out), S_OK);
+        assert_eq!(out.cast::<Reading>(), r2);
+        release(out.cast());
+
+        assert_eq!(temporal(&hub.object, t1, &hub.devices[1], &mut out), S_OK);
+        assert_eq!(out.cast::<Reading>(), r1);
+        release(out.cast());
+
+        out = std::ptr::dangling();
+        assert_eq!(
+            temporal(&hub.object, t1 - 1, &hub.devices[1], &mut out),
+            READING_NOT_FOUND
+        );
+        assert!(out.is_null());
+
+        // Disconnecting clears the pad's reading history and reports `DEVICE_DISCONNECTED`.
+        host.lock().unwrap().pads[1] = None;
+        hub.poll();
+        assert!(hub.state().slots[1].history.is_empty());
+
+        out = std::ptr::dangling();
+        assert_eq!(
+            temporal(&hub.object, u64::MAX, &hub.devices[1], &mut out),
+            DEVICE_DISCONNECTED
+        );
+        assert!(out.is_null());
+
+        out = std::ptr::dangling();
+        assert_eq!(
+            prev_fn(&hub.object, r2, GAMEPAD_KIND, &hub.devices[1], &mut out),
+            DEVICE_DISCONNECTED
+        );
+        assert!(out.is_null());
+
+        out = std::ptr::dangling();
+        assert_eq!(
+            prev_fn(&hub.object, r2, GAMEPAD_KIND, std::ptr::null(), &mut out),
+            REFERENCE_TOO_OLD
+        );
+        assert!(out.is_null());
+
+        // Reconnecting starts a fresh session: no pre-disconnect readings leak back.
+        host.lock().unwrap().pads[1] = Some(PadState {
+            buttons: X,
+            ..Default::default()
+        });
+        hub.poll();
+        let r3 = current(hub, GAMEPAD_KIND, 1).unwrap();
+        assert_eq!(walk(hub, 0x30, r3), Err(READING_NOT_FOUND));
+
+        out = std::ptr::dangling();
+        assert_eq!(
+            next_fn(&hub.object, r2, GAMEPAD_KIND, &hub.devices[1], &mut out),
+            REFERENCE_TOO_OLD
+        );
+        assert!(out.is_null());
+
+        release(r1);
+        release(r2);
+        release(r3);
+    }
+
+    #[test]
+    fn callback_registration_validates_arguments_clears_token_and_rejects_zero_unregister() {
+        type RegisterDevice = extern "system" fn(
+            This,
+            *const Device,
+            u32,
+            u32,
+            u32,
+            *mut c_void,
+            Option<DeviceCallback>,
+            *mut u64,
+        ) -> HRESULT;
+        type RegisterReading = extern "system" fn(
+            This,
+            *const c_void,
+            u32,
+            f32,
+            *mut c_void,
+            *const c_void,
+            *mut u64,
+        ) -> HRESULT;
+        type RegisterOther =
+            extern "system" fn(This, *const c_void, *mut c_void, *const c_void, *mut u64) -> HRESULT;
+        type Unregister = extern "system" fn(This, u64, u64) -> bool;
+
+        let (hub, _) = fake();
+        let reg_dev = slot::<RegisterDevice, _>(&hub.object, 0x48);
+        let reg_read = slot::<RegisterReading, _>(&hub.object, 0x40);
+        let reg_guide = slot::<RegisterOther, _>(&hub.object, 0x50);
+        let unregister = slot::<Unregister, _>(&hub.object, 0x68);
+
+        let mut token = 0xDEAD_BEEF_u64;
+        assert_eq!(
+            reg_dev(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                STATUS_CONNECTED,
+                0,
+                std::ptr::null_mut(),
+                None,
+                &mut token,
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(token, 0);
+
+        token = 0xDEAD_BEEF;
+        assert_eq!(
+            reg_dev(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                STATUS_CONNECTED,
+                3,
+                std::ptr::null_mut(),
+                Some(record),
+                &mut token,
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(token, 0);
+
+        token = 0xDEAD_BEEF;
+        assert_eq!(
+            reg_dev(
+                &hub.object,
+                std::ptr::dangling(),
+                GAMEPAD_KIND,
+                STATUS_CONNECTED,
+                0,
+                std::ptr::null_mut(),
+                Some(record),
+                &mut token,
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(token, 0);
+
+        token = 0xDEAD_BEEF;
+        assert_eq!(
+            reg_read(
+                &hub.object,
+                std::ptr::null(),
+                GAMEPAD_KIND,
+                0.0,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut token,
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(token, 0);
+
+        token = 0xDEAD_BEEF;
+        assert_eq!(
+            reg_guide(
+                &hub.object,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &mut token,
+            ),
+            E_INVALIDARG
+        );
+        assert_eq!(token, 0);
+
+        assert!(!unregister(&hub.object, 0, 0));
     }
 }
