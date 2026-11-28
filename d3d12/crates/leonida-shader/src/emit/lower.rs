@@ -229,6 +229,9 @@ pub(super) fn lower_counted(parts: &Parts, counted: bool) -> Result<Lowered, Sha
     }
 }
 
+#[path = "valu16_ext.rs"]
+mod valu16_ext;
+
 const TWO_PI: f32 = std::f32::consts::TAU;
 /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
 const GS_ALLOC_REQ: u16 = 9;
@@ -9282,6 +9285,9 @@ impl<'a> Lower<'a> {
         let float = |l: &mut Self, r: V| l.write_f(inst, r, guard);
         let int = |l: &mut Self, r: V| l.write_i(inst, r, guard);
         if let Some(r) = self.valu16(inst, name, guard) {
+            return r;
+        }
+        if let Some(r) = self.valu16_ext(inst, name, guard) {
             return r;
         }
         if let Some(op) = name.strip_prefix("v_pk_") {
