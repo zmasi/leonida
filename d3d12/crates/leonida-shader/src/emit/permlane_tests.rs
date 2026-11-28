@@ -490,3 +490,180 @@ fn pixel_computed_readlane_masks_to_host_wave_and_validates() {
         }
     }
 }
+
+/// Under `with_local_waves_any`, `v_writelane_b32` must compare `console_lane()` (`0..63`)
+/// against `lane & 63` rather than `lane_index()` (`0..31`) against `lane & 31`, so writing
+/// console lane `L + 32` does not overwrite console lane `L` in the lower host wave.
+#[test]
+fn local_any_writelane_does_not_alias_lower_and_upper_halves() {
+    const VAL_LO: u32 = 0x1111_2222;
+    const VAL_HI: u32 = 0x3333_4444;
+    let smov = |dst: u32, src: u32| 0xBE80_0300 | dst << 16 | src;
+    let mov = |dst: u32, src: u32| 0x7E00_0200 | dst << 17 | src;
+    let prog = |threads: u32| {
+        let words = [
+            smov(5, 128),
+            0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
+            125 << 25,          // s_load_dwordx4 s[8:11], s[4:5], 0
+            0x340E_0082,        // v_lshlrev_b32 v7, 2, v0
+            0x4A0A_00FF,
+            BASE,               // v_add_nc_u32 v5, BASE, v0
+            0xD761_0005, 1,     // v_writelane_b32 v5, s1, s0
+            0xD761_0005, 0x403, // v_writelane_b32 v5, s3, s2
+            0xD760_0006, 0x105, // v_readlane_b32 s6, v5, s0
+            0xD760_0007, 0x505, // v_readlane_b32 s7, v5, s2
+            mov(6, 6),          // v_mov_b32 v6, s6
+            mov(4, 7),          // v_mov_b32 v4, s7
+            0xE070_1000,
+            0x8002_0507, // buffer_store_dword v5, v7, s[8:11], 0 offen
+            0xE070_1000 | (threads * 4),
+            0x8002_0607, // buffer_store_dword v6, v7, s[8:11], 0 offen offset:threads*4
+            0xE070_1000 | (threads * 8),
+            0x8002_0407, // buffer_store_dword v4, v7, s[8:11], 0 offen offset:threads*8
+            0xBF81_0000,
+        ];
+        NativeProgram {
+            stage: HwStage::Cs,
+            wave64: true,
+            vgprs: 8,
+            layout: vec![
+                RootParam {
+                    root: RootType::Constants,
+                    table_offset_dwords: 0,
+                    sgprs: 4,
+                    base_register: 0,
+                    user_data: 0,
+                    slot: 0,
+                },
+                RootParam {
+                    root: RootType::Table,
+                    table_offset_dwords: 0,
+                    sgprs: 1,
+                    base_register: 0,
+                    user_data: 4,
+                    slot: 1,
+                },
+            ],
+            used: vec![UsedResource {
+                kind: ResourceType::Uav,
+                root: RootType::Table,
+                table_offset_dwords: 0,
+                lower_bound: 0,
+                stride: 0,
+                dwords: 4,
+                user_data: 4,
+                slot: 1,
+            }],
+            io: StageIo::Cs(ComputeIo {
+                rsrc2: 5 << 1,
+                threads: [threads, 1, 1],
+            }),
+            code: words.into_iter().flat_map(u32::to_le_bytes).collect(),
+        }
+    };
+
+    let _one = super::valu_tests::ONE_AT_A_TIME
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for (backend, warp) in [("hardware", false), ("WARP", true)] {
+        let Ok(host) = Host::new(warp) else {
+            continue;
+        };
+        let mut options =
+            windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
+        // SAFETY: options is the correctly sized output for this feature query.
+        unsafe {
+            host.device
+                .CheckFeatureSupport(
+                    windows::Win32::Graphics::Direct3D12::D3D12_FEATURE_D3D12_OPTIONS1,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                )
+                .expect("wave capabilities");
+        }
+        if options.WaveLaneCountMax < 32 || options.WaveLaneCountMin > 32 {
+            continue;
+        }
+
+        let shader64 =
+            lower::with_local_waves_any(|| lowered(&prog(64), 32)).expect("lower local_any 64");
+        let (root64, pso64) = host.compute_pipeline(&shader64).expect("pso 64");
+        for &(sel_lo, sel_hi) in &[(8u32, 40u32), (72, 104), (31, u32::MAX)] {
+            let constants = [sel_lo, VAL_LO, sel_hi, VAL_HI];
+            let mut ud = vec![0; shader64.user_data_dwords() as usize];
+            for u in &shader64.user_data {
+                if u.root == RootType::Constants {
+                    ud[u.index as usize] = constants[u.dword as usize];
+                }
+            }
+            let out = host
+                .dispatch(
+                    &root64,
+                    &pso64,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(64 * 3)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("dispatch local_any 64");
+            let lo = sel_lo & 63;
+            let hi = sel_hi & 63;
+            for t in 0..64u32 {
+                let want_v5 = if t == lo {
+                    VAL_LO
+                } else if t == hi {
+                    VAL_HI
+                } else {
+                    BASE + t
+                };
+                assert_eq!(
+                    out[0][t as usize], want_v5,
+                    "{backend} sel=({sel_lo},{sel_hi}) lane={t}: v5 writelane mismatch"
+                );
+                if t < 32 {
+                    assert_eq!(
+                        out[0][(64 + t) as usize], VAL_LO,
+                        "{backend} sel=({sel_lo},{sel_hi}) wave0 lane={t}: readlane(lo) corrupted"
+                    );
+                } else {
+                    assert_eq!(
+                        out[0][(128 + t) as usize], VAL_HI,
+                        "{backend} sel=({sel_lo},{sel_hi}) wave1 lane={t}: readlane(hi) mismatch"
+                    );
+                }
+            }
+        }
+
+        // Single-half group (32 threads) under `with_local_waves_any`: lanes 32..63 never run and read 0.
+        let shader32 =
+            lower::with_local_waves_any(|| lowered(&prog(32), 32)).expect("lower local_any 32");
+        let (root32, pso32) = host.compute_pipeline(&shader32).expect("pso 32");
+        let constants = [8u32, VAL_LO, 40u32, VAL_HI];
+        let mut ud = vec![0; shader32.user_data_dwords() as usize];
+        for u in &shader32.user_data {
+            if u.root == RootType::Constants {
+                ud[u.index as usize] = constants[u.dword as usize];
+            }
+        }
+        let out32 = host
+            .dispatch(
+                &root32,
+                &pso32,
+                &Dispatch {
+                    roots: vec![(0, Root::Constants(ud))],
+                    views: &[View::RawUav(32 * 3)],
+                    samplers: &[],
+                    groups: [1, 1, 1],
+                },
+            )
+            .expect("dispatch local_any 32");
+        for t in 0..32u32 {
+            let want_v5 = if t == 8 { VAL_LO } else { BASE + t };
+            assert_eq!(out32[0][t as usize], want_v5, "{backend} 32-thread lane={t}: v5");
+            assert_eq!(out32[0][(32 + t) as usize], VAL_LO, "{backend} 32-thread lane={t}: read lo");
+            assert_eq!(out32[0][(64 + t) as usize], 0, "{backend} 32-thread lane={t}: read hi -> 0");
+        }
+    }
+}
