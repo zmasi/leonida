@@ -6,9 +6,11 @@
 //! * Connects (also by name, by list, `ConnectEx` from `WSAIoctl`) and
 //!   datagram sends to anything but 127.0.0.0/8 and ::1 fail with
 //!   `WSAENETUNREACH`.
-//! * Forward lookups other than `localhost` and IP literals fail with
-//!   `WSAHOST_NOT_FOUND`; reverse lookups of other addresses come back
-//!   numeric, or fail if a name is required, as with no network.
+//! * Forward lookups other than `localhost` and loopback IP literals (plus a
+//!   service-only null `getaddrinfo` node) fail with `WSAHOST_NOT_FOUND`;
+//!   `localhost` resolves to `127.0.0.1` or `::1` without reading the host's
+//!   `hosts` file. Reverse lookups of other addresses come back numeric, or
+//!   fail if a name is required, as with no network.
 //! * `WinHttpConnect` to a host that is not loopback fails with
 //!   `ERROR_WINHTTP_CANNOT_CONNECT`, so no request (or WebSocket) handle can
 //!   exist for one. Proxies are off and proxy auto-detection (WPAD, PAC
@@ -30,6 +32,8 @@ use crate::{HleExport, HleModule, hle_export};
 
 const SOCKET_ERROR: i32 = -1;
 const INVALID_SOCKET: Socket = !0;
+const WSA_IO_PENDING: i32 = 997;
+const WSAEFAULT: i32 = 10014;
 const WSAEINVAL: i32 = 10022;
 const WSAEADDRNOTAVAIL: i32 = 10049;
 const WSAENETUNREACH: i32 = 10051;
@@ -39,6 +43,7 @@ const ERROR_WINHTTP_CANNOT_CONNECT: u32 = 12029;
 const ERROR_WINHTTP_AUTODETECTION_FAILED: u32 = 12180;
 const AF_INET: u16 = 2;
 const AF_INET6: u16 = 23;
+const AI_NUMERICHOST: i32 = 0x04;
 const NI_NUMERICHOST: i32 = 0x02;
 const NI_NAMEREQD: i32 = 0x04;
 const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC800_0006;
@@ -78,6 +83,10 @@ fn once(what: &'static str, destination: String) {
 
 fn wsa_error(code: i32) {
     host!("ws2_32.dll", "WSASetLastError": extern "system" fn(i32))(code);
+}
+
+fn wsa_last_error() -> i32 {
+    host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32)()
 }
 
 fn narrow(text: *const c_char) -> Option<String> {
@@ -132,10 +141,27 @@ fn loopback(ip: IpAddr) -> bool {
     ip.to_canonical().is_loopback()
 }
 
-/// `localhost` or a loopback literal (bracketed IPv6 too).
+fn localhost_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("localhost") || name.eq_ignore_ascii_case("localhost.")
+}
+
+fn ip_literal(name: &str) -> Option<IpAddr> {
+    if let Ok(ip) = name.parse::<IpAddr>() {
+        return Some(ip);
+    }
+    let unbracketed = name
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(name);
+    let without_zone = unbracketed
+        .split_once('%')
+        .map_or(unbracketed, |(ip, _)| ip);
+    without_zone.parse::<std::net::Ipv6Addr>().ok().map(IpAddr::V6)
+}
+
+/// `localhost` (with optional trailing dot) or a loopback literal (bracketed IPv6 too).
 fn loopback_name(name: &str) -> bool {
-    let bare = name.trim_start_matches('[').trim_end_matches(']');
-    bare.eq_ignore_ascii_case("localhost") || bare.parse().is_ok_and(loopback)
+    localhost_name(name) || ip_literal(name).is_some_and(loopback)
 }
 
 fn shown(addr: Option<impl ToString>) -> String {
@@ -157,11 +183,11 @@ fn reachable(what: &'static str, addr: *const u8, len: i32) -> bool {
 
 /// Connecting by name: only to loopback. A name would need a lookup
 /// (`WSAHOST_NOT_FOUND`), an address a route (`WSAENETUNREACH`).
-fn reachable_name(name: Option<String>) -> bool {
+fn reachable_name(name: Option<&str>) -> bool {
     match name {
-        Some(name) if !loopback_name(&name) => {
-            let literal = name.parse::<IpAddr>().is_ok();
-            once("network connect blocked", name);
+        Some(name) if !loopback_name(name) => {
+            let literal = ip_literal(name).is_some();
+            once("network connect blocked", name.to_owned());
             wsa_error(if literal {
                 WSAENETUNREACH
             } else {
@@ -174,20 +200,21 @@ fn reachable_name(name: Option<String>) -> bool {
     }
 }
 
-/// Names answered without asking the network: none, `localhost`, IP
-/// literals (connecting to one is vetted separately).
-fn resolvable(name: Option<String>) -> bool {
+/// Names answered without asking the network or returning LAN adapter
+/// addresses: `localhost` and loopback IP literals, plus a null node for
+/// service-only `getaddrinfo` lookups (`allow_null`).
+fn resolvable(name: Option<&str>, allow_null: bool) -> bool {
     match name {
-        Some(name)
-            if !(name.is_empty()
-                || name.eq_ignore_ascii_case("localhost")
-                || name.parse::<IpAddr>().is_ok()) =>
-        {
-            once("network name lookup blocked", name);
+        None if allow_null => true,
+        Some(name) if loopback_name(name) => true,
+        other => {
+            once(
+                "network name lookup blocked",
+                other.unwrap_or("<null>").to_owned(),
+            );
             wsa_error(WSAHOST_NOT_FOUND);
             false
         }
-        _ => true,
     }
 }
 
@@ -261,9 +288,15 @@ pub extern "system" fn WSAConnectByNameA(
     timeout: *const c_void,
     reserved: *mut c_void,
 ) -> i32 {
-    if !reachable_name(narrow(node)) {
+    let parsed = narrow(node);
+    if !reachable_name(parsed.as_deref()) {
         return 0;
     }
+    let node = if parsed.as_deref().is_some_and(localhost_name) {
+        c"127.0.0.1".as_ptr()
+    } else {
+        node
+    };
     host!("ws2_32.dll", "WSAConnectByNameA": extern "system" fn(Socket, *const c_char, *const c_char, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
         s, node, service, local_len, local, remote_len, remote, timeout, reserved,
     )
@@ -280,9 +313,27 @@ pub extern "system" fn WSAConnectByNameW(
     timeout: *const c_void,
     reserved: *mut c_void,
 ) -> i32 {
-    if !reachable_name(wide(node)) {
+    let parsed = wide(node);
+    if !reachable_name(parsed.as_deref()) {
         return 0;
     }
+    let mut loopback_v4: [u16; 10] = [
+        b'1' as u16,
+        b'2' as u16,
+        b'7' as u16,
+        b'.' as u16,
+        b'0' as u16,
+        b'.' as u16,
+        b'0' as u16,
+        b'.' as u16,
+        b'1' as u16,
+        0,
+    ];
+    let node = if parsed.as_deref().is_some_and(localhost_name) {
+        loopback_v4.as_mut_ptr().cast_const()
+    } else {
+        node
+    };
     host!("ws2_32.dll", "WSAConnectByNameW": extern "system" fn(Socket, *const u16, *const u16, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
         s, node, service, local_len, local, remote_len, remote, timeout, reserved,
     )
@@ -308,16 +359,14 @@ pub extern "system" fn WSAConnectByList(
     reserved: *mut c_void,
 ) -> i32 {
     if !list.is_null() {
-        // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`.
-        let entries = unsafe {
-            let count = usize::try_from(list.cast::<i32>().read()).unwrap_or(0);
-            std::slice::from_raw_parts(list.add(8).cast::<SocketAddress>(), count)
-        };
-        if !entries
-            .iter()
-            .all(|e| reachable("network connect blocked", e.addr, e.len))
-        {
-            return 0;
+        // SAFETY: the title passes a `SOCKET_ADDRESS_LIST`; read unaligned.
+        let count = usize::try_from(unsafe { list.cast::<i32>().read_unaligned() }).unwrap_or(0);
+        let base = unsafe { list.add(8).cast::<SocketAddress>() };
+        for i in 0..count {
+            let e = unsafe { base.add(i).read_unaligned() };
+            if !reachable("network connect blocked", e.addr, e.len) {
+                return 0;
+            }
         }
     }
     host!("ws2_32.dll", "WSAConnectByList": extern "system" fn(Socket, *const u8, *mut u32, *mut c_void, *mut u32, *mut c_void, *const c_void, *mut c_void) -> i32)(
@@ -398,6 +447,12 @@ extern "system" fn connect_ex(
     real(s, name, len, send, send_len, sent, overlapped)
 }
 
+#[repr(C)]
+struct HostExtensionAnswer {
+    pointer: usize,
+    returned: u32,
+}
+
 /// The `ConnectEx` and `WSASendMsg` pointers it hands out are ours; the
 /// multi-pointer query (Registered I/O, whose `RIOSendEx` takes any
 /// address) is refused as by an old system. Other controls pass through.
@@ -416,21 +471,66 @@ pub extern "system" fn WSAIoctl(
         wsa_error(WSAEINVAL);
         return SOCKET_ERROR;
     }
-    let result = host!("ws2_32.dll", "WSAIoctl": extern "system" fn(Socket, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32)(
-        s, code, input, input_len, output, output_len, returned, overlapped, completion,
-    );
-    if result == 0 && code == SIO_GET_EXTENSION_FUNCTION_POINTER && input_len >= 16 {
-        // SAFETY: the host just read a GUID from `input` and wrote a pointer to `output`.
-        unsafe {
-            let ours = match input.cast::<Guid>().read_unaligned() {
-                WSAID_CONNECTEX => connect_ex as *const () as usize,
-                WSAID_WSASENDMSG => WSASendMsg as *const () as usize,
-                _ => return result,
-            };
-            output.cast::<usize>().write_unaligned(ours);
+    let host_ioctl = host!("ws2_32.dll", "WSAIoctl": extern "system" fn(Socket, u32, *const c_void, u32, *mut c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32);
+    if code == SIO_GET_EXTENSION_FUNCTION_POINTER {
+        if input.is_null() || (input_len as usize) < size_of::<Guid>() {
+            wsa_error(WSAEFAULT);
+            return SOCKET_ERROR;
+        }
+        // SAFETY: `input` is non-null and at least `size_of::<Guid>()` bytes.
+        let guid = unsafe { input.cast::<Guid>().read_unaligned() };
+        let wrapped = match guid {
+            WSAID_CONNECTEX => Some(connect_ex as *const () as usize),
+            WSAID_WSASENDMSG => Some(WSASendMsg as *const () as usize),
+            _ => None,
+        };
+        if let Some(ours) = wrapped {
+            if output.is_null()
+                || (output_len as usize) < size_of::<usize>()
+                || returned.is_null()
+            {
+                wsa_error(WSAEFAULT);
+                return SOCKET_ERROR;
+            }
+            // Write our wrapper to `output` before calling the host so an IOCP
+            // consumer never observes the raw provider pointer, and pass heap
+            // scratch to the host in case overlapped completion is deferred.
+            // SAFETY: `output` has at least `size_of::<usize>()` bytes and `returned` is non-null.
+            let previous = unsafe { output.cast::<usize>().read_unaligned() };
+            unsafe { output.cast::<usize>().write_unaligned(ours) };
+            let answer = Box::into_raw(Box::new(HostExtensionAnswer {
+                pointer: 0,
+                returned: 0,
+            }));
+            let rc = host_ioctl(
+                s,
+                code,
+                input,
+                input_len,
+                unsafe { (&raw mut (*answer).pointer).cast() },
+                size_of::<usize>() as u32,
+                unsafe { &raw mut (*answer).returned },
+                overlapped,
+                completion,
+            );
+            if rc == 0 {
+                unsafe { returned.write_unaligned(size_of::<usize>() as u32) };
+                drop(unsafe { Box::from_raw(answer) });
+                return 0;
+            }
+            let err = wsa_last_error();
+            if err == WSA_IO_PENDING {
+                return rc;
+            }
+            unsafe { output.cast::<usize>().write_unaligned(previous) };
+            drop(unsafe { Box::from_raw(answer) });
+            wsa_error(err);
+            return rc;
         }
     }
-    result
+    host_ioctl(
+        s, code, input, input_len, output, output_len, returned, overlapped, completion,
+    )
 }
 
 // Datagram sends.
@@ -497,12 +597,12 @@ pub extern "system" fn WSASendMsg(
     overlapped: *mut c_void,
     completion: *const c_void,
 ) -> i32 {
-    // SAFETY: the title passes a `WSAMSG` or null.
-    if let Some(m) = unsafe { message.cast::<MessageName>().as_ref() }
-        && !m.name.is_null()
-        && !reachable("network datagram blocked", m.name, m.len)
-    {
-        return SOCKET_ERROR;
+    if !message.is_null() {
+        // SAFETY: the title passes a readable `WSAMSG` when non-null; read unaligned.
+        let m = unsafe { message.cast::<MessageName>().read_unaligned() };
+        if !m.name.is_null() && !reachable("network datagram blocked", m.name, m.len) {
+            return SOCKET_ERROR;
+        }
     }
     host!("ws2_32.dll", "WSASendMsg": extern "system" fn(Socket, *const c_void, u32, *mut u32, *mut c_void, *const c_void) -> i32)(
         s, message, flags, sent, overlapped, completion,
@@ -537,10 +637,43 @@ pub extern "system" fn bind(s: Socket, name: *const u8, len: i32) -> i32 {
 
 // Forward lookups.
 
-fn blocked_lookup(result: *mut *mut c_void) -> i32 {
+#[repr(C)]
+struct HintsPrefix {
+    flags: i32,
+    family: i32,
+}
+
+fn hints_flags_family(hints: *const c_void) -> (i32, i32) {
+    if hints.is_null() {
+        (0, 0)
+    } else {
+        // SAFETY: `ADDRINFOA/W` and `ADDRINFOEXA/W` all start with `ai_flags` and `ai_family`.
+        let h = unsafe { hints.cast::<HintsPrefix>().read_unaligned() };
+        (h.flags, h.family)
+    }
+}
+
+fn narrow_lookup_node(node: *const c_char, parsed: Option<&str>, hints: *const c_void) -> *const c_char {
+    let (flags, family) = hints_flags_family(hints);
+    if flags & AI_NUMERICHOST == 0 && parsed.is_some_and(localhost_name) {
+        if family == i32::from(AF_INET6) {
+            c"::1".as_ptr()
+        } else {
+            c"127.0.0.1".as_ptr()
+        }
+    } else {
+        node
+    }
+}
+
+fn blocked_lookup(result: *mut *mut c_void, cancel: *mut Handle) -> i32 {
     if !result.is_null() {
         // SAFETY: a non-null result points to the caller's output slot.
-        unsafe { result.write(std::ptr::null_mut()) };
+        unsafe { result.write_unaligned(std::ptr::null_mut()) };
+    }
+    if !cancel.is_null() {
+        // SAFETY: a non-null handle points to the caller's cancel-handle slot.
+        unsafe { cancel.write_unaligned(std::ptr::null_mut()) };
     }
     WSAHOST_NOT_FOUND
 }
@@ -551,9 +684,11 @@ pub extern "system" fn getaddrinfo(
     hints: *const c_void,
     result: *mut *mut c_void,
 ) -> i32 {
-    if !resolvable(narrow(node)) {
-        return blocked_lookup(result);
+    let parsed = narrow(node);
+    if !resolvable(parsed.as_deref(), true) {
+        return blocked_lookup(result, std::ptr::null_mut());
     }
+    let node = narrow_lookup_node(node, parsed.as_deref(), hints);
     host!("ws2_32.dll", "getaddrinfo": extern "system" fn(*const c_char, *const c_char, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
     )
@@ -565,9 +700,33 @@ pub extern "system" fn GetAddrInfoW(
     hints: *const c_void,
     result: *mut *mut c_void,
 ) -> i32 {
-    if !resolvable(wide(node)) {
-        return blocked_lookup(result);
+    let parsed = wide(node);
+    if !resolvable(parsed.as_deref(), true) {
+        return blocked_lookup(result, std::ptr::null_mut());
     }
+    let mut loopback_v4: [u16; 10] = [
+        b'1' as u16,
+        b'2' as u16,
+        b'7' as u16,
+        b'.' as u16,
+        b'0' as u16,
+        b'.' as u16,
+        b'0' as u16,
+        b'.' as u16,
+        b'1' as u16,
+        0,
+    ];
+    let mut loopback_v6: [u16; 4] = [b':' as u16, b':' as u16, b'1' as u16, 0];
+    let (flags, family) = hints_flags_family(hints);
+    let node = if flags & AI_NUMERICHOST == 0 && parsed.as_deref().is_some_and(localhost_name) {
+        if family == i32::from(AF_INET6) {
+            loopback_v6.as_mut_ptr().cast_const()
+        } else {
+            loopback_v4.as_mut_ptr().cast_const()
+        }
+    } else {
+        node
+    };
     host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
     )
@@ -585,9 +744,11 @@ pub extern "system" fn GetAddrInfoExA(
     completion: *const c_void,
     handle: *mut Handle,
 ) -> i32 {
-    if !resolvable(narrow(name)) {
-        return blocked_lookup(result);
+    let parsed = narrow(name);
+    if !resolvable(parsed.as_deref(), true) {
+        return blocked_lookup(result, handle);
     }
+    let name = narrow_lookup_node(name, parsed.as_deref(), hints);
     host!("ws2_32.dll", "GetAddrInfoExA": extern "system" fn(*const c_char, *const c_char, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
@@ -605,18 +766,48 @@ pub extern "system" fn GetAddrInfoExW(
     completion: *const c_void,
     handle: *mut Handle,
 ) -> i32 {
-    if !resolvable(wide(name)) {
-        return blocked_lookup(result);
+    let parsed = wide(name);
+    if !resolvable(parsed.as_deref(), true) {
+        return blocked_lookup(result, handle);
     }
+    let mut loopback_v4: [u16; 10] = [
+        b'1' as u16,
+        b'2' as u16,
+        b'7' as u16,
+        b'.' as u16,
+        b'0' as u16,
+        b'.' as u16,
+        b'0' as u16,
+        b'.' as u16,
+        b'1' as u16,
+        0,
+    ];
+    let mut loopback_v6: [u16; 4] = [b':' as u16, b':' as u16, b'1' as u16, 0];
+    let (flags, family) = hints_flags_family(hints);
+    let name = if flags & AI_NUMERICHOST == 0 && parsed.as_deref().is_some_and(localhost_name) {
+        if family == i32::from(AF_INET6) {
+            loopback_v6.as_mut_ptr().cast_const()
+        } else {
+            loopback_v4.as_mut_ptr().cast_const()
+        }
+    } else {
+        name
+    };
     host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
 }
 
 pub extern "system" fn gethostbyname(name: *const c_char) -> *mut c_void {
-    if !resolvable(narrow(name)) {
+    let parsed = narrow(name);
+    if !resolvable(parsed.as_deref(), false) {
         return std::ptr::null_mut();
     }
+    let name = if parsed.as_deref().is_some_and(localhost_name) {
+        c"127.0.0.1".as_ptr()
+    } else {
+        name
+    };
     host!("ws2_32.dll", "gethostbyname": extern "system" fn(*const c_char) -> *mut c_void)(name)
 }
 
@@ -627,9 +818,15 @@ pub extern "system" fn WSAAsyncGetHostByName(
     buf: *mut c_char,
     buf_len: i32,
 ) -> Handle {
-    if !resolvable(narrow(name)) {
+    let parsed = narrow(name);
+    if !resolvable(parsed.as_deref(), false) {
         return std::ptr::null_mut();
     }
+    let name = if parsed.as_deref().is_some_and(localhost_name) {
+        c"127.0.0.1".as_ptr()
+    } else {
+        name
+    };
     host!("ws2_32.dll", "WSAAsyncGetHostByName": extern "system" fn(Handle, u32, *const c_char, *mut c_char, i32) -> Handle)(
         window, message, name, buf, buf_len,
     )
@@ -1118,5 +1315,239 @@ mod tests {
             }
             assert!(present, "{dll} lacks {}", e.name);
         }
+    }
+
+    #[test]
+    fn empty_null_and_external_lookups_ioctl_bounds_and_unaligned_sendmsg() {
+        const TEST_WSAEFAULT: i32 = 10014;
+        const TEST_AI_NUMERICHOST: i32 = 0x04;
+
+        #[repr(C)]
+        struct AddrInfo {
+            flags: i32,
+            family: i32,
+            socktype: i32,
+            protocol: i32,
+            addrlen: usize,
+            canonname: *mut c_char,
+            addr: *mut u8,
+            next: *mut AddrInfo,
+        }
+
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = host!("ws2_32.dll", "socket": extern "system" fn(i32, i32, i32) -> Socket);
+        let close = host!("ws2_32.dll", "closesocket": extern "system" fn(Socket) -> i32);
+        let last_error = host!("ws2_32.dll", "WSAGetLastError": extern "system" fn() -> i32);
+        let free_ai = host!("ws2_32.dll", "freeaddrinfo": extern "system" fn(*mut c_void));
+
+        // Null and empty names in `gethostbyname` / `WSAAsyncGetHostByName` name the
+        // local computer and would return LAN adapter addresses; non-loopback IP
+        // literals and octal leading-zero forms must also be refused.
+        for bad in [
+            std::ptr::null(),
+            c"".as_ptr(),
+            c"   ".as_ptr(),
+            c"192.0.2.1".as_ptr(),
+            c"0127.0.0.1".as_ptr(),
+        ] {
+            assert!(gethostbyname(bad).is_null());
+            assert_eq!(last_error(), WSAHOST_NOT_FOUND);
+            let mut async_buf = [0 as c_char; 128];
+            assert!(
+                WSAAsyncGetHostByName(
+                    std::ptr::null_mut(),
+                    0x400,
+                    bad,
+                    async_buf.as_mut_ptr(),
+                    128,
+                )
+                .is_null()
+            );
+            assert_eq!(last_error(), WSAHOST_NOT_FOUND);
+        }
+        assert!(!gethostbyname(c"LOCALHOST.".as_ptr()).is_null());
+
+        // `getaddrinfo` / `GetAddrInfoW` / `GetAddrInfoExA/W`: empty, whitespace,
+        // non-loopback literals, and octal IPv4 fail and clear outputs; a null node
+        // (service-only lookup) still succeeds.
+        for bad in [
+            c"".as_ptr(),
+            c" ".as_ptr(),
+            c"192.0.2.1".as_ptr(),
+            c"0127.0.0.1".as_ptr(),
+        ] {
+            let mut out = std::ptr::dangling_mut::<c_void>();
+            assert_eq!(
+                getaddrinfo(bad, c"80".as_ptr(), std::ptr::null(), &mut out),
+                WSAHOST_NOT_FOUND
+            );
+            assert!(out.is_null());
+
+            let mut out_ex = std::ptr::dangling_mut::<c_void>();
+            let mut cancel = std::ptr::dangling_mut::<c_void>();
+            assert_eq!(
+                GetAddrInfoExA(
+                    bad,
+                    c"80".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    &mut out_ex,
+                    std::ptr::null(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    &mut cancel,
+                ),
+                WSAHOST_NOT_FOUND
+            );
+            assert!(out_ex.is_null());
+            assert!(cancel.is_null());
+        }
+        let empty_w = [0u16];
+        let mut out_w = std::ptr::dangling_mut::<c_void>();
+        assert_eq!(
+            GetAddrInfoW(empty_w.as_ptr(), std::ptr::null(), std::ptr::null(), &mut out_w),
+            WSAHOST_NOT_FOUND
+        );
+        assert!(out_w.is_null());
+
+        // Service-only lookup (`node == null`) is still answered.
+        let mut svc_res = std::ptr::null_mut();
+        assert_eq!(
+            getaddrinfo(std::ptr::null(), c"80".as_ptr(), std::ptr::null(), &mut svc_res),
+            0
+        );
+        assert!(!svc_res.is_null());
+        free_ai(svc_res);
+
+        // `localhost` under `AF_INET6` resolves to `::1`; under `AI_NUMERICHOST` it fails.
+        let mut v6_hints: AddrInfo = unsafe { std::mem::zeroed() };
+        v6_hints.family = i32::from(AF_INET6);
+        let mut v6_res = std::ptr::null_mut::<c_void>();
+        assert_eq!(
+            getaddrinfo(
+                c"localhost.".as_ptr(),
+                c"80".as_ptr(),
+                (&raw const v6_hints).cast(),
+                &mut v6_res,
+            ),
+            0
+        );
+        let ai = unsafe { &*v6_res.cast::<AddrInfo>() };
+        let resolved = socket_addr(ai.addr, ai.addrlen as i32).unwrap();
+        assert!(loopback(resolved.ip()) && resolved.is_ipv6());
+        free_ai(v6_res);
+
+        let mut num_hints: AddrInfo = unsafe { std::mem::zeroed() };
+        num_hints.flags = TEST_AI_NUMERICHOST;
+        let mut num_res = std::ptr::dangling_mut::<c_void>();
+        assert_eq!(
+            getaddrinfo(
+                c"localhost".as_ptr(),
+                std::ptr::null(),
+                (&raw const num_hints).cast(),
+                &mut num_res,
+            ),
+            WSAHOST_NOT_FOUND
+        );
+        assert!(num_res.is_null());
+
+        // `WSAIoctl(SIO_GET_EXTENSION_FUNCTION_POINTER)` validates `input`, `output`,
+        // `output_len`, and `returned`, and restores `output` on socket failure.
+        let s = socket(2, 1, 6);
+        assert_ne!(s, INVALID_SOCKET);
+        let guid = WSAID_CONNECTEX;
+        let mut fn_slot = 0usize;
+        let mut ret_bytes = 0u32;
+        assert_eq!(
+            WSAIoctl(
+                s,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                std::ptr::null(),
+                16,
+                (&raw mut fn_slot).cast(),
+                8,
+                &mut ret_bytes,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ),
+            SOCKET_ERROR
+        );
+        assert_eq!(last_error(), TEST_WSAEFAULT);
+        assert_eq!(
+            WSAIoctl(
+                s,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                (&raw const guid).cast(),
+                16,
+                (&raw mut fn_slot).cast(),
+                4,
+                &mut ret_bytes,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ),
+            SOCKET_ERROR
+        );
+        assert_eq!(last_error(), TEST_WSAEFAULT);
+        assert_eq!(
+            WSAIoctl(
+                s,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                (&raw const guid).cast(),
+                16,
+                (&raw mut fn_slot).cast(),
+                8,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ),
+            SOCKET_ERROR
+        );
+        assert_eq!(last_error(), TEST_WSAEFAULT);
+
+        let sentinel = 0xDEAD_BEEF_CAFE_BABE_usize;
+        fn_slot = sentinel;
+        assert_eq!(
+            WSAIoctl(
+                INVALID_SOCKET,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                (&raw const guid).cast(),
+                16,
+                (&raw mut fn_slot).cast(),
+                8,
+                &mut ret_bytes,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ),
+            SOCKET_ERROR
+        );
+        assert_eq!(fn_slot, sentinel);
+        close(s);
+
+        // Unaligned `WSASendMsg` destination header must not panic on misaligned pointer deref.
+        let u = socket(2, 2, 17);
+        assert_ne!(u, INVALID_SOCKET);
+        let away = v4(AWAY, 9000);
+        let mut unaligned = [0u8; 64];
+        unsafe {
+            let msg_ptr = unaligned.as_mut_ptr().add(1).cast::<MessageName>();
+            msg_ptr.write_unaligned(MessageName {
+                name: away.as_ptr(),
+                len: 16,
+            });
+            assert_eq!(
+                WSASendMsg(
+                    u,
+                    msg_ptr.cast(),
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                ),
+                SOCKET_ERROR
+            );
+        }
+        assert_eq!(last_error(), WSAENETUNREACH);
+        close(u);
     }
 }
