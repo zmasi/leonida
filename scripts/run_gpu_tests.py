@@ -29,7 +29,7 @@ from check import (Skip, clip_test, fmt_1010102_test, fmt_d16_xyz_test, fmt_int_
                    fmt_sint32_test, fmt_xy_xyz_test, tbuffer_store_test, compute_unsupported)
 from compute_fixture import compute_header
 from check import SAMPLER_CASES, sampler_test   # ps_ssharp: the S#/T# mip fields (vk_sampler_test)
-from check import (CS_SMEM_VCC, CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
+from check import (CS_SMEM_VCC, CMPX_CLASS_WORDS, CVT_F32_SAT_CASES, CVT_PK_U8_WORDS, PK_MUL_LO_WORDS, PK_MUL_LO_ENV, GRADIENT_TESTS, TEST_PROGRAMS, TEXTURE_MIP_DEPENDENCIES,
                    TEXTURE_MIP_TEST, GATHER_LOD_TEST, MIP_TEST_PASSES, TEXTURE_CONSTANTS, USER_SGPRS_ENV, USER_SGPRS_WORDS, Skip, mesh_v5_test, not_found_message,
                    pick_build_dir, start_failure, table_fetch_test, texture_gradient_a16_test, texture_mip_test)
 from check import SIGNED_MIP_TEST, UINT_MIP_TEST
@@ -314,6 +314,18 @@ def compute_result(rc: int, msg: str, ok: bool, detail: str) -> tuple[bool | Non
     lacks (check.compute_unsupported: exit 77 with an "unsupported: ..." line), which is a SKIP quoting it."""
     skip = compute_unsupported(rc, msg)
     return (None, skip) if skip else (ok, detail)
+
+
+def dump_result(rc: int, msg: str, want: list[int]) -> tuple[bool | None, str]:
+    """(ok, detail) for a vk_compute_test "dump" run whose first len(want) words must be exact. A non-zero exit fails
+    with the program's output even when it printed the words: validation errors come with the right words."""
+    words = dump_words(msg)
+    vals = words[:len(want)] if words else []
+    if rc != 0:
+        detail = f"exit {rc}: {msg or 'no test output'}"
+    else:
+        detail = " ".join(hex(x) for x in vals) if vals else msg
+    return compute_result(rc, msg, rc == 0 and vals == want, detail)
 
 
 def run_cmd(cmd: list[str], env: dict | None = None, gpu: bool = True, *,
@@ -895,6 +907,8 @@ def run_suite(a, work: str) -> int:
             ])
         elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3", "ms_f16_pack"):
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 64, 64, 2))])
+        elif name in ("ms_w64x_wave_votes", "ms_w64x_wave_loops"):      # vertex 64 comes from the second wave: 128 output vertices
+            dxbc = make_dxbc([(b"PSV0", make_ms_psv0(128, 128, 64, 2))])
         elif name == "ms_v5_workgroup":
             dxbc = make_dxbc([(b"PSV0", make_ms_psv0(32, 3, 1, group_shared=128))])
         elif name == "ms_clip":
@@ -945,6 +959,8 @@ def run_suite(a, work: str) -> int:
             cmd.append("--texel-offset-fallback")
         if MESH_COMPUTE:   # mesh shaders as compute writing to a buffer, drawn by tools/mesh_compute_vs.py
             cmd.append("--mesh-compute")
+        if os.environ.get("LEONIDA_MESH_SERIAL_WAVES") == "1":   # with --wave64-emulate: one pass per wave
+            cmd.append("--mesh-serial-waves")
         if pc_tail_ubo():   # 128 push-constant bytes; heap base and code base from a uniform block at set 1
             cmd.append("--pc-tail-ubo")
         if os.environ.get("LEONIDA_FMA") in ("glsl", "khr", "exact"):   # GLSL Fma, OpFmaKHR or emulated (docs/design.md)
@@ -1057,7 +1073,8 @@ def run_suite(a, work: str) -> int:
             # load reads 0, so thread 0's four output words are fixed. One thread, no wave64 requirement.
             # cs_cmpx_class_f32 and cs_cvt_pk_u8 are per-lane and need no particular subgroup width either.
             # The other four pin the SMEM and raw MUBUF rules measured on an RX 6800 (derivations in each .asm).
-            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=cs_env)
+            env = dict(cs_env or os.environ, **PK_MUL_LO_ENV) if name == "cs_pk_mul_lo_const" else cs_env
+            rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=env)
             want = {
                 "cs_bounds": [0x12345678, 0x12345678, 0, 0xEEEEEEEE],
                 "cs_smem_bounds": [0, 0x5EED0010, 0x5EED000C, 0, 0x5EED000C, 0x5EED0010, 0, 0],
@@ -1081,10 +1098,7 @@ def run_suite(a, work: str) -> int:
                 "cs_buf_load_sub": [0x80, 0xFFFFFF80, 0x1FF, 0xFFFF807F, 0xAB01, 0xCD, 0, 0],
                 "cs_buf_fmt8": [0x7F, 0x80, 0xFF, 0x01, 0, 0, 0xFF, 1],
             }[name]
-            words = dump_words(msg)
-            vals = words[:len(want)] if words else []
-            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == want,
-                                                    " ".join(hex(x) for x in vals) if vals else msg))
+            results.append((name,) + dump_result(rc, msg, want))
         elif name == "cs_fmt_1010102":
             problem = fmt_1010102_test(a.build, spirv_dir, cs_env)
             results.append((name, not problem, problem or "64/64 dumped words exact"))
@@ -1119,17 +1133,11 @@ def run_suite(a, work: str) -> int:
         elif name == "cs_heap_init":
             # vk_compute_test copies VKC_HEAP_INIT's file into the heap; the shader copies its words at 0x100 to 0.
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **heap_init_env()))
-            words = dump_words(msg)
-            vals = words[:len(HEAP_INIT_EXPECTED)] if words else []
-            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == HEAP_INIT_EXPECTED,
-                                                    " ".join(hex(x) for x in vals) if vals else msg))
+            results.append((name,) + dump_result(rc, msg, HEAP_INIT_EXPECTED))
         elif name == "cs_user_sgprs":
             # vk_compute_test seeds s4..s7 from VKC_SGPRS; the shader stores them back.
             rc, msg = run_cmd([vk_compute, spv, "1", "dump"], env=dict(cs_env or os.environ, **USER_SGPRS_ENV))
-            words = dump_words(msg)
-            vals = words[:len(USER_SGPRS_WORDS)] if words else []
-            results.append((name,) + compute_result(rc, msg, rc == 0 and vals == USER_SGPRS_WORDS,
-                                                    " ".join(hex(x) for x in vals) if vals else msg))
+            results.append((name,) + dump_result(rc, msg, USER_SGPRS_WORDS))
         elif name == "cs_w32_salu_ext":
             detail = salu_ext_test(a.build, spirv_dir, cs_env)
             results.append((name, None if isinstance(detail, Skip) else not detail,
@@ -1632,13 +1640,13 @@ def run_suite(a, work: str) -> int:
             problem = mesh_v5_test(a.build, spirv_dir, Path(raw_dir) / f"{name}.raw")
             results.append((name, None if isinstance(problem, Skip) else not problem,
                             problem or "24/24 workgroup coordinates exact (2 x 3 x 4)"))
-        elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3"):
+        elif name in ("ms_tri", "ms_w64x_ballot", "ms_wave_info_s3", "ms_w64x_wave_votes", "ms_w64x_wave_loops"):
             raw = os.path.join(raw_dir, f"{name}.raw")
             env = mesh_env(spirv_dir, name, gfx_env)
             rc, msg = run_readback(raw, run_cmd, [vk_harness, spv, fs_passthru, raw], env=env)
             # ms_w64x_ballot needs exact wave64 (a 64-wide subgroup, or --wave64-emulate): skip it elsewhere, as
             # the wave64 compute dumps are.
-            no64 = (name == "ms_w64x_ballot" and not w64_emulated() and
+            no64 = (name in ("ms_w64x_ballot", "ms_w64x_wave_votes", "ms_w64x_wave_loops") and not w64_emulated() and
                     not any(int(x) >= 64 for x in re.findall(r"subgroup \d+\.\.(\d+)", msg)))
             if rc == UNSUPPORTED:
                 results.append((name, None, unsupported_skip(msg)))

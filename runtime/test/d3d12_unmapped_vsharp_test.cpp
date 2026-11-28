@@ -264,7 +264,15 @@ int check_console_heap(ID3D12Device* device, ID3D12CommandQueue* queue, ID3D12Fe
     leonida::title_va_aliases().add(unmapped, kViewBytes, b.arena_va);
     EXPECT(submit());
     EXPECT(count_restored(restored) && restored == 128);
-    std::printf("128 waiting zero descriptors, all restored at the first submission after their alias came\n");
+    // A slot written now with the words the first refresh had no copy for: the refresh that copies the write asks
+    // for them again rather than reuse that answer (fix_vsharp's answers last one pass over the heap).
+    put(140, raw_vsharp(unmapped));
+    EXPECT(submit());
+    std::uint32_t rewritten[8];
+    EXPECT(rt::d3d12::read_arena(device, shader_va + 140 * kDescriptor, rewritten, sizeof(rewritten)));
+    EXPECT(base_of(rewritten) == b.arena_va && rewritten[2]);
+    std::printf("128 waiting zero descriptors, all restored at the first submission after their alias came, a "
+                "rewritten one at once\n");
     // The alias goes: at the next submission none of them names its copy any more.
     leonida::title_va_aliases().remove(unmapped, b.arena_va);
     EXPECT(submit());

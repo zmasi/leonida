@@ -38,28 +38,44 @@ inline bool async_replay_compile() {
 
 // LEONIDA_ASYNC_MIN_BYTES=<n> (with LEONIDA_ASYNC_PIPELINES=1): only pipelines with n bytes of SPIR-V or more are built
 // asynchronously; a smaller one is built where it is needed, as with asynchronous builds off. Unset or 0: every
-// pipeline, as before the variable (src/async_pipeline_size.h).
-inline std::uint64_t async_min_bytes() {
-    static const std::uint64_t bytes = [] {
-        char text[32]{};
-        const DWORD n = GetEnvironmentVariableA("LEONIDA_ASYNC_MIN_BYTES", text, sizeof(text));
-        bool valid = n < sizeof(text);
-        const std::uint64_t value = valid ? leonida::async_pipelines::parse_min_bytes(text, &valid) : 0;
-        if (!valid)
+// pipeline, as before the variable (src/async_pipeline_size.h). LEONIDA_ASYNC_MIN_BYTES_GRAPHICS=<n> gives graphics and
+// mesh pipelines their own threshold (0: every one asynchronous); unset, they take LEONIDA_ASYNC_MIN_BYTES's.
+inline const leonida::async_pipelines::MinBytes& async_min_bytes() {
+    static const leonida::async_pipelines::MinBytes thresholds = [] {
+        // Text of a variable, or null when it is unset or empty; `valid` false when it is too long to be a number.
+        const auto read = [](const char* name, char (&text)[32], bool& valid) -> const char* {
+            const DWORD n = GetEnvironmentVariableA(name, text, sizeof(text));
+            valid = n < sizeof(text);
+            return valid && n ? text : nullptr;
+        };
+        char all_text[32]{}, graphics_text[32]{};
+        bool all_fits = true, graphics_fits = true, all_valid = true, graphics_valid = true;
+        const char* all = read("LEONIDA_ASYNC_MIN_BYTES", all_text, all_fits);
+        const char* graphics = read("LEONIDA_ASYNC_MIN_BYTES_GRAPHICS", graphics_text, graphics_fits);
+        // Text that is not a number counts as unset: 0 for LEONIDA_ASYNC_MIN_BYTES, compute's for the graphics one.
+        const auto value = leonida::async_pipelines::parse_thresholds(all, graphics, &all_valid, &graphics_valid);
+        if (!all_fits || !all_valid)
             std::fprintf(stderr, "[rt] d3d12: LEONIDA_ASYNC_MIN_BYTES: not a number of bytes, ignored (every "
                                  "asynchronous pipeline stays asynchronous)\n");
-        else if (value && async_replay_compile())
-            std::fprintf(stderr, "[rt] d3d12: LEONIDA_ASYNC_MIN_BYTES: pipelines under %llu bytes of SPIR-V are built "
-                                 "where they are needed; larger ones asynchronously\n", (unsigned long long)value);
+        if (!graphics_fits || !graphics_valid)
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_ASYNC_MIN_BYTES_GRAPHICS: not a number of bytes, ignored "
+                                 "(graphics pipelines take LEONIDA_ASYNC_MIN_BYTES)\n");
+        if ((value.compute || value.graphics_set) && async_replay_compile())
+            std::fprintf(stderr, "[rt] d3d12: LEONIDA_ASYNC_MIN_BYTES: compute pipelines under %llu bytes of SPIR-V and "
+                                 "graphics pipelines under %llu (%s) are built where they are needed; larger ones "
+                                 "asynchronously (0: every one)\n",
+                         (unsigned long long)value.compute, (unsigned long long)value.graphics,
+                         value.graphics_set ? "LEONIDA_ASYNC_MIN_BYTES_GRAPHICS"
+                                            : "LEONIDA_ASYNC_MIN_BYTES_GRAPHICS unset, the same");
         return value;
     }();
-    return bytes;
+    return thresholds;
 }
 
-// Whether a pipeline of `spirv_bytes` (compute: its module; graphics: all its stages) is built asynchronously.
-inline bool async_replay_compile(std::uint64_t spirv_bytes) {
+// Whether a pipeline of `spirv_bytes` (compute: its module; graphics and mesh: all its stages) is built asynchronously.
+inline bool async_replay_compile(bool graphics, std::uint64_t spirv_bytes) {
     return async_replay_compile() &&
-           leonida::async_pipelines::asynchronous(true, async_min_bytes(), spirv_bytes);
+           leonida::async_pipelines::asynchronous(true, async_min_bytes(), graphics, spirv_bytes);
 }
 
 // LOCAL FIX (post-load stalls): LEONIDA_FAST_PIPELINES=graphics, compute, or all (1 = all) creates those pipelines with
@@ -219,8 +235,82 @@ private:
 };
 
 
-// Demanded work has priority zero, speculative work is ordered by module size, and
-// an idle checkpoint runs last. No Vulkan call runs with the queue lock held.
+// How many compile workers PipelineCompiler runs, and how many of them may build a large module at once.
+//   LEONIDA_COMPILE_THREADS=<n>: n workers (1..64). Unset: half the logical processors, 2 at least and 8 at most. 1: one
+//     worker for every job plus the graphics-only one (LEONIDA_GRAPHICS_COMPILE_WORKER), the layout before the pool.
+//   LEONIDA_COMPILE_HEAVY_MAX=<n>: at most n large builds (compute modules over 128 KiB, graphics pipelines of
+//     PipelineCompiles::large_spirv_bytes or more) at once, 1..threads-1. Unset: threads-1, or 1 with
+//     LEONIDA_SERIAL_BIG_COMPILES=1. Large builds still take their place at the memory gate (big_compile_gate) too.
+// With two workers or more, large and speculative builds (warm-ups) together take at most threads-1 of them, so one
+// worker is always free for a small build a submission waits for. Warm-ups run one at a time, as on the single worker,
+// and none starts while a demanded build is queued or running: each holds the compile gate for its whole create, and a
+// submission waits there for every create in flight (MoonEyes, #1608: with the gate on, submissions waited 142 s in all
+// behind warm-ups of about 800 KB, 5-13.5 s each).
+struct CompilePool {
+    unsigned threads = 1;
+    unsigned heavy = 1;          // large builds at once
+    bool threads_valid = true;   // false: LEONIDA_COMPILE_THREADS was not a number (the default is used)
+    bool heavy_valid = true;
+};
+
+inline bool parse_compile_count(const wchar_t* text, unsigned& out) {
+    if (!text || !*text) return false;
+    unsigned value = 0;
+    for (const wchar_t* c = text; *c; ++c) {
+        if (*c < L'0' || *c > L'9') return false;
+        value = (std::min)(1000u, value * 10 + unsigned(*c - L'0'));
+    }
+    out = value;
+    return true;
+}
+
+// Null or empty text: the setting is unset.
+inline CompilePool compile_pool(const wchar_t* threads_text, const wchar_t* heavy_text, unsigned logical_processors,
+                                bool serial_big) {
+    CompilePool pool;
+    pool.threads = std::clamp(logical_processors / 2, 2u, 8u);
+    unsigned value = 0;
+    if (threads_text && *threads_text) {
+        if (parse_compile_count(threads_text, value)) pool.threads = std::clamp(value, 1u, 64u);
+        else pool.threads_valid = false;
+    }
+    const unsigned most = pool.threads > 1 ? pool.threads - 1 : 1;
+    pool.heavy = serial_big ? 1 : most;
+    if (heavy_text && *heavy_text) {
+        if (parse_compile_count(heavy_text, value)) pool.heavy = std::clamp(value, 1u, most);
+        else pool.heavy_valid = false;
+    }
+    return pool;
+}
+
+inline CompilePool compile_pool_from_environment() {
+    wchar_t threads[16]{}, heavy[16]{}, serial[2]{};
+    const DWORD t = GetEnvironmentVariableW(L"LEONIDA_COMPILE_THREADS", threads, 16);
+    const DWORD h = GetEnvironmentVariableW(L"LEONIDA_COMPILE_HEAVY_MAX", heavy, 16);
+    const DWORD s = GetEnvironmentVariableW(L"LEONIDA_SERIAL_BIG_COMPILES", serial, 2);
+    if (t >= 16) threads[0] = L'x';  // too long to be a count
+    if (h >= 16) heavy[0] = L'x';
+    const bool serial_big = s == 1 && serial[0] != L'0';
+    const CompilePool pool = compile_pool(t ? threads : nullptr, h ? heavy : nullptr,
+                                          std::thread::hardware_concurrency(), serial_big);
+    if (!pool.threads_valid) std::fprintf(stderr, "[rt] d3d12: LEONIDA_COMPILE_THREADS is not a number; not used\n");
+    if (!pool.heavy_valid) std::fprintf(stderr, "[rt] d3d12: LEONIDA_COMPILE_HEAVY_MAX is not a number; not used\n");
+    return pool;
+}
+
+// The compile workers: replay's asynchronous builds (LEONIDA_ASYNC_PIPELINES=1), the compute warm-up and the startup
+// cache checkpoint. Jobs are taken most urgent first: demanded work has priority zero (in the order it came), speculative
+// work is ordered by module size, and a checkpoint (SIZE_MAX) runs last. No Vulkan call runs with the queue lock held.
+// With two workers or more (CompilePool), a worker takes the most urgent job that
+//   - is not a checkpoint while any worker is busy (it saves the cache only when nothing compiles);
+//   - has no other job of its owner running (one build of a PSO at a time);
+//   - when it is large or speculative, leaves one worker for the others (threads-1 of these at once); when it is
+//     large, keeps within the heavy count; when it is speculative, runs alone among speculative ones and only while
+//     no demanded build is queued or running.
+// So a long driver compile holds up only the jobs of its own PSO, and a small build a submission asked for gets a free
+// worker while large ones run. With one worker the order is the old one: the next job, whatever it is, except that
+// with the graphics-only worker beside it one build of a PSO at a time holds there too (a PSO's last Release waits only
+// for the build of it that runs: two at once, one on each worker, left the other using the deleted PSO).
 //
 // Lifetime. A job names its owner (the PSO it builds, or the device for a cache checkpoint) and the device whose
 // Vulkan objects it uses, and holds no reference to either: a reference kept the device alive past the title's last
@@ -229,46 +319,68 @@ private:
 //   - A PSO's last Release does not wait for its running build, which can be a dispatch-worker build of a module the
 //     driver takes minutes over: after_running() drops its queued jobs and hands the PSO's deletion to the worker,
 //     to run when that build returns (PipelineState::last_release). The PSO lets its device reference go at once.
-//   - A device's teardown waits: cancel() drops its queued jobs (by owner or device) and waits for its running one
-//     and what runs after it, so an in-flight vkCreate*Pipelines finishes before the device's objects go.
-//   - The worker thread runs while a device is alive (retain/release): the last device's release stops and joins it.
+//   - A device's teardown waits: cancel() drops its queued jobs (by owner or device) and waits for its running ones
+//     and what runs after them, so an in-flight vkCreate*Pipelines finishes before the device's objects go.
+//   - The workers run while a device is alive (retain/release): the last device's release stops and joins them.
 //   - stop_for_exit() is for a process that ends with its device alive (main.cpp: the title's exit, a console Ctrl+C
 //     or close). After it nothing more is queued: submit() refuses, and the callers build in place or not at all.
 class PipelineCompiler {
 public:
     static PipelineCompiler& instance() {
-        static auto* pool = new PipelineCompiler;  // never destroyed: static destruction must not race the worker
+        static auto* pool = new PipelineCompiler;  // never destroyed: static destruction must not race the workers
         return *pool;
     }
 
     struct Stats {
         std::uint64_t submitted = 0;
-        std::uint64_t completed = 0;  // jobs the worker ran
+        std::uint64_t completed = 0;  // jobs the workers ran
         std::uint64_t dropped = 0;    // queued jobs thrown away by cancel, after_running, release or stop_for_exit
         std::uint64_t refused = 0;    // submissions after stop_for_exit
         std::uint64_t waited = 0;     // cancel calls that waited for a running job
         std::uint64_t deferred = 0;   // after_running calls that left something to run after a running job
+        unsigned threads = 0;         // the pool's workers (CompilePool), 0 before the first job
+        unsigned heavy = 0;           // its large builds at once
+        std::size_t most_running = 0; // the most jobs that ran at once
     };
 
-    // False, with nothing queued, after stop_for_exit. A `graphics` job (a graphics pipeline build) may also run on a
-    // second worker that takes only graphics jobs, so a compute build the driver takes minutes over does not hold
-    // up later graphics pipelines. LEONIDA_GRAPHICS_COMPILE_WORKER=0 uses one shared worker.
+    // Sets the pool size before the first job (tests); otherwise it is read from the environment at the first submit.
+    // False when it was set already.
+    bool configure(CompilePool pool) {
+        std::lock_guard lock(mutex_);
+        if (pool_) return false;
+        pool_ = pool;
+        return true;
+    }
+
+    // False, with nothing queued, after stop_for_exit. `graphics`: a graphics pipeline build; with one worker it may also
+    // run on a second worker that takes only graphics jobs, so a compute build the driver takes minutes over does not
+    // hold up later graphics pipelines (LEONIDA_GRAPHICS_COMPILE_WORKER=0: no second worker). `large`: a build of a
+    // large module (CompilePool's heavy count).
     bool submit(const void* owner, const void* device, std::size_t priority, std::function<void()> work,
-                bool graphics = false) {
+                bool graphics = false, bool large = false) {
         std::lock_guard lock(mutex_);
         if (closed_) {
             ++stats_.refused;
             return false;
         }
-        if (!worker_.joinable()) {
-            const std::uint64_t generation = generation_;
-            worker_ = std::thread([this, generation] { run(generation, false); });
+        if (!pool_) {
+            pool_ = compile_pool_from_environment();
+            if (pool_->threads > 1)
+                std::fprintf(stderr, "[rt] d3d12: %u pipeline compile workers, at most %u large builds at once "
+                                     "(LEONIDA_COMPILE_THREADS, LEONIDA_COMPILE_HEAVY_MAX)\n",
+                             pool_->threads, pool_->heavy);
         }
-        if (graphics && graphics_worker_enabled() && !graphics_worker_.joinable()) {
+        stats_.threads = pool_->threads;
+        stats_.heavy = pool_->heavy;
+        while (workers_.size() < pool_->threads) {
+            const std::uint64_t generation = generation_;
+            workers_.emplace_back([this, generation] { run(generation, false); });
+        }
+        if (graphics && pool_->threads == 1 && graphics_worker_enabled() && !graphics_worker_.joinable()) {
             const std::uint64_t generation = generation_;
             graphics_worker_ = std::thread([this, generation] { run(generation, true); });
         }
-        jobs_.emplace(priority, Job{owner, device, std::move(work), graphics});
+        jobs_.emplace(priority, Job{owner, device, std::move(work), graphics, large});
         ++stats_.submitted;
         wake_.notify_all();
         return true;
@@ -277,9 +389,14 @@ public:
     // Lock-free: replay asks at every draw and dispatch whose pipeline is not built yet.
     bool closed() const { return closed_flag_.load(std::memory_order_acquire); }
 
+    // True while a build other than the checkpoint is queued, or a demanded build runs. The checkpoint asks twice: before
+    // and after the size query, during which a demanded build can start on another worker (no warm-up can: one runs
+    // only when no other speculative job does, and the checkpoint counts as one).
     bool has_compile_waiter() {
         std::lock_guard lock(mutex_);
-        return !jobs_.empty() && jobs_.begin()->first != SIZE_MAX;
+        if (!jobs_.empty() && jobs_.begin()->first != SIZE_MAX) return true;
+        return std::any_of(running_.begin(), running_.end(),
+                           [](const Running& r) { return !r.speculative && !r.finished; });
     }
     // Returns when no job is queued or running. A job owns its pipeline state, and through it the device, until it
     // finishes; a caller that counts references (rt::d3d12_xs::device_proxy_ref_count) waits here first.
@@ -328,7 +445,7 @@ public:
         return false;
     }
 
-    // True on the worker while it runs a job whose owner or device is `key` (not what runs after it).
+    // True on a worker while it runs a job whose owner or device is `key` (not what runs after it).
     bool running_here(const void* key) {
         std::lock_guard lock(mutex_);
         const auto me = std::this_thread::get_id();
@@ -337,40 +454,40 @@ public:
         });
     }
 
-    // A device holds the worker while it lives. The last release drops whatever is still queued, stops the worker
-    // and joins it; a release on the worker itself lets it return after the job it is in.
+    // A device holds the workers while it lives. The last release drops whatever is still queued, stops the workers
+    // and joins them; a release on a worker itself lets it return after the job it is in.
     void retain() {
         std::lock_guard lock(mutex_);
         ++users_;
     }
     void release() {
         std::vector<Job> dropped;
-        Workers worker;
+        Workers workers;
         {
             std::lock_guard lock(mutex_);
             if (users_ && --users_) return;
-            worker = stop_locked(dropped);
+            workers = stop_locked(dropped);
         }
-        finish(std::move(worker), true);
+        finish(std::move(workers), true);
     }
 
-    // Process exit with a device still alive: drops the queue, refuses new jobs and waits up to `wait` for a running
-    // one, so ExitProcess does not end the worker inside the driver. False when a job was still running.
+    // Process exit with a device still alive: drops the queue, refuses new jobs and waits up to `wait` for the running
+    // ones, so ExitProcess does not end a worker inside the driver. False when a job was still running.
     bool stop_for_exit(std::chrono::milliseconds wait) {
         std::vector<Job> dropped;
-        Workers worker;
+        Workers workers;
         bool idle = true;
         {
             std::unique_lock lock(mutex_);
             closed_ = true;
             closed_flag_.store(true, std::memory_order_release);
-            worker = stop_locked(dropped);
+            workers = stop_locked(dropped);
             const auto me = std::this_thread::get_id();
             idle = done_.wait_for(lock, wait, [&] {
                 return std::none_of(running_.begin(), running_.end(), [&](const Running& r) { return r.thread != me; });
             });
         }
-        finish(std::move(worker), idle);
+        finish(std::move(workers), idle);
         return idle;
     }
 
@@ -380,7 +497,8 @@ public:
     }
     bool worker_running() {
         std::lock_guard lock(mutex_);
-        return worker_.joinable() || graphics_worker_.joinable();
+        return graphics_worker_.joinable() ||
+               std::any_of(workers_.begin(), workers_.end(), [](const std::thread& t) { return t.joinable(); });
     }
     // Tests: called on the worker with each job's owner, once the job counts as running and before its work.
     void set_job_probe(std::function<void(const void* owner)> probe) {
@@ -394,6 +512,7 @@ private:
         const void* device = nullptr;
         std::function<void()> work;
         bool graphics = false;  // a graphics pipeline build: the graphics worker may take it too
+        bool large = false;     // a large module's build (CompilePool::heavy)
     };
     static bool graphics_worker_enabled() {
         static const bool on = [] {
@@ -402,14 +521,18 @@ private:
         }();
         return on;
     }
-    // Both workers: the general one, and the graphics one when it was started.
+    // The pool's workers, and the graphics-only one when it was started (one worker only).
     struct Workers {
-        std::thread general, graphics;
+        std::vector<std::thread> general;
+        std::thread graphics;
     };
     struct Running {
         const void* owner;
         const void* device;
         std::thread::id thread;
+        bool heavy = false;           // large or speculative: counts against threads-1
+        bool large = false;           // counts against the heavy count
+        bool speculative = false;     // a warm-up: one at a time
         std::function<void()> after;  // after_running
         bool finished = false;        // the job returned; `after` may be running
     };
@@ -430,7 +553,9 @@ private:
         drop_locked(dropped, [](const Job&) { return true; });
         ++generation_;  // the workers return when they next look: after the job each is running, if any
         wake_.notify_all();
-        return {std::move(worker_), std::move(graphics_worker_)};
+        Workers workers{std::move(workers_), std::move(graphics_worker_)};
+        workers_.clear();
+        return workers;
     }
 
     static void finish(std::thread worker, bool join) {
@@ -439,7 +564,7 @@ private:
         else worker.detach();
     }
     static void finish(Workers workers, bool join) {
-        finish(std::move(workers.general), join);
+        for (std::thread& worker : workers.general) finish(std::move(worker), join);
         finish(std::move(workers.graphics), join);
     }
 
@@ -447,11 +572,40 @@ private:
         return *std::find_if(running_.begin(), running_.end(), [me](const Running& r) { return r.thread == me; });
     }
 
-    // The first job this worker may take, most urgent first: any job for the general worker, a graphics job for the
-    // graphics one.
+    // The first job this worker may take, most urgent first (see the class comment). With one worker: any job for the
+    // general worker, a graphics job for the graphics one, but not one whose PSO has a build running on the other.
     std::multimap<std::size_t, Job>::iterator next_locked(bool graphics_only) {
-        if (!graphics_only) return jobs_.begin();
-        return std::find_if(jobs_.begin(), jobs_.end(), [](const auto& entry) { return entry.second.graphics; });
+        // As on main with #2361 (qhukz13, RT-COMPILE-OWNER-RACE): a job whose PSO has an entry running waits, so
+        // after_running never deletes a PSO while another build of it runs on the other worker.
+        if (!pool_ || pool_->threads < 2) {
+            return std::find_if(jobs_.begin(), jobs_.end(), [this, graphics_only](const auto& entry) {
+                if (graphics_only && !entry.second.graphics) return false;
+                const void* owner = entry.second.owner;
+                // A finished entry may still be running what comes after its job (the PSO's deletion): it counts too.
+                return std::none_of(running_.begin(), running_.end(), [owner](const Running& r) { return r.owner == owner; });
+            });
+        }
+        unsigned heavy = 0, large = 0, speculative = 0, demanded = 0;
+        for (const Running& r : running_) {
+            heavy += r.heavy;
+            large += r.large;
+            speculative += r.speculative;
+            demanded += !r.speculative;
+        }
+        for (auto it = jobs_.begin(); it != jobs_.end(); ++it) {
+            const Job& job = it->second;
+            if (it->first == SIZE_MAX) {
+                if (running_.empty()) return it;
+                continue;
+            }
+            if (std::any_of(running_.begin(), running_.end(), [&](const Running& r) { return r.owner == job.owner; }))
+                continue;
+            if ((job.large || it->first != 0) && heavy >= pool_->threads - 1) continue;
+            if (job.large && large >= pool_->heavy) continue;
+            if (it->first != 0 && (speculative || demanded)) continue;
+            return it;
+        }
+        return jobs_.end();
     }
 
     void run(std::uint64_t generation, bool graphics_only) {
@@ -462,9 +616,11 @@ private:
             wake_.wait(lock, [&] { return generation_ != generation || next_locked(graphics_only) != jobs_.end(); });
             if (generation_ != generation) return;
             auto first = next_locked(graphics_only);
+            const bool speculative = first->first != 0;
             Job job = std::move(first->second);
             jobs_.erase(first);
-            running_.push_back({job.owner, job.device, me});
+            running_.push_back({job.owner, job.device, me, job.large || speculative, job.large, speculative});
+            stats_.most_running = (std::max)(stats_.most_running, running_.size());
             const auto probe = probe_;
             lock.unlock();
             try {
@@ -492,6 +648,7 @@ private:
                 return r.thread == me;
             }));
             done_.notify_all();
+            wake_.notify_all();  // a job this one held back (its PSO's, a heavy one, a checkpoint) may go now
         }
     }
 
@@ -499,9 +656,10 @@ private:
     std::condition_variable wake_;
     std::condition_variable done_;
     std::multimap<std::size_t, Job> jobs_;
-    std::vector<Running> running_;  // one per worker; a stopped worker may still be finishing one
-    std::thread worker_;
-    std::thread graphics_worker_;  // graphics jobs only (submit's `graphics`), started at the first one
+    std::vector<Running> running_;  // one per busy worker; a stopped worker may still be finishing one
+    std::vector<std::thread> workers_;  // CompilePool::threads, started at the first job
+    std::thread graphics_worker_;  // one worker only: graphics jobs (submit's `graphics`), started at the first one
+    std::optional<CompilePool> pool_;  // read at the first submit unless configure() came first
     std::uint64_t generation_ = 0;  // a worker runs while this is the value it started with
     unsigned users_ = 0;            // live devices (retain/release)
     bool closed_ = false;           // stop_for_exit: nothing more is queued

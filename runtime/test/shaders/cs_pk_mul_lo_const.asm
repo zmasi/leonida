@@ -15,7 +15,7 @@
 ; Measured natively on RDNA2 (gfx1036, Ryzen 9 9950X3D iGPU, driver 26.10.1) through tools/hw_oracle (raw HIP kernel).
 ; On the AMD Windows driver the translated (x * y) & 0xffff of case 0 came out 0x0c229e88: the mask was dropped when the
 ; other half was a constant 0. The translator now computes the low 16 bits as ((x << 16) * y) >> 16.
-; Run: vk_compute_test cs_pk_mul_lo_const.spv 1 dump
+; Run: VKC_OUT_WORDS=128 vk_compute_test cs_pk_mul_lo_const.spv 1 dump   (32 lanes x 16 bytes: 128 words, not the default 64)
 ; out[0..7] = 00009E88 03675433 00230000 00077F6C 00009E88 03675433 00230000 00077F6C (hex)
 s_mov_b32 exec_lo, -1
 v_mov_b32_e32 v20, v0

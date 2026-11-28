@@ -2233,7 +2233,7 @@ class TestExportFileAndCli(unittest.TestCase):
         out = self.root / "replace_fail.dds"
 
         with _fake_native_context(), \
-                mock.patch("replace_retry.replace", side_effect=OSError("simulated I/O write failure")):
+                mock.patch.object(ct.replace_retry, "replace", side_effect=OSError("simulated I/O write failure")):
             with self.assertRaisesRegex(OSError, "simulated I/O write failure"):
                 ct.export_file(pool, 0, out, None, True, self.profile)
 

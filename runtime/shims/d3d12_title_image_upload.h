@@ -35,20 +35,21 @@ public:
         ready_ = VK_NULL_HANDLE;
     }
 
+    // Uploads the mips from `from` on; `tiled` then needs only mip_chain_bytes(layout, from) bytes.
     template<class Device>
     bool write(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
                const xg_xs::Texture& layout, const std::uint8_t* tiled, std::vector<std::uint64_t>& columns,
-               bool inspect, bool& nonzero) {
+               bool inspect, bool& nonzero, unsigned from = 0) {
         const auto block = leonida::copy_block_format(image, VK_IMAGE_ASPECT_COLOR_BIT);
         const auto mips = layout.layout.mips;
         const auto layers = layout.array;
-        if (!block.bytes || block.bytes != layout.format.bytes || !mips || mips > image.mip_levels ||
+        if (!block.bytes || block.bytes != layout.format.bytes || from >= mips || mips > image.mip_levels ||
             !layers || layers > image.array_layers) return false;
 
         regions_.clear();
         VkDeviceSize bytes = 0;
         for (unsigned layer = 0; layer < layers; ++layer) {
-            for (unsigned level = 0; level < mips; ++level) {
+            for (unsigned level = from; level < mips; ++level) {
                 const auto& mip = layout.layout.plane[0].mips[level];
                 VkBufferImageCopy copy{};
                 copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
@@ -81,7 +82,7 @@ public:
                                       [](std::uint8_t c) { return c != 0; });
         }
 
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, from, mips - from, 0, layers};
         const auto result = d.context->write_staged_title_image(id, range, [&](const leonida::ReplayFunctions& replay,
                                                                                const leonida::LayoutPieces& pieces) {
             auto& vk = d.context->vk;
