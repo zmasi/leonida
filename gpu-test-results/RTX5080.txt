@@ -1,0 +1,53 @@
+GPU:        NVIDIA GeForce RTX 5080 (Blackwell, PCI 10de:2c02)
+Driver:     NVIDIA 620.70.06 (proprietary), Vulkan device API 1.4.357
+Subgroup:   32..32 (default 32)
+OS:         Nobara Linux 44
+Commit:     a73a57e
+Tools:      llvm-mc 22.1.8 (AMDGPU), SPIRV-Tools v2026.1,
+            glslangValidator 16.2.0, CMake 4.3.0, GCC 16.2.1,
+            Ninja 1.13.2, Python 3.14.10
+CPU:        AMD Ryzen 7 9800X3D 8-Core Processor
+RAM:        30.25 GiB reported
+
+run_gpu_tests.py:
+            277/277 shaders translated and passed spirv-val in each mode.
+            Native: 211/268 passed, 56 skipped, 1 failed.
+            LEONIDA_W64_EMULATE=1: 246/268 passed, 21 skipped, 1 failed.
+            Wave64 VS/PS/GS on 32-wide subgroups: tier A: 1, tier C: 1
+            (tier C is not exact there; see wave64_graphics_reasons
+            in the index).
+
+Failed:     cs_imgatomic_ext in both profiles:
+            6 of 64 sint words differ; first word 32:
+            got 0x0badf00d, expected 0x00000101 (matches #1518).
+
+Runtime:    Linux native build, Unix Makefiles, default build type
+            (no CMAKE_BUILD_TYPE set).
+            108 registered, 106 passed, 2 skipped, 0 failed.
+            Skipped: shader_library_corpus, vk_sync_validation.
+
+Notes:
+- Full two-profile run on 2026-11-26. Validation profiles were not
+  run: the Khronos validation layer is not installed on this system
+  and no validation-layer package was found in the distro repos.
+- The native profile skips all wave64 tests (no 64-wide subgroup on
+  this device); they run under LEONIDA_W64_EMULATE=1, which is why
+  that profile passes more (246 vs 211).
+- The d3d12 translated-draw family (d3d12_translated_draw,
+  d3d12_m2_textured, d3d12_m3_frame, d3d12_quad_index and friends)
+  is Windows-only; on Linux the runtime configures the portable
+  subset (108 tests). The GPU-test skips marked "run by
+  d3d12_*_test" (vs_m15, vs_m2, vs_m3, vs_quad_inst, cs_buf_counter,
+  cs_buf_typed, cs_m4_fill, cs_m4_indirect, cs_texture_uav, ps_m2*,
+  ps_m3*, ps_quad_flat, ps_live_width, ps_w64x_readlane) are
+  expected on Linux for the same reason.
+- Build note: the build failed at first because the CMakeLists
+  writes vk_null_descriptor_test's shader to
+  runtime/build/linux/generated/cs_null_descriptors.spv without
+  creating the generated/ directory (glslangValidator cannot open
+  the output path). Creating the directory by hand lets the build
+  finish; no repo files were changed.
+- The test device is the RTX 5080; this PC also has the Ryzen
+  9800X3D integrated graphics (RADV), which the runner did not use.
+- Synthetic tests only; no retail game execution or game data.
+- AI-assisted test automation and report preparation.

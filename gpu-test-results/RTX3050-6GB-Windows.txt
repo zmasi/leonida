@@ -1,0 +1,30 @@
+GPU:        NVIDIA GeForce RTX 3050 6GB (Ampere, 6144 MiB)
+Driver:     NVIDIA 621.14 (621.14.0.0), Vulkan 1.4.357
+Subgroup:   32..32
+OS:         Windows 11 x64
+Commit:     3d4f66123 (main, 2026-11-25)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools, AMDGPU target), SPIRV-Tools v2026.4,
+            Visual Studio 2022 (MSBuild 17.14.60), Python 3.12+
+Build:      cmake -S runtime -B runtime/build, then
+            cmake --build runtime/build --config RelWithDebInfo
+run_gpu_tests.py:
+            274 shaders: 274 translated, 274 pass spirv-val
+            LEONIDA_W64_EMULATE=1: 243/264 passed, 20 skipped, 1 failed
+Failed:     cs_imgatomic_ext (6 of 64 sint words differ; first word 32: got 0x0badf00d,
+            expected 0x00000101)
+Skipped:    20 =
+            19 documented "run by d3d12_*_test / w64_graphics.py" cases
+            (cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, ps_live_width,
+            ps_m15, ps_m15_dual, ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff, ps_m3,
+            ps_m3_post, ps_m3_query, ps_quad_flat, vs_m15, vs_m2, vs_m3, vs_quad_inst)
+            + ps_w64x_readlane (this device cannot require a 64-wide fragment subgroup:
+              subgroup 32..32)
+Notes:
+- All 6 mesh fixtures (ms_clip, ms_f16_pack, ms_tri, ms_v5_workgroup, ms_w64x_ballot,
+  ms_wave_info_s3) and cs_dpp_cmp passed.
+- cs_div_fmas_f64 passed with note: "split: the driver rounded GLSL Fma on doubles twice
+  when folding the constants; --fma khr fixes it".
+- cs_imgatomic_ext failed consistently in both runtime/test/shaders/check.py and
+  scripts/run_gpu_tests.py with the same mismatch (word 32: got 0x0badf00d,
+  expected 0x00000101).
+- No game files were used or needed. AI-assisted (setup and report formatting assisted by AI).

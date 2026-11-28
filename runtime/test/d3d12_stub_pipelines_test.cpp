@@ -1,7 +1,7 @@
-// LEONIDA_STUB_PIPELINES (diagnostic): a pipeline whose translated shader is missing is created as a no-op stub
-// instead of failing. Without the switch, a graphics PSO with no shader library is E_FAIL, as before; with it, the
-// call succeeds and the PSO is never registered, so it binds as no pipeline at all (its draws and dispatches are
-// no-ops, D3D-482). Synthetic only: no shader library, no game data, nothing reaches the GPU.
+// LEONIDA_STUB_PIPELINES (diagnostic): a pipeline whose translated shader is missing is created as a stub instead of
+// failing. Without the switch, a graphics PSO with no shader library is E_FAIL, as before; with it, the call succeeds
+// and the PSO is a registered graphics pipeline built from the stages in src/stub_pipeline.h (MVP-GPU-04; its draws
+// are d3d12_stub_draw_test's). Synthetic only: no shader library, no game data.
 #include "../shims/d3d12_com.h"
 
 #include <cstdio>
@@ -67,12 +67,12 @@ int main() {
         Ref<ID3D12PipelineState> pso;
         CHECK(device.p->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso.p)) == E_FAIL && !pso.p);
     }
-    {  // On: a stub that is no registered pipeline, so SetPipelineState binds none.
+    {  // On: a registered graphics pipeline from the built-in stages, so SetPipelineState binds it.
         _putenv_s("LEONIDA_STUB_PIPELINES", "1");
         Ref<ID3D12PipelineState> pso;
         CHECK(device.p->CreateGraphicsPipelineState(&desc, IID_PPV_ARGS(&pso.p)) == S_OK);
         CHECK(pso.p != nullptr);
-        CHECK(rt::d3d12::graphics_pipeline_id(pso.p) == 0);
+        CHECK(rt::d3d12::graphics_pipeline_id(pso.p) != 0);
         CHECK(rt::d3d12::compute_pipeline_id(pso.p) == 0);
     }
     {  // Real refusals are not stubbed: a bad description is still E_INVALIDARG.

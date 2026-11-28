@@ -1,0 +1,41 @@
+GPU:        AMD Radeon RX 6700 XT (RDNA2 / GFX1031, NAVI22, PCI 1002:73df), 12 GiB VRAM (11.75 GiB device-local heap, 256 MiB BAR), subgroup 32..64
+CPU / RAM:  AMD Ryzen 7 5800X3D 8-Core Processor (16 threads), 32 GiB RAM
+Driver:     RADV (Mesa 26.2.7), Vulkan 1.4.354
+Subgroup:   32..64 (minSubgroupSize 32, maxSubgroupSize 64; default 64, subgroupSizeControl, requiredSubgroupSizeStages: fragment, compute, task, mesh)
+OS:         Fedora Linux 45, kernel 7.3.4-300.fc45.x86_64
+Commit:     e380a69a60e2a2b648d23e433ab11436bbe3071b (main, 2026-11-25)
+Tools:      llvm-mc 23.1.5 (Fedora, AMDGPU target), SPIRV-Tools v2026.2, CMake 4.3.0 + Ninja 1.13.2,
+            GCC 16.2.1, Python 3.15.2, Vulkan headers and loader 1.4.350 (Fedora);
+            glslangValidator from Vulkan SDK 1.4.313.0 for the ctest GLSL fixtures
+run_gpu_tests.py: 274 shaders: 274 translated, 274 pass spirv-val
+            native:                 243/264 passed, 20 skipped, 1 failed
+            LEONIDA_W64_EMULATE=1:  243/264 passed, 20 skipped, 1 failed
+Failed:     cs_imgatomic_ext: 6 of 64 sint words differ; first word 32: got 0x0badf00d, expected 0x00000101.
+            Native, LEONIDA_W64_EMULATE=1, and 3/3 isolated --filter reruns match this known main
+            failure (#1518 updates the fixture's volume T# tag). cs_imgatomic and cs_imgatomic3d pass.
+Skipped:    20 skips are the documented "run by d3d12_*_test / w64_graphics.py" and Windows D3D12
+            runtime cases: cs_buf_counter, cs_buf_typed, cs_m4_fill, cs_m4_indirect, cs_texture_uav,
+            ps_live_width, ps_m15, ps_m15_dual, ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff,
+            ps_m3, ps_m3_post, ps_m3_query, ps_quad_flat, vs_m15, vs_m2, vs_m3, vs_quad_inst.
+build.py:   on main, stops at cs_dpp_cmp.asm ("dpp variant of this instruction is not supported" with
+            llvm-mc 23.1.5; open #1444; the six ms_* fixtures also need DXBC containers).
+w64_graphics.py: 30/30 ok (0 skipped, 0 failed): 10 tier A, 9 tier B, 11 tier C
+            (building vs_ids, gs_tri, and the 30 ps_w64_*, vs_w64_*, gs_w64_* fixtures directly
+            via build.py; PS uses VKH_SUBGROUP_SIZE 64 vs 32, VS and GS use RADV_PERFTEST=gewave32).
+vk_pipeline_check:
+            native:                 274/274 modules ok, 274/274 pipelines ok, 0 failed, 0 skipped
+                                    (cs 136 [97 wave32, 39 wave64], gs 1, ms 6, ps 119 [118 w32, 1 w64], vs 12)
+            LEONIDA_W64_EMULATE=1:  274/274 modules ok, 274/274 pipelines ok, 0 failed, 0 skipped
+                                    (cs 136 wave32, gs 1, ms 6 wave32, ps 119 [118 w32, 1 w64], vs 12)
+probe_signed_zero.py: 768/768 words exact for both Unknown and Rgba32f.
+ctest:      95/97 passed, 2 skipped, 0 failed (shader_library_corpus and vk_sync_validation skipped).
+Notes:
+- Built Linux Vulkan targets with cmake -S runtime -B runtime/build/linux-ctest -G Ninja
+  -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_CXX_COMPILER=/usr/bin/g++ (and glslangValidator from
+  Vulkan SDK 1.4.313.0); LEONIDA_VK_DEVICE=6700 selected the RX 6700 XT over llvmpipe.
+- Implicit Vulkan layers present and left enabled: VkLayer_MESA_device_select,
+  VkLayer_MESA_anti_lag, VkLayer_FROG_gamescope_wsi, MangoHud.
+- Every mesh fixture (ms_clip, ms_f16_pack, ms_tri, ms_v5_workgroup, ms_w64x_ballot,
+  ms_wave_info_s3) and every pixel fixture passed natively and with LEONIDA_W64_EMULATE=1.
+- AI-assisted: built main at e380a69a60e2a2b648d23e433ab11436bbe3071b and ran the tests above
+  on this GPU. Synthetic tests only; no game files.

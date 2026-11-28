@@ -1,0 +1,56 @@
+GPU:        NVIDIA RTX PRO 3000 Blackwell Generation Laptop GPU (Blackwell, PCI 10de:2f38)
+            Intel Graphics, the Core Ultra 9 285HX iGPU (Arrow Lake-HX, PCI 8086:7d67), same laptop
+Driver:     NVIDIA 610.47 (32.0.16.1047), Vulkan 1.4.341
+            Intel 101.8132 (32.0.101.8132), Vulkan 1.4.325
+Subgroup:   NVIDIA 32..32; Intel 8..32
+OS:         Windows 10 Enterprise 22H2 (19045.6456)
+Commit:     73516a2902a9872e4d21d1bdbbde4e26059497c5 (main, 2026-11-26)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools, AMDGPU target), SPIRV-Tools 2026.4 and glslang 16.6.0
+            (conda-forge), CMake 4.5.1 + Ninja 1.13.2 (conda-forge), llvm-mingw 20261117 (clang 23.1.6, UCRT),
+            Vulkan-Headers d277a0a (1.4.369), the Windows Vulkan loader, Python 3.14.6
+Build:      the standalone Vulkan test programs only (docs/testing.md, llvm-mingw), no Windows runtime:
+            cmake -S runtime -B runtime/build/vulkan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+                  -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang -DLEONIDA_BUILD_WINDOWS_RUNTIME=OFF
+                  -DVulkan_INCLUDE_DIR=<Vulkan-Headers>/include
+            cmake --build runtime/build/vulkan --parallel --target vk_harness vk_texture_test vk_sampler_test
+                  vk_compute_test vk_store_test vk_bindless_test
+build.py:   not run
+check.py:   not run (run via run_gpu_tests.py)
+run_gpu_tests.py: --require-pass, the GPU picked with LEONIDA_VK_DEVICE ("rtx pro", "intel")
+            NVIDIA: 277 shaders: 277 translated, 277 pass spirv-val
+              native:                211/268 passed, 55 skipped, 2 failed
+              LEONIDA_W64_EMULATE=1: 246/268 passed, 20 skipped, 2 failed
+            Intel:  277 shaders: 276 translated, 276 pass spirv-val (ps_ij_computed is left out:
+                    no PerVertexKHR without VK_KHR_fragment_shader_barycentric)
+              native:                192/268 passed, 74 skipped, 2 failed
+              LEONIDA_W64_EMULATE=1: 227/268 passed, 39 skipped, 2 failed
+Failed:     the same two in all four runs, neither a driver difference:
+            - cs_imgatomic_ext: "6 of 64 sint words differ; first word 32: got 0x0badf00d, expected
+              0x00000101", the fixture's volume T# key (#1518). With #1518's change to cs_imgatomic_ext.asm
+              applied on this same main, cs_imgatomic, cs_imgatomic3d and cs_imgatomic_ext pass 3/3 on both
+              GPUs, native and emulated.
+            - cs_texture_uav: "missing ...\runtime\build\vulkan\d3d12_texture_uav_test.exe". A setup
+              failure: this build has no Windows runtime (LEONIDA_BUILD_WINDOWS_RUNTIME=OFF), so the program
+              cannot be there, and the D3D-78 case is unverified on both GPUs.
+Skipped:    NVIDIA native 55 = 19 cases another harness runs (cs_buf_counter, cs_buf_typed, cs_m4_fill,
+            cs_m4_indirect, ps_live_width, ps_m15, ps_m15_dual, ps_m2, ps_m2_array, ps_m2_literal, ps_m2_uoff,
+            ps_m3, ps_m3_post, ps_m3_query, ps_quad_flat, vs_m15, vs_m2, vs_m3, vs_quad_inst)
+            + 34 that need a 64-wide compute subgroup + ms_w64x_ballot (no 64-wide subgroup)
+            + ps_w64x_readlane (no 64-wide fragment subgroup can be required).
+            NVIDIA emulated 20 = the 19 + ps_w64x_readlane; the 35 64-wide cases all pass emulated.
+            Intel native 74 = the 19 + the 34 + ms_w64x_ballot + ps_w64x_readlane + 19 the Windows driver
+            cannot run as written, in both modes:
+              shaderFloat64 absent: cs_div_fmas_f64, cs_div_fmas_f64_rt, cs_f64_add, cs_w32_round_f64,
+                ps_f64_mods, ps_f64_round
+              VK_KHR_fragment_shader_barycentric absent: ps_bary, ps_persp_bary, ps_scc_mask32,
+                ps_uniform_branch, ps_ij_computed
+              VK_KHR_maintenance8 absent (non-constant texel offset): ps_texoff, ps_texoff_forms,
+                ps_texoff_implicit
+              shaderResourceMinLod absent: ps_texture_b_cl, ps_texture_cl, ps_texture_grad_cl_a16
+              fragment subgroups narrower than 32: ps_bitmask_perm (ran at 16 lanes), ps_vcmpx_forms
+            Intel emulated 39 = the 19 + ps_w64x_readlane + those 19; ms_w64x_ballot and the 34 pass emulated.
+Notes:
+- Each run took 71 to 86 s. No game files; only the synthetic fixtures of runtime/test/shaders.
+- The Intel Windows driver reports no shaderFloat64, fragment-shader barycentrics, maintenance8 or
+  shaderResourceMinLod; every case it can run passes, apart from the two above.
+- AI-assisted (Claude Code).
