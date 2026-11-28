@@ -1244,6 +1244,9 @@ fn frame_ends() {
         if switch == "LEONIDA_ASYNC_SUBMIT" && was && !will {
             behind::leave();
         }
+        if switch.starts_with("LEONIDA_PLACE_") && was != will {
+            crate::cores::placing(switch, will);
+        }
     });
 }
 

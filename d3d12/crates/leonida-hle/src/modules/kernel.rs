@@ -434,6 +434,88 @@ pub extern "system" fn SetThreadPriority(thread: *mut c_void, priority: i32) -> 
     unsafe { windows_sys::Win32::System::Threading::SetThreadPriority(thread, priority) }
 }
 
+const ERROR_INVALID_PARAMETER: u32 = 87;
+
+// (Ported from Biskwit/VIctory-reloaded, commit d92322077d, through
+// Keel62155/VIctoryUnified 74f4035fd9, GPL-3.0-or-later: the title's thread pins.)
+/// `GROUP_AFFINITY`.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct GroupAffinity {
+    pub mask: usize,
+    pub group: u16,
+    pub reserved: [u16; 3],
+}
+
+/// The title pins its threads as on the console: told to the GPU side
+/// (`leonida_gpu::title_affinity`), which can keep our own threads off those
+/// processors on hybrid P/E CPUs (`LEONIDA_PLACE_APART`, `LEONIDA_PLACE_LANE`).
+/// `LEONIDA_TITLE_AFFINITY=0`: the title's threads are left free to run
+/// anywhere (the call succeeds and changes nothing).
+///
+/// When the title names processor cores or a group this PC lacks, Windows
+/// rejects the call with `ERROR_INVALID_PARAMETER`; as on the console (and in
+/// `runtime/shims/process.cpp`), a valid thread handle still succeeds and
+/// leaves the thread where it was without recording the unapplied mask.
+pub extern "system" fn SetThreadGroupAffinity(
+    thread: *mut c_void,
+    affinity: *const GroupAffinity,
+    previous: *mut GroupAffinity,
+) -> i32 {
+    static FREE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let free = *FREE.get_or_init(|| std::env::var_os("LEONIDA_TITLE_AFFINITY").is_some_and(|v| v == "0"));
+    // SAFETY: the title passes its thread handle, its requested affinity, and
+    // an optional output slot for the previous affinity, as for the Win32 call.
+    let Some(asked) = (unsafe { affinity.as_ref() }).copied() else {
+        host::set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    };
+    if asked.mask == 0 {
+        host::set_last_error(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    if free {
+        let mut actual = GroupAffinity::default();
+        if host::get_thread_group_affinity(thread, &mut actual) == 0 {
+            return 0;
+        }
+        if !previous.is_null() {
+            // SAFETY: caller-provided output buffer.
+            unsafe { *previous = actual };
+        }
+        tracing::debug!(mask = format_args!("{:#x}", asked.mask), group = asked.group, free, "the title pins a thread");
+        host::set_last_error(0);
+        return 1;
+    }
+    let ok = host::set_thread_group_affinity(thread, affinity, previous);
+    if ok != 0 {
+        #[cfg(windows)]
+        leonida_gpu::title_affinity(asked.mask, asked.group);
+        tracing::debug!(mask = format_args!("{:#x}", asked.mask), group = asked.group, free, "the title pins a thread");
+        return ok;
+    }
+    if host::get_last_error() != ERROR_INVALID_PARAMETER {
+        return 0;
+    }
+    let mut actual = GroupAffinity::default();
+    if host::get_thread_group_affinity(thread, &mut actual) == 0 {
+        return 0;
+    }
+    if !previous.is_null() {
+        // SAFETY: caller-provided output buffer.
+        unsafe { *previous = actual };
+    }
+    tracing::debug!(
+        mask = format_args!("{:#x}", asked.mask),
+        group = asked.group,
+        actual_mask = format_args!("{:#x}", actual.mask),
+        actual_group = actual.group,
+        "the title asks for cores or a group the host lacks; the thread stays where it was"
+    );
+    host::set_last_error(0);
+    1
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "kernel",
@@ -442,6 +524,7 @@ pub(crate) fn module() -> HleModule {
             "kernelbase.dll",
             "api-ms-win-core-libraryloader-*",
             "api-ms-win-core-processthreads-*",
+            "api-ms-win-core-processtopology-*",
             "api-ms-win-core-debug-*",
             "api-ms-win-core-errorhandling-*",
             "api-ms-win-crt-runtime-*",
@@ -469,6 +552,7 @@ pub(crate) fn module() -> HleModule {
             hle_export!(TerminateProcess),
             hle_export!(SetUnhandledExceptionFilter),
             hle_export!(SetThreadPriority),
+            hle_export!(SetThreadGroupAffinity),
         ],
     }
 }
@@ -483,7 +567,7 @@ pub(crate) fn callers() -> String {
 mod host {
     use std::ffi::c_void;
 
-    use windows_sys::Win32::Foundation::{FreeLibrary, SetLastError};
+    use windows_sys::Win32::Foundation::{FreeLibrary, GetLastError, SetLastError};
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
     use windows_sys::Win32::System::LibraryLoader::{
         DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
@@ -496,6 +580,16 @@ mod host {
         fn crt_exit(code: i32) -> !;
         #[link_name = "abort"]
         fn crt_abort() -> !;
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn SetThreadGroupAffinity(
+            thread: *mut c_void,
+            affinity: *const super::GroupAffinity,
+            previous: *mut super::GroupAffinity,
+        ) -> i32;
+        fn GetThreadGroupAffinity(thread: *mut c_void, affinity: *mut super::GroupAffinity) -> i32;
     }
 
     // SAFETY (every function): forwarding the title's own arguments to the
@@ -524,6 +618,28 @@ mod host {
     pub(super) fn set_last_error(code: u32) {
         // SAFETY: see above.
         unsafe { SetLastError(code) }
+    }
+
+    pub(super) fn get_last_error() -> u32 {
+        // SAFETY: see above.
+        unsafe { GetLastError() }
+    }
+
+    pub(super) fn set_thread_group_affinity(
+        thread: *mut c_void,
+        affinity: *const super::GroupAffinity,
+        previous: *mut super::GroupAffinity,
+    ) -> i32 {
+        // SAFETY: see above.
+        unsafe { SetThreadGroupAffinity(thread, affinity, previous) }
+    }
+
+    pub(super) fn get_thread_group_affinity(
+        thread: *mut c_void,
+        affinity: *mut super::GroupAffinity,
+    ) -> i32 {
+        // SAFETY: see above.
+        unsafe { GetThreadGroupAffinity(thread, affinity) }
     }
 
     pub(super) fn load_library_ex_a(name: *const u8, file: *mut c_void, flags: u32) -> *mut c_void {
@@ -640,6 +756,29 @@ mod host {
 
     pub(super) fn set_last_error(_: u32) {}
 
+    pub(super) fn get_last_error() -> u32 {
+        0
+    }
+
+    pub(super) fn set_thread_group_affinity(
+        _: *mut c_void,
+        _: *const super::GroupAffinity,
+        _: *mut super::GroupAffinity,
+    ) -> i32 {
+        1
+    }
+
+    pub(super) fn get_thread_group_affinity(
+        _: *mut c_void,
+        affinity: *mut super::GroupAffinity,
+    ) -> i32 {
+        if !affinity.is_null() {
+            // SAFETY: caller-supplied output slot.
+            unsafe { *affinity = super::GroupAffinity { mask: 1, group: 0, reserved: [0; 3] } };
+        }
+        1
+    }
+
     pub(super) fn load_library_ex_w(_: *const u16, _: *mut c_void, _: u32) -> *mut c_void {
         std::ptr::null_mut()
     }
@@ -696,6 +835,61 @@ mod tests {
             assert_eq!(SetThreadPriority(thread, -15), 1);
             // SAFETY: as above.
             assert_eq!(unsafe { GetThreadPriority(thread) }, -1);
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn thread_group_affinity_overrides_host_validates_masks_and_keeps_missing_cores_alive() {
+        for dll in [
+            "kernel32.dll",
+            "kernelbase.dll",
+            "api-ms-win-core-processtopology-l1-1-0.dll",
+        ] {
+            assert_eq!(
+                crate::registry::lookup(dll, "SetThreadGroupAffinity"),
+                Some(SetThreadGroupAffinity as *const () as usize),
+                "{dll}"
+            );
+        }
+
+        std::thread::spawn(|| {
+            // SAFETY: current thread pseudo-handle.
+            let thread = unsafe { windows_sys::Win32::System::Threading::GetCurrentThread() };
+            let mut initial = GroupAffinity::default();
+            assert_ne!(host::get_thread_group_affinity(thread, &mut initial), 0);
+            assert_ne!(initial.mask, 0);
+
+            // Null affinity and empty masks fail with ERROR_INVALID_PARAMETER.
+            assert_eq!(SetThreadGroupAffinity(thread, std::ptr::null(), std::ptr::null_mut()), 0);
+            assert_eq!(host::get_last_error(), ERROR_INVALID_PARAMETER);
+            let empty = GroupAffinity { mask: 0, group: 0, reserved: [0; 3] };
+            assert_eq!(SetThreadGroupAffinity(thread, &empty, std::ptr::null_mut()), 0);
+            assert_eq!(host::get_last_error(), ERROR_INVALID_PARAMETER);
+
+            // Bad handle fails even when asking for a missing processor group.
+            let missing_group = GroupAffinity { mask: 1, group: 63, reserved: [0; 3] };
+            assert_eq!(
+                SetThreadGroupAffinity(std::ptr::null_mut(), &missing_group, std::ptr::null_mut()),
+                0
+            );
+
+            // Valid single-processor pin succeeds and restores cleanly.
+            let one_bit = initial.mask & initial.mask.wrapping_neg();
+            let pin_one = GroupAffinity { mask: one_bit, group: initial.group, reserved: [0; 3] };
+            let mut prev = GroupAffinity::default();
+            assert_eq!(SetThreadGroupAffinity(thread, &pin_one, &mut prev), 1);
+            assert_eq!(prev.mask, initial.mask);
+
+            // Asking for a processor group the PC lacks succeeds without changing affinity.
+            let mut stayed = GroupAffinity::default();
+            assert_eq!(SetThreadGroupAffinity(thread, &missing_group, &mut stayed), 1);
+            assert_eq!(host::get_last_error(), 0);
+            assert_eq!((stayed.mask, stayed.group), (one_bit, initial.group));
+
+            assert_eq!(SetThreadGroupAffinity(thread, &initial, std::ptr::null_mut()), 1);
         })
         .join()
         .unwrap();
