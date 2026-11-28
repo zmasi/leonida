@@ -10718,14 +10718,10 @@ impl<'a> Lower<'a> {
             return self.write_f(inst, f, guard);
         }
         let float_result = |l: &mut Self, mut f: V| -> Result<(), Why> {
-            match v.omod {
-                0 => {}
-                k => {
-                    let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(k)];
-                    let k = l.s.m.f32(factor.to_bits());
-                    f = l.s.m.bin(l.cur, Bin::Mul, f, k);
-                }
-            }
+            // Under RDNA2 console MODE (`denorm_mode_16_64 = 3`, `IEEE = 0`,
+            // `docs/shader_validation.md` SHADER-135), silicon ignores `omod`
+            // (`mul:2`, `mul:4`, `div:2`) on `f16` destinations while `clamp`
+            // still saturates to `[0, 1]`.
             if v.clamp {
                 f = l.unary(7, f);
             }
