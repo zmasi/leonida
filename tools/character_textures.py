@@ -42,9 +42,12 @@ import json
 import ntpath
 import os
 import sys
+import tempfile
 
 # -I keeps the script directory off sys.path, so add it explicitly before importing the sibling module.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import file_mode  # noqa: E402
+import replace_retry  # noqa: E402
 from report_paths import path_key, same_report_path  # noqa: E402
 
 SLOT_ROLES = {
@@ -116,6 +119,8 @@ def _shader_id(value: object) -> str | None:
 
 
 def _texture_name(value: object) -> str:
+    if value is None:
+        return "-"
     text = _one_line(value)
     return text or "-"
 
@@ -162,7 +167,8 @@ def texture_bindings(material: dict) -> list:
             for slot, entry in value.items():
                 if isinstance(entry, dict):
                     binding = dict(entry)
-                    binding.setdefault("Param", slot)
+                    if _first(binding, PARAM_KEYS) is None:
+                        binding["Param"] = slot
                 else:
                     binding = {"Param": slot, "Name": entry}
                 bindings.append(binding)
@@ -172,7 +178,8 @@ def texture_bindings(material: dict) -> list:
 
 def classify_material(material: dict, index: int) -> dict:
     """Classify one decoded material."""
-    name = _one_line(_first(material, MATERIAL_NAME_KEYS) or f"material[{index}]")
+    raw_name = _first(material, MATERIAL_NAME_KEYS)
+    name = (_one_line(raw_name) if raw_name is not None else "") or f"material[{index}]"
     shader = _shader_id(_first(material, SHADER_KEYS))
     bindings = []
     for reference in texture_bindings(material):
@@ -274,7 +281,8 @@ def build_report(sources: list) -> dict:
             for material in model["materials"]:
                 material_count += 1
                 binding_count += len(material["bindings"])
-                unknown_count += sum(1 for b in material["bindings"] if b["role"].startswith("unknown 0x"))
+                unknown_count += sum(1 for b in material["bindings"]
+                                     if b["role"] == "unknown" or b["role"].startswith("unknown "))
                 if material["flags"]:
                     flagged += 1
                     warnings.append(
@@ -332,24 +340,47 @@ def _make_parent(path: str) -> None:
         os.makedirs(parent, exist_ok=True)
 
 
-def write_csv(path: str, rows: list) -> None:
+def _write_atomic(path: str, write_body, *, newline: str) -> None:
     _make_parent(path)
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    parent = os.path.dirname(os.path.abspath(path))
+    mode = file_mode.published_mode(path)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", newline=newline, dir=parent,
+                prefix=f".{os.path.basename(path)}.", suffix=".tmp", delete=False) as f:
+            tmp_path = f.name
+            write_body(f)
+        os.chmod(tmp_path, mode)
+        replace_retry.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
+def write_csv(path: str, rows: list) -> None:
+    def body(f):
         writer = csv.DictWriter(f, fieldnames=CSV_FIELDS, lineterminator="\n", extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
+    _write_atomic(path, body, newline="")
+
 
 def write_json(path: str, report: dict, rows: list) -> None:
-    _make_parent(path)
     public = {"summary": report["summary"], "warnings": report["warnings"],
               "models": report["models"], "rows": rows}
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(public, f, indent=2)
-        f.write("\n")
+    payload = json.dumps(public, indent=2, allow_nan=False) + "\n"
+    _write_atomic(path, lambda f: f.write(payload), newline="\n")
 
 
 def check_report_path(parser: argparse.ArgumentParser, flag: str, path: str, sources: list) -> None:
+    if not path.strip():
+        parser.error(f"{flag} path must not be empty")
     if os.path.isdir(path):
         parser.error(f"{flag} is a directory: {path}")
     for source in sources:
@@ -357,14 +388,17 @@ def check_report_path(parser: argparse.ArgumentParser, flag: str, path: str, sou
             parser.error(f"{flag} would overwrite the input {source}")
 
 
-def main() -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("targets", nargs="+", help="decoded model.json file(s), or a directory searched recursively")
     parser.add_argument("--json", metavar="FILE", help="write the full per-material report as JSON")
     parser.add_argument("--csv", metavar="FILE", help="write one row per texture binding as CSV")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
-    if args.json and args.csv and same_report_path(args.json, args.csv):
+    for flag, path in (("--json", args.json), ("--csv", args.csv)):
+        if path is not None and not path.strip():
+            parser.error(f"{flag} path must not be empty")
+    if args.json is not None and args.csv is not None and same_report_path(args.json, args.csv):
         parser.error("--json and --csv must use different paths")
     try:
         sources = model_files(args.targets)
@@ -375,7 +409,7 @@ def main() -> int:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
     for flag, path in (("--json", args.json), ("--csv", args.csv)):
-        if path:
+        if path is not None:
             check_report_path(parser, flag, path, sources)
 
     try:
@@ -388,11 +422,11 @@ def main() -> int:
     print_report(report)
     for path, writer, values in ((args.json, write_json, (report, rows)),
                                  (args.csv, write_csv, (rows,))):
-        if path:
+        if path is not None:
             try:
                 writer(path, *values)
-            except OSError as exc:
-                print(f"ERROR: cannot write {path}: {exc.strerror or exc}", file=sys.stderr)
+            except (OSError, ValueError) as exc:
+                print(f"ERROR: cannot write {path}: {getattr(exc, 'strerror', None) or exc}", file=sys.stderr)
                 return 2
             print("wrote", path)
     return 0

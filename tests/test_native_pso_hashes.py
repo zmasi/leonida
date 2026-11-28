@@ -152,6 +152,21 @@ class NativePsoHashesTest(unittest.TestCase):
         with self.assertRaises(tool.DigestClash):
             tool.build(self.dxbc, self.spirv)
 
+    def test_stage_cleanup_restores_write_mode_on_replace_failure(self):
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(path, mode, *args, **kwargs):
+            chmod_calls.append((str(path), mode))
+            return real_chmod(path, mode, *args, **kwargs)
+
+        with mock.patch.object(tool.os, "replace", side_effect=OSError("replace failed")), \
+             mock.patch.object(tool.os, "chmod", side_effect=track_chmod):
+            with self.assertRaisesRegex(OSError, "replace failed"):
+                tool.write(self.spirv, {"key": ("vs", "path")})
+
+        self.assertTrue(any(mode == 0o600 for _, mode in chmod_calls), chmod_calls)
+
 
 if __name__ == "__main__":
     unittest.main()

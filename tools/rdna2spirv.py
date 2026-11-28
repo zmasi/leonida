@@ -20022,11 +20022,14 @@ def write_index(path, index):
             _json.dump(index, f, indent=0, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())    # on disk before the rename, or a power cut could leave the name with no data
-        if os.name != "nt":
-            os.chmod(tmp, published_mode(path))  # do not publish NamedTemporaryFile's private 0600 mode
+        os.chmod(tmp, published_mode(path))  # do not publish NamedTemporaryFile's private 0600 mode
         replace_retry(tmp, path)    # a scanner or sync client on Windows may hold the new file open for a moment
     except BaseException:
         if tmp is not None:
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             try:
                 os.unlink(tmp)
             except OSError:

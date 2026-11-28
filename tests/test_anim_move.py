@@ -401,6 +401,41 @@ class AnimMoveTest(unittest.TestCase):
         with open(path, encoding="utf-8") as f:
             self.assertEqual(f.read(), previous)
 
+    def test_publish_cleans_up_staged_file_when_replace_fails_even_if_readonly(self):
+        path = os.path.join(self.tmp.name, "report.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"initial": 1}\n')
+        os.chmod(path, 0o444)
+
+        real_unlink = os.unlink
+
+        def windows_strict_unlink(p):
+            mode = os.stat(p).st_mode
+            if not (mode & 0o200):
+                raise PermissionError(13, f"Access is denied: {p}")
+            return real_unlink(p)
+
+        with mock.patch.object(anim_move, "replace_retry", side_effect=OSError(13, "Permission denied")), \
+             mock.patch("os.unlink", side_effect=windows_strict_unlink):
+            with self.assertRaises(OSError):
+                anim_move._write_json_atomic(path, {"new": True})
+
+        leftover = [f for f in os.listdir(self.tmp.name) if f.startswith(".anim_move_")]
+        self.assertEqual(leftover, [])
+
+    def test_publish_applies_published_mode_on_windows(self):
+        path = os.path.join(self.tmp.name, "report_win.json")
+        chmod_calls = []
+        real_chmod = os.chmod
+
+        def track_chmod(p, mode):
+            chmod_calls.append((p, mode))
+            real_chmod(p, mode)
+
+        with mock.patch("os.name", "nt"), mock.patch("os.chmod", side_effect=track_chmod):
+            anim_move._write_json_atomic(path, {"win": True})
+        self.assertTrue(len(chmod_calls) > 0)
+
     def test_module_docstring_has_no_double_encoded_characters(self):
         """The preamble layout uses U+00D7; it was once stored as the pair U+00C3 U+2014."""
         with open(TOOL, encoding="utf-8") as f:

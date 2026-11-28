@@ -74,6 +74,50 @@ class SkeletonMatchTests(unittest.TestCase):
             with open(path, encoding="utf-8") as f:
                 self.assertEqual(f.read(), previous)
 
+    def test_publish_cleans_up_staged_file_when_replace_fails_even_if_readonly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "report.json")
+            real_unlink = os.unlink
+            unlink_calls = []
+
+            def windows_strict_unlink(p):
+                mode = os.stat(p).st_mode
+                if not (mode & 0o200):
+                    raise PermissionError(13, f"Access is denied: {p}")
+                unlink_calls.append(p)
+                return real_unlink(p)
+
+            replace_calls = []
+
+            def fake_replace(src, dst):
+                replace_calls.append((src, dst))
+                raise OSError(13, "Permission denied")
+
+            with mock.patch.object(asm, "published_mode", return_value=0o444), \
+                 mock.patch.object(asm, "replace_retry", side_effect=fake_replace), \
+                 mock.patch("os.unlink", side_effect=windows_strict_unlink):
+                with self.assertRaises(OSError):
+                    asm._write_json_report(path, '{"failed": true}')
+
+            self.assertEqual(len(replace_calls), 1)
+            self.assertEqual(len(unlink_calls), 1)
+            leftover = [f for f in os.listdir(tmp) if f.startswith(".anim_skeleton_match-")]
+            self.assertEqual(leftover, [])
+
+    def test_publish_applies_published_mode_on_windows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "report_win.json")
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode):
+                chmod_calls.append((p, mode))
+                real_chmod(p, mode)
+
+            with mock.patch("os.name", "nt"), mock.patch("os.chmod", side_effect=track_chmod):
+                asm._write_json_report(path, '{"win": true}')
+            self.assertTrue(any(p.endswith(".tmp") and mode == asm.published_mode(path) for p, mode in chmod_calls), chmod_calls)
+
 
 if __name__ == "__main__":
     unittest.main()

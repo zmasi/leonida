@@ -595,10 +595,13 @@ def _write_json_atomic(path, doc):
     try:
         with staged:
             json.dump(doc, staged, indent=1)
-        if os.name != "nt":
-            os.chmod(staged.name, published_mode(destination))
+        os.chmod(staged.name, published_mode(destination))
         replace_retry(staged.name, destination)
     finally:
+        try:
+            os.chmod(staged.name, 0o600)
+        except OSError:
+            pass
         try:
             os.unlink(staged.name)
         except FileNotFoundError:
