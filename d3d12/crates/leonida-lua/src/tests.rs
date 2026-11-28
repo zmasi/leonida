@@ -1150,3 +1150,60 @@ fn string_methods_use_each_mods_own_string_table_and_hide_dump() {
     assert_eq!(fake.of("a"), ["dump nil false", "load_a HI! A:3 YO!", "frame_a HI! A:3"]);
     assert_eq!(fake.of("b"), ["load_b nil xxx nil", "frame_b nil xxx nil"]);
 }
+
+/// A `_ENV`-less `__gc` finalizer or chunkname-spoofed `load()` from mod B
+/// running while mod A's frame handler triggers GC must never resolve mod A's
+/// `string.*` closures, while `_ENV`-less closures in `require` and `load`
+/// still resolve their own mod's `string` table at `O(1)` stack level 1.
+#[test]
+fn gc_finalizer_and_spoofed_load_cannot_steal_another_mods_string_methods() {
+    let a = r#"
+        leonida.write_file("secret.txt", "TOP_SECRET_A")
+        string.steal = function() return leonida.read_file("secret.txt") end
+        local helper = require("helper")
+        leonida.on("frame", function()
+            collectgarbage()
+            local acc = 0
+            for _ = 1, 10000 do
+                acc = acc + #("hello"):sub(1, 2)
+            end
+            leonida.log("a_ok", helper(), acc)
+        end)
+    "#;
+    let b = r#"
+        local stolen = "untouched"
+        local armed = false
+        leonida.on("frame", function()
+            if not armed then
+                armed = true
+                -- `_ENV`-less `__gc` closure: touches only the upvalue `stolen`.
+                setmetatable({}, { __gc = function() stolen = ("").steal end })
+            else
+                local spoof = load("return function() return ('').steal end", "=1:a/main.lua", "t", {})()
+                leonida.log("b_check", tostring(stolen), tostring(spoof()))
+            end
+        end)
+    "#;
+    let dir = folder(&[("a", JSON, a), ("b", JSON, b)]);
+    std::fs::write(
+        dir.path().join("a").join("helper.lua"),
+        "return function() return ('x'):steal() end",
+    )
+    .unwrap();
+    let fake = Fake::new();
+    let mut rt = Runtime::new(fake.clone(), Config::default()).unwrap();
+    rt.load_dir(dir.path());
+    assert_eq!(status(&rt, "a"), Status::Running, "{:?}", fake.of("a"));
+    assert_eq!(status(&rt, "b"), Status::Running, "{:?}", fake.of("b"));
+
+    // Pass 1: mod B arms a `__gc` object; Pass 2: mod A runs `collectgarbage()`
+    // on its own stack frame, firing mod B's `_ENV`-less `__gc` finalizer, then
+    // mod B logs what `__gc` and its spoofed `load` saw.
+    pass(&mut rt, 1);
+    pass(&mut rt, 2);
+    assert_eq!(
+        fake.of("a"),
+        ["a_ok TOP_SECRET_A 20000", "a_ok TOP_SECRET_A 20000"]
+    );
+    assert_eq!(fake.of("b"), ["b_check nil nil"]);
+}

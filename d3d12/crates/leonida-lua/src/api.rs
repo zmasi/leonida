@@ -44,18 +44,19 @@ pub fn build_env(
     shared: &Rc_<Shared>,
     idx: usize,
     folder: &Path,
-) -> Result<Table> {
+) -> Result<sandbox::Env> {
     let log_to = shared.clone();
-    let env = sandbox::mod_env(lua, guard, move |line| log_to.borrow().log(idx, line))?.table;
-    env.set("leonida", leonida(lua, shared, idx, folder)?)?;
-    env.set("require", require(lua, &env, folder)?)?;
+    let env = sandbox::mod_env(lua, guard, move |line| log_to.borrow().log(idx, line))?;
+    env.table.set("leonida", leonida(lua, shared, idx, folder)?)?;
+    env.table
+        .set("require", require(lua, env.id, &env.table, folder)?)?;
     Ok(env)
 }
 
 /// `require(name)`: a Lua file of the mod's own folder (`name.lua` or
 /// `name/init.lua`, dots as folders), run once in the mod's environment. There
 /// is no `package` and no C module.
-fn require(lua: &Lua, env: &Table, folder: &Path) -> Result<Function> {
+fn require(lua: &Lua, mod_id: usize, env: &Table, folder: &Path) -> Result<Function> {
     let env = env.clone();
     let folder = folder.to_path_buf();
     let loaded = lua.create_table()?;
@@ -95,7 +96,7 @@ fn require(lua: &Lua, env: &Table, folder: &Path) -> Result<Function> {
             let code = std::fs::read(&file).map_err(err)?;
             let value: Value = lua
                 .load(code)
-                .set_name(format!("={name}.lua"))
+                .set_name(sandbox::chunk_name(mod_id, &format!("{name}.lua")))
                 .set_mode(ChunkMode::Text)
                 .set_environment(env.clone())
                 .call(name.as_str())?;

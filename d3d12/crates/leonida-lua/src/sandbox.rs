@@ -15,7 +15,7 @@
 //! that loops or allocates without end; `pcall` and the like cannot swallow
 //! the budget's error.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -46,13 +46,28 @@ impl Default for Budget {
     }
 }
 
+/// Tags a chunk source with the owning mod's unforgeable id so every nested
+/// prototype (including `_ENV`-less closures and `__gc` finalizers) resolves
+/// string methods to its own mod at stack level 1 in `O(1)`.
+pub fn chunk_name(id: usize, label: &str) -> String {
+    let label = label.trim_start_matches(['=', '@']);
+    format!("={id}:{label}")
+}
+
+fn mod_id_from_source(source: Option<&str>) -> Option<usize> {
+    let rest = source?.strip_prefix('=')?;
+    let (id, _) = rest.split_once(':')?;
+    id.parse().ok()
+}
+
 /// The state's guard: the moment the running call must end by, whether it
-/// went past it, and how strings find the running mod's `string` table.
+/// went past it, and how strings find the calling chunk's `string` table.
 #[derive(Clone)]
 pub struct Guard {
     deadline: Rc<Cell<Instant>>,
     tripped: Rc<Cell<bool>>,
-    active_string: Rc<RefCell<Option<Table>>>,
+    next_mod: Rc<Cell<usize>>,
+    mod_strings: Table,
     env_strings: Table,
 }
 
@@ -61,11 +76,6 @@ impl Guard {
     pub fn start(&self, limit: Duration) {
         self.tripped.set(false);
         self.deadline.set(Instant::now() + limit);
-    }
-
-    /// Sets the fallback `string` table for callbacks that capture no `_ENV`.
-    pub fn set_active_string(&self, table: Option<Table>) {
-        *self.active_string.borrow_mut() = table;
     }
 
     /// Time spent in a native function (a scan) does not count against the call.
@@ -93,28 +103,32 @@ pub fn new_lua() -> Result<(Lua, Guard)> {
     let base_string: Table = lua.globals().get("string")?;
     base_string.set("dump", Value::Nil)?;
     let fallback_string = copy_table(&lua, &base_string, None, &["dump"])?;
+    let mod_strings = lua.create_table()?;
     let env_strings = lua.create_table()?;
-    let weak = lua.create_table()?;
-    weak.set("__mode", "k")?;
-    let _ = env_strings.set_metatable(Some(weak));
-    let active_string: Rc<RefCell<Option<Table>>> = Rc::new(RefCell::new(None));
+    let weak_keys = lua.create_table()?;
+    weak_keys.set("__mode", "k")?;
+    let _ = env_strings.set_metatable(Some(weak_keys));
+    let mods_for_mt = mod_strings.clone();
     let map_for_mt = env_strings.clone();
-    let active_for_mt = active_string.clone();
     let mt: Table = lua.load("return getmetatable('')").eval()?;
     mt.set(
         "__index",
         lua.create_function(move |lua, (_s, key): (Value, Value)| {
-            for level in 1..64 {
-                let Some(env) = lua.inspect_stack(level, |d| d.function().environment()) else {
-                    break;
-                };
-                if let Some(env) = env
-                    && let Value::Table(own) = map_for_mt.raw_get::<Value>(env)?
-                {
-                    return own.get::<Value>(key);
-                }
+            // Inspect only stack level 1 (the immediate function indexing the
+            // string); never walk into caller frames, which would let a
+            // foreign mod's `_ENV`-less `__gc` finalizer borrow the caller's
+            // `string` table.
+            let id = lua
+                .inspect_stack(1, |d| mod_id_from_source(d.source().source.as_deref()))
+                .flatten();
+            if let Some(id) = id
+                && let Value::Table(own) = mods_for_mt.raw_get::<Value>(id)?
+            {
+                return own.get::<Value>(key);
             }
-            if let Some(own) = active_for_mt.borrow().clone() {
+            if let Some(Some(env)) = lua.inspect_stack(1, |d| d.function().environment())
+                && let Value::Table(own) = map_for_mt.raw_get::<Value>(env)?
+            {
                 return own.get::<Value>(key);
             }
             fallback_string.get::<Value>(key)
@@ -123,7 +137,8 @@ pub fn new_lua() -> Result<(Lua, Guard)> {
     let guard = Guard {
         deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(3600))),
         tripped: Rc::new(Cell::new(false)),
-        active_string,
+        next_mod: Rc::new(Cell::new(1)),
+        mod_strings,
         env_strings,
     };
     let watch = guard.clone();
@@ -198,6 +213,7 @@ pub fn display(value: &Value) -> String {
 
 /// What a mod's `load`, `require` and `print` need to know.
 pub struct Env {
+    pub id: usize,
     pub table: Table,
 }
 
@@ -205,6 +221,8 @@ pub struct Env {
 /// `print`, `load` and `collectgarbage` made for it. The caller adds
 /// `leonida` and `require`.
 pub fn mod_env(lua: &Lua, guard: &Guard, print: impl Fn(&str) + 'static) -> Result<Env> {
+    let mod_id = guard.next_mod.get();
+    guard.next_mod.set(mod_id + 1);
     let globals = lua.globals();
     let env = copy_table(lua, &globals, Some(&BASE), &[])?;
     for lib in LIBS {
@@ -261,11 +279,11 @@ pub fn mod_env(lua: &Lua, guard: &Guard, print: impl Fn(&str) + 'static) -> Resu
 
     // The string metatable is shared by every string: a mod sees a copy that
     // points at its own `string` table, and string method syntax resolves
-    // through `guard.env_strings` to that same table.
+    // through `guard.mod_strings` (and `guard.env_strings` at level 1) to that
+    // same table.
     let own_string: Table = env.get("string")?;
+    guard.mod_strings.raw_set(mod_id, own_string.clone())?;
     guard.env_strings.raw_set(env.clone(), own_string.clone())?;
-    let own_for_load = own_string.clone();
-    let map_for_load = guard.env_strings.clone();
     let original: Function = env.get("getmetatable")?;
     env.set(
         "getmetatable",
@@ -326,19 +344,11 @@ pub fn mod_env(lua: &Lua, guard: &Guard, print: impl Fn(&str) + 'static) -> Resu
                         ));
                     }
                 };
-                let name = name.unwrap_or_else(|| "=(load)".to_owned());
-                let chosen = match env {
-                    Some(custom) => {
-                        if matches!(map_for_load.raw_get::<Value>(custom.clone())?, Value::Nil) {
-                            map_for_load.raw_set(custom.clone(), own_for_load.clone())?;
-                        }
-                        custom
-                    }
-                    None => target.clone(),
-                };
+                let label = name.as_deref().unwrap_or("(load)");
+                let chosen = env.unwrap_or_else(|| target.clone());
                 let compiled = lua
                     .load(source)
-                    .set_name(name)
+                    .set_name(chunk_name(mod_id, label))
                     .set_mode(ChunkMode::Text)
                     .set_environment(chosen)
                     .into_function();
@@ -366,5 +376,8 @@ pub fn mod_env(lua: &Lua, guard: &Guard, print: impl Fn(&str) + 'static) -> Resu
             }
         })?,
     )?;
-    Ok(Env { table: env })
+    Ok(Env {
+        id: mod_id,
+        table: env,
+    })
 }
