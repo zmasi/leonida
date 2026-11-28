@@ -301,22 +301,19 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
     let (Some(c), false) = (computer(this), out.is_null()) else {
         return E_INVALIDARG;
     };
-    // SAFETY: the title passes room for the layout; every field is plain
-    // data, so zeroes are a valid start.
-    let out = unsafe {
-        out.write_bytes(0, 1);
-        &mut *out
-    };
-    out.size = c.texture.size;
-    out.alignment = c.texture.alignment;
-    out.mips = c.mips;
-    out.planes = c.texture.planes.len() as u32;
-    out.dimension = c.desc.dimension;
+    // SAFETY: every field of `LayoutOut` is plain integer data, so zeroes are
+    // valid; written with `write_unaligned` so `out` need not be aligned.
+    let mut built: LayoutOut = unsafe { std::mem::zeroed() };
+    built.size = c.texture.size;
+    built.alignment = c.texture.alignment;
+    built.mips = c.mips;
+    built.planes = c.texture.planes.len() as u32;
+    built.dimension = c.desc.dimension;
     // The library calls a depth plane "depth" only beside stencil or
     // without mips.
     let depth =
         c.desc.flags & ALLOW_DEPTH_STENCIL != 0 && (c.texture.planes.len() > 1 || c.mips == 1);
-    for (plane, p) in out.plane.iter_mut().zip(&c.texture.planes) {
+    for (plane, p) in built.plane.iter_mut().zip(&c.texture.planes) {
         let l = &p.layout;
         plane.usage = match (p.stencil, depth) {
             (true, _) => 8,
@@ -334,6 +331,7 @@ extern "system" fn layout(this: This, out: *mut LayoutOut) -> HRESULT {
             *mip = mip_out(&c.desc, l, i);
         }
     }
+    unsafe { out.write_unaligned(built) };
     S_OK
 }
 
@@ -354,7 +352,6 @@ fn copy_args(
     subresource: u32,
     row: u32,
     depth: u32,
-    detile: bool,
 ) -> Result<CopyArgs<'_>, HRESULT> {
     if c.mips == 0 {
         return Err(E_INVALIDARG);
@@ -394,8 +391,7 @@ fn copy_args(
         .and_then(|offset| offset.checked_add(slice_bytes))
         .ok_or(E_INVALIDARG)?;
     let plane_offset = usize::try_from(p.offset).map_err(|_| E_INVALIDARG)?;
-    let tiled_bytes = if detile { l.bytes_from(mip) } else { l.size };
-    let tiled = usize::try_from(tiled_bytes).map_err(|_| E_INVALIDARG)?;
+    let tiled = usize::try_from(l.bytes_from(mip)).map_err(|_| E_INVALIDARG)?;
     if tiled > isize::MAX as usize || linear > isize::MAX as usize {
         return Err(E_INVALIDARG);
     }
@@ -456,7 +452,7 @@ extern "system" fn copy_into(
     if tiled.is_null() || linear.is_null() {
         return E_INVALIDARG;
     }
-    let a = match copy_args(c, plane, subresource, row, depth, false) {
+    let a = match copy_args(c, plane, subresource, row, depth) {
         Ok(a) => a,
         Err(hr) => {
             tracing::warn!(hr, desc = ?c.desc, subresource, "copy into a texture failed");
@@ -501,7 +497,7 @@ extern "system" fn copy_from(
     if tiled.is_null() || linear.is_null() {
         return E_INVALIDARG;
     }
-    let a = match copy_args(c, plane, subresource, row, depth, true) {
+    let a = match copy_args(c, plane, subresource, row, depth) {
         Ok(a) => a,
         Err(hr) => {
             tracing::warn!(hr, desc = ?c.desc, subresource, "copy out of a texture failed");
@@ -1082,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_from_coarse_mip_uses_prefix_footprint() {
+    fn copy_into_and_from_coarse_mips_use_prefix_footprint_across_modes() {
         type Into = extern "system" fn(This, *mut u8, u32, u32, *const u8, u32, u32) -> HRESULT;
         type From =
             extern "system" fn(This, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT;
@@ -1090,40 +1086,103 @@ mod tests {
         // 256x256 BC7 SW_64KB_D: full texture is 128 KiB, while mips 1..=8 live in the first 64 KiB tile.
         let c = create(&desc(256, 256, 0, 98, 0x10a));
         let (into, from): (Into, From) = (slot(c, 8), slot(c, 9));
-        let mut full_tiled = vec![0u8; 131072];
+
+        // Unaligned `layout()` output pointer must succeed without UB.
+        let mut unaligned_buf = vec![0u64; (size_of::<LayoutOut>() + 16).div_ceil(8)];
+        let unaligned_out = unsafe { unaligned_buf.as_mut_ptr().cast::<u8>().add(1) }.cast::<LayoutOut>();
+        let get: extern "system" fn(This, *mut LayoutOut) -> HRESULT = slot(c, 2);
+        assert_eq!(get(c, unaligned_out), S_OK);
+        let read_layout = unsafe { unaligned_out.read_unaligned() };
+        assert_eq!(read_layout.size, 131072);
+
         let mip1_row = 32 * 16;
         let mip1_src: Vec<u8> = (0..mip1_row * 32).map(|i| (i * 5 + 11) as u8).collect();
-        assert_eq!(
-            into(
-                c,
-                full_tiled.as_mut_ptr(),
-                0,
-                1,
-                mip1_src.as_ptr(),
-                mip1_row as u32,
-                0,
-            ),
-            S_OK
-        );
 
-        // Place the linear output immediately after the 64 KiB coarse-mip prefix in one arena.
+        // Place the linear source/destination immediately after the 64 KiB coarse-mip prefix in one arena.
         let prefix = 65536usize;
         let mut arena = vec![0u8; prefix + 65536];
-        arena[..prefix].copy_from_slice(&full_tiled[..prefix]);
-        let dst = unsafe { arena.as_mut_ptr().add(prefix) };
+        arena[prefix..prefix + mip1_src.len()].copy_from_slice(&mip1_src);
+        let linear_after = unsafe { arena.as_mut_ptr().add(prefix) };
 
         assert_eq!(
-            from(c, dst, 0, 1, 0, arena.as_ptr(), mip1_row as u32, 0),
+            into(c, arena.as_mut_ptr(), 0, 1, linear_after.cast_const(), mip1_row as u32, 0),
+            S_OK
+        );
+        arena[prefix..prefix + mip1_src.len()].fill(0);
+        assert_eq!(
+            from(c, linear_after, 0, 1, 0, arena.as_ptr(), mip1_row as u32, 0),
             S_OK
         );
         assert_eq!(&arena[prefix..prefix + mip1_src.len()], mip1_src.as_slice());
 
-        // Mip 0 needs all 128 KiB of tiled memory, which overlaps `dst` at +64 KiB and must fail.
+        // Mip 0 needs all 128 KiB of tiled memory, which overlaps `linear_after` at +64 KiB and must fail.
         assert_eq!(
-            from(c, dst, 0, 0, 0, arena.as_ptr(), 1024, 0),
+            into(c, arena.as_mut_ptr(), 0, 0, linear_after.cast_const(), 1024, 0),
             E_INVALIDARG
         );
-
+        assert_eq!(
+            from(c, linear_after, 0, 0, 0, arena.as_ptr(), 1024, 0),
+            E_INVALIDARG
+        );
         assert_eq!(release(c), 0);
+
+        // Sweep mips, formats, dimensions, and addressable swizzle modes to prove
+        // `Layout::bytes_from(mip)` never underestimates any `copy_into` or `copy_from` span.
+        let cases = [
+            (TEXTURE_1D, 131u64, 1u32, 1u16, 28u32, 0x100u32),
+            (3, 259, 175, 1, 61, 0x101),  // R8, SW_256B_S
+            (3, 109, 71, 1, 71, 0x102),   // BC1, SW_256B_D
+            (3, 300, 190, 1, 28, 0x105),  // RGBA8, SW_4KB_S
+            (3, 250, 175, 1, 10, 0x106),  // RGBA16F, SW_4KB_D
+            (3, 512, 300, 1, 98, 0x109),  // BC7, SW_64KB_S
+            (3, 333, 211, 1, 2, 0x10a),   // RGBA32F, SW_64KB_D
+            (3, 128, 96, 3, 98, 0x105),   // 2D array
+            (TEXTURE_3D, 45, 29, 19, 28, 0x105), // 3D thick
+        ];
+        for (dim, w, h, d_or_a, fmt, swz) in cases {
+            let mut d = desc(w, h, 0, fmt, swz);
+            d.dimension = dim;
+            d.depth_or_array = d_or_a;
+            let comp = create(&d);
+            let (into, from): (Into, From) = (slot(comp, 8), slot(comp, 9));
+            let plane = unsafe { &(&*comp).texture.planes[0].layout };
+            let slices = if dim == TEXTURE_3D { 1 } else { u32::from(d_or_a) };
+            for slice in 0..slices {
+                for mip in 0..plane.mips.len() as u32 {
+                    let sub = slice * plane.mips.len() as u32 + mip;
+                    let m = &plane.mips[mip as usize];
+                    let row = m.width * plane.desc.element_bytes + 8;
+                    let depth_pitch = row * m.height + 16;
+                    let lin_len = (depth_pitch * m.depth) as usize;
+                    let til_len = plane.bytes_from(mip) as usize;
+                    let src: Vec<u8> = (0..lin_len).map(|i| (i * 13 + sub as usize) as u8).collect();
+                    let mut arena = vec![0u8; til_len + lin_len];
+                    arena[til_len..].copy_from_slice(&src);
+                    let lin_ptr = unsafe { arena.as_mut_ptr().add(til_len) };
+                    assert_eq!(
+                        into(comp, arena.as_mut_ptr(), 0, sub, lin_ptr.cast_const(), row, depth_pitch),
+                        S_OK,
+                        "into dim={dim} fmt={fmt} swz={swz:#x} sub={sub}"
+                    );
+                    arena[til_len..].fill(0xcd);
+                    assert_eq!(
+                        from(comp, lin_ptr, 0, sub, 0, arena.as_ptr(), row, depth_pitch),
+                        S_OK,
+                        "from dim={dim} fmt={fmt} swz={swz:#x} sub={sub}"
+                    );
+                    let active = (m.width * plane.desc.element_bytes) as usize;
+                    for z in 0..m.depth as usize {
+                        for y in 0..m.height as usize {
+                            let off = z * depth_pitch as usize + y * row as usize;
+                            assert_eq!(
+                                &arena[til_len + off..til_len + off + active],
+                                &src[off..off + active]
+                            );
+                        }
+                    }
+                }
+            }
+            assert_eq!(release(comp), 0);
+        }
     }
 }

@@ -703,7 +703,7 @@ impl Layout {
         } else {
             (dst.len(), src.len())
         };
-        let tiled_need = if DETILE { self.bytes_from(mip) } else { self.size };
+        let tiled_need = self.bytes_from(mip);
         if tiled_len < tiled_need as usize || linear_len < need || row_pitch < bytes {
             return Err(Error::TooSmall);
         }
