@@ -52,7 +52,8 @@ pub extern "system" fn GetModuleFileNameW(module: *mut c_void, out: *mut u16, si
         return host::get_module_file_name_w(module, out, size);
     };
     let wide: Vec<u16> = path.encode_utf16().collect();
-    copy_truncated(&wide, title_buffer(out, size))
+    // SAFETY: `out` is either null or writable for `size` `u16` elements.
+    unsafe { write_module_path(&wide, out, size) }
 }
 
 /// See [`GetModuleFileNameW`].
@@ -60,18 +61,8 @@ pub extern "system" fn GetModuleFileNameA(module: *mut c_void, out: *mut u8, siz
     let Some(path) = title_path(module) else {
         return host::get_module_file_name_a(module, out, size);
     };
-    copy_truncated(path.as_bytes(), title_buffer(out, size))
-}
-
-/// The title's buffer of `size` elements; none for a null pointer (a slice
-/// may not start at null, even an empty one, so `(NULL, 0)` would be
-/// undefined behaviour).
-fn title_buffer<'a, T>(out: *mut T, size: u32) -> &'a mut [T] {
-    if out.is_null() {
-        return &mut [];
-    }
-    // SAFETY: the title passes a buffer of `size` elements.
-    unsafe { std::slice::from_raw_parts_mut(out, size as usize) }
+    // SAFETY: `out` is either null or writable for `size` `u8` elements.
+    unsafe { write_module_path(path.as_bytes(), out, size) }
 }
 
 fn title_path(module: *mut c_void) -> Option<String> {
@@ -83,25 +74,35 @@ fn title_path(module: *mut c_void) -> Option<String> {
     Some(runtime::image_path(base)?.to_string_lossy().into_owned())
 }
 
-/// `GetModuleFileName`'s contract: copy with a NUL; if it does not fit,
-/// truncate to the buffer, report `ERROR_INSUFFICIENT_BUFFER` and return
-/// the buffer size.
-fn copy_truncated<T: Copy + Default>(text: &[T], out: &mut [T]) -> u32 {
-    let Some(room) = out.len().checked_sub(1) else {
+/// `GetModuleFileName`'s contract: write directly with `write_unaligned` (never
+/// forming `&mut [T]` over uninitialized or misaligned caller memory) plus a
+/// trailing NUL; if it does not fit, truncate to `size`, report
+/// `ERROR_INSUFFICIENT_BUFFER` and return `size`; otherwise clear last error to
+/// `ERROR_SUCCESS` (`0`) and return the copied length.
+unsafe fn write_module_path<T: Copy + Default>(text: &[T], out: *mut T, size: u32) -> u32 {
+    let cap = size as usize;
+    let Some(room) = cap.checked_sub(1).filter(|_| !out.is_null()) else {
         host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
         return 0;
     };
     let n = text.len().min(room);
-    out[..n].copy_from_slice(&text[..n]);
-    out[n] = T::default();
+    for (i, &unit) in text[..n].iter().enumerate() {
+        // SAFETY: `i < n < cap` and `out` is non-null with room for `cap` elements.
+        unsafe { out.add(i).write_unaligned(unit) };
+    }
+    // SAFETY: `n <= room < cap`.
+    unsafe { out.add(n).write_unaligned(T::default()) };
     if n < text.len() {
         host::set_last_error(ERROR_INSUFFICIENT_BUFFER);
-        return out.len() as u32;
+        size
+    } else {
+        host::set_last_error(0);
+        n as u32
     }
-    n as u32
 }
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const ERROR_PROC_NOT_FOUND: u32 = 127;
 
 /// Console-only DLLs we implement load as a pseudo handle (titles load
 /// `xgameruntime.dll` this way), the title's DLLs as the images we map
@@ -151,6 +152,7 @@ pub extern "system" fn LoadLibraryW(name: *const u16) -> *mut c_void {
 /// Looks up our implementations behind a pseudo handle; real modules go to
 /// the host.
 pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void {
+    let saved = host::get_last_error();
     // `NULL` is the process's exe, which for the title is its own image.
     let module = if module.is_null() {
         runtime::main_image().unwrap_or(0) as *mut c_void
@@ -158,23 +160,29 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
         module
     };
     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
-        return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
+        let found = host_override(module, name);
+        host::set_last_error(saved);
+        return found.unwrap_or_else(|| host::get_proc_address(module, name));
     };
-    // Values below 0x10000 are ordinals; we export by name only.
-    if (name as usize) < 0x1_0000 {
-        tracing::warn!(
-            module = m.name,
-            ordinal = name as usize,
-            "GetProcAddress by ordinal"
-        );
+    if name.is_null() {
+        host::set_last_error(ERROR_PROC_NOT_FOUND);
         return std::ptr::null_mut();
     }
-    // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
-    let name = unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy();
-    match m.exports.iter().find(|e| e.name == name) {
-        Some(e) => e.address as *mut c_void,
+    // Values below 0x10000 are ordinals (`#n` in `m.exports`, e.g. `gameinput.dll` `#1`).
+    let symbol = if (name as usize) < 0x1_0000 {
+        std::borrow::Cow::Owned(format!("#{}", name as usize))
+    } else {
+        // SAFETY: not an ordinal, so the title passes a NUL-terminated name.
+        unsafe { CStr::from_ptr(name.cast()) }.to_string_lossy()
+    };
+    match m.exports.iter().find(|e| e.name == symbol) {
+        Some(e) => {
+            host::set_last_error(saved);
+            e.address as *mut c_void
+        }
         None => {
-            tracing::warn!(module = m.name, %name, "GetProcAddress: not implemented");
+            tracing::warn!(module = m.name, name = %symbol, "GetProcAddress: not implemented");
+            host::set_last_error(ERROR_PROC_NOT_FOUND);
             std::ptr::null_mut()
         }
     }
@@ -184,7 +192,7 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
 /// when we override it: a title that looks a function up by name must not
 /// get past our overrides (the network guard, path rewriting).
 fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
-    if module.is_null() || runtime::image_path(module as usize).is_some() {
+    if module.is_null() || name.is_null() || runtime::image_path(module as usize).is_some() {
         return None;
     }
     let symbol = if (name as usize) < 0x1_0000 {
@@ -192,11 +200,26 @@ fn host_override(module: *mut c_void, name: *const u8) -> Option<*mut c_void> {
     } else {
         narrow(name)
     };
-    let mut path = [0u16; 260];
-    let len = host::get_module_file_name_w(module, path.as_mut_ptr(), path.len() as u32) as usize;
-    let path = String::from_utf16_lossy(&path[..len.min(path.len())]);
-    let file = path.rsplit('\\').next()?;
+    let path = read_module_path(|buf, cap| host::get_module_file_name_w(module, buf, cap))?;
+    let file = path.rsplit(['\\', '/']).next()?;
     crate::registry::lookup(file, &symbol).map(|address| address as *mut c_void)
+}
+
+fn read_module_path(mut get: impl FnMut(*mut u16, u32) -> u32) -> Option<String> {
+    let mut buf = vec![0u16; 260];
+    loop {
+        let len = get(buf.as_mut_ptr(), buf.len() as u32) as usize;
+        if len == 0 {
+            return None;
+        }
+        if len < buf.len() {
+            return Some(String::from_utf16_lossy(&buf[..len]));
+        }
+        if buf.len() >= 32_768 {
+            return None;
+        }
+        buf.resize((buf.len() * 2).min(32_768), 0);
+    }
 }
 
 /// Our pseudo modules and the title's images stay loaded: `LoadLibrary`
@@ -213,6 +236,9 @@ pub extern "system" fn FreeLibrary(module: *mut c_void) -> i32 {
 /// Title images hear of thread starts and ends from us, not from the
 /// Windows loader (`leonida_loader::disable_thread_calls`).
 pub extern "system" fn DisableThreadLibraryCalls(module: *mut c_void) -> i32 {
+    if registry().iter().any(|m| handle(m) == module) {
+        return 1;
+    }
     host::disable_thread_library_calls(module)
 }
 
@@ -295,18 +321,27 @@ fn handle(m: &HleModule) -> *mut c_void {
     m as *const HleModule as *mut c_void
 }
 
+fn module_file_name(path: &str) -> Option<String> {
+    let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    if file.is_empty() {
+        return None;
+    }
+    // As the Windows loader does, a name without '.' gets `.dll`; when '.' is
+    // present no extension is added and trailing dots are stripped.
+    if file.contains('.') {
+        let trimmed = file.trim_end_matches('.');
+        (!trimmed.is_empty()).then(|| trimmed.to_owned())
+    } else {
+        Some(format!("{file}.dll"))
+    }
+}
+
 /// The title's images and our console modules by name; `None` leaves the
 /// name to the host, which only DLLs `HostPolicy` passes through get (as at
 /// import binding); others fail. With `load`, a title DLL not mapped yet is
 /// mapped now.
 fn find_module(path: &str, load: bool) -> Option<*mut c_void> {
-    let file = path.rsplit(['\\', '/']).next().unwrap_or(path);
-    // As the Windows loader does, a name without extension means a DLL.
-    let file = if file.contains('.') {
-        file.to_owned()
-    } else {
-        format!("{file}.dll")
-    };
+    let file = module_file_name(path)?;
     // Loads go through the title DLL loader first: it waits for a DLL that
     // another thread is still initialising, as the Windows loader lock does.
     if load {
@@ -483,7 +518,7 @@ pub(crate) fn callers() -> String {
 mod host {
     use std::ffi::c_void;
 
-    use windows_sys::Win32::Foundation::{FreeLibrary, SetLastError};
+    use windows_sys::Win32::Foundation::{FreeLibrary, GetLastError, SetLastError};
     use windows_sys::Win32::System::Diagnostics::Debug::RtlCaptureStackBackTrace;
     use windows_sys::Win32::System::LibraryLoader::{
         DisableThreadLibraryCalls, GetModuleFileNameA, GetModuleFileNameW, GetModuleHandleA,
@@ -519,6 +554,11 @@ mod host {
     pub(super) fn get_module_file_name_a(module: *mut c_void, out: *mut u8, size: u32) -> u32 {
         // SAFETY: see above.
         unsafe { GetModuleFileNameA(module, out, size) }
+    }
+
+    pub(super) fn get_last_error() -> u32 {
+        // SAFETY: see above.
+        unsafe { GetLastError() }
     }
 
     pub(super) fn set_last_error(code: u32) {
@@ -635,6 +675,10 @@ mod host {
     }
 
     pub(super) fn get_module_file_name_a(_: *mut c_void, _: *mut u8, _: u32) -> u32 {
+        0
+    }
+
+    pub(super) fn get_last_error() -> u32 {
         0
     }
 
@@ -787,6 +831,7 @@ mod tests {
         let base = 0x7100_0000_0000usize;
         runtime::set_image_path(base, std::path::Path::new(r"C:\title\Mapped.dll"));
         runtime::set_title_dll_loader(Box::new(|file| match file {
+            ".dll" | "" => panic!("empty module name reached title DLL loader: {file:?}"),
             "late.dll" => Ok(Some(0x7200_0000_0000)),
             "broken.dll" => Err("bad image".into()),
             _ => Ok(None),
@@ -827,5 +872,161 @@ mod tests {
             let last = unsafe { windows_sys::Win32::Foundation::GetLastError() };
             assert_eq!(last, ERROR_INSUFFICIENT_BUFFER);
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pseudo_modules_resolve_ordinals_report_errors_and_disable_thread_calls() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        const TEST_ERROR_PROC_NOT_FOUND: u32 = 127;
+
+        let gi = LoadLibraryA(c"gameinput.dll".as_ptr().cast());
+        assert!(!gi.is_null());
+        assert_eq!(DisableThreadLibraryCalls(gi), 1);
+        let gi_create = crate::registry::lookup("gameinput.dll", "#1").unwrap();
+        assert_eq!(
+            GetProcAddress(gi, std::ptr::without_provenance(1)) as usize,
+            gi_create
+        );
+
+        unsafe { SetLastError(0) };
+        assert!(GetProcAddress(gi, std::ptr::without_provenance(2)).is_null());
+        assert_eq!(unsafe { GetLastError() }, TEST_ERROR_PROC_NOT_FOUND);
+
+        unsafe { SetLastError(0) };
+        assert!(GetProcAddress(gi, std::ptr::null()).is_null());
+        assert_eq!(unsafe { GetLastError() }, TEST_ERROR_PROC_NOT_FOUND);
+
+        unsafe { SetLastError(0) };
+        assert!(GetProcAddress(gi, c"MissingExport".as_ptr().cast()).is_null());
+        assert_eq!(unsafe { GetLastError() }, TEST_ERROR_PROC_NOT_FOUND);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn host_proc_overrides_handle_long_paths_and_preserve_last_error() {
+        use std::os::windows::ffi::OsStrExt;
+        use std::path::PathBuf;
+        use windows_sys::Win32::Foundation::{FreeLibrary as HostFreeLibrary, GetLastError, SetLastError};
+        use windows_sys::Win32::System::LibraryLoader::LoadLibraryW as HostLoadLibraryW;
+
+        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        assert!(!kernel32.is_null());
+        unsafe { SetLastError(0x1234) };
+        assert_eq!(
+            GetProcAddress(kernel32, c"CreateFileW".as_ptr().cast()) as usize,
+            crate::registry::lookup("kernel32.dll", "CreateFileW").unwrap()
+        );
+        assert_eq!(unsafe { GetLastError() }, 0x1234);
+
+        unsafe { SetLastError(0) };
+        assert!(GetProcAddress(kernel32, std::ptr::null()).is_null());
+        assert_ne!(unsafe { GetLastError() }, 0);
+
+        struct LongModuleGuard {
+            handle: *mut c_void,
+            root: PathBuf,
+        }
+        impl Drop for LongModuleGuard {
+            fn drop(&mut self) {
+                if !self.handle.is_null() {
+                    unsafe { HostFreeLibrary(self.handle) };
+                }
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_base = std::env::temp_dir().join(format!("leo_hle_lp_{}_{stamp}", std::process::id()));
+        let raw_base = temp_base.to_string_lossy();
+        let verbatim_root = if raw_base.starts_with(r"\\?\") {
+            PathBuf::from(raw_base.as_ref())
+        } else {
+            PathBuf::from(format!(r"\\?\{raw_base}"))
+        };
+        let deep_dir = verbatim_root.join("d".repeat(120)).join("e".repeat(120));
+        std::fs::create_dir_all(&deep_dir).unwrap();
+        let deep_dll = deep_dir.join("winhttp.dll");
+        let sys_root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let src_dll = PathBuf::from(sys_root).join("System32").join("winhttp.dll");
+        std::fs::copy(&src_dll, &deep_dll).unwrap();
+        let deep_wide: Vec<u16> = deep_dll.as_os_str().encode_wide().chain(Some(0)).collect();
+        let h_long = unsafe { HostLoadLibraryW(deep_wide.as_ptr()) };
+        let _guard = LongModuleGuard {
+            handle: h_long,
+            root: verbatim_root,
+        };
+        assert!(!h_long.is_null());
+        unsafe { SetLastError(0x2345) };
+        assert_eq!(
+            GetProcAddress(h_long, c"WinHttpOpen".as_ptr().cast()) as usize,
+            crate::registry::lookup("winhttp.dll", "WinHttpOpen").unwrap()
+        );
+        assert_eq!(unsafe { GetLastError() }, 0x2345);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn empty_and_trailing_dot_module_names_follow_win32_rules() {
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+        const TEST_ERROR_INVALID_PARAMETER: u32 = 87;
+
+        let kernel32 = GetModuleHandleW(w("kernel32.dll").as_ptr());
+        assert!(!kernel32.is_null());
+
+        unsafe { SetLastError(0) };
+        assert!(LoadLibraryW(w("").as_ptr()).is_null());
+        assert_eq!(unsafe { GetLastError() }, TEST_ERROR_INVALID_PARAMETER);
+        assert!(LoadLibraryW(w(r"C:\Windows\").as_ptr()).is_null());
+        assert_eq!(GetModuleHandleW(w("kernel32.dll.").as_ptr()), kernel32);
+        assert_eq!(GetModuleHandleW(w("kernel32.dll..").as_ptr()), kernel32);
+        assert_eq!(
+            LoadLibraryA(c"xgameruntime.dll.".as_ptr().cast()),
+            LoadLibraryA(c"xgameruntime.dll".as_ptr().cast())
+        );
+        assert!(GetModuleHandleW(w("kernel32.").as_ptr()).is_null());
+        assert!(LoadLibraryA(c"wininet.dll.".as_ptr().cast()).is_null());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn title_module_filenames_accept_unaligned_uninit_buffers_and_clear_last_error() {
+        use std::mem::MaybeUninit;
+        use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
+
+        let base = 0x7400_0000_0000usize;
+        runtime::set_image_path(base, std::path::Path::new(r"C:\title\unaligned.exe"));
+        let title_mod = base as *mut c_void;
+        let mut raw_uninit = [MaybeUninit::<u8>::uninit(); 128];
+        let odd_w: *mut u16 = unsafe { raw_uninit.as_mut_ptr().add(1).cast() };
+
+        let trunc_len = GetModuleFileNameW(title_mod, odd_w, 5);
+        assert_eq!(trunc_len, 5);
+        assert_eq!(unsafe { GetLastError() }, ERROR_INSUFFICIENT_BUFFER);
+        let trunc_units: Vec<u16> = (0..5)
+            .map(|i| unsafe { odd_w.add(i).read_unaligned() })
+            .collect();
+        assert_eq!(trunc_units, [b'C' as u16, b':' as u16, b'\\' as u16, b't' as u16, 0]);
+
+        let full_len = GetModuleFileNameW(title_mod, odd_w, 40);
+        assert_eq!(full_len, 22);
+        assert_eq!(unsafe { GetLastError() }, 0);
+        let full_units: Vec<u16> = (0..22)
+            .map(|i| unsafe { odd_w.add(i).read_unaligned() })
+            .collect();
+        assert_eq!(
+            String::from_utf16_lossy(&full_units),
+            r"C:\title\unaligned.exe"
+        );
+        assert_eq!(unsafe { odd_w.add(22).read_unaligned() }, 0);
+
+        let mut ansi_uninit = [MaybeUninit::<u8>::uninit(); 40];
+        unsafe { SetLastError(ERROR_INSUFFICIENT_BUFFER) };
+        let ansi_len = GetModuleFileNameA(title_mod, ansi_uninit.as_mut_ptr().cast(), 40);
+        assert_eq!(ansi_len, 22);
+        assert_eq!(unsafe { GetLastError() }, 0);
     }
 }
