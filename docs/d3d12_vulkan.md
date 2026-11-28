@@ -1707,8 +1707,30 @@ The copies:
   (logged once otherwise).
 - Any **other address in the title's memory** gets a window: the 64 KiB-aligned pages it covers, clipped to the
   title's range, copied into the arena now and before every submission, through the same shadow refresh as slot 133
-  (so dirty-page tracking for that refresh applies to both). Windows stay until the device goes, up to
-  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that
+  (so dirty-page tracking for that refresh applies to both). A window never covers bytes an existing range already
+  serves: it stays inside the free span around the address (and a stream-pool extent inside the free span in both of
+  the pair's views), because a range entered over a live one replaces it whole, and the copy that range answered from
+  would be left reached by nothing. Windows stay while an address range still answers from them, up to
+  `LEONIDA_TITLE_WINDOWS_MB` (64 MiB by default). A window that no range answers from any more (a slot-133 buffer the
+  title placed over its pages, or a BVH input's exact copy, replaced its ranges) is **retired** after the next
+  submission's refresh: the alias table's listener records the removed ranges' copies, and a window none of its
+  ranges is left for loses its stream-pool extent and its bytes of the budget at once. Its memory is freed once every
+  `ExecuteCommandLists` replay in progress then has recorded its submissions, every command list whose recording
+  began before the retirement is gone (reset, released, or a held batch's or the async worker's copy of it run), and
+  the submissions recorded by then have completed: a list resolves its root views when they are recorded, so one
+  recorded before the retirement and executed, or executed again, after it still names the window
+  (`src/command_list_epochs.h`). Until then its copy stays a target of its pages' tracker, refreshed like the others,
+  and what the GPU wrote in it goes back to the title's pages: with its submissions' write-back, and once more when it
+  is freed (a range noted when a list was recorded can be copied back before a held batch has run). A retired copy goes
+  back only on the bytes no live copy over them changed, byte by byte (the window and the buffer that replaced it can
+  each have written their own bytes of one 256-byte piece), and every copy is compared with the title's bytes as
+  they were before any copy went back. The bytes a retired copy returns are also written into every other copy over
+  them that still held the title's older bytes, as the next refresh would: a window is freed after its submission's
+  refresh, and the range that replaced it reads its last bytes in that same submission. `d3d12_title_window_orphans` covers it, with a writing batch held on a fence
+  while the next submission's refresh retires its window. A window is
+  not retired when its pages are released or remapped: a retail run measured no release at all of the pages windows
+  cover (the title remaps its pool frames instead), and the tracker follows the pages.
+  A tracker the window shared with a copy still live keeps its extent (a retirement never splits one). A window that
   cannot fit between the title's address reservations can use a separate mapped buffer. The buffer's device address
   must fit as a positive 47-bit offset from the arena base. The same window cap and dirty-page refresh apply.
   `LEONIDA_STREAM_BUFFER_WINDOWS=0` requires the window to fit in the arena.
@@ -1721,7 +1743,7 @@ The copies:
   title itself wrote in between keeps the title's newer bytes and its GPU result is dropped. The copy back asks the
   write watch first (the refresh's own asking comes after it, so a hot page's last answer is a submission old), passes
   over pages whose mapping changed, that a kernel write may be filling or that xmem maps at another address too, and
-  writes only the 256-byte pieces where the copy differs from the title's bytes: a read-only view writes nothing and
+  writes only the bytes where the copy differs from the title's (compared in 256-byte pieces): a read-only view writes nothing and
   its pages stay guarded. The copy runs under the tracker's lock and can still fault on a page another guard keeps
   read-only (the geometry watch, another view's shadow): the fault handler asks every tracker over the address, this
   one included, and on the thread whose copy faulted it does not take that lock again (an SRW lock is not
@@ -1738,9 +1760,22 @@ The copies:
   loses the device. The refusal and the count of zero-size views are logged.
 - A **stream pool** (the title's CPU view paired with a 16-24 GiB GPU-only
   alias) is not windowed per request. The GPU-only pages are translated to the CPU view of the same frames (rule B in
-  that note), and **one mapping serves a page-aligned readable run** of the pool (at most 1 MiB, a geometry copy when
-  the cap allows, a window otherwise). Both addresses of the pair are entered in the table, so a V# naming either
-  reaches that one mapping instead of asking for a second one; `LEONIDA_GEOMETRY_MB` is the preferred backing.
+  that note), and **one mapping serves a page-aligned readable run** of the pool (at most 1 MiB, and never past the
+  next mapping in either view; a geometry copy when the cap allows, a window otherwise). A request whose byte a
+  mapping already holds in either view is served by it when the mapping holds all of the request's bytes, and the
+  other view is entered as far as that mapping reaches. A request never gets a mapping shorter than its bytes (a V#'s
+  size, 64 KiB for a root view): one that runs into the next mapping, or past the end of the one holding its first
+  byte, gets one mapping over itself and every window it reaches, each whole, in both views (`title_pool_cover`,
+  `TitleVaAliases::replace_twin`), and those windows are retired at the next submission. `replace_twin` checks, under
+  the lock it replaces them under, that every range it would erase is one of those windows: a slot-133 buffer is
+  entered without the window lock, so one placed in the span after the plan makes it refuse, the new window is dropped
+  and the request falls back as below. Only with a range in the way
+  that is not a window (a slot-133 buffer, a geometry copy) or that reaches past the pool in its view, or pages that are
+  not readable, does it get a zero-size
+  view: a refusal there would also have the root views a title rings through a pool read zeros where it served them
+  before. `vsharp_address` asks again, like `TitleVaAliases::resolve`, when the range holding a V#'s base ends before
+  the V# does. Both addresses of the pair are entered in the table, so a V# naming either reaches that one mapping instead of
+  asking for a second one; `LEONIDA_GEOMETRY_MB` is the preferred backing.
   Acceleration-structure destinations and scratch also resolve through the table, and a structure no window holds
   whole gets a copy of its whole range, so the BVH builder's commands are recorded.
 - `LEONIDA_GEOMETRY_MB` sets the device-local memory cap for streamed buffer views. The default is 0.
@@ -2794,6 +2829,48 @@ Pipeline creation:
   a submission waits for them, and what is skipped, is "Pipelines still being built" below. Strict replay builds
   synchronously and waits for every build. `LEONIDA_COMPUTE_WARMUP=0` restricts the worker to pipelines requested by
   the title.
+  `LEONIDA_PIPELINE_ORDER_LOG=1` records the order in which the title first asks for pipelines
+  (RT-PIPELINE-PREWARM-ORDER, phase 1; `runtime/src/pipeline_order.h`). It is off by default: nothing reads the file yet,
+  so a run that does not ask for it writes nothing and its pipelines carry no hook. For each pipeline and variant (the
+  unbound-slot mask for graphics, 0 for compute) that a dispatch or draw names for the first time, one line is
+  appended to `pipeline_order.log` beside `pipeline_cache.session.bin` (so `LEONIDA_PIPELINE_CACHE_DIR` moves it):
+  `P <c|g|m> <key> <variant hex> <created ms> <first use ms> <build ms or -> <ready 0|1> *<checksum>`, with the
+  times in milliseconds since the process started. The key is the SHA-256 of the title's own description of the PSO
+  (`GetCachedBlob`'s key; a mesh pipeline's MS is folded in), not of the SPIR-V, so a translator change keeps it. A
+  build that ends after its line was written adds `B <key> <variant hex> <build ms> *<checksum>`; a session starts
+  with `S 1 <vendor hex> <device hex>`. A compute pipeline's `P` line is followed by
+  `E <key> <variant hex> <name hash hex> *<checksum>`: the name hash is 16 hex digits of FNV-1a 64 over the name of
+  the library entry the pipeline was made from (the name itself is not written). A reader from before `E` lines
+  skips them (counted as lines not read). Each line ends with an FNV-1a checksum: a cut or damaged line is skipped on
+  read, never fatal. The hook sits in replay's `ComputePipeline::requested` / `GraphicsPipeline::requested`, called
+  where a submission is prepared, also for a handle that exists already (a warm-up build, a cached one); the
+  recorder decides "first" with one compare-and-swap in a table made at start, never blocks and allocates nothing (a non-blocking `try_lock` on the first request of a pipeline and of a variant),
+  and a thread of its own appends every 250 ms, so a killed process loses at most that. The record holds 8192 lines
+  per run (the rest is counted, not kept); a file past 8 MiB is set aside as `pipeline_order.log.prev`. At exit (the
+  exit cache save, or the device's release) one line gives the counts: `[rt] pipeline-order: requested N, already
+  ready M, median lead X ms`. "Lead" is first use minus creation. A PSO made from a pipeline state stream on the
+  console path is created when it is first bound, so its lead is the title's, not an upper bound on a head start.
+  A root signature the runtime does not know is hashed by its address, so the key of a pipeline made with one can
+  change from one run to the next. The file is local, like the cache files, and is not meant to be attached to a
+  report: quote the counts. It changes no build, order or cache.
+  `LEONIDA_PIPELINE_PREWARM_ORDER=<file>` reads such a log at boot and builds, ahead of their first draw, the graphics
+  and mesh pipelines an earlier run asked for first (RT-PIPELINE-PREWARM-ORDER, phase 2; `runtime/src/pipeline_prewarm.h`).
+  `1` names `pipeline_order.log` beside the session cache; it is read before this run's own record is appended, so
+  both variables can be on together. Of the runs recorded on this GPU (vendor and device id), the one with the most
+  records is read, the newest on a tie. When the title creates a PSO whose key is in it, each recorded variant is
+  queued on the compile workers as a warm-up at its recorded rank: after every demanded build, one warm-up at a time
+  and none while a demanded build runs (`PipelineCompiler`; the compile-gate finding in "Compile workers" below is
+  why), ahead of the compute warm-up's size order and before the cache checkpoint. A variant 0 built at create is
+  skipped. A console stream kept for its first bind (`LEONIDA_PIPELINE_COMPILE=on-demand`) is otherwise parsed only
+  there, which would leave the prewarm no lead: when its pipeline is in the plan, the parse is queued as its first
+  prewarm job instead (at the rank of its first recorded variant, on a compile worker), and its variants follow with
+  their ranks. A bind that comes first waits for that parse, which it would otherwise have done itself. Records are taken in order until their recorded build times add up to
+  `LEONIDA_PIPELINE_PREWARM_BUDGET_MS` (default 300000; a record with no build time counts 1000 ms), and at most
+  `LEONIDA_PIPELINE_PREWARM_MAX_ENTRIES` (default 4096). Compute records are left to the compute warm-up and to
+  `gta6rt --precompile-pipelines`. A missing or unreadable file, a file with no readable record and a file from
+  another GPU are ignored with one `[rt] pipeline-prewarm:` line; a damaged line is skipped, as are line types a v1
+  reader does not know (`E`). A queued prewarm holds no reference: a PSO released first drops it. One that is already
+  running when the title submits still holds the compile gate (`LEONIDA_COMPILE_GATE`), as any warm-up does.
   A queued build holds no reference to its PSO or device (`PipelineCompiler`, `runtime/shims/d3d12_pipeline_compile.h`).
   A PSO's last release drops its queued builds and returns at once; one already running is left to finish, and the
   worker deletes the PSO after it (`PipelineState::last_release`). The PSO's device reference goes at the release, so
@@ -2880,6 +2957,23 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   at record time already: at `SetPipelineState` for compute and at each draw for graphics, with the variant its bound
   targets give (`request_pipeline_build`). A compute build the compile helper is still making (`LEONIDA_COMPILE_HELPER`)
   publishes nothing, so its next use asks again.
+- **Compile workers** (RT-ASYNC-COMPILE-POOL, after MoonEyes' design in #2077). The jobs above, the compute warm-up
+  and the cache checkpoint run on `LEONIDA_COMPILE_THREADS` workers (half the logical processors, 2 to 8). With one
+  worker a driver compile of minutes held every pipeline a submission asked for behind it, and their draws and
+  dispatches were skipped meanwhile. A worker now takes the most urgent job it may: demanded builds first, in the
+  order they came, then warm-ups by module size, then the checkpoint, which waits until no worker compiles. Large
+  builds (compute over 128 KiB, graphics of 1 MiB or more) and warm-ups together take at most threads-1 workers, so
+  one is always free for a small demanded build; at most `LEONIDA_COMPILE_HEAVY_MAX` large builds run at once (default
+  threads-1, 1 with `LEONIDA_SERIAL_BIG_COMPILES=1`), each still within the memory gate; warm-ups run one at a time,
+  as before, and none starts while a demanded build is queued or running, since each holds the compile gate for its
+  whole create (MoonEyes measured in #1608 that with the gate on, submissions waited 142 s in all behind warm-ups of
+  about 800 KB, and that with `LEONIDA_COMPILE_GATE=0` the same boot reached game state 3); and a PSO has one build
+  running at a time, so
+  `after_running` and the teardown rules hold as they were. `LEONIDA_COMPILE_THREADS=1` is the layout before the pool:
+  one general worker and the graphics-only one; there too a PSO has one build running at a time (two variants of one
+  graphics PSO, one on each worker, let its last release delete it under the other build, qhukz13). A submission still
+  waits at the compile gate for every compute create in flight (and graphics creates too with `LEONIDA_COMPILE_GATE=adaptive` or `1`; the classic default gates compute builds only), so more workers
+  do not shorten that wait (`SubmitMutex::CompileTurn`; `LEONIDA_COMPILE_GATE=0` turns it off).
 - **Only the large ones asynchronous** (`LEONIDA_ASYNC_MIN_BYTES=<n>`, with `LEONIDA_ASYNC_PIPELINES=1`). With every
   pipeline asynchronous, the small lighting and post programs are skipped with the large ones until the worker gets to
   them, and on an RTX 4070 Laptop (NVIDIA 621.40) the world phase was reached with the screen black; with none, a
@@ -2893,6 +2987,17 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   still goes through the compile gate and `LargeModuleGate` as before, so a smaller one a submission waits for can
   queue behind it there; `async_pipeline_size_test` covers the decision and `d3d12_m4_compute_async_small_waits` a
   submission whose two pipelines are under the threshold with the worker held (both dispatches run).
+  `LEONIDA_ASYNC_MIN_BYTES_GRAPHICS=<n>` gives graphics and mesh pipelines (all their stages) a threshold of their
+  own; unset, they take `LEONIDA_ASYNC_MIN_BYTES`, as before the variable, and compute always does. `0` makes every
+  graphics pipeline asynchronous, as `LEONIDA_ASYNC_PIPELINES=1` did on its own. The reason: @MoonEyes's thread dumps
+  (RTX 4060, `LEONIDA_ASYNC_MIN_BYTES=1048576`) showed the draw thread building lazy graphics variants under 1 MiB in
+  place (`PipelineState::variant` -> `build` -> `vkCreateGraphicsPipelines`, 2.5-11 s each, back to back), so no
+  present came for about 100 s. A graphics pipeline that is not built yet costs one skipped draw, while the image
+  needs the small lighting and post compute programs, so graphics can stay asynchronous while those are built where
+  they are needed. One startup line states both thresholds. `d3d12_pipeline_workers_async_graphics_zero` holds the
+  compile worker with compute over its threshold and graphics at `0`: every dispatch runs, every draw is skipped, and
+  the draws come once the worker is let go; `d3d12_pipeline_workers_async_graphics_unset` checks that graphics follow
+  `LEONIDA_ASYNC_MIN_BYTES` without the variable.
 - **Warm-ups while the title submits.** A compute warm-up holds the compile gate for its whole create, and every
   submission waits behind it: a native boot's submissions waited 140 s in all at the gate behind compute warm-ups, and
   past the story load the worker went through 694 warm-ups of modules over 128 KiB (those over 640 KiB take 4-25 s
@@ -2901,6 +3006,106 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   title submits (a submission in the last second, `src/pipeline_wait.h`); the pipeline is built at its first use
   instead. Opt-in: unset or 0, every warm-up runs, as on `main`, and `LargeModuleGate` (#1889) orders them behind a
   submission's compiles. Smaller warm-ups, and every warm-up before the first submission, run as before.
+- **A bounded, adaptive compile gate, where the driver was measured for it** (`SubmitMutex::enter_submit`,
+  `src/vulkan_device_fault.h`; `LEONIDA_COMPILE_GATE=adaptive` forces it, `classic` forces the classic one). The
+  classic gate: compute creates only, each waited for however long it takes, no probes, as before. Unset or `auto`,
+  the device measures which one this driver gets before the title runs (the next item). The adaptive gate is not on
+  everywhere because of what it costs on a driver that does hold submissions behind a create (630.20, below): no run
+  of it there has been reported yet. The gate keeps a
+  `vkQueueSubmit` out of the driver while a create is in it, since on NVIDIA 630.20 one that entered during a long
+  `vkCreateComputePipelines` waited 10 s and lost the device. The waiting submission holds the submit lock, so all
+  queues stop: on an RTX 4070 Laptop (NVIDIA 621.40) one compute create of a 2.3 MB module stayed in the driver for
+  more than 54 s during the story load, the submission waited for all of it and the title's 30 s hang watchdog ended
+  the process; with `LEONIDA_COMPILE_GATE=0` the same build went past that point. With the adaptive gate a
+  submission waits at most `LEONIDA_COMPILE_GATE_WAIT_MS` (15 s by default there) and then goes ahead; the creates in
+  the driver at that moment hold no later submission back, and creates that enter after it are waited for again. On
+  630.20 that loses only creates over 25 s (15 s here, then the driver's 10 s), which the watchdog ends anyway.
+  On the same laptop the three submissions that went ahead came back from the driver in 11, 1 and 0 ms with the
+  create still there, and no device was lost; but consecutive long creates made submissions wait the full 15 s again
+  and again, and the title's watchdog still ended the run. So the adaptive gate adapts: every submission that
+  enters the driver next to a create it no longer waits for is a probe. Two that come back in under 250 ms, at least
+  1 s apart, with that create still in the driver turn the gate off for the rest of the run (a driver that holds a
+  submission behind a create holds it as long as the create stays, and 630.20 held one for the full 10 s). Two, and a
+  second apart, because back-to-back creates take and release that driver's lock, so one submission can slip in
+  between; the second costs no extra wait, since after one has gone ahead the next enter at once while the create is
+  still there. One probe that stays 2 s or more keeps the gate on for the rest of the run (presents and idle waits do
+  not probe, below). Both verdicts are logged once. `LEONIDA_COMPILE_GATE=1` gates always and never probes.
+  In the next run on that laptop the story load passed, but no wait reached 15 s, so no probe came: 80 submissions
+  waited 3-7 s each (90 s in all, the longest 6.7 s), back to back, and the title's watchdog ended the run at 433 s.
+  So until a verdict is in, a submission also goes ahead once the submissions' waits at the gate in the last 10 s, its
+  own included, add up to `LEONIDA_COMPILE_GATE_PROBE_MS` (2500 ms). A budget over a
+  window rather than a shorter limit per wait, because it also counts many short waits, and one wait reaches it as
+  soon as a 2.5 s limit would. Before the verdict the gate then stops the queues for at most about a quarter of any
+  10 s, after a quick verdict not at all. On a driver that does hold submissions (630.20) the first probe now enters
+  the driver after 2.5 s of waiting instead of 15 s, and loses the device if the create stays there 10 s more (the
+  classic gate waits that create out). One probe per kind and run: it holds the submit lock while it is in the
+  driver, so no other submission enters until it comes back, and it then gives the held verdict (2 s or more, back
+  within 500 ms of the create leaving), after which no submission goes ahead beside a create of that kind before the
+  held limit. The held threshold stays 2 s, well inside the 10 s such a driver gives before the loss. The limit and the
+  budget apply with the title's watchdog kept kicked too (`LEONIDA_TITLE_WATCHDOG=0` and
+  `LEONIDA_TITLE_WATCHDOG_KICK`): nothing ends the run then, but the stops still cost the frames, and an RTX 4060 run
+  that way had 459 waits, 155 s in all and the longest 2.9 s, by t=202 s. Only `LEONIDA_COMPILE_GATE_WAIT_MS=0` (with
+  no `LEONIDA_COMPILE_GATE_PROBE_MS`) or `LEONIDA_COMPILE_GATE=1` (with no `LEONIDA_COMPILE_GATE_WAIT_MS`) waits
+  however long the creates take and never adapts.
+  Tested by `submit_mutex` (no GPU); the probe budget is not yet measured in the title.
+  The verdict is kept per kind of create, compute and graphics (mesh pipelines included), and graphics creates
+  pass this gate and `LEONIDA_COMPILE_GATE=1` too (the classic gate, as before, only compute builds). On 621.40 every probe beside a compute create came back in
+  0-12 ms (and on an RTX 4060 with 610.88, 133 of them), but a run whose gate those probes had turned off lost the
+  device 9 s later with a submission held 7.8 s beside a mesh create, and with `LEONIDA_COMPILE_GATE=0` a
+  `vkQueueSubmit` sat 54 s in the driver beside a 56 s mesh create (541 KB) and the device was lost. A probe counts
+  for each kind that had a create in the driver from before the submission entered until it came back; a held one
+  counts against all of them, since which create held it cannot be told. A kind that is off is still timed: a
+  submission that stays 2 s or more beside one of its creates turns that kind back on for the rest of the run. A
+  held probe (pending or off) counts only if the submission came back within 500 ms after a create of that kind,
+  there when it entered, left the driver: a submission held behind a create comes back when the create does. On the
+  4070 Laptop (621.40, 8 GB nearly full) a 36 s submission came back 18 s before the 58 s compute create beside it;
+  counted as held, it re-armed the gate, which then kept the next submission 78 s behind compute creates. A
+  synthetic probe on the same machine (one to three threads creating 2 MB graphics pipelines of 8-10 s each, with
+  and without `VK_NV_device_diagnostics_config` and a shared pipeline cache) never held a submission past 80 ms.
+  The recent leaves are kept in a ring, so a create that entered after the submission and left after the one it
+  entered beside does not hide that one. Only submissions (`vkQueueSubmit`, `vkQueueBindSparse`) probe: presents and
+  idle or semaphore waits pass the gate the same way but can take seconds on their own, so they judge nothing, and
+  they never go ahead at the probe budget, only at the limit. While a create of a kind that holds submissions is in
+  the driver, no submission goes ahead at the limit or the budget, and such a create is waited for even when one went
+  past it before the verdict, up to the held limit (`LEONIDA_COMPILE_GATE_HELD_WAIT_MS`, 60 s; 0 waits however long,
+  and a held limit under the plain one applies on its own): then the creates in the driver are gone past and the
+  next submissions no longer wait for them. This is checked on every pass of the wait: once such a create leaves
+  while creates of a kind with no verdict stay, the plain limit and budget apply again. A false
+  "holds" verdict so costs at most that per create, not the rest of the run. On a device loss the log names every
+  create in the driver (kind, program, SPIR-V size, thread, how long it had been there, whether submissions waited
+  for it) and each kind's gate. Long graphics creates would leave the title's process only through the compile
+  helper, which builds compute pipelines alone today.
+- **`LEONIDA_COMPILE_GATE=auto`, the default: a calibration at device creation** (`src/compile_gate_policy.h`,
+  `src/compile_gate_calibration.h`, `decide_auto_compile_gate` in `shims/d3d12_vulkan_device.cpp`). Before the
+  `VulkanContext` (and its `SubmitMutex`) exists, so nothing is gated before the decision, a worker thread creates a
+  compute pipeline written in code (a chain of `fract(sin(...))` steps and branches over a storage buffer, its
+  constants from specialization constant 0 with a new seed each run, so neither a pipeline cache nor the driver's
+  shader cache answers it; no game data) while this thread submits an empty command buffer to the device's queue and
+  waits for its fence, over and over, until the create returns. At least 3 submissions back in 50 ms or less, before
+  the create left and some in its second half, with none slower: adaptive. One of 250 ms or more that came back
+  within 200 ms of the create leaving: the driver holds submissions, classic. A create under 300 ms is tried again
+  larger (up to 4 trials, none started after 6 s); a slow submission the create does not explain, too few samples
+  or any failed call: classic. The verdict is kept per vendor, device, driver version and pipeline cache UUID in
+  `compile_gate_calibration.txt` beside the pipeline cache, so it runs once per driver; a failed call or an unclear
+  verdict (a slow submission the create does not explain) is not kept, and the next launch measures again, so one
+  busy moment on the GPU does not hold every later launch on the classic gate. After a wait that times out, the fence
+  and command pool are destroyed only once the submission's fence signals (left alive on a lost device).
+  `LEONIDA_COMPILE_GATE_RECALIBRATE=1` measures again. It is logged once, `[rt] compile-gate: auto: adaptive
+  (calibrated on NVIDIA 621.40 in 0.7 s: 115 submissions came back in <= 0.5 ms beside a 722 ms create; cached in
+  ...)` (`classic` and the reason otherwise). Only gta6rt's title process calibrates; `--precompile-pipelines`,
+  `--compile-server` and the tests keep the classic gate, and a forced value never waits for it.
+  Why a calibration can ask what an in-game probe cannot: the adaptive gate learns by letting a submission into the
+  driver beside a create of the title's, which can take 30-60 s, and on a driver that holds submissions such a probe
+  loses the device once it waits 10 s more. The calibration's create takes about a second and its submissions are
+  empty, so on such a driver one is held about a second and comes back with the create; that cannot reach the 10 s
+  the driver allows. What is known for the verdict to agree with, `MEASURED` but small (#2412,
+  [comment 7217585003](https://github.com/ubiquitarianism/leonida/pull/2412#issuecomment-7217585003)): on an RTX 4070
+  Laptop with NVIDIA 621.40 a synthetic probe never held a submission past 80 ms beside 8-10 s graphics creates and
+  retail adaptive runs had no gate hang after #2418, and this calibration gives adaptive there (in 6 runs of
+  `vk_compile_gate_calibration_test`, 53-125 submissions each, none over 0.9 ms, beside creates of 354-783 ms); an RTX 4060 with 610.88 turned the adaptive gate off with no
+  regression reported; other 621.x users report fewer crashes with it; one freeze at about 231 s on an RTX 5070
+  (621.x) was at a head without #2418 and is being rechecked. On 630.20 the calibration has not run yet: the
+  expected verdict there is classic, from the 10 s hold measured beside a long compute create.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.
@@ -3345,7 +3550,8 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   the driver's), as on D3D12.
 - GPU-writable slot-133 images on a default heap bind memory when replay, presentation or creation of a shader
   view first needs their Vulkan image. D3D12 placement and logical attachment views can precede that bind.
-  A CPU-fillable, typed BC texture can initially sample an immutable zero image of the same format, extent,
+  A CPU-fillable, typed BC texture (filled by host copies or the staged upload) can initially sample
+  an immutable zero image of the same format, extent,
   layer count and mip count. A CPU upload or explicit GPU command gives the placement private backing and
   republishes its existing descriptor keys. The cache holds at most 256 MiB. `LEONIDA_PLACED_IMAGE_DEFER=0`
   restores eager binding.
@@ -3353,6 +3559,15 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
   complete CPU read. Copies of descriptors written earlier resolve to the fallback until that upload succeeds.
   `LEONIDA_TITLE_IMAGE_DEFER=0` allocates these textures eagerly. The memory probe reports the live unbound
   image count and its Vulkan memory requirements in MiB.
+- With `LEONIDA_TITLE_PARTIAL_MIPS=1`, such a texture can be filled before all its pages are readable. The XG
+  layout of a 2D texture of one slice stores its mips from the smallest to the largest, so the mips from `m` on are
+  the first `mip_chain_bytes(layout, m)` bytes from its base (`xg_xs_layout.h`; checked in `xg_xs_test` for tiled,
+  tail and linear layouts). The probe (`texture_memory_readable_bytes`) returns how many bytes from the base are
+  readable and `first_mip_within` the first mip those hold. When the last slot-70 view starts at that mip or later,
+  the mips from there on are filled and only the descriptor keys of views that start there or later are published.
+  The others stay on the fallback (`PendingImage::first_mip`) until a later fill has their mips. The image still has
+  memory for every mip: `LEONIDA_TITLE_PARTIAL_MIPS_MB` (2048) limits the image memory of the textures filled in
+  part. Arrays, cubes and volumes are filled whole or not at all.
 - Small optimal Vulkan images synthesized for slot-70 texture views share memory pages. Each slice meets the
   image's size, alignment and memory type requirements. The GPU retirement queue destroys the image before its
   slice can be reused. Large images, dedicated-only images, and failed pool allocations use individual memory
@@ -3398,6 +3613,14 @@ The console has two list topologies Vulkan lacks: rectangle list (`IASetPrimitiv
     without host-transfer usage before it is bound, and takes the staging path. `d3d12_vulkan_device_test` and
     `d3d12_subresource_copy_test` force this branch on any GPU with `VulkanDeviceInfo::force_host_transfer_retry`
     (their third CPU-copy path; the second compares it with the host runtime).
+  - `LEONIDA_HOST_IMAGE_COPY` chooses whether the device enables the extension at all (`src/host_image_copy_policy.h`,
+    tested by `host_image_copy_policy_test`): `1` wherever the device has it, `0` never, and `auto`, the default, as
+    `1` except on NVIDIA (`vendorID` `0x10DE`), where it is off. On an RTX 4070 SUPER (Windows 11) a real boot lost
+    the device with `WRITE_INVALID` in 7 of 7 runs that used host image copies and in 0 of 2 that did not; why is
+    still under investigation. Off, the extension is neither enabled nor chained, no texture gets host-transfer
+    usage, and every copy takes the staging path, as on a device without the extension. Device creation logs one
+    line, `[rt] d3d12: host image copy: on (available)` or `off (...)` with the reason. Results with
+    `LEONIDA_HOST_IMAGE_COPY=1` on other NVIDIA GPUs and drivers are welcome in an issue.
 - 96-bit textures (`R32G32B32_FLOAT`/`_UINT`/`_SINT`/`_TYPELESS`, D3D-62) are `R32G32B32A32` images
   (`ResourceBinding::rgb96`), on every GPU. Most GPUs have no optimal-tiling RGB32 image (an RX 9070 XT reports
   no optimal features for `R32G32B32_SFLOAT`), and one that has would not avoid the repack: D3D12 places

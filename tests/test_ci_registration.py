@@ -750,9 +750,16 @@ class StdlibLoopTest(unittest.TestCase):
         markers = ci_rules(ROOT)[0]
         failing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(1)\n"
         passing = "import sys\nif __name__ == \"__main__\":\n    sys.exit(0)\n"
+        # In the old shell loop a child could consume the find stream from stdin,
+        # silently preventing subsequent test files from running.
+        reading_stdin = "import sys\nif __name__ == \"__main__\":\n    assert sys.stdin.read() == ''\n"
         with tempfile.TemporaryDirectory() as tmp:
             os.makedirs(os.path.join(tmp, "tests", "semantic"))
+            os.makedirs(os.path.join(tmp, "scripts"))
+            shutil.copyfile(os.path.join(ROOT, "scripts", "run_standalone_tests.py"),
+                            os.path.join(tmp, "scripts", "run_standalone_tests.py"))
             files = {
+                "tests/test_0_reads_stdin.py": reading_stdin,
                 "tests/test_a_fails.py": failing,
                 "tests/test_b_passes.py": passing,
                 "tests/test_c_fails.py": failing,
@@ -778,13 +785,14 @@ class StdlibLoopTest(unittest.TestCase):
         out = result.stdout + result.stderr
         self.assertNotEqual(result.returncode, 0, out)
         ran = re.findall(r"^== (\S+)$", out, re.M)
-        self.assertEqual(ran, ["tests/test_a_fails.py", "tests/test_b_passes.py", "tests/test_c_fails.py"], out)
+        self.assertCountEqual(ran, ["tests/test_0_reads_stdin.py", "tests/test_a_fails.py",
+                                    "tests/test_b_passes.py", "tests/test_c_fails.py"], out)
         errors = re.findall(r"^::error file=(\S+)::", out, re.M)
         self.assertEqual(errors, ["tests/test_a_fails.py", "tests/test_c_fails.py"], out)
 
     def test_step_script_reads_the_check_loop(self):
         script = step_script(ROOT, STDLIB_STEP)
-        self.assertIn('python -I "$t"', script)
+        self.assertIn('python -I scripts/run_standalone_tests.py -j 2', script)
         self.assertIn("-name 'test_*.py'", script)
 
 

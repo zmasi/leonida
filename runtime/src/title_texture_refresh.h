@@ -54,7 +54,12 @@ public:
 
 // Sorted, disjoint half-open intervals let each texture find its first possible writer by end address.
 inline void merge_title_writes(TitleWriteRanges& writes) {
-    std::sort(writes.begin(), writes.end());
+    if (writes.empty()) return;
+    if (writes.size() == 1) {
+        if (writes[0].first >= writes[0].second) writes.clear();
+        return;
+    }
+    if (!std::is_sorted(writes.begin(), writes.end())) std::sort(writes.begin(), writes.end());
     std::size_t count = 0;
     for (const auto [begin, end] : writes) {
         if (begin >= end) continue;
@@ -67,9 +72,12 @@ inline void merge_title_writes(TitleWriteRanges& writes) {
 }
 
 inline bool title_write_overlaps(const TitleWriteRanges& writes, std::uintptr_t begin, std::uintptr_t end) {
+    if (begin >= end || writes.empty()) return false;
+    if (end <= writes.front().first || begin >= writes.back().second) return false;
+    if (writes.size() == 1) return true;
     const auto it = std::upper_bound(writes.begin(), writes.end(), begin,
                                      [](auto address, const auto& range) { return address < range.second; });
-    return begin < end && it != writes.end() && it->first < end;
+    return it != writes.end() && it->first < end;
 }
 
 // The registry's entries as one pass will visit them, in placement order. A pass cannot walk the registry itself: a
@@ -100,7 +108,7 @@ void poll_title_textures(const std::vector<Entry>& entries, std::uint64_t& curso
     if (index == entries.size()) index = 0;  // the cursor is past the last address: resume at the first
     for (auto left = entries.size(); left; --left) {
         const auto& [address, texture] = entries[index];
-        cursor = address + 1;
+        cursor = address == UINT64_MAX ? 0u : address + 1u;
         if (!texture->mapped && !texture->stale) visit(*texture);
         if (exhausted()) break;  // advance at least one registry entry even if a deadline already passed
         index = index + 1 == entries.size() ? 0 : index + 1;

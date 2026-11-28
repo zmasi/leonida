@@ -1,4 +1,5 @@
 #pragma once
+#include "command_list_epochs.h"
 #include "gpu_label_memory.h"
 
 // The command-list IR (docs/d3d12_vulkan.md section 3.2): what a D3D12 command list records, kept until
@@ -983,6 +984,7 @@ public:
         commands_.clear();
         active_.clear();
         closed_ = false;
+        stamp_.restamp();
         return true;
     }
 
@@ -1026,6 +1028,7 @@ private:
     std::vector<Command> commands_;
     std::vector<BeginQuery> active_;  // queries begun and not yet ended
     bool closed_ = false;
+    command_list_epochs::Stamp stamp_;  // when this recording began: a copy the layer retires waits for it
 };
 
 } // namespace leonida

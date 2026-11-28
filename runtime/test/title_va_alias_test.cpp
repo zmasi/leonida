@@ -138,6 +138,45 @@ int main() {
     EXPECT(!a.shader_side(arena) && a.shader_side(0xA0000ff) && !a.shader_side(0xA000100));
     a.remove(title + 0x100, 0xA000000);
     EXPECT(a.size() == 0 && !a.shader_side(0xA000000));
+
+    constexpr std::uint64_t twin = title + 0x10000000;
+    EXPECT(a.add(twin + size, size, arena));
+    first.clear();
+    a.add_listener(&first, hear);
+    const auto pool_generation = a.generation();
+    EXPECT(!a.add_twin(title, twin, size * 2, 0x5000000));
+    EXPECT(a.generation() == pool_generation && !a.shader_side(0x5000000));
+    EXPECT(a.size() == 1 && a.shader_va(title) == title && a.shader_va(twin) == twin);
+    EXPECT(a.shader_va(twin + size) == arena);
+    EXPECT(a.add_twin(title, twin, size, 0x5000000));
+    EXPECT(a.generation() != pool_generation && a.shader_side(0x5000000));
+    EXPECT(first.size() == 2);
+    EXPECT(first[0].change == Change::added && first[0].title_va == title && first[0].bytes == size);
+    EXPECT(first[1].change == Change::added && first[1].title_va == twin && first[1].bytes == size);
+    a.remove_listener(&first);
+    EXPECT(a.size() == 3 && a.shader_va(title) == 0x5000000 && a.shader_va(twin) == 0x5000000);
+    EXPECT(a.shader_va(twin + size) == arena);
+
+    a.remove(title, 0x5000000);
+    EXPECT(a.add(title + size / 2, size, 0x7000000));
+    EXPECT(!a.reuse_pool_mapping(title, twin, size, size, to));
+    EXPECT(a.shader_va(title) == title);
+    EXPECT(a.reuse_pool_mapping(title, twin, size / 2, size, to) && to == 0x5000000);
+    EXPECT(!a.reuse_pool_mapping(title, twin, size / 2 + 1, size, to));
+    EXPECT(a.range_of(title, to, room) && room == size / 2);
+    EXPECT(a.shader_va(title + size / 2) == 0x7000000);
+    EXPECT(a.reuse_pool_mapping(title + size / 2, twin + size / 2, size, size, to) && to == 0x7000000);
+    EXPECT(!a.add_twin(title + 4 * size, title + 5 * size, size * 2, arena));
+    EXPECT(a.add(title + 4 * size, size, 0x8000000));
+    EXPECT(a.add(twin + 5 * size - 16, 16, 0x9000000));
+    EXPECT(a.reuse_pool_mapping(twin + 4 * size + 16, title + 4 * size + 16, size - 32, size, to) && to == 0x8000010);
+    a.remove(title + 4 * size, 0x8000000);
+    EXPECT(a.shader_side(0x8000010));
+    a.forget_copy(twin + 4 * size, size, 0x8000000);
+    EXPECT(!a.shader_side(0x8000010));
+    EXPECT(a.shader_va(twin + 4 * size + 16) == twin + 4 * size + 16);
+    EXPECT(a.shader_va(twin + 5 * size - 16) == 0x9000000);
+
     std::printf("title_va_alias: translation inside a title-placed range, identity outside it and after release\n");
     return 0;
 }

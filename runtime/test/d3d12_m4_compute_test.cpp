@@ -436,8 +436,9 @@ int main(int argc, char** argv) {
             if (jobs) std::fprintf(stderr, "%u build(s) went to the compile worker under LEONIDA_ASYNC_MIN_BYTES\n", jobs);
             EXPECT(jobs == 0);
             // Both modules are under the threshold, so neither is asynchronous.
-            EXPECT(!rt::d3d12::async_replay_compile(library.spirv_bytes(*library.find("cs", leonida::sha256_hex(fill)))));
-            EXPECT(!rt::d3d12::async_replay_compile(
+            EXPECT(!rt::d3d12::async_replay_compile(false,
+                library.spirv_bytes(*library.find("cs", leonida::sha256_hex(fill)))));
+            EXPECT(!rt::d3d12::async_replay_compile(false,
                 library.spirv_bytes(*library.find("cs", leonida::sha256_hex(indirect)))));
         }
 
