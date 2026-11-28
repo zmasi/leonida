@@ -6773,18 +6773,18 @@ impl<'a> Lower<'a> {
             l.operand(inst, op)
         };
         let sext16 = |l: &mut Self| l.s.m.i32(i32::from(imm.unwrap_or(0) as i16) as u32);
-        // Dword `h` of 64-bit source `k` (inline constants sign-extend).
+        // Dword `h` of 64-bit source `k` (an inline constant: its 64-bit value, `inline64`).
         let half = |l: &mut Self, k: usize, h: u8| -> Result<V, Why> {
             match src.get(k) {
                 Some(&Operand::Scalar { code, .. }) if code != NULL => {
                     let v = inst.read(Reg::S(code + h)).ok_or("an unread operand")?;
                     l.i32_of(v)
                 }
-                Some(op) if h == 0 => l.operand(inst, op),
-                Some(Operand::Const(k)) => {
-                    let x = crate::resource::inline(*k).ok_or("a special operand")?;
-                    Ok(l.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 }))
+                Some(&Operand::Const(c)) if super::inline64::value(c).is_some() => {
+                    Ok(l.s.m.i32(super::inline64::dword(c, h).expect("checked")))
                 }
+                Some(op) if h == 0 => l.operand(inst, op),
+                Some(Operand::Const(_)) => Err("a special operand"),
                 // Of a signed operand, a literal sign-extends too.
                 Some(&Operand::Literal(x)) if name.ends_with("_i64") => {
                     Ok(l.s.m.i32(if (x as i32) < 0 { u32::MAX } else { 0 }))
@@ -10262,7 +10262,7 @@ impl<'a> Lower<'a> {
         }
     }
 
-    /// A 64-bit source (a register pair; inline constants sign-extend).
+    /// A 64-bit source (a register pair, or an inline constant's 64-bit value: `inline64`).
     fn src64(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -10284,9 +10284,9 @@ impl<'a> Lower<'a> {
             Operand::Scalar { code, .. } if code != NULL => {
                 pair(self, Reg::S(code), Reg::S(code + 1))
             }
-            Operand::Const(k @ 128..=208) => {
-                let x = crate::resource::inline(k).ok_or("a special operand")?;
-                Ok(self.s.m.int_const(i64t, i64::from(x as i32)))
+            Operand::Const(k) if super::inline64::value(k).is_some() => {
+                let x = super::inline64::value(k).expect("checked");
+                Ok(self.s.m.int_const(i64t, x as i64))
             }
             // A signed 64-bit operand sign-extends its 32-bit literal, as
             // the hardware does (LLVM's AMDGPU operand rules).
@@ -10322,21 +10322,9 @@ impl<'a> Lower<'a> {
             Operand::Scalar { code, .. } if code != NULL => {
                 pair(self, Reg::S(code), Reg::S(code + 1))?
             }
-            Operand::Const(128) => (self.s.m.i32(0), self.s.m.i32(0)),
-            Operand::Const(c @ 240..=248) => {
-                const INLINE_F64: [f64; 9] = [
-                    0.5,
-                    -0.5,
-                    1.0,
-                    -1.0,
-                    2.0,
-                    -2.0,
-                    4.0,
-                    -4.0,
-                    1.0 / std::f64::consts::TAU,
-                ];
-                let bits = INLINE_F64[(c - 240) as usize].to_bits();
-                (self.s.m.i32(bits as u32), self.s.m.i32((bits >> 32) as u32))
+            Operand::Const(c @ (128 | 240..=248)) => {
+                let x = super::inline64::value(c).expect("an inline constant");
+                (self.s.m.i32(x as u32), self.s.m.i32((x >> 32) as u32))
             }
             // GFX10 places a 32-bit literal in the high 32 bits of a 64-bit float operand.
             Operand::Literal(x) => (self.s.m.i32(0), self.s.m.i32(x)),
