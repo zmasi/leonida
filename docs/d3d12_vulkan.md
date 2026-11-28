@@ -4065,9 +4065,10 @@ mapped stages/accesses, and if no single layout serves all uses, use `GENERAL` a
   the units of `GetTimestampFrequency`) and the CPU stamp in `QueryPerformanceCounter` units. When the device has
   `VK_KHR_calibrated_timestamps` or `VK_EXT_calibrated_timestamps` enabled (`VulkanDeviceInfo::calibrated_timestamps`;
   the standalone device enables whichever the GPU has) and offers the `DEVICE` and `QUERY_PERFORMANCE_COUNTER`
-  domains, it is one `vkGetCalibratedTimestampsKHR` call. Otherwise the queue waits until idle, submits a
-  `vkCmdWriteTimestamp` and waits for it, and answers with the midpoint of the `QueryPerformanceCounter` reads
-  around that submission. This stalls the queue, which is acceptable for a call made once per profiling capture. A
+  domains, it is one `vkGetCalibratedTimestampsKHR` call. The fallback waits for an empty completion marker and
+  then submits a `vkCmdWriteTimestamp`. It answers with the midpoint of the `QueryPerformanceCounter` reads
+  around the timestamp submission. The collecting thread waits on its private timeline, outside the device-wide
+  submission lock, so other application threads can still submit work. A
   queue family with `timestampValidBits = 0` fails with `E_FAIL`. `d3d12_fence_timing_test` takes two calibrations
   50 ms apart and compares the GPU and CPU intervals. On an RTX 4090 (driver 621.14) the gap is 2 us with calibrated
   timestamps, 20 us with the fallback, and 0.4 ms with the fallback under the validation layer. The test fails

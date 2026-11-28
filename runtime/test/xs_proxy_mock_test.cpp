@@ -117,6 +117,9 @@ struct Mock {
     Mock* completes_with;    // fence: once its completed value reaches completes_at, a GetCompletedValue first
     std::uint64_t completes_at, completes_value;  // signals that fence to completes_value (GPU order across queues)
     bool signals_complete;   // queue: a Signal (slot 14) completes the fence at once, as an idle GPU would
+    const void* observed_queue;  // optional proxy pair to sample during a forwarded fence call
+    const void* observed_fence;
+    unsigned long observed_queue_refs, observed_fence_refs;
     unsigned calls[kMockSlots];
     std::uint64_t args[kMockSlots][6];
     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
@@ -580,6 +583,10 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
         if (slot == 9) return static_cast<std::uint32_t>(m->list_error ? E_INVALIDARG : S_OK);  // Close
         if (slot == 48 && mock_is_null_rtv(static_cast<SIZE_T>(a1))) m->list_error = true;  // ClearRenderTargetView
         if (slot == 80) mock_barrier(m, a1, a2);                                             // Barrier
+    }
+    if (m->kind == Kind::queue && (slot == 14 || slot == 15) && m->observed_queue) {
+        m->observed_queue_refs = xs::command_object_proxy_ref_count(m->observed_queue);
+        m->observed_fence_refs = xs::command_object_proxy_ref_count(m->observed_fence);
     }
     return S_OK;
 }
@@ -3288,9 +3295,16 @@ int check_tail(bool want_guarded) {
     EXPECT(queue && fence);
     EXPECT(xs::command_object_tables_guarded() == want_guarded);
     Mock* const queue_mock = reinterpret_cast<Mock*>(xs::queue_proxy_real_queue(queue));
-    // Signal (14) still reaches the real queue, with the real fence.
-    EXPECT(hr_of(raw(queue, 14, word(fence), 5)) == S_OK && queue_mock->calls[14] == 1 &&
-           queue_mock->args[14][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[14][1] == 5);
+    // Both wrappers keep a reference until the native call returns.
+    queue_mock->observed_queue = queue;
+    queue_mock->observed_fence = fence;
+    for (unsigned slot : {14u, 15u}) {
+        queue_mock->observed_queue_refs = queue_mock->observed_fence_refs = 0;
+        EXPECT(hr_of(raw(queue, slot, word(fence), 5)) == S_OK && queue_mock->calls[slot] == 1 &&
+               queue_mock->args[slot][0] == word(xs::fence_proxy_real_fence(fence)) && queue_mock->args[slot][1] == 5);
+        EXPECT(queue_mock->observed_queue_refs == 2 && queue_mock->observed_fence_refs == 2);
+        EXPECT(xs::command_object_proxy_ref_count(queue) == 1 && xs::command_object_proxy_ref_count(fence) == 1);
+    }
     // Console-only queue methods (the tail past the PC chain, SignalX, PresentX) report S_OK instead of
     // refusing: frame pacing flows through them. Nothing is forwarded — the real queue never sees them.
     for (unsigned slot = 19; slot < xs::queue_proxy_table_size(); ++slot) {
@@ -3299,6 +3313,16 @@ int check_tail(bool want_guarded) {
     }
     EXPECT(raw(fence, 12) != 0);  // the completed value's address (check_fence_completed_value)
     for (unsigned slot = 13; slot < xs::fence_proxy_table_size(); ++slot) EXPECT(hr_of(raw(fence, slot)) == E_NOTIMPL);
+    for (unsigned slot : {16u, 17u, 25u}) {
+        const unsigned native_slot = slot == 17u ? 15u : 14u;
+        const unsigned expected_calls = queue_mock->calls[native_slot] + 1;
+        queue_mock->observed_queue_refs = queue_mock->observed_fence_refs = 0;
+        EXPECT(hr_of(raw(queue, slot, word(fence), 6)) == S_OK && queue_mock->calls[native_slot] == expected_calls &&
+               queue_mock->args[native_slot][0] == word(xs::fence_proxy_real_fence(fence)) &&
+               queue_mock->args[native_slot][1] == 6);
+        EXPECT(queue_mock->observed_queue_refs == 2 && queue_mock->observed_fence_refs == 2);
+        EXPECT(xs::command_object_proxy_ref_count(queue) == 1 && xs::command_object_proxy_ref_count(fence) == 1);
+    }
     EXPECT(xs::queue_table_overruns() == 0 && xs::fence_table_overruns() == 0);
     EXPECT(release(queue) == 0 && release(fence) == 0 && release(device) == 0 && mock->refs == 0);
     return 0;

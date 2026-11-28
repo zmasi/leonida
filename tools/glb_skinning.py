@@ -28,17 +28,21 @@ Only the standard library is used, and the input is read, never modified.
 from __future__ import annotations
 
 import argparse
+from contextlib import suppress
+import errno
 import json
 import math
 import os
 import re
 import struct
 import sys
+import tempfile
 
 TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if TOOLS_DIR not in sys.path:
     sys.path.insert(0, TOOLS_DIR)
 
+from file_mode import published_mode  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 
 GLB_MAGIC = b"glTF"
@@ -78,7 +82,8 @@ MODE_NAMES = {
     6: "TRIANGLE_FAN",
 }
 
-ATTRIBUTE_RE = re.compile(r"^(JOINTS|WEIGHTS)_(\d+)$")
+ATTRIBUTE_RE = re.compile(r"^(JOINTS|WEIGHTS)_(0|[1-9]\d*)$")
+LEADING_ZERO_ATTRIBUTE_RE = re.compile(r"^(JOINTS|WEIGHTS)_(0\d+)$")
 _MISSING = object()
 
 
@@ -351,6 +356,11 @@ class _Reader:
                     f"bufferViews[{view_index}].byteStride {stride} is not a multiple "
                     f"of the component size {component_size}"
                 )
+        if accessor_offset > view_length:
+            raise GlbSkinError(
+                f"accessors[{index}].byteOffset {accessor_offset} exceeds "
+                f"bufferViews[{view_index}] length {view_length}"
+            )
         if count:
             last_end = accessor_offset + (count - 1) * stride + element_size
             if last_end > view_length:
@@ -400,20 +410,20 @@ def _skin_label(skin_index, skin_name):
 def _bbox(values):
     minimum = [math.inf, math.inf, math.inf]
     maximum = [-math.inf, -math.inf, -math.inf]
+    axis_finite = [False, False, False]
     non_finite = 0
-    finite = 0
     for row in values:
         for axis in range(3):
             value = row[axis]
             if not math.isfinite(value):
                 non_finite += 1
                 continue
-            finite += 1
+            axis_finite[axis] = True
             if value < minimum[axis]:
                 minimum[axis] = value
             if value > maximum[axis]:
                 maximum[axis] = value
-    if not finite:
+    if not all(axis_finite):
         return None, None, non_finite
     return minimum, maximum, non_finite
 
@@ -502,6 +512,10 @@ def _validate_skins(gltf, reader, warnings, errors):
                 errors.append(
                     f"{_skin_label(skin_index, name)}: inverseBindMatrices component type "
                     f"{meta['component_type_name']} is not FLOAT"
+                )
+            if meta["normalized"]:
+                errors.append(
+                    f"{_skin_label(skin_index, name)}: inverseBindMatrices must not be normalized"
                 )
             bad = 0
             first_non_affine = None
@@ -704,6 +718,9 @@ def _validate_primitive(reader, primitive, mesh_index, mesh_name, primitive_inde
                 f"{path}.POSITION has {non_finite_positions} non-finite component(s)"
             )
 
+    for key in sorted(attributes):
+        if LEADING_ZERO_ATTRIBUTE_RE.match(key):
+            errors.append(f"{path}: {key} must not have leading zeros in set index")
     set_numbers = sorted({
         int(match.group(2))
         for key in attributes
@@ -1109,10 +1126,34 @@ def format_report(report):
 
 
 def write_json(path, report):
-    """Write LF-only JSON without ever guessing values that JSON cannot hold."""
-    payload = json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n"
-    with open(path, "wb") as handle:
-        handle.write(payload.encode("utf-8"))
+    """Write LF-only JSON atomically without ever guessing values that JSON cannot hold."""
+    payload = (json.dumps(report, indent=2, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8")
+    out_path = os.fspath(path)
+    destination = os.path.realpath(out_path)
+    if os.path.islink(destination):
+        raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), out_path)
+    if os.path.isdir(destination):
+        raise IsADirectoryError(errno.EISDIR, os.strerror(errno.EISDIR), out_path)
+    if os.path.exists(destination) and not os.path.isfile(destination):
+        with open(destination, "wb") as handle:
+            handle.write(payload)
+        return
+    directory = os.path.dirname(os.path.abspath(destination)) or "."
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb", dir=directory, prefix=".glb_skinning-", suffix=".tmp", delete=False
+        ) as handle:
+            staged = handle.name
+            handle.write(payload)
+        os.chmod(staged, published_mode(destination))
+        os.replace(staged, destination)
+        staged = None
+    finally:
+        if staged is not None:
+            with suppress(OSError):
+                os.chmod(staged, 0o600)
+                os.unlink(staged)
 
 
 def main(argv=None):
@@ -1123,9 +1164,13 @@ def main(argv=None):
     parser.add_argument("--json", metavar="FILE", help="write the report as LF-only JSON")
     args = parser.parse_args(argv)
 
-    if args.json and same_report_path(args.glb, args.json):
-        print("ERROR: --json must not overwrite the input GLB", file=sys.stderr)
-        return 2
+    if args.json:
+        if same_report_path(args.glb, args.json):
+            print("ERROR: --json must not overwrite the input GLB", file=sys.stderr)
+            return 2
+        if os.path.isdir(args.json):
+            print(f"ERROR: --json is a directory: {args.json}", file=sys.stderr)
+            return 2
     try:
         with open(args.glb, "rb") as handle:
             data = handle.read()

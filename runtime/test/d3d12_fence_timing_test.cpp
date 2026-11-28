@@ -45,6 +45,101 @@ struct Event {
     bool set_within(DWORD ms) const { return WaitForSingleObject(h, ms) == WAIT_OBJECT_0; }
 };
 
+namespace calibration_driver {
+PFN_vkGetInstanceProcAddr instance_proc = nullptr;
+PFN_vkGetDeviceProcAddr device_proc = nullptr;
+PFN_vkWaitSemaphores real_wait = nullptr;
+PFN_vkQueueWaitIdle real_idle = nullptr;
+
+struct Pause {
+    Event waiting;
+    Event resume;
+};
+
+thread_local Pause* pause = nullptr;
+thread_local unsigned fail_wait_number = 0;
+
+void pause_wait() {
+    if (auto* active = std::exchange(pause, nullptr)) {
+        SetEvent(active->waiting.h);
+        active->resume.set_within(10000);
+    }
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL wait(VkDevice device, const VkSemaphoreWaitInfo* info, std::uint64_t timeout) {
+    pause_wait();
+    if (fail_wait_number && --fail_wait_number == 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    return real_wait(device, info, timeout);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL idle(VkQueue queue) {
+    // Catch the old path at the same point: it waited here while holding the submission lock.
+    pause_wait();
+    return real_idle(queue);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_device(VkDevice device, const char* name) {
+    if (std::strcmp(name, "vkWaitSemaphores") == 0) return reinterpret_cast<PFN_vkVoidFunction>(wait);
+    if (std::strcmp(name, "vkQueueWaitIdle") == 0) return reinterpret_cast<PFN_vkVoidFunction>(idle);
+    return device_proc(device, name);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL get_instance(VkInstance instance, const char* name) {
+    if (std::strcmp(name, "vkGetDeviceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(get_device);
+    return instance_proc(instance, name);
+}
+
+bool install(const vktest::Device& device) {
+    instance_proc = device.instance_proc;
+    device_proc = reinterpret_cast<PFN_vkGetDeviceProcAddr>(instance_proc(device.instance, "vkGetDeviceProcAddr"));
+    if (!device_proc) return false;
+    real_wait = reinterpret_cast<PFN_vkWaitSemaphores>(device_proc(device.device, "vkWaitSemaphores"));
+    real_idle = reinterpret_cast<PFN_vkQueueWaitIdle>(device_proc(device.device, "vkQueueWaitIdle"));
+    return real_wait && real_idle;
+}
+}  // namespace calibration_driver
+
+int check_calibration_progress(ID3D12Device* device, ID3D12CommandQueue* queue) {
+    D3D12_COMMAND_QUEUE_DESC desc{};
+    Ref<ID3D12CommandQueue> other;
+    Ref<ID3D12Fence> on_other, on_same;
+    EXPECT(SUCCEEDED(device->CreateCommandQueue(&desc, IID_PPV_ARGS(&other.p))));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&on_other.p))));
+    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&on_same.p))));
+
+    calibration_driver::Pause paused;
+    Event submitted;
+    EXPECT(paused.waiting.h && paused.resume.h && submitted.h);
+    HRESULT measured = E_FAIL, other_signal = E_FAIL, same_signal = E_FAIL;
+    UINT64 gpu = 0, cpu = 0;
+    std::thread measure([&] {
+        calibration_driver::pause = &paused;
+        measured = queue->GetClockCalibration(&gpu, &cpu);
+    });
+    const bool waiting = paused.waiting.set_within(5000);
+    std::thread submit([&] {
+        other_signal = other->Signal(on_other.p, 1);
+        same_signal = queue->Signal(on_same.p, 1);
+        SetEvent(submitted.h);
+    });
+    const bool made_progress = submitted.set_within(5000);
+    SetEvent(paused.resume.h);
+    measure.join();
+    submit.join();
+    EXPECT(waiting && made_progress && SUCCEEDED(measured));
+    EXPECT(SUCCEEDED(other_signal) && SUCCEEDED(same_signal));
+    EXPECT(SUCCEEDED(on_other->SetEventOnCompletion(1, nullptr)));
+    EXPECT(SUCCEEDED(on_same->SetEventOnCompletion(1, nullptr)));
+
+    // Fail the host wait after the timestamp command buffer was submitted. A retry must retire that
+    // command buffer before recording into it again.
+    calibration_driver::fail_wait_number = 2;
+    const auto failed = queue->GetClockCalibration(&gpu, &cpu);
+    EXPECT(failed == E_FAIL && calibration_driver::fail_wait_number == 0);
+    EXPECT(SUCCEEDED(queue->GetClockCalibration(&gpu, &cpu)));
+    return 0;
+}
+
 UINT64 qpc() {
     LARGE_INTEGER now{};
     QueryPerformanceCounter(&now);
@@ -354,7 +449,8 @@ int main() {
     // A device without calibrated timestamps (the test device enables no extensions): the submitted fallback.
     {
         rt::d3d12::VulkanDeviceInfo info{};
-        info.get_instance_proc = d.instance_proc;
+        EXPECT(calibration_driver::install(d));
+        info.get_instance_proc = calibration_driver::get_instance;
         info.instance = d.instance;
         info.physical = d.physical;
         info.device = d.device;
@@ -369,6 +465,7 @@ int main() {
         EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
         EXPECT(!rt::d3d12::queue_uses_calibrated_timestamps(queue.p));
         EXPECT(check_calibration(queue.p, gpu_frequency, "fallback (submitted timestamp query)") == 0);
+        EXPECT(check_calibration_progress(device.p, queue.p) == 0);
         EXPECT(check_multiple_fences(device.p, queue.p) == 0);
         EXPECT(check_held_cpu_signal(device.p, queue.p) == 0);
         EXPECT(check_luid(device.p) == 0);
