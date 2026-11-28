@@ -224,6 +224,96 @@ bool seed_ms_images(vktest::Device& d, VkImage single, VkImage array) {
     return ok;
 }
 
+// Seed the depth plane of a 4x4 4x image (`single`) and optionally three layers of an array (`array`) with
+// `(16 * tag + 4 * y + x) / 255.0` per sample (`tag = 4 * k + sample`). Multiples of 1/255 are exact in D16_UNORM,
+// D24_UNORM and D32_SFLOAT.
+bool seed_ms_depth_images(vktest::Device& d, VkFormat depth_format, VkImage single, VkImage array = VK_NULL_HANDLE) {
+    const VkShaderModule vs = load_shader(d, LEONIDA_TEST_MSAA_VERT_SPV);
+    const VkShaderModule fs = load_shader(d, LEONIDA_TEST_MSAA_DEPTH_FRAG_SPV);
+    VkPipelineLayout layout{};
+    VkPipeline pipeline{};
+    VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    bool ok = vs && fs && d.fn<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(
+                              d.device, &layout_info, nullptr, &layout) == VK_SUCCESS;
+    VkPipelineRenderingCreateInfo rendering{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    rendering.depthAttachmentFormat = depth_format;
+    VkPipelineShaderStageCreateInfo stages[] = {
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_VERTEX_BIT, vs, "main"},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, nullptr, 0, VK_SHADER_STAGE_FRAGMENT_BIT, fs, "main"}};
+    VkPipelineVertexInputStateCreateInfo vertices{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    VkPipelineInputAssemblyStateCreateInfo assembly{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    const VkRect2D area{{0, 0}, {4, 4}};
+    const VkViewport viewport{0, 0, 4, 4, 0, 1};
+    VkPipelineViewportStateCreateInfo viewports{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewports.viewportCount = viewports.scissorCount = 1;
+    viewports.pViewports = &viewport;
+    viewports.pScissors = &area;
+    VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    raster.lineWidth = 1;
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_4_BIT;
+    VkPipelineDepthStencilStateCreateInfo depth_state{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    depth_state.depthTestEnable = VK_TRUE;
+    depth_state.depthWriteEnable = VK_TRUE;
+    depth_state.depthCompareOp = VK_COMPARE_OP_ALWAYS;
+    VkGraphicsPipelineCreateInfo pi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &rendering};
+    pi.stageCount = 2;
+    pi.pStages = stages;
+    pi.pVertexInputState = &vertices;
+    pi.pInputAssemblyState = &assembly;
+    pi.pViewportState = &viewports;
+    pi.pRasterizationState = &raster;
+    pi.pMultisampleState = &ms;
+    pi.pDepthStencilState = &depth_state;
+    pi.layout = layout;
+    ok = ok && d.fn<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(
+                   d.device, VK_NULL_HANDLE, 1, &pi, nullptr, &pipeline) == VK_SUCCESS;
+    const UINT view_count = array ? 4u : 1u;
+    VkImageView views[4]{};
+    for (UINT k = 0; ok && k < view_count; ++k) {
+        VkImageViewUsageCreateInfo usage{VK_STRUCTURE_TYPE_IMAGE_VIEW_USAGE_CREATE_INFO};
+        usage.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+        VkImageViewCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, &usage};
+        info.image = k == 0 ? single : array;
+        info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        info.format = depth_format;
+        info.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, k == 0 ? 0 : k - 1, 1};
+        ok = d.fn<PFN_vkCreateImageView>("vkCreateImageView")(d.device, &info, nullptr, &views[k]) == VK_SUCCESS;
+    }
+    ok = ok && d.run([&](VkCommandBuffer cb) {
+        d.fn<PFN_vkCmdBindPipeline>("vkCmdBindPipeline")(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+        for (UINT k = 0; k < view_count; ++k) {
+            VkRenderingAttachmentInfo attachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            attachment.imageView = views[k];
+            attachment.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+            attachment.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+            attachment.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+            VkRenderingInfo draw{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            draw.renderArea = area;
+            draw.layerCount = 1;
+            draw.pDepthAttachment = &attachment;
+            d.fn<PFN_vkCmdBeginRendering>("vkCmdBeginRendering")(cb, &draw);
+            d.fn<PFN_vkCmdDraw>("vkCmdDraw")(cb, 3, 4, 0, 4 * k);
+            d.fn<PFN_vkCmdEndRendering>("vkCmdEndRendering")(cb);
+        }
+        VkMemoryBarrier ready{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        ready.srcAccessMask = VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+        ready.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        d.fn<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(
+            cb, VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0, 1, &ready, 0, nullptr, 0, nullptr);
+        return true;
+    });
+    for (UINT k = 0; k < view_count; ++k)
+        if (views[k]) d.fn<PFN_vkDestroyImageView>("vkDestroyImageView")(d.device, views[k], nullptr);
+    if (pipeline) d.fn<PFN_vkDestroyPipeline>("vkDestroyPipeline")(d.device, pipeline, nullptr);
+    if (layout) d.fn<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(d.device, layout, nullptr);
+    if (fs) d.fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(d.device, fs, nullptr);
+    if (vs) d.fn<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(d.device, vs, nullptr);
+    return ok;
+}
+
 // Runs test/glsl/cs_sample.comp once for each of `keys` on `set0`, the device's bindless set, and copies the
 // texels they wrote to `results` (64 RGBA8 texels each). Set 1 is the test's output buffer.
 bool sample_through_set(vktest::Device& d, VkDescriptorSet set0, VkDescriptorSetLayout set0_layout,
@@ -2922,6 +3012,398 @@ int main() {
                         valid_depth_srvs, d.validation_errors() - validation_before_depth);
 #endif
             EXPECT(d.validation_errors() == validation_before_depth);
+        }
+
+        // Multisampled depth-plane SRVs (RT-MSAA-DEPTH-SRV): TEXTURE2DMS, TEXTURE2DMSARRAY and default SRVs on typed
+        // depth/depth-stencil resources, plus explicit depth-plane view formats on typeless resources (including
+        // slot-133 placed R32G8X24_TYPELESS). Stencil-plane, colour, cross-family and typeless colour MSAA views
+        // remain null descriptors with zero validation errors.
+        {
+            const unsigned validation_before_ms_depth = d.validation_errors();
+            D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS d32s8_ms_q{DXGI_FORMAT_D32_FLOAT_S8X24_UINT, 4};
+            EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &d32s8_ms_q,
+                                                         sizeof(d32s8_ms_q))));
+            for (const DXGI_FORMAT plane_fmt :
+                 {DXGI_FORMAT_R24_UNORM_X8_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS}) {
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT ps{plane_fmt};
+                EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &ps, sizeof(ps))));
+                if (ms_texture.p && d32s8_ms_q.NumQualityLevels)
+                    EXPECT((ps.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD) != 0);
+            }
+            for (const DXGI_FORMAT no_ms_load :
+                 {DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_D24_UNORM_S8_UINT,
+                  DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R32_TYPELESS,
+                  DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R32G8X24_TYPELESS,
+                  DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT}) {
+                D3D12_FEATURE_DATA_FORMAT_SUPPORT ns{no_ms_load};
+                EXPECT(SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_FORMAT_SUPPORT, &ns, sizeof(ns))));
+                EXPECT((ns.Support1 & D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD) == 0);
+            }
+
+            if (ms_texture.p && d32s8_ms_q.NumQualityLevels) {
+                struct MsDepthFamily {
+                    DXGI_FORMAT resource_format;
+                    DXGI_FORMAT view_format;
+                    VkFormat expected_vk;
+                    bool typeless;
+                };
+                const MsDepthFamily families[] = {
+                    {DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_R16_UNORM, VK_FORMAT_D16_UNORM, false},
+                    {DXGI_FORMAT_R16_TYPELESS, DXGI_FORMAT_R16_UNORM, VK_FORMAT_D16_UNORM, true},
+                    {DXGI_FORMAT_D32_FLOAT, DXGI_FORMAT_R32_FLOAT, VK_FORMAT_D32_SFLOAT, false},
+                    {DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT, VK_FORMAT_D32_SFLOAT, true},
+                    {DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, d24_backing, false},
+                    {DXGI_FORMAT_R24G8_TYPELESS, DXGI_FORMAT_R24_UNORM_X8_TYPELESS, d24_backing, true},
+                    {DXGI_FORMAT_D32_FLOAT_S8X24_UINT, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+                     VK_FORMAT_D32_SFLOAT_S8_UINT, false},
+                    {DXGI_FORMAT_R32G8X24_TYPELESS, DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS,
+                     VK_FORMAT_D32_SFLOAT_S8_UINT, true},
+                };
+
+                constexpr UINT ms_depth_slots = 24, ms_depth_scratch = 23;
+                Ref<ID3D12DescriptorHeap> ms_depth_heap;
+                const D3D12_DESCRIPTOR_HEAP_DESC ms_depth_hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, ms_depth_slots,
+                                                             D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+                EXPECT(SUCCEEDED(device->CreateDescriptorHeap(&ms_depth_hd, IID_PPV_ARGS(&ms_depth_heap.p))));
+                const std::uint64_t ms_depth_cpu =
+                    reinterpret_cast<XboxHeapHandleFn>(slot(ms_depth_heap.p, 9))(ms_depth_heap.p);
+                const auto msd_slot = [&](UINT i) {
+                    return D3D12_CPU_DESCRIPTOR_HANDLE{SIZE_T(ms_depth_cpu + i * step)};
+                };
+                const auto msd_bytes = [&](UINT i) {
+                    return reinterpret_cast<std::uint8_t*>(ms_depth_cpu + i * step);
+                };
+                const auto msd_null = [&](UINT i) {
+                    return std::all_of(msd_bytes(i), msd_bytes(i) + step, [](std::uint8_t b) { return b == 0; });
+                };
+                const auto expect_msd_null = [&](ID3D12Resource* res, const D3D12_SHADER_RESOURCE_VIEW_DESC* srv) {
+                    std::memset(msd_bytes(ms_depth_scratch), 0x77, step);
+                    device->CreateShaderResourceView(res, srv, msd_slot(ms_depth_scratch));
+                    return msd_null(ms_depth_scratch);
+                };
+                const auto expect_msd_valid = [&](UINT idx, g::ImageType want_type, VkFormat want_vk, UINT want_first,
+                                                  UINT want_layers, g::Swizzle want_swizzle = g::channels_r) {
+                    g::ImageWords words{};
+                    std::memcpy(words.data(), msd_bytes(idx), sizeof(words));
+                    g::Image dec{};
+                    if (!g::is_image(words) || !g::decode(words, dec)) return false;
+                    std::uint32_t key[8]{};
+                    std::memcpy(key, words.data(), sizeof(key));
+                    return dec.type == want_type && dec.samples == 4 && dec.first_mip == 0 && dec.mip_count == 1 &&
+                           dec.first_layer == want_first && dec.layer_count == want_layers &&
+                           dec.format == g::format_from_vulkan(want_vk) && dec.swizzle == want_swizzle &&
+                           rt::d3d12::bindless_hash_lookup(device.p, key) != 0;
+                };
+
+                D3D12_RESOURCE_DESC base_msd{};
+                base_msd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+                base_msd.Width = 4;
+                base_msd.Height = 4;
+                base_msd.DepthOrArraySize = 1;
+                base_msd.MipLevels = 1;
+                base_msd.SampleDesc = {4, 0};
+                base_msd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
+
+                Ref<ID3D12Resource> d16_ms, d24_ms, d32s8_ms, d32s8_ms_arr;
+                for (const MsDepthFamily& fam : families) {
+                    D3D12_FEATURE_DATA_MULTISAMPLE_QUALITY_LEVELS fq{fam.resource_format, 4};
+                    EXPECT(SUCCEEDED(
+                        device->CheckFeatureSupport(D3D12_FEATURE_MULTISAMPLE_QUALITY_LEVELS, &fq, sizeof(fq))));
+                    if (!fq.NumQualityLevels) continue;
+
+                    D3D12_RESOURCE_DESC d1 = base_msd;
+                    d1.Format = fam.resource_format;
+                    Ref<ID3D12Resource> res;
+                    EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &d1,
+                                                                     D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                     IID_PPV_ARGS(&res.p))));
+                    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+                    srv.Format = fam.view_format;
+                    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                    std::memset(msd_bytes(0), 0x77, step);
+                    device->CreateShaderResourceView(res.p, &srv, msd_slot(0));
+                    EXPECT(expect_msd_valid(0, g::ImageType::image_2d_msaa, fam.expected_vk, 0, 1));
+
+                    if (fam.typeless) {
+                        EXPECT(expect_msd_null(res.p, nullptr));
+                        srv.Format = DXGI_FORMAT_UNKNOWN;
+                        EXPECT(expect_msd_null(res.p, &srv));
+                    } else {
+                        std::memset(msd_bytes(1), 0x77, step);
+                        device->CreateShaderResourceView(res.p, nullptr, msd_slot(1));
+                        EXPECT(expect_msd_valid(1, g::ImageType::image_2d_msaa, fam.expected_vk, 0, 1));
+                        EXPECT(std::memcmp(msd_bytes(0), msd_bytes(1), step) == 0);
+                        srv.Format = DXGI_FORMAT_UNKNOWN;
+                        std::memset(msd_bytes(1), 0x77, step);
+                        device->CreateShaderResourceView(res.p, &srv, msd_slot(1));
+                        EXPECT(std::memcmp(msd_bytes(0), msd_bytes(1), step) == 0);
+                    }
+
+                    const DXGI_FORMAT bad_ms_views[] = {
+                        DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_UINT, DXGI_FORMAT_R32_UINT, DXGI_FORMAT_R32_SINT,
+                        DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_D16_UNORM, DXGI_FORMAT_D32_FLOAT,
+                        DXGI_FORMAT_D24_UNORM_S8_UINT, DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+                        DXGI_FORMAT_X24_TYPELESS_G8_UINT, DXGI_FORMAT_X32_TYPELESS_G8X24_UINT,
+                        fam.view_format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS
+                            ? DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+                            : DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS};
+                    for (const DXGI_FORMAT bad : bad_ms_views) {
+                        if (bad == fam.view_format) continue;
+                        srv.Format = bad;
+                        EXPECT(expect_msd_null(res.p, &srv));
+                    }
+
+                    if (fam.resource_format == DXGI_FORMAT_R16_TYPELESS) std::swap(d16_ms.p, res.p);
+                    else if (fam.resource_format == DXGI_FORMAT_R24G8_TYPELESS) std::swap(d24_ms.p, res.p);
+                    else if (fam.resource_format == DXGI_FORMAT_R32G8X24_TYPELESS) std::swap(d32s8_ms.p, res.p);
+                }
+
+                // Slot-133 Xbox placed 4x R32G8X24_TYPELESS depth-stencil target + R32_FLOAT_X8X24_TYPELESS SRV.
+                {
+                    using PlaceX = HRESULT(WINAPI*)(void*, UINT64, const D3D12_RESOURCE_DESC*, UINT,
+                                                    const D3D12_CLEAR_VALUE*, const IID*, void**);
+                    constexpr SIZE_T alloc_bytes = 24u << 20;
+                    void* raw_va = VirtualAlloc(nullptr, alloc_bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+                    EXPECT(raw_va != nullptr);
+                    const UINT64 aligned_va =
+                        (reinterpret_cast<UINT64>(raw_va) + ((4ull << 20) - 1)) & ~((4ull << 20) - 1);
+                    D3D12_RESOURCE_DESC placed_desc = base_msd;
+                    placed_desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+                    placed_desc.Layout = static_cast<D3D12_TEXTURE_LAYOUT>(0x101);
+                    D3D12_CLEAR_VALUE clear{};
+                    clear.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+                    clear.DepthStencil.Depth = 1.0f;
+                    Ref<ID3D12Resource> placed_ms;
+                    EXPECT(SUCCEEDED(reinterpret_cast<PlaceX>(slot(device.p, 133))(
+                        device.p, aligned_va, &placed_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE, &clear,
+                        &__uuidof(ID3D12Resource), reinterpret_cast<void**>(&placed_ms.p))));
+                    D3D12_SHADER_RESOURCE_VIEW_DESC placed_srv{};
+                    placed_srv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+                    placed_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    placed_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                    std::memset(msd_bytes(2), 0x77, step);
+                    device->CreateShaderResourceView(placed_ms.p, &placed_srv, msd_slot(2));
+                    EXPECT(expect_msd_valid(2, g::ImageType::image_2d_msaa, VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 1));
+                    placed_ms.reset();
+                    VirtualFree(raw_va, 0, MEM_RELEASE);
+                }
+
+                // Typeless colour 4x MSAA resources remain rejected.
+                for (const auto& [col_typeless, col_typed] :
+                     {std::pair{DXGI_FORMAT_R8G8B8A8_TYPELESS, DXGI_FORMAT_R8G8B8A8_UNORM},
+                      std::pair{DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_R32_FLOAT}}) {
+                    D3D12_RESOURCE_DESC col_ms = base_msd;
+                    col_ms.Format = col_typeless;
+                    col_ms.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+                    Ref<ID3D12Resource> col_res;
+                    if (SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &col_ms,
+                                                                  D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                  IID_PPV_ARGS(&col_res.p)))) {
+                        D3D12_SHADER_RESOURCE_VIEW_DESC col_srv{};
+                        col_srv.Format = col_typed;
+                        col_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                        col_srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                        EXPECT(expect_msd_null(col_res.p, &col_srv));
+                        EXPECT(expect_msd_null(col_res.p, nullptr));
+                    }
+                }
+
+                // DENY_SHADER_RESOURCE on 4x depth-stencil rejects SRV creation.
+                {
+                    D3D12_RESOURCE_DESC denied_ms_desc = base_msd;
+                    denied_ms_desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+                    denied_ms_desc.Flags |= D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE;
+                    Ref<ID3D12Resource> denied_ms;
+                    EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE,
+                                                                     &denied_ms_desc, D3D12_RESOURCE_STATE_DEPTH_WRITE,
+                                                                     nullptr, IID_PPV_ARGS(&denied_ms.p))));
+                    D3D12_SHADER_RESOURCE_VIEW_DESC dsrv{};
+                    dsrv.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+                    dsrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    dsrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                    EXPECT(expect_msd_null(denied_ms.p, &dsrv));
+                }
+
+                // Multi-layer 4x R32G8X24_TYPELESS array, sliced array views, layer-0 2DMS view, swizzled view,
+                // dimension/sample-count mismatches, and per-sample GPU readback across D32S8, D16 and D24.
+                EXPECT(d32s8_ms.p != nullptr);
+                D3D12_RESOURCE_DESC arr_desc = base_msd;
+                arr_desc.Format = DXGI_FORMAT_R32G8X24_TYPELESS;
+                arr_desc.DepthOrArraySize = 3;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &arr_desc,
+                                                                 D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                 IID_PPV_ARGS(&d32s8_ms_arr.p))));
+
+                // Slots: 3 = d32s8 2DMS, 4 = d32s8 full 2DMSArray (3 layers), 5 = d32s8 sliced 2DMSArray (1..2),
+                //        6 = d32s8 2DMS of array (layer 0), 7 = d32s8 swizzled (0, R, 1, 0),
+                //        8 = d16 2DMS (if supported), 9 = d24 2DMS (if supported).
+                D3D12_SHADER_RESOURCE_VIEW_DESC v{};
+                v.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+                v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                device->CreateShaderResourceView(d32s8_ms.p, &v, msd_slot(3));
+                EXPECT(expect_msd_valid(3, g::ImageType::image_2d_msaa, VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 1));
+
+                device->CreateShaderResourceView(d32s8_ms_arr.p, &v, msd_slot(6));
+                EXPECT(expect_msd_valid(6, g::ImageType::image_2d_msaa, VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 1));
+
+                // Dimension / sample-count / slice / mapping negative controls on 4x depth.
+                {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC bad = v;
+                    bad.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+                    bad.Texture2D.MipLevels = 1;
+                    EXPECT(expect_msd_null(d32s8_ms.p, &bad));
+                    D3D12_RESOURCE_DESC one_x = base_msd;
+                    one_x.SampleDesc = {1, 0};
+                    one_x.Format = DXGI_FORMAT_D32_FLOAT;
+                    Ref<ID3D12Resource> d32_1x;
+                    EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &one_x,
+                                                                     D3D12_RESOURCE_STATE_COMMON, nullptr,
+                                                                     IID_PPV_ARGS(&d32_1x.p))));
+                    D3D12_SHADER_RESOURCE_VIEW_DESC bad_1x{};
+                    bad_1x.Format = DXGI_FORMAT_R32_FLOAT;
+                    bad_1x.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    bad_1x.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                    EXPECT(expect_msd_null(d32_1x.p, &bad_1x));
+
+                    bad = v;
+                    bad.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                    bad.Texture2DMSArray = {3, 1};
+                    EXPECT(expect_msd_null(d32s8_ms_arr.p, &bad));
+                    for (UINT bad_count : {0u, 3u, UINT_MAX - 1}) {
+                        bad.Texture2DMSArray = {1, bad_count};
+                        EXPECT(expect_msd_null(d32s8_ms_arr.p, &bad));
+                    }
+                    bad.Texture2DMSArray = {0, 3};
+                    bad.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(6, 1, 2, 3);
+                    EXPECT(expect_msd_null(d32s8_ms_arr.p, &bad));
+                    bad.Shader4ComponentMapping = 0;  // missing D3D12 always-set bit (1 << 12)
+                    EXPECT(expect_msd_null(d32s8_ms_arr.p, &bad));
+                }
+
+                v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
+                v.Texture2DMSArray = {0, UINT_MAX};
+                device->CreateShaderResourceView(d32s8_ms_arr.p, &v, msd_slot(4));
+                EXPECT(expect_msd_valid(4, g::ImageType::image_2d_msaa_array, VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 3));
+
+                v.Texture2DMSArray = {1, 2};
+                device->CreateShaderResourceView(d32s8_ms_arr.p, &v, msd_slot(5));
+                EXPECT(expect_msd_valid(5, g::ImageType::image_2d_msaa_array, VK_FORMAT_D32_SFLOAT_S8_UINT, 1, 2));
+
+                v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                v.Shader4ComponentMapping = D3D12_ENCODE_SHADER_4_COMPONENT_MAPPING(
+                    D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0,
+                    D3D12_SHADER_COMPONENT_MAPPING_FROM_MEMORY_COMPONENT_0,
+                    D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_1,
+                    D3D12_SHADER_COMPONENT_MAPPING_FORCE_VALUE_0);
+                device->CreateShaderResourceView(d32s8_ms.p, &v, msd_slot(7));
+                EXPECT(expect_msd_valid(7, g::ImageType::image_2d_msaa, VK_FORMAT_D32_SFLOAT_S8_UINT, 0, 1,
+                                        g::Swizzle{g::select_zero, g::select_x, g::select_one, g::select_zero}));
+
+                if (d16_ms.p) {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC v16{};
+                    v16.Format = DXGI_FORMAT_R16_UNORM;
+                    v16.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    v16.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                    device->CreateShaderResourceView(d16_ms.p, &v16, msd_slot(8));
+                    EXPECT(expect_msd_valid(8, g::ImageType::image_2d_msaa, VK_FORMAT_D16_UNORM, 0, 1));
+                }
+                if (d24_ms.p) {
+                    D3D12_SHADER_RESOURCE_VIEW_DESC v24{};
+                    v24.Format = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+                    v24.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                    v24.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+                    device->CreateShaderResourceView(d24_ms.p, &v24, msd_slot(9));
+                    EXPECT(expect_msd_valid(9, g::ImageType::image_2d_msaa, d24_backing, 0, 1));
+                }
+
+                // Transition all MSAA depth resources to NON_PIXEL_SHADER_RESOURCE and flush set 0.
+                EXPECT(SUCCEEDED(allocator->Reset()) && SUCCEEDED(list->Reset(allocator.p, nullptr)));
+                std::vector<D3D12_RESOURCE_BARRIER> msd_barriers = {
+                    transition(d32s8_ms.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
+                    transition(d32s8_ms_arr.p, D3D12_RESOURCE_STATE_COMMON,
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)};
+                if (d16_ms.p)
+                    msd_barriers.push_back(
+                        transition(d16_ms.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+                if (d24_ms.p)
+                    msd_barriers.push_back(
+                        transition(d24_ms.p, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE));
+                list->ResourceBarrier(UINT(msd_barriers.size()), msd_barriers.data());
+                EXPECT(list->Close() == S_OK);
+                queue->ExecuteCommandLists(1, lists);
+                EXPECT(rt::d3d12::last_execute_result(queue.p) == leonida::ReplayResult::success);
+                ++packed_signal;
+                EXPECT(SUCCEEDED(queue->Signal(fence.p, packed_signal)) &&
+                       SUCCEEDED(fence->SetEventOnCompletion(packed_signal, nullptr)));
+
+#ifdef LEONIDA_TEST_CS_SAMPLE_SPV
+                EXPECT(seed_ms_depth_images(d, VK_FORMAT_D32_SFLOAT_S8_UINT, rt::d3d12::vulkan_image(d32s8_ms.p),
+                                            rt::d3d12::vulkan_image(d32s8_ms_arr.p)));
+                if (d16_ms.p) EXPECT(seed_ms_depth_images(d, VK_FORMAT_D16_UNORM, rt::d3d12::vulkan_image(d16_ms.p)));
+                if (d24_ms.p) EXPECT(seed_ms_depth_images(d, d24_backing, rt::d3d12::vulkan_image(d24_ms.p)));
+
+                struct MsDepthRead {
+                    UINT slot;
+                    UINT mode;
+                    UINT view_layer;
+                    UINT seed_layer;
+                    bool swizzled;
+                    bool fallback;
+                };
+                std::vector<MsDepthRead> msd_reads = {
+                    {3, 2, 0, 0, false, false},
+                    {4, 3, 0, 1, false, false},
+                    {4, 3, 1, 2, false, false},
+                    {4, 3, 2, 3, false, false},
+                    {5, 3, 0, 2, false, false},
+                    {5, 3, 1, 3, false, false},
+                    {6, 2, 0, 1, false, false},
+                    {7, 2, 0, 0, true, false},
+                };
+                if (d16_ms.p) msd_reads.push_back({8, 2, 0, 0, false, false});
+                if (d24_ms.p) msd_reads.push_back({9, 2, 0, 0, false, false});
+                std::memset(msd_bytes(ms_depth_scratch), 0, step);  // null T# -> fallback (0, 0, 0, 0)
+                msd_reads.push_back({ms_depth_scratch, 2, 0, 0, false, true});
+                msd_reads.push_back({ms_depth_scratch, 3, 0, 0, false, true});
+
+                std::vector<SampleKeys> msd_keys(msd_reads.size());
+                for (std::size_t k = 0; k < msd_reads.size(); ++k) {
+                    std::memcpy(msd_keys[k].tsharp, msd_bytes(msd_reads[k].slot), sizeof(msd_keys[k].tsharp));
+                    msd_keys[k].first = UINT(k) * texels;
+                    msd_keys[k].mode = msd_reads[k].mode;
+                    msd_keys[k].layer = msd_reads[k].view_layer;
+                }
+                std::vector<std::uint8_t> msd_results(msd_reads.size() * bytes);
+                EXPECT(sample_through_set(d, rt::d3d12::bindless_set(device.p), rt::d3d12::bindless_set_layout(device.p),
+                                          msd_keys, msd_results.data(), LEONIDA_TEST_MS_FLOAT_SPV));
+                for (std::size_t k = 0; k < msd_reads.size(); ++k) {
+                    for (UINT i = 0; i < texels; ++i) {
+                        const UINT x = (i / 4) % 4, y = i / 16, s = i % 4;
+                        const UINT tag = 4 * msd_reads[k].seed_layer + s;
+                        const auto z = std::uint8_t(16 * tag + 4 * y + x);
+                        const std::uint8_t expected[4] = {
+                            msd_reads[k].fallback ? std::uint8_t(0) : (msd_reads[k].swizzled ? std::uint8_t(0) : z),
+                            msd_reads[k].swizzled ? z : std::uint8_t(0),
+                            msd_reads[k].swizzled ? std::uint8_t(255) : std::uint8_t(0),
+                            msd_reads[k].fallback || msd_reads[k].swizzled ? std::uint8_t(0) : std::uint8_t(255)};
+                        const auto* got = msd_results.data() + 4 * (k * texels + i);
+                        if (std::memcmp(got, expected, 4) != 0) {
+                            std::fprintf(stderr, "MSAA depth SRV %zu (slot %u) texel (%u,%u) sample %u: got "
+                                         "%u,%u,%u,%u, expected %u,%u,%u,%u\n",
+                                         k, msd_reads[k].slot, x, y, s, got[0], got[1], got[2], got[3],
+                                         expected[0], expected[1], expected[2], expected[3]);
+                            return 1;
+                        }
+                    }
+                }
+                std::printf("MSAA depth SRVs: %zu per-sample depth values matched across 2DMS, full/sliced 2DMSArray, "
+                            "swizzled, D16/D24/D32S8 and null-fallback views (validation errors: %u)\n",
+                            msd_reads.size() * texels, d.validation_errors() - validation_before_ms_depth);
+#endif
+            }
+            EXPECT(d.validation_errors() == validation_before_ms_depth);
         }
 
         upload.reset();

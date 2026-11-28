@@ -14636,13 +14636,17 @@ bool image_descriptor(const Resource& resource, const TextureView& asked, bool s
         log_once("view type incompatible with texture dimension or sample count; view type", int(view.type));
         return false;
     }
+    const bool depth_plane = (resource.aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) && !stencil;
     if (msaa) {
-        // The MS bindings expose typed colour SRVs. An MS view has one mip and can name an array slice range.
-        const Format format = texture_storage_format(desc.Format, false);
-        if (resource.aspects() != VK_IMAGE_ASPECT_COLOR_BIT || format.typeless ||
-            (view.format != DXGI_FORMAT_UNKNOWN && view.format != desc.Format)) {
-            log_once("multisample shader view requires a matching typed colour format:", int(desc.Format));
-            return false;
+        // The MS bindings expose typed colour SRVs and depth-plane SRVs. An MS view has one mip and can name an array
+        // slice range.
+        if (!depth_plane) {
+            const Format format = texture_storage_format(desc.Format, false);
+            if (resource.aspects() != VK_IMAGE_ASPECT_COLOR_BIT || format.typeless ||
+                (view.format != DXGI_FORMAT_UNKNOWN && view.format != desc.Format)) {
+                log_once("multisample shader view requires a matching typed colour format:", int(desc.Format));
+                return false;
+            }
         }
         // Four 3-bit selectors followed by D3D12's always-set bit.
         if ((view.mapping >> 12) != 1) {
@@ -14672,7 +14676,6 @@ bool image_descriptor(const Resource& resource, const TextureView& asked, bool s
     // format (VUID-VkImageViewCreateInfo-image-01762 / 09594), so colour view formats such as R16_FLOAT on D16 or
     // R32_UINT on D32 must be rejected. Each view format belongs to its own DXGI family only, whatever format
     // backs the texture (a D24 texture may be D32_SFLOAT_S8_UINT underneath).
-    const bool depth_plane = (resource.aspects() & VK_IMAGE_ASPECT_DEPTH_BIT) && !stencil;
     if (depth_plane) {
         const bool depth_format_fits =
             (desc.Format == xbox_d16s8 && (view.format == DXGI_FORMAT_UNKNOWN || view.format == xbox_d16_plane)) ||
@@ -20512,8 +20515,9 @@ public:
             }
             // The plane formats a shader reads a depth-stencil texture through (CreateShaderResourceView takes them on
             // R24G8/R32G8X24 and D24S8/D32S8 textures) have no image of their own, so the lookups below find nothing.
-            // The host reports them as sampled 2D and cube textures with mips, the depth plane also filtered and
-            // compared. Left out, as for the depth formats themselves: 1D, and multisample loads.
+            // The host reports them as sampled 2D and cube textures with mips, the depth plane also filtered,
+            // compared and multisample-loaded. Left out, as for the depth formats themselves: 1D, and stencil
+            // multisample loads.
             const bool depth_plane = fs->Format == xbox_d16_plane || fs->Format == DXGI_FORMAT_R24_UNORM_X8_TYPELESS ||
                                      fs->Format == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
             if (depth_plane || fs->Format == xbox_s8_plane || fs->Format == DXGI_FORMAT_X24_TYPELESS_G8_UINT ||
@@ -20535,6 +20539,17 @@ public:
                     fs->Support1 |= D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE | D3D12_FORMAT_SUPPORT1_SHADER_GATHER |
                                     D3D12_FORMAT_SUPPORT1_SHADER_SAMPLE_COMPARISON |
                                     D3D12_FORMAT_SUPPORT1_SHADER_GATHER_COMPARISON;
+                VkImageFormatProperties image_properties{};
+                constexpr VkImageUsageFlags ms_usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+                                                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                                                       VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+                if (depth_plane && leonida::gfx10::format_from_vulkan(family) && state_.bindless &&
+                    state_.bindless->supports_ms_class(0) && state_.image_format_properties &&
+                    state_.image_format_properties(state_.info.physical, family, VK_IMAGE_TYPE_2D,
+                                                   VK_IMAGE_TILING_OPTIMAL, ms_usage, 0,
+                                                   &image_properties) == VK_SUCCESS &&
+                    (image_properties.sampleCounts & d3d12_multisample_sample_counts))
+                    fs->Support1 |= D3D12_FORMAT_SUPPORT1_MULTISAMPLE_LOAD;
                 return d3d12_trace::result(method, S_OK);
             }
             const Format fmt = texture_storage_format(fs->Format, false);
