@@ -599,11 +599,14 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         context.set_field(0, 20 + current, 1, 0);
         return true;
     };
-    let mut at = context.field(2, 0, 26) as usize;
-    if at < 32 {
-        at = 32 + xma::packet(data, 0).map_or(0, |p| p.first_frame_bit as usize);
+    let at = context.field(2, 0, 26) as usize;
+    let frame = if at < 32 {
+        xma::first_frame_from(data, 0)
+    } else {
+        Some(at)
     }
-    let Some(frame) = xma::read_frame(data, at) else {
+    .and_then(|bit| xma::read_frame(data, bit));
+    let Some(frame) = frame else {
         // This input is used up.
         context.set_field(0, 20 + current, 1, 0);
         return true;
@@ -618,7 +621,7 @@ fn decode(context: Context, voice: &mut Voice) -> bool {
         voice.trace.bad_frames += 1;
         if voice.trace.bad_frames <= 2 {
             tracing::debug!(
-                at,
+                at = frame.start,
                 bits = frame.bits,
                 head = ?&frame.data[..frame.data.len().min(8)],
                 %e,
@@ -1029,6 +1032,86 @@ mod tests {
             }
         }
         data
+    }
+
+    #[test]
+    fn xma_buffer_starts_skip_continuations_and_reject_damaged_offsets() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut input, mut input_apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut input, &mut input_apu, 0x1800, 0x800, 1), S_OK);
+        let silent = silent_stream();
+        let put = |buf: &mut [u8], at: usize, value: u32, width: usize| {
+            for i in 0..width {
+                let (p, bit) = (at + i, (value >> (width - 1 - i)) & 1);
+                buf[p / 8] = (buf[p / 8] & !(0x80 >> (p % 8))) | ((bit as u8) << (7 - p % 8));
+            }
+        };
+
+        // 1. Packet 0 is a `0x7fff` continuation with `skip = 1` over packet 1
+        // (another stream); packet 2 holds three silent frames. Starting at
+        // bit 0 (as when flipping to the next input buffer) must advance to
+        // packet 2 instead of dropping the buffer as used up.
+        let mut cont = vec![0u8; 3 * xma::PACKET_BYTES];
+        put(&mut cont, 0, (0x7fff << 11) | 1, 32);
+        cont[xma::PACKET_BYTES..2 * xma::PACKET_BYTES].fill(0xff);
+        cont[2 * xma::PACKET_BYTES..].copy_from_slice(&silent[..xma::PACKET_BYTES]);
+        // SAFETY: three packets were allocated.
+        unsafe { std::ptr::copy_nonoverlapping(cont.as_ptr(), input.cast(), cont.len()) };
+
+        let mut words = [0u32; 16];
+        let context = Context(words.as_mut_ptr());
+        context.set(0, 3 | 1 << 20 | 4 << 22);
+        context.set(1, 1 << 31 | 3 << 27);
+        context.set(2, 0);
+        context.set(5, input_apu);
+        let fresh_voice = || Voice {
+            decoder: None,
+            pcm: VecDeque::new(),
+            skip: 0,
+            ended: false,
+            trace: Trace {
+                since: Instant::now(),
+                produced: 0,
+                taken: 0,
+                takes: 0,
+                partial_takes: 0,
+                frames: 0,
+                bad_frames: 0,
+                peak: 0,
+                ended_ms: None,
+            },
+        };
+        let mut voice = fresh_voice();
+        for expected in 1..=3 {
+            assert!(decode(context, &mut voice));
+            assert_eq!(voice.trace.frames, expected);
+        }
+        assert_eq!(voice.pcm.len(), 3 * xma::FRAME_SAMPLES);
+        assert_eq!(context.field(0, 20, 1), 0, "packet 2's three frames finish input 0");
+
+        // 2. Packet 0 has a damaged first-frame offset (16400 >= 16352) that
+        // `32 + first_frame_bit` used to turn into bit 16432 (16 bits inside
+        // packet 1's payload). Plant a valid silent frame at bit 16432 and
+        // verify `decode` rejects the buffer without decoding it.
+        let mut damaged = vec![0u8; 2 * xma::PACKET_BYTES];
+        put(&mut damaged, 0, (1 << 26) | (16400 << 11), 32);
+        put(&mut damaged, xma::PACKET_BYTES * 8, 1 << 26, 32);
+        let rogue = 32 + 16400;
+        put(&mut damaged, rogue, 31, 15);
+        put(&mut damaged, rogue + 15, 0b10, 2);
+        put(&mut damaged, rogue + 17, 0, 14);
+        // SAFETY: two packets fit inside the three-packet allocation.
+        unsafe { std::ptr::copy_nonoverlapping(damaged.as_ptr(), input.cast(), damaged.len()) };
+
+        context.set(0, 2 | 1 << 20 | 4 << 22);
+        context.set(2, 0);
+        let mut voice = fresh_voice();
+        assert!(decode(context, &mut voice));
+        assert_eq!(voice.trace.frames, 0, "damaged offset 16400 must not decode packet 1 payload");
+        assert!(voice.pcm.is_empty());
+        assert_eq!(context.field(0, 20, 1), 0, "damaged input buffer marked used up");
+
+        ApuFree(input);
     }
 
     /// A read block past the end of the ring (6 on a ring of four) is block
