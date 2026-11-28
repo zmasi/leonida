@@ -308,11 +308,63 @@ fn views_mut() -> std::sync::RwLockWriteGuard<'static, Views> {
     VIEWS.write().unwrap_or_else(|e| e.into_inner())
 }
 
+fn remove_view(v: &mut Views, base: usize) {
+    let Some((bytes, section, offset)) = v.views.remove(&base) else {
+        return;
+    };
+    for k in 0..bytes.div_ceil(K64) {
+        let step = (k * K64) as u64;
+        let (Some(key_off), Some(page)) = (offset.checked_add(step), base.checked_add(k * K64)) else {
+            break;
+        };
+        let key = (section, key_off);
+        if let Some(pages) = v.pages.get_mut(&key) {
+            let before = pages.len();
+            pages.retain(|&shown| shown != page);
+            let after = pages.len();
+            if after == 0 {
+                v.pages.remove(&key);
+            }
+            v.pages_twice = v.pages_twice.saturating_sub(usize::from(before >= 2 && after < 2));
+        }
+    }
+}
+
+fn views_gone_in(v: &mut Views, at: usize, len: usize) {
+    if len == 0 || v.views.is_empty() {
+        return;
+    }
+    let end = at.saturating_add(len);
+    let first = v
+        .views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, view)| (**base).saturating_add(view.0) > at)
+        .map(|(&base, _)| base);
+    let rest_start = at.saturating_add(1);
+    let gone: Vec<usize> = first
+        .into_iter()
+        .chain(v.views.range(rest_start..end.max(rest_start)).map(|(&base, _)| base))
+        .collect();
+    for base in gone {
+        remove_view(v, base);
+    }
+}
+
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
     let mut v = views_mut();
     v.sections.retain(|s| s.0 != section);
+    let stale: Vec<usize> = v
+        .views
+        .iter()
+        .filter(|&(_, view)| view.1 == section)
+        .map(|(&base, _)| base)
+        .collect();
+    for base in stale {
+        remove_view(&mut v, base);
+    }
     // A handle's number given out again: the view was of the section that
     // had it before (it stays mapped: someone may be writing through it).
     v.whole.retain(|w| w.0 != section);
@@ -324,6 +376,16 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
 pub fn title_memory_section_gone(section: usize) {
     let whole = {
         let mut v = views_mut();
+        v.sections.retain(|s| s.0 != section);
+        let gone: Vec<usize> = v
+            .views
+            .iter()
+            .filter(|&(_, view)| view.1 == section)
+            .map(|(&base, _)| base)
+            .collect();
+        for base in gone {
+            remove_view(&mut v, base);
+        }
         let at = v.whole.iter().position(|w| w.0 == section);
         at.map(|i| v.whole.swap_remove(i).1)
     };
@@ -338,14 +400,21 @@ pub fn title_memory_section_gone(section: usize) {
 /// The runtime mapped `[at, at + len)` as a view of `section` from
 /// `offset` on. Call after [`crate::title_memory_remapped`] of the range.
 pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
+    if len == 0 || at.checked_add(len).is_none() || offset.checked_add(len as u64).is_none() {
+        return;
+    }
     {
         let mut v = views_mut();
+        views_gone_in(&mut v, at, len);
         v.views.insert(at, (len, section, offset));
         for k in 0..len.div_ceil(K64) {
+            let page = at + k * K64;
             let shown = v.pages.entry((section, offset + (k * K64) as u64)).or_default();
-            shown.push(at + k * K64);
-            let twice = shown.len() == 2;
-            v.pages_twice += usize::from(twice);
+            if !shown.contains(&page) {
+                shown.push(page);
+                let twice = shown.len() == 2;
+                v.pages_twice += usize::from(twice);
+            }
         }
     }
     // This view is writable from now on: a guard over the same bytes at
@@ -359,30 +428,7 @@ pub fn title_memory_view(at: usize, len: usize, section: usize, offset: u64) {
 /// maps anew).
 pub(crate) fn views_gone(at: usize, len: usize) {
     let mut v = views_mut();
-    if v.views.is_empty() {
-        return;
-    }
-    let end = at.saturating_add(len);
-    let first = v.views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at).map(|(base, _)| *base);
-    let gone: Vec<usize> = first.into_iter().chain(v.views.range(at.saturating_add(1)..end).map(|(base, _)| *base)).collect();
-    for base in gone {
-        let Some((bytes, section, offset)) = v.views.remove(&base) else {
-            continue;
-        };
-        for k in 0..bytes.div_ceil(K64) {
-            let key = (section, offset + (k * K64) as u64);
-            if let Some(pages) = v.pages.get_mut(&key) {
-                let page = base + k * K64;
-                let before = pages.len();
-                pages.retain(|&shown| shown != page);
-                let after = pages.len();
-                if after == 0 {
-                    v.pages.remove(&key);
-                }
-                v.pages_twice = v.pages_twice.saturating_sub(usize::from(before >= 2 && after < 2));
-            }
-        }
-    }
+    views_gone_in(&mut v, at, len);
 }
 
 /// The 64 KiB pages of `[start, end)` that the title shows at other
@@ -394,11 +440,19 @@ pub(crate) fn shown_elsewhere(start: usize, end: usize) -> Vec<(usize, Vec<usize
     if start >= end || v.pages_twice == 0 {
         return out;
     }
-    let first = v.views.range(..=start).next_back().filter(|(base, view)| *base + view.0 > start).map(|(base, _)| *base);
+    let first = v
+        .views
+        .range(..=start)
+        .next_back()
+        .filter(|(base, view)| (**base).saturating_add(view.0) > start)
+        .map(|(&base, _)| base);
     for (&base, &(bytes, section, offset)) in v.views.range(first.unwrap_or(start)..end) {
         let from = start.max(base) & !(K64 - 1);
-        for page in (from..end.min(base + bytes)).step_by(K64) {
-            let Some(shown) = v.pages.get(&(section, offset + (page - base) as u64)) else {
+        for page in (from..end.min(base.saturating_add(bytes))).step_by(K64) {
+            let Some(key_off) = offset.checked_add((page - base) as u64) else {
+                continue;
+            };
+            let Some(shown) = v.pages.get(&(section, key_off)) else {
                 continue;
             };
             if (2..=crate::watch::MANY_VIEWS).contains(&shown.len()) {
@@ -514,18 +568,33 @@ pub(crate) enum Cover {
 }
 
 fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> Cover {
-    let end = at + len.max(1);
-    let Some((&base, &(bytes, section, offset))) = views.range(..=at).next_back().filter(|(base, view)| *base + view.0 > at) else {
+    let Some((&base, &(bytes, section, offset))) = views
+        .range(..=at)
+        .next_back()
+        .filter(|(base, view)| view.0 > 0 && (**base).checked_add(view.0).is_some_and(|stop| stop > at))
+    else {
         return Cover::None;
     };
-    let first = (section, offset + (at - base) as u64);
+    let Some(first_off) = offset.checked_add((at - base) as u64) else {
+        return Cover::None;
+    };
+    let Some(end) = at.checked_add(len.max(1)) else {
+        return Cover::Holes;
+    };
+    let first = (section, first_off);
     let (mut reached, mut one) = (base + bytes, true);
     while reached < end {
         let Some(&(bytes, s, o)) = views.get(&reached) else {
             return Cover::Holes;
         };
-        one &= s == first.0 && o == first.1 + (reached - at) as u64;
-        reached += bytes;
+        if bytes == 0 {
+            return Cover::Holes;
+        }
+        one &= s == first.0 && first.1.checked_add((reached - at) as u64) == Some(o);
+        let Some(next) = reached.checked_add(bytes) else {
+            return Cover::Holes;
+        };
+        reached = next;
     }
     if one { Cover::Run(first.0, first.1) } else { Cover::Scattered }
 }
@@ -554,17 +623,22 @@ fn stretch_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usiz
     let (&first, &(n, _, _)) = views.range(..=at).next_back()?;
     let mut start = first;
     for (&a, &(n, s, o)) in views.range(..first).rev() {
-        if a + n != start || !follows(a, s, o) {
+        if n == 0 || a.checked_add(n) != Some(start) || !follows(a, s, o) {
             break;
         }
         start = a;
     }
-    let mut stop = first + n;
-    for (&a, &(n, s, o)) in views.range(first + 1..) {
-        if a != stop || !follows(a, s, o) {
-            break;
+    let mut stop = first.checked_add(n)?;
+    if let Some(after_first) = first.checked_add(1) {
+        for (&a, &(n, s, o)) in views.range(after_first..) {
+            if n == 0 || a != stop || !follows(a, s, o) {
+                break;
+            }
+            let Some(next) = a.checked_add(n) else {
+                break;
+            };
+            stop = next;
         }
-        stop = a + n;
     }
     Some((start, stop - start, section, (start as i128 - delta) as u64))
 }
@@ -586,7 +660,9 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
         v.whole.iter().find(|w| w.0 == section).map(|w| (w.1, offset))
     };
     if let Some((base, offset)) = known {
-        return (base != 0).then(|| base + offset as usize);
+        return (base != 0)
+            .then(|| usize::try_from(offset).ok().and_then(|o| base.checked_add(o)))
+            .flatten();
     }
     let mut v = views_mut();
     let Cover::Run(section, offset) = cover_in(&v.views, at, len) else {
@@ -606,7 +682,9 @@ pub(crate) fn beside(at: usize, len: usize) -> Option<usize> {
             base
         }
     };
-    (base != 0).then(|| base + offset as usize)
+    (base != 0)
+        .then(|| usize::try_from(offset).ok().and_then(|o| base.checked_add(o)))
+        .flatten()
 }
 
 /// Our own address of the 64 KiB page the title sees at `page` ([`beside`]),
@@ -1399,6 +1477,86 @@ pub(crate) mod tests {
         assert_eq!(cover(at + 4 * K64, K64), Cover::Run(77, 4 * K64 as u64));
         views_gone(at + 4 * K64, K64);
         assert_eq!(cover(at + 4 * K64, K64), Cover::None);
+    }
+
+    #[test]
+    fn zero_length_views_gone_keeps_existing_views_without_panicking() {
+        let at = 0x7ff5_0000_0000_usize;
+        let sec = 991_001_usize;
+        title_memory_view(at, 2 * K64, sec, 0);
+        views_gone(at + K64, 0);
+        views_gone(usize::MAX, 0);
+        assert_eq!(shown_bytes(at, 2 * K64), Some(2 * K64 as u64));
+        views_gone(at, 2 * K64);
+    }
+
+    #[test]
+    fn overwriting_title_memory_view_evicts_stale_section_aliases() {
+        let at = 0x7ff5_2000_0000_usize;
+        let sec = 991_002_usize;
+        title_memory_view(at, 2 * K64, sec, 0);
+        title_memory_view(at + 4 * K64, K64, sec, 0);
+        assert_eq!(shown_elsewhere(at + 4 * K64, at + 5 * K64), vec![(at + 4 * K64, vec![at])]);
+
+        title_memory_view(at, 2 * K64, sec, 2 * K64 as u64);
+        assert_eq!(views_of_section(sec, 0, 2 * K64), vec![(at + 4 * K64, K64)]);
+        assert!(shown_elsewhere(at + 4 * K64, at + 5 * K64).is_empty());
+        assert_eq!(views_of_section(sec, 2 * K64 as u64, 2 * K64), vec![(at, 2 * K64)]);
+        views_gone(at, 6 * K64);
+    }
+
+    #[test]
+    fn section_gone_evicts_views_and_drops_closed_section_metadata() {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        let at = 0x7ff5_4000_0000_usize;
+        // SAFETY: anonymous pagefile-backed section owned by this test.
+        let handle = unsafe {
+            mem::CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                std::ptr::null(),
+                mem::PAGE_READWRITE,
+                0,
+                (4 * K64) as u32,
+                std::ptr::null(),
+            )
+        };
+        assert!(!handle.is_null());
+        let sec = handle as usize;
+        title_memory_section(sec, 4 * K64 as u64, true);
+        title_memory_view(at, 2 * K64, sec, 0);
+        assert!(beside(at, K64).is_some());
+
+        title_memory_section_gone(sec);
+        let shown_after = shown_bytes(at, 2 * K64);
+        let section_views_after = views_of_section(sec, 0, 4 * K64);
+        // Even if a caller registers a stale view for the retired section id, `v.sections` no longer holds it.
+        title_memory_view(at, K64, sec, 0);
+        let beside_after = beside(at, K64);
+        title_memory_section_gone(sec);
+        views_gone(at, 2 * K64);
+        // SAFETY: unmapped above before closing the section handle.
+        unsafe { CloseHandle(handle) };
+
+        assert_eq!(shown_after, None);
+        assert!(section_views_after.is_empty());
+        assert_eq!(beside_after, None);
+    }
+
+    #[test]
+    fn high_address_cover_and_stretch_check_overflow_cleanly() {
+        let mut views = BTreeMap::new();
+        let near_max = usize::MAX - K64 + 1;
+        views.insert(near_max, (K64 - 1, 9, 0));
+        assert_eq!(cover_in(&views, near_max, 2 * K64), Cover::Holes);
+        assert_eq!(cover_in(&views, usize::MAX - 7, 64), Cover::Holes);
+        assert_eq!(
+            stretch_in(&views, near_max, 16),
+            Some((near_max, K64 - 1, 9, 0))
+        );
+
+        let mut wrapping = BTreeMap::new();
+        wrapping.insert(near_max, (2 * K64, 9, 0));
+        assert_eq!(cover_in(&wrapping, near_max, 16), Cover::None);
     }
 
     /// Only private memory committed whole, read-write, is taken for a part.
