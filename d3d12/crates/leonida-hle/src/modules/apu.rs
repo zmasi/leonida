@@ -9,9 +9,10 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::Layout;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use opus_pure::OpusDecoder;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -130,6 +131,23 @@ pub struct Connection {
     state: Mutex<State>,
 }
 
+// SAFETY: `memory` and `event` are owned by `Connection`, accessed under the
+// `CONNECTIONS` RwLock, and released once in `Drop` after exclusive removal.
+unsafe impl Send for Connection {}
+// SAFETY: mutable connection state sits behind `state: Mutex<State>`.
+unsafe impl Sync for Connection {}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if !self.event.is_null() {
+            // SAFETY: created in `XApuConnect` and owned exclusively by `self`.
+            unsafe { CloseHandle(self.event) };
+        }
+        // SAFETY: allocated in `XApuConnect` with `self.layout`.
+        unsafe { std::alloc::dealloc(self.memory, self.layout) };
+    }
+}
+
 struct State {
     streams: Vec<Option<OpusDecoder>>,
     /// Results not yet dequeued, per stream.
@@ -137,6 +155,27 @@ struct State {
     results: VecDeque<ApuResult>,
     commands: u32,
     dequeued: u32,
+}
+
+static NEXT_HANDLE: AtomicUsize = AtomicUsize::new(1);
+static CONNECTIONS: LazyLock<RwLock<HashMap<usize, Connection>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+fn next_handle_id() -> usize {
+    loop {
+        let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
+fn read_connections() -> RwLockReadGuard<'static, HashMap<usize, Connection>> {
+    CONNECTIONS.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write_connections() -> RwLockWriteGuard<'static, HashMap<usize, Connection>> {
+    CONNECTIONS.write().unwrap_or_else(|e| e.into_inner())
 }
 
 fn lock(c: &Connection) -> std::sync::MutexGuard<'_, State> {
@@ -148,11 +187,15 @@ pub extern "system" fn XApuConnect(
     output: *mut ConnectOutput,
     handle: *mut *mut Connection,
 ) -> HRESULT {
+    if !handle.is_null() {
+        // SAFETY: caller's output slot; clear before any early error return.
+        unsafe { handle.write_unaligned(std::ptr::null_mut()) };
+    }
     if input.is_null() || output.is_null() || handle.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: checked non-null.
-    let input = unsafe { &*input };
+    // SAFETY: checked non-null; `read_unaligned` tolerates packed caller structs.
+    let input = unsafe { input.read_unaligned() };
     if !(1..=500).contains(&input.streams)
         || !(1..=16).contains(&input.commands_per_stream)
         || input.memory == 0
@@ -198,7 +241,7 @@ pub extern "system" fn XApuConnect(
         options = input.options,
         "audio decoder connected"
     );
-    let connection = Box::new(Connection {
+    let connection = Connection {
         memory,
         layout,
         event,
@@ -211,14 +254,16 @@ pub extern "system" fn XApuConnect(
             commands: 0,
             dequeued: 0,
         }),
-    });
+    };
+    let id = next_handle_id();
+    write_connections().insert(id, connection);
     // SAFETY: checked non-null.
     unsafe {
-        output.write(ConnectOutput {
+        output.write_unaligned(ConnectOutput {
             memory: memory.cast(),
             result_event: event,
         });
-        handle.write(Box::into_raw(connection));
+        handle.write_unaligned(std::ptr::without_provenance_mut(id));
     }
     S_OK
 }
@@ -227,14 +272,11 @@ pub extern "system" fn XApuDisconnect(handle: *mut Connection) -> HRESULT {
     if handle.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: made by `XApuConnect`; disconnected once.
-    let connection = unsafe { Box::from_raw(handle) };
-    if !connection.event.is_null() {
-        // SAFETY: our event.
-        unsafe { CloseHandle(connection.event) };
-    }
-    // SAFETY: allocated in `XApuConnect` with this layout.
-    unsafe { std::alloc::dealloc(connection.memory, connection.layout) };
+    let removed = write_connections().remove(&handle.addr());
+    let Some(connection) = removed else {
+        return E_INVALIDARG;
+    };
+    drop(connection);
     S_OK
 }
 
@@ -246,8 +288,16 @@ pub extern "system" fn XApuEnqueueCommand(
     if handle.is_null() || command.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: a connection from `XApuConnect`; every command starts with an id.
-    let (connection, id) = unsafe { (&*handle, command.read_unaligned()) };
+    let connections = read_connections();
+    let Some(connection) = connections.get(&handle.addr()) else {
+        return E_INVALIDARG;
+    };
+    // SAFETY: checked non-null; every command starts with a packed `CommandId`.
+    let id = unsafe { command.read_unaligned() };
+    let kind = id.kind;
+    if !(ACTIVATE..=RESET).contains(&kind) {
+        return INVALID_COMMAND;
+    }
     let mut state = lock(connection);
     let stream = id.stream as usize;
     if stream >= state.streams.len() {
@@ -304,14 +354,14 @@ pub extern "system" fn XApuEnqueueCommand(
                 None => result.error = INVALID_STREAM,
             }
         }
-        _ => return INVALID_COMMAND,
+        _ => unreachable!(),
     }
     state.queued[stream] += 1;
     state.commands = state.commands.wrapping_add(1);
     state.results.push_back(result);
     if !total.is_null() {
         // SAFETY: optional out parameter.
-        unsafe { total.write(state.commands) };
+        unsafe { total.write_unaligned(state.commands) };
     }
     if id.options & SIGNAL != 0 && !connection.event.is_null() {
         // SAFETY: our event.
@@ -329,11 +379,16 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     result.input = input;
     result.input_length = input_length;
     result.output = output;
-    if input.is_null() || output.is_null() || input_length == 0 {
+    if input.is_null()
+        || output.is_null()
+        || input_length == 0
+        || input.addr().checked_add(input_length as usize).is_none()
+        || output.addr().checked_add(output_length as usize).is_none()
+    {
         result.error = E_INVALIDARG;
         return;
     }
-    // SAFETY: the title's packet in its connection memory.
+    // SAFETY: `input` is non-null and `input..input + input_length` does not wrap.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
     let mut pcm = vec![0f32; MAX_FRAMES * channels];
     let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm) {
@@ -375,8 +430,11 @@ pub extern "system" fn XApuDequeueResult(handle: *mut Connection, out: *mut ApuR
     if handle.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
-    // SAFETY: a connection from `XApuConnect`.
-    let mut state = lock(unsafe { &*handle });
+    let connections = read_connections();
+    let Some(connection) = connections.get(&handle.addr()) else {
+        return E_INVALIDARG;
+    };
+    let mut state = lock(connection);
     let Some(result) = state.results.pop_front() else {
         return PENDING_RESULTS;
     };
@@ -392,11 +450,14 @@ pub extern "system" fn XApuGetResultCount(handle: *mut Connection, total: *mut u
     if handle.is_null() {
         return 0;
     }
-    // SAFETY: a connection from `XApuConnect`.
-    let state = lock(unsafe { &*handle });
+    let connections = read_connections();
+    let Some(connection) = connections.get(&handle.addr()) else {
+        return 0;
+    };
+    let state = lock(connection);
     if !total.is_null() {
         // SAFETY: optional out parameter.
-        unsafe { total.write(state.dequeued) };
+        unsafe { total.write_unaligned(state.dequeued) };
     }
     state.results.len() as u32
 }
@@ -674,5 +735,134 @@ mod tests {
             );
             assert_eq!(XApuDisconnect(handle), S_OK);
         }
+    }
+
+    #[test]
+    fn refuses_stale_foreign_and_wrapping_handles_and_unaligned_io() {
+        let bad_in = ConnectInput {
+            process: DECODE_OPUS,
+            streams: 0,
+            commands_per_stream: 2,
+            memory: 0x1000,
+            frames_per_output: 0,
+            options: 0,
+        };
+        let mut out = ConnectOutput {
+            memory: std::ptr::null_mut(),
+            result_event: std::ptr::null_mut(),
+        };
+        let mut handle: *mut Connection = std::ptr::dangling_mut();
+        assert_eq!(XApuConnect(&bad_in, &mut out, &mut handle), E_INVALIDARG);
+        assert!(handle.is_null(), "failed connect must clear handle");
+
+        let foreign: *mut Connection = std::ptr::without_provenance_mut(0xDEAD_BEEF);
+        let cmd = id(NOTIFY, 0);
+        let mut res = std::mem::MaybeUninit::<ApuResult>::zeroed();
+        let mut count = 99u32;
+        assert_eq!(XApuDisconnect(foreign), E_INVALIDARG);
+        assert_eq!(
+            XApuEnqueueCommand(foreign, &raw const cmd, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        assert_eq!(XApuDequeueResult(foreign, res.as_mut_ptr()), E_INVALIDARG);
+        assert_eq!(XApuGetResultCount(foreign, &mut count), 0);
+        assert_eq!(count, 99);
+
+        // Unaligned ConnectInput, ConnectOutput, handle, and total pointers.
+        let make_good = || ConnectInput {
+            process: DECODE_OPUS,
+            streams: 2,
+            commands_per_stream: 4,
+            memory: 0x8000,
+            frames_per_output: 0,
+            options: RESULT_EVENT,
+        };
+        let mut in_buf = [0u8; size_of::<ConnectInput>() + 8];
+        let mut out_buf = [0u8; size_of::<ConnectOutput>() + 8];
+        let mut handle_buf = [0u8; size_of::<*mut Connection>() + 8];
+        let mut total_buf = [0u8; size_of::<u32>() + 8];
+        // SAFETY: `+1` is inside each stack buffer and intentionally misaligned.
+        let (in_ptr, out_ptr, handle_ptr, total_ptr) = unsafe {
+            let ip = in_buf.as_mut_ptr().add(1).cast::<ConnectInput>();
+            ip.write_unaligned(make_good());
+            (
+                ip.cast_const(),
+                out_buf.as_mut_ptr().add(1).cast::<ConnectOutput>(),
+                handle_buf.as_mut_ptr().add(1).cast::<*mut Connection>(),
+                total_buf.as_mut_ptr().add(1).cast::<u32>(),
+            )
+        };
+        assert_eq!(XApuConnect(in_ptr, out_ptr, handle_ptr), S_OK);
+        // SAFETY: initialized by `XApuConnect`.
+        let (h1, out1) = unsafe { (handle_ptr.read_unaligned(), out_ptr.read_unaligned()) };
+        assert!(!h1.is_null() && !out1.memory.is_null() && !out1.result_event.is_null());
+
+        let activate = Activate {
+            id: id(ACTIVATE, 0),
+            channels: 1,
+            init_length: 0,
+            init: std::ptr::null(),
+            start_pitch: 1.0,
+            processing_length: 0,
+            processing: std::ptr::null_mut(),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(h1, (&raw const activate).cast(), total_ptr),
+            S_OK
+        );
+        // SAFETY: written by `XApuEnqueueCommand`.
+        assert_eq!(unsafe { total_ptr.read_unaligned() }, 1);
+        assert_eq!(XApuDequeueResult(h1, res.as_mut_ptr()), S_OK);
+
+        // Wrapping input/output spans must be rejected before `from_raw_parts`.
+        let wrap_in = Process {
+            id: id(PROCESS, 0),
+            pitch_ramp: 0.0,
+            target_pitch: 1.0,
+            first_frame: 0,
+            frame_count: 120,
+            input_length: 32,
+            input: std::ptr::without_provenance(usize::MAX - 7),
+            output_length: 1024,
+            output: out1.memory.cast(),
+        };
+        assert_eq!(
+            XApuEnqueueCommand(h1, (&raw const wrap_in).cast(), std::ptr::null_mut()),
+            S_OK
+        );
+        assert_eq!(XApuDequeueResult(h1, res.as_mut_ptr()), S_OK);
+        // SAFETY: written above.
+        let err = unsafe { res.assume_init() }.error;
+        assert_eq!(err, E_INVALIDARG);
+
+        assert_eq!(XApuDisconnect(h1), S_OK);
+        // Double disconnect and post-disconnect calls fail without UAF/ABA.
+        assert_eq!(XApuDisconnect(h1), E_INVALIDARG);
+        assert_eq!(
+            XApuEnqueueCommand(h1, &raw const cmd, std::ptr::null_mut()),
+            E_INVALIDARG
+        );
+        assert_eq!(XApuDequeueResult(h1, res.as_mut_ptr()), E_INVALIDARG);
+        assert_eq!(XApuGetResultCount(h1, std::ptr::null_mut()), 0);
+
+        let good = make_good();
+        let mut h2 = std::ptr::null_mut();
+        assert_eq!(XApuConnect(&good, &mut out, &mut h2), S_OK);
+        assert_ne!(h2, h1, "new connection must not reuse disconnected handle");
+        assert_eq!(XApuDisconnect(h1), E_INVALIDARG);
+
+        // Concurrent enqueue + disconnect on a shared handle never dereferences freed memory.
+        let h2_addr = h2 as usize;
+        let worker = std::thread::spawn(move || {
+            let h = std::ptr::without_provenance_mut::<Connection>(h2_addr);
+            let notify = id(NOTIFY, 0);
+            for _ in 0..64 {
+                let hr = XApuEnqueueCommand(h, &raw const notify, std::ptr::null_mut());
+                assert!(hr == S_OK || hr == QUEUE_FULL || hr == E_INVALIDARG);
+            }
+        });
+        assert_eq!(XApuDisconnect(h2), S_OK);
+        worker.join().unwrap();
+        assert_eq!(XApuDisconnect(h2), E_INVALIDARG);
     }
 }
