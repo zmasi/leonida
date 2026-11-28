@@ -10322,8 +10322,10 @@ impl<'a> Lower<'a> {
             Operand::Scalar { code, .. } if code != NULL => {
                 pair(self, Reg::S(code), Reg::S(code + 1))?
             }
-            Operand::Const(c @ (128 | 240..=248)) => {
-                let x = super::inline64::value(c).expect("an inline constant");
+            // Inline constants: their 64-bit value (`inline64`); an integer is
+            // the raw bits, sign-extended, as LLVM's AMDGPU disassembler reads it.
+            Operand::Const(c) if super::inline64::value(c).is_some() => {
+                let x = super::inline64::value(c).expect("checked");
                 (self.s.m.i32(x as u32), self.s.m.i32((x >> 32) as u32))
             }
             // GFX10 places a 32-bit literal in the high 32 bits of a 64-bit float operand.

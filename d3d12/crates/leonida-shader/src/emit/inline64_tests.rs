@@ -299,3 +299,31 @@ fn valu_64_bit_integer_sources_read_inline_floats_as_f64_bits() {
         });
     }
 }
+
+/// Integer inline constants in an f64 operand are the raw 64-bit pattern,
+/// sign-extended (LLVM's `decodeIntImmed`): 1..=64 are f64 subnormals (an f32
+/// zero), -1..=-16 NaNs whose top mantissa bits are all set (the f32 NaN
+/// `0xFFFFFFFF`).
+#[test]
+fn v_cvt_f32_f64_reads_integer_inline_constants_as_raw_f64_bits() {
+    let mut cases: Vec<(u8, u8, u8, u32)> = Vec::new(); // (code, abs, neg, f32 bits)
+    for code in [128u8, 129, 130, 150, 192] {
+        cases.push((code, 0, 0, 0));
+    }
+    for code in [193u8, 194, 200, 208] {
+        cases.push((code, 0, 0, 0xFFFF_FFFF));
+    }
+    cases.push((129, 0, 1, 0x8000_0000)); // -(subnormal): -0.0
+    cases.push((193, 1, 0, 0x7FFF_FFFF)); // |NaN|
+    cases.push((193, 1, 1, 0xFFFF_FFFF)); // -|NaN|
+    for (code, f32_bits) in [(240u8, 0x3F00_0000u32), (243, 0xBF80_0000), (248, 0x3E22_F983)] {
+        cases.push((code, 0, 0, f32_bits));
+    }
+    for (code, abs, neg, want) in cases {
+        // v_cvt_f32_f64 v0, <code> (VOP3, abs/neg on src0); v_mov_b32 v1, 0
+        let [w0, w1] = vop3(0x18f, 0, 0, [code.into(), 0, 0]);
+        let body = [w0 | u32::from(abs) << 8, w1 | u32::from(neg) << 29, vop1_mov(1, 128)];
+        let label = format!("v_cvt_f32_f64 {code} abs={abs} neg={neg}");
+        run(&build_cs(&body), &label, &[(0, 0)], |_, _| u64::from(want));
+    }
+}
