@@ -1729,6 +1729,455 @@ int check_shadow_keep_refill(Context& c) {
     return 0;
 }
 
+// A buffer V# in an ordinary (arena) descriptor heap whose base is below the arena's size is either the console VA
+// the layer wrote (an arena offset) or a raw address of the title's that is the same number, once a title range was
+// registered there (Wine maps xmem pages low, over live arena allocations). The scan read every one as an arena
+// offset by the number alone; the layer now keeps provenance by slot (DeviceState::slot_heaps). 1 KiB buffers carry
+// high-contrast words (a tag in the top byte); K..K5 are arena ranges of a heap with the buffers gone, as a window or
+// shadow is no buffer of the title's. Source ranges are registered with TitleVaAliases::add, as the layer does:
+//   - raw: a V# the CPU writes whose base is a number in an arena hole (no buffer there), where a source maps it to
+//     buffer T, reads T; a V# in live buffer A with no source is the control and reads A;
+//   - repeated scans: a raw V# at a high address is rebased to K's console VA; a source registered over K's numbers
+//     afterwards (to O) must not translate it again, at the second and third scan. A retried slot (null at the first
+//     scan, backed at the second) and the UAV counter half of a slot behave the same (K5, K3);
+//   - API and copies: CBVs made in a CPU-only staging heap, moved into the table by CopyDescriptorsSimple and
+//     CopyDescriptors (K2, K4), are the layer's words in their new slots, and keep K2 and K4 under sources to O2, O4;
+//   - identical bytes at distinct slots: the title's CPU writes of the very words slot 2 holds (a raw V# at K's number)
+//     into slot 7, into another heap, and the same for the counter half, read O, O and O3, while slot 2 keeps K;
+//   - overwrite: the title writes other words over slot 2 and they read O;
+//   - heap reuse: words the layer wrote in a heap that was destroyed leave nothing behind when the title writes them
+//     into a new heap (at the same address, where the allocator reuses it): they read O2;
+//   - overlapping CopyDescriptorsSimple (memmove up by one slot): each moved slot keeps its own record (K2, K4);
+//   - observed overwrites: a null UAV over a CBV of the layer's, or a null CBV over a slot with a counter half, ends
+//     the records of both halves, and the same bytes the title writes next over the clear read O2, O3;
+//   - unobserved writes: the title writing the recorded words over the same slot, or a memcpy of a slot of the
+//     layer's into a slot with no record, cannot be told from raw bytes. The rule is conservative: the first leaves
+//     the slot the layer's (K), the second is the title's (O2);
+//   - a live buffer of the title's at a source's number (U, U2, U3): a V# the title composes from the buffer's
+//     GetGPUVirtualAddress is byte for byte a raw address over the same number, and no record exists. The number keeps
+//     meaning the live buffer (what stock reads); a number with no buffer there (a hole, K) is the title's.
+int check_low_title_vsharp(Context& c) {
+    auto& aliases = leonida::title_va_aliases();
+    constexpr UINT kBuf = 1024;
+    enum Which : UINT { A, T, K, O, K2, O2, K3, O3, K4, O4, K5, O5, U, U2, U3, kBuffers };
+    constexpr std::uint32_t tags[kBuffers] = {0xA1, 0x71, 0x4B, 0x0E, 0x4C, 0x0F, 0x4D, 0x10,
+                                              0x4E, 0x11, 0x4F, 0x12, 0x55, 0x56, 0x57};
+    const auto data = [&](UINT b, UINT word) { return (tags[b] << 24) | (word + 1); };
+    const D3D12_HEAP_PROPERTIES def{D3D12_HEAP_TYPE_DEFAULT}, up{D3D12_HEAP_TYPE_UPLOAD}, rb{D3D12_HEAP_TYPE_READBACK};
+    Ref<ID3D12Resource> upload, buf[kBuffers];
+    const auto upload_desc = buffer_desc(kBuffers * kBuf);
+    const auto data_desc = buffer_desc(kBuf);
+    EXPECT(c.device->CreateCommittedResource(&up, {}, &upload_desc, D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                                             IID_PPV_ARGS(&upload.p)) == S_OK);
+    // K, K2..K5 are made in a heap (below); U2 and U3 later.
+    Ref<ID3D12Heap> arena_range;
+    D3D12_HEAP_DESC range_desc{};
+    range_desc.SizeInBytes = 5 * 0x10000;
+    range_desc.Properties.Type = D3D12_HEAP_TYPE_DEFAULT;
+    range_desc.Alignment = 0x10000;
+    range_desc.Flags = D3D12_HEAP_FLAG_ALLOW_ONLY_BUFFERS;
+    EXPECT(c.inner->CreateHeap(&range_desc, IID_PPV_ARGS(&arena_range.p)) == S_OK);
+    UINT placed = 0;
+    for (UINT b = 0; b < kBuffers; ++b) {
+        if (b == U2 || b == U3) continue;
+        if (b == K || b == K2 || b == K3 || b == K4 || b == K5)
+            EXPECT(c.inner->CreatePlacedResource(arena_range.p, 0x10000 * placed++, &data_desc,
+                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                 IID_PPV_ARGS(&buf[b].p)) == S_OK);
+        else
+            EXPECT(c.device->CreateCommittedResource(&def, {}, &data_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                     IID_PPV_ARGS(&buf[b].p)) == S_OK);
+    }
+    std::uint32_t* input = nullptr;
+    EXPECT(upload->Map(0, nullptr, reinterpret_cast<void**>(&input)) == S_OK);
+    for (UINT b = 0; b < kBuffers; ++b)
+        for (UINT i = 0; i < kBuf / 4; ++i) input[b * kBuf / 4 + i] = data(b, i);
+    upload->Unmap(0, nullptr);
+
+    const auto run = [&](ID3D12GraphicsCommandList* l) -> int {
+        ID3D12CommandList* lists[] = {l};
+        c.queue->ExecuteCommandLists(1, lists);
+        EXPECT(rt::d3d12::last_execute_result(c.queue) == leonida::ReplayResult::success);
+        EXPECT(c.queue->Signal(c.fence, ++c.fence_value) == S_OK);
+        EXPECT(c.fence->SetEventOnCompletion(c.fence_value, nullptr) == S_OK);
+        return 0;
+    };
+    const auto transition = [&](ID3D12GraphicsCommandList* l, ID3D12Resource* resource, D3D12_RESOURCE_STATES from,
+                                D3D12_RESOURCE_STATES to) {
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barrier.Transition = {resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, from, to};
+        l->ResourceBarrier(1, &barrier);
+    };
+    {
+        Ref<ID3D12CommandAllocator> alloc;
+        Ref<ID3D12GraphicsCommandList> list;
+        EXPECT(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc.p)) == S_OK);
+        EXPECT(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.p, nullptr,
+                                           IID_PPV_ARGS(&list.p)) == S_OK);
+        for (UINT b = 0; b < kBuffers; ++b) {
+            if (!buf[b].p) continue;
+            list->CopyBufferRegion(buf[b].p, 0, upload.p, b * kBuf, kBuf);
+            transition(list.p, buf[b].p, D3D12_RESOURCE_STATE_COPY_DEST,
+                       D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        }
+        EXPECT(list->Close() == S_OK);
+        if (run(list.p)) return 1;
+    }
+    std::uint64_t va[kBuffers] = {};
+    for (UINT b = 0; b < kBuffers; ++b) {
+        if (!buf[b].p) continue;
+        va[b] = buf[b]->GetGPUVirtualAddress();
+        EXPECT(va[b] && va[b] + kBuf <= c.arena && !(va[b] & 3));  // arena offsets: the numbers a V# holds as they are
+    }
+    // The K buffers stand for what a scan rebases to (a window, a shadow): arena ranges with data in them that are no
+    // buffer of the title's. Their placed buffers go, the heap keeps the range.
+    for (const UINT b : {K, K2, K3, K4, K5}) buf[b].reset();
+    // Released resources are retired by the next submissions; a buffer made later, filled from the upload buffer.
+    const auto settle = [&]() -> int {
+        Ref<ID3D12CommandAllocator> alloc;
+        Ref<ID3D12GraphicsCommandList> list;
+        EXPECT(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc.p)) == S_OK);
+        EXPECT(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.p, nullptr,
+                                           IID_PPV_ARGS(&list.p)) == S_OK);
+        EXPECT(list->Close() == S_OK);
+        return run(list.p) || run(list.p);
+    };
+    const auto make_user = [&](UINT b) -> int {
+        Ref<ID3D12CommandAllocator> alloc;
+        Ref<ID3D12GraphicsCommandList> list;
+        EXPECT(c.device->CreateCommittedResource(&def, {}, &data_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                 IID_PPV_ARGS(&buf[b].p)) == S_OK);
+        EXPECT(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&alloc.p)) == S_OK);
+        EXPECT(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, alloc.p, nullptr,
+                                           IID_PPV_ARGS(&list.p)) == S_OK);
+        list->CopyBufferRegion(buf[b].p, 0, upload.p, b * kBuf, kBuf);
+        transition(list.p, buf[b].p, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        EXPECT(list->Close() == S_OK);
+        if (run(list.p)) return 1;
+        va[b] = buf[b]->GetGPUVirtualAddress();
+        EXPECT(va[b] && va[b] + kBuf <= c.arena);
+        return 0;
+    };
+    if (settle()) return 1;
+
+    // A shader-visible heap with a closed list that dispatches the V# of each slot into its own 256 bytes of one
+    // UAV buffer, which it copies to a readback buffer. A slot's mode is 0xFFFFFFFF for a buffer V#, 0 for a CBV.
+    struct Table {
+        Ref<ID3D12DescriptorHeap> heap;
+        Ref<ID3D12CommandAllocator> alloc;
+        Ref<ID3D12GraphicsCommandList> list;
+        Ref<ID3D12Resource> out, readback;
+        std::uint64_t cpu = 0, gpu = 0;
+        std::vector<UINT> modes;
+    };
+    const UINT inc = c.device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    EXPECT(inc == 32);
+    const D3D12_DESCRIPTOR_HEAP_DESC heap_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 16,
+                                               D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    const auto make_table = [&](Table& t, std::vector<UINT> modes) -> int {
+        t.modes = std::move(modes);
+        const UINT bytes = UINT(t.modes.size()) * kBytes;
+        const auto out_desc = buffer_desc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+        const auto readback_desc = buffer_desc(bytes);
+        EXPECT(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&t.heap.p)) == S_OK);
+        t.cpu = reinterpret_cast<XboxHeapHandleFn>(slot(t.heap.p, 9))(t.heap.p);
+        t.gpu = reinterpret_cast<XboxHeapHandleFn>(slot(t.heap.p, 10))(t.heap.p);
+        EXPECT(c.device->CreateCommittedResource(&def, {}, &out_desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+                                                 IID_PPV_ARGS(&t.out.p)) == S_OK);
+        EXPECT(c.device->CreateCommittedResource(&rb, {}, &readback_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                 IID_PPV_ARGS(&t.readback.p)) == S_OK);
+        EXPECT(c.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&t.alloc.p)) == S_OK);
+        EXPECT(c.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, t.alloc.p, c.pso,
+                                           IID_PPV_ARGS(&t.list.p)) == S_OK);
+        EXPECT(t.list->Close() == S_OK);
+        return 0;
+    };
+    const auto record = [&](Table& t) -> int {
+        EXPECT(t.alloc->Reset() == S_OK);
+        EXPECT(t.list->Reset(t.alloc.p, c.pso) == S_OK);
+        ID3D12DescriptorHeap* heaps[] = {t.heap.p};
+        t.list->SetDescriptorHeaps(1, heaps);
+        t.list->SetComputeRootSignature(c.root);
+        for (UINT k = 0; k < t.modes.size(); ++k) {
+            t.list->SetComputeRoot32BitConstant(0, 0, 0);
+            t.list->SetComputeRoot32BitConstant(0, t.modes[k], 1);
+            t.list->SetComputeRootUnorderedAccessView(1, t.out->GetGPUVirtualAddress() + k * kBytes);
+            t.list->SetComputeRootDescriptorTable(2, D3D12_GPU_DESCRIPTOR_HANDLE{t.gpu + k * inc});
+            t.list->Dispatch(1, 1, 1);
+        }
+        D3D12_RESOURCE_BARRIER barrier{};
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+        t.list->ResourceBarrier(1, &barrier);
+        transition(t.list.p, t.out.p, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        t.list->CopyBufferRegion(t.readback.p, 0, t.out.p, 0, t.modes.size() * kBytes);
+        transition(t.list.p, t.out.p, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        EXPECT(t.list->Close() == S_OK);
+        return 0;
+    };
+    const auto raw_vsharp = [](std::uint64_t address, UINT bytes = kBytes) {
+        leonida::gfx10::Buffer b{};
+        b.address = address;
+        b.num_records = bytes;
+        b.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
+        b.oob_select = leonida::gfx10::OobSelect::raw;
+        return leonida::gfx10::encode(b);
+    };
+    const auto put_half = [&](Table& t, UINT slot_index, UINT half, const leonida::gfx10::BufferWords& words) {
+        std::memcpy(reinterpret_cast<void*>(t.cpu + slot_index * inc + half * 16), words.data(), sizeof(words));
+    };
+    const auto base_of = [&](Table& t, UINT slot_index, UINT half) {
+        return vsharp_base(t.cpu + slot_index * inc + half * 16);
+    };
+
+    // Title addresses: x is a number inside arena buffer A; the others are far past the arena.
+    const std::uint64_t x = (c.arena / 2 & ~0xFFFFull) + 0x40, control = va[A] + 0x180;  // x: an arena hole
+    const std::uint64_t y_k = (1ull << 40) + 0x10000, y_k2 = (1ull << 40) + 0x20000, y_k3 = (1ull << 40) + 0x30000,
+                        y_k4 = (1ull << 40) + 0x40000, y_late = (1ull << 46) + 0x8000;
+    EXPECT(aliases.add(x, kBytes, va[T] + 0x40));
+    EXPECT(aliases.add(y_k, kBuf, va[K]));
+    EXPECT(aliases.add(y_k2, kBytes, va[K2]));
+    EXPECT(aliases.add(y_k3, kBuf, va[K3]));
+    EXPECT(aliases.add(y_k4, kBytes, va[K4]));
+
+    // CBVs made in a CPU-only staging heap, as a title builds them before it copies them into the table.
+    Ref<ID3D12DescriptorHeap> staging;
+    const D3D12_DESCRIPTOR_HEAP_DESC staging_desc{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 2,
+                                                  D3D12_DESCRIPTOR_HEAP_FLAG_NONE, 0};
+    EXPECT(c.inner->CreateDescriptorHeap(&staging_desc, IID_PPV_ARGS(&staging.p)) == S_OK);
+    const auto staging_cpu = staging->GetCPUDescriptorHandleForHeapStart();
+    const D3D12_CPU_DESCRIPTOR_HANDLE staging_second{staging_cpu.ptr + inc};
+    const D3D12_CONSTANT_BUFFER_VIEW_DESC cbv2{y_k2, kBytes}, cbv4{y_k4, kBytes};
+    c.device->CreateConstantBufferView(&cbv2, staging_cpu);
+    c.device->CreateConstantBufferView(&cbv4, staging_second);
+    EXPECT(vsharp_base(staging_cpu.ptr) == va[K2] && vsharp_base(staging_second.ptr) == va[K4]);
+
+    // Table H: 0 raw low V#; 1 control; 2 raw high V# (rebased to K); 3 CopyDescriptorsSimple of the staging CBV (K2);
+    // 4 control with a raw counter half (K3); 5 and 6 CopyDescriptors of both staging CBVs (K2, K4); 7 later the
+    // title's bytes identical to slot 2's; 8 a raw V# with no copy yet, retried when it has one (K5); 9 later a
+    // memcpy of slot 3's bytes; 10 and 11 CopyDescriptorsSimple of both staging CBVs (K2, K4), moved up one slot by an
+    // overlapping copy later; 13 a CBV the API writes (K2), cleared by the API later. Table H2 (another heap): 0 bytes
+    // identical to slot 2's, 1 control with a counter half identical to slot 4's.
+    constexpr UINT F = 0xFFFFFFFFu;
+    Table h, h2;
+    if (make_table(h, {F, F, F, 0, F, 0, 0, F, F, 0, 0, 0, 0, 0}) || make_table(h2, {F, F})) return 1;
+    put_half(h, 0, 0, raw_vsharp(x));
+    put_half(h, 1, 0, raw_vsharp(control));
+    put_half(h, 2, 0, raw_vsharp(y_k));
+    c.device->CopyDescriptorsSimple(1, D3D12_CPU_DESCRIPTOR_HANDLE{h.cpu + 3 * inc}, staging_cpu,
+                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    put_half(h, 4, 0, raw_vsharp(control));
+    put_half(h, 4, 1, raw_vsharp(y_k3 + 0x80, 4));
+    {
+        const D3D12_CPU_DESCRIPTOR_HANDLE destinations[] = {{h.cpu + 5 * inc}, {h.cpu + 6 * inc}};
+        const UINT destination_sizes[] = {1, 1}, source_sizes[] = {2};
+        c.device->CopyDescriptors(2, destinations, destination_sizes, 1, &staging_cpu, source_sizes,
+                                  D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    }
+    put_half(h, 8, 0, raw_vsharp(y_late));
+    c.device->CopyDescriptorsSimple(2, D3D12_CPU_DESCRIPTOR_HANDLE{h.cpu + 10 * inc}, staging_cpu,
+                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    c.device->CreateConstantBufferView(&cbv2, D3D12_CPU_DESCRIPTOR_HANDLE{h.cpu + 13 * inc});
+    EXPECT(base_of(h, 3, 0) == va[K2] && base_of(h, 5, 0) == va[K2] && base_of(h, 6, 0) == va[K4]);
+    if (record(h)) return 1;
+
+    int failures = 0;
+    // The words of a slot as the shader read them, and the base the heap holds for the half that matters.
+    const auto check = [&](Table& t, const char* step, const char* slot_name, UINT slot_index, auto expected,
+                           unsigned half, std::uint64_t want_base) {
+        void* mapped = nullptr;
+        if (t.readback->Map(0, nullptr, &mapped) != S_OK) {
+            ++failures;
+            return;
+        }
+        const auto* got = static_cast<const std::uint32_t*>(mapped) + slot_index * kElements;
+        unsigned matched = 0;
+        for (UINT i = 0; i < kElements; ++i) matched += got[i] == expected(i);
+        const std::uint32_t first = got[0];
+        t.readback->Unmap(0, nullptr);
+        const std::uint64_t base = base_of(t, slot_index, half);
+        const bool ok = matched == kElements && base == want_base;
+        failures += !ok;
+        std::printf("low title VA, %-9s %-28s read %2u/%u words (first 0x%08x), heap base 0x%llx (expected 0x%llx) %s\n",
+                    step, slot_name, matched, kElements, first, static_cast<unsigned long long>(base),
+                    static_cast<unsigned long long>(want_base), ok ? "ok" : "WRONG");
+    };
+    const auto words_of = [&](UINT which, UINT first_word, UINT count = kElements) {
+        return [=](UINT i) { return i < count ? data(which, first_word + i) : 0u; };
+    };
+
+    if (run(h.list.p)) return 1;
+    check(h, "scan 1", "raw V# in A -> T", 0, words_of(T, 0x40 / 4), 0, va[T] + 0x40);
+    check(h, "scan 1", "control V# in A", 1, words_of(A, 0x180 / 4), 0, control);
+    check(h, "scan 1", "raw high V# -> K", 2, words_of(K, 0), 0, va[K]);
+    check(h, "scan 1", "CopyDescriptorsSimple (K2)", 3, words_of(K2, 0), 0, va[K2]);
+    check(h, "scan 1", "control + counter K3", 4, words_of(A, 0x180 / 4), 1, va[K3] + 0x80);
+    check(h, "scan 1", "CopyDescriptors (K2)", 5, words_of(K2, 0), 0, va[K2]);
+    check(h, "scan 1", "CopyDescriptors (K4)", 6, words_of(K4, 0), 0, va[K4]);
+    check(h, "scan 1", "no copy yet: nulled", 8, words_of(A, 0, 0), 0, 0);
+    check(h, "scan 1", "CopyDescriptorsSimple 2 (K2)", 10, words_of(K2, 0), 0, va[K2]);
+    check(h, "scan 1", "CopyDescriptorsSimple 2 (K4)", 11, words_of(K4, 0), 0, va[K4]);
+    check(h, "scan 1", "API CBV (K2)", 13, words_of(K2, 0), 0, va[K2]);
+
+    // Sources registered over the layer's own numbers afterwards; a copy for the nulled slot; the title's bytes.
+    EXPECT(aliases.add(va[K], kBuf, va[O]));
+    EXPECT(aliases.add(va[K2], kBytes, va[O2]));
+    EXPECT(aliases.add(va[K3], kBuf, va[O3]));
+    EXPECT(aliases.add(va[K4], kBytes, va[O4]));
+    EXPECT(aliases.add(y_late, kBuf, va[K5]));
+    put_half(h, 7, 0, raw_vsharp(va[K]));  // what slot 2 holds, written by the CPU into an independent slot
+    std::memcpy(reinterpret_cast<void*>(h.cpu + 9 * inc), reinterpret_cast<const void*>(h.cpu + 3 * inc), inc);
+    put_half(h2, 0, 0, raw_vsharp(va[K]));
+    put_half(h2, 1, 0, raw_vsharp(control));
+    put_half(h2, 1, 1, raw_vsharp(va[K3] + 0x80, 4));  // what slot 4's counter half holds
+    if (record(h2)) return 1;
+    for (const char* step : {"scan 2", "scan 3"}) {
+        if (run(h.list.p) || run(h2.list.p)) return 1;
+        check(h, step, "layer's V# over O", 2, words_of(K, 0), 0, va[K]);
+        check(h, step, "layer's copy over O2", 3, words_of(K2, 0), 0, va[K2]);
+        check(h, step, "layer's counter over O3", 4, words_of(A, 0x180 / 4), 1, va[K3] + 0x80);
+        check(h, step, "CopyDescriptors over O2", 5, words_of(K2, 0), 0, va[K2]);
+        check(h, step, "CopyDescriptors over O4", 6, words_of(K4, 0), 0, va[K4]);
+        check(h, step, "bytes of slot 2, slot 7 -> O", 7, words_of(O, 0), 0, va[O]);
+        check(h, step, "retried slot -> K5", 8, words_of(K5, 0), 0, va[K5]);
+        check(h, step, "memcpy of slot 3 -> O2", 9, words_of(O2, 0), 0, va[O2]);
+        check(h, step, "staging copy K2, K4 (10, 11)", 10, words_of(K2, 0), 0, va[K2]);
+        check(h, step, "staging copy K4", 11, words_of(K4, 0), 0, va[K4]);
+        check(h, step, "API CBV over O2 (13)", 13, words_of(K2, 0), 0, va[K2]);
+        check(h, step, "raw V# in A -> T", 0, words_of(T, 0x40 / 4), 0, va[T] + 0x40);
+        check(h2, step, "other heap: bytes of 2 -> O", 0, words_of(O, 0), 0, va[O]);
+        check(h2, step, "other heap: counter -> O3", 1, words_of(A, 0x180 / 4), 1, va[O3] + 0x80);
+        if (step[5] == '2') EXPECT(aliases.add(va[K5], kBuf, va[O5]));  // over the retried slot's copy for scan 3
+    }
+
+    // CopyDescriptorsSimple over an overlapping range (memmove): slots 10 and 11 move up one, so 11 holds K2 and 12 K4.
+    c.device->CopyDescriptorsSimple(2, D3D12_CPU_DESCRIPTOR_HANDLE{h.cpu + 11 * inc},
+                                    D3D12_CPU_DESCRIPTOR_HANDLE{h.cpu + 10 * inc},
+                                    D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    if (run(h.list.p)) return 1;
+    check(h, "overlap", "slot 10 stays K2", 10, words_of(K2, 0), 0, va[K2]);
+    check(h, "overlap", "moved to 11 (K2)", 11, words_of(K2, 0), 0, va[K2]);
+    check(h, "overlap", "moved to 12 (K4)", 12, words_of(K4, 0), 0, va[K4]);
+
+    // An overwrite the API makes ends the record: a null UAV clears slot 13 (the layer's CBV of K2 until now), and the
+    // title writes the old bytes over the clear; the counter half of slot 4 likewise after a null CBV clears both.
+    leonida::gfx10::BufferWords cbv_words{};
+    std::memcpy(cbv_words.data(), reinterpret_cast<const void*>(h.cpu + 13 * inc), sizeof(cbv_words));
+    c.device->CreateUnorderedAccessView(nullptr, nullptr, nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{h.cpu + 13 * inc});
+    EXPECT(base_of(h, 13, 0) == 0);
+    put_half(h, 13, 0, cbv_words);
+    c.device->CreateConstantBufferView(nullptr, D3D12_CPU_DESCRIPTOR_HANDLE{h.cpu + 4 * inc});
+    EXPECT(base_of(h, 4, 0) == 0 && base_of(h, 4, 1) == 0);
+    put_half(h, 4, 0, raw_vsharp(control));
+    put_half(h, 4, 1, raw_vsharp(va[K3] + 0x80, 4));
+    if (run(h.list.p)) return 1;
+    check(h, "cleared", "old bytes after null UAV -> O2", 13, words_of(O2, 0), 0, va[O2]);
+    check(h, "cleared", "counter after null CBV -> O3", 4, words_of(A, 0x180 / 4), 1, va[O3] + 0x80);
+
+    // The title overwrites slot 2 with other words at K's number: not the layer's, so the source says O.
+    put_half(h, 2, 0, raw_vsharp(va[K], kBytes / 2));
+    if (run(h.list.p)) return 1;
+    check(h, "overwrite", "other words at K -> O", 2, words_of(O, 0, kElements / 2), 0, va[O]);
+    // The layer rebases a raw V# into slot 2 again: its words equal slot 7's, which stays the title's.
+    put_half(h, 2, 0, raw_vsharp(y_k));
+    if (run(h.list.p)) return 1;
+    check(h, "rebase", "slot 2 again -> K", 2, words_of(K, 0), 0, va[K]);
+    check(h, "rebase", "identical bytes, slot 7 -> O", 7, words_of(O, 0), 0, va[O]);
+    // Unobserved: the title writes the recorded words over the same slot. Conservatively still the layer's.
+    put_half(h, 2, 0, raw_vsharp(va[K]));
+    if (run(h.list.p)) return 1;
+    check(h, "same slot", "recorded words rewritten", 2, words_of(K, 0), 0, va[K]);
+    check(h, "same slot", "identical bytes, slot 7 -> O", 7, words_of(O, 0), 0, va[O]);
+
+    // Heap reuse: the layer's CBV in a heap that is then destroyed; the title writes its bytes into a new heap.
+    std::uint64_t old_cpu = 0;
+    leonida::gfx10::BufferWords old_words{};
+    {
+        Ref<ID3D12DescriptorHeap> old_heap;
+        EXPECT(c.device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&old_heap.p)) == S_OK);
+        old_cpu = reinterpret_cast<XboxHeapHandleFn>(slot(old_heap.p, 9))(old_heap.p);
+        c.device->CreateConstantBufferView(&cbv2, D3D12_CPU_DESCRIPTOR_HANDLE{old_cpu});
+        EXPECT(vsharp_base(old_cpu) == va[K2]);
+        std::memcpy(old_words.data(), reinterpret_cast<const void*>(old_cpu), sizeof(old_words));
+    }
+    Table h3;
+    if (make_table(h3, {0})) return 1;
+    std::printf("low title VA, heap reuse: the new heap is %s the old one's address\n",
+                h3.cpu == old_cpu ? "at" : "NOT at");
+    put_half(h3, 0, 0, old_words);
+    if (record(h3) || run(h3.list.p)) return 1;
+    check(h3, "heap reuse", "destroyed heap's words -> O2", 0, words_of(O2, 0), 0, va[O2]);
+    failures += h3.cpu != old_cpu;
+
+    // A live buffer of the title's at a source's number, the V# composed by the title from GetGPUVirtualAddress (bytes
+    // identical to a raw address). A slot has no record and a source covers the number, so the bytes alone cannot say
+    // which is meant; where a live buffer is at the number it keeps meaning that buffer (what stock reads), and only
+    // a number with no buffer there is the title's.
+    //   L1: buffer U exists, a source is registered over its VA afterwards: reads U.
+    //   L2a: a source (no title memory) over a freed buffer's number, then a new buffer lands on that number: reads U2.
+    //        arena_allocate keeps out of title memory, not out of a source.
+    //   L2b: title memory registered over a freed buffer's number first: the new buffer U3 is placed elsewhere, so
+    //        no collision exists; a V# at the number in the title memory (nothing live there) reads the title's T.
+    Table h5;
+    if (make_table(h5, {F, F, F, F})) return 1;
+    EXPECT(aliases.add(va[U], kBytes, va[T]));
+    put_half(h5, 0, 0, raw_vsharp(va[U]));
+    std::uint64_t lone = 0, lone2 = 0;
+    {
+        Ref<ID3D12Resource> probe;
+        EXPECT(c.device->CreateCommittedResource(&def, {}, &data_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                 IID_PPV_ARGS(&probe.p)) == S_OK);
+        lone = probe->GetGPUVirtualAddress();
+    }
+    if (settle()) return 1;
+    EXPECT(aliases.add(lone, kBytes, va[T]));
+    if (make_user(U2)) return 1;
+    std::printf("low title VA, placement: a new buffer is %s a freed buffer's number under a source alone\n",
+                va[U2] == lone ? "ON" : "NOT on");
+    failures += va[U2] != lone;
+    put_half(h5, 1, 0, raw_vsharp(va[U2]));
+    {
+        Ref<ID3D12Resource> probe;
+        EXPECT(c.device->CreateCommittedResource(&def, {}, &data_desc, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                 IID_PPV_ARGS(&probe.p)) == S_OK);
+        lone2 = probe->GetGPUVirtualAddress();
+    }
+    if (settle()) return 1;
+    aliases.add_title_memory(lone2, 0x10000);
+    EXPECT(aliases.add(lone2, kBytes, va[T]));
+    if (make_user(U3)) return 1;
+    const bool kept_out = va[U3] + kBuf <= lone2 || va[U3] >= lone2 + 0x10000;
+    std::printf("low title VA, placement: with title memory registered first a new buffer is %s that number\n",
+                kept_out ? "kept off" : "ON");
+    failures += !kept_out;
+    put_half(h5, 2, 0, raw_vsharp(va[U3]));
+    put_half(h5, 3, 0, raw_vsharp(lone2));
+    if (record(h5) || run(h5.list.p)) return 1;
+    check(h5, "live", "L1 buffer, source after -> U", 0, words_of(U, 0), 0, va[U]);
+    check(h5, "live", "L2a source, buffer after -> U2", 1, words_of(U2, 0), 0, va[U2]);
+    check(h5, "live", "L2b title memory first: U3", 2, words_of(U3, 0), 0, va[U3]);
+    check(h5, "live", "L2b number with no buffer -> T", 3, words_of(T, 0), 0, va[T]);
+
+    aliases.remove(x, va[T] + 0x40);
+    aliases.remove(y_k, va[K]);
+    aliases.remove(y_k2, va[K2]);
+    aliases.remove(y_k3, va[K3]);
+    aliases.remove(y_k4, va[K4]);
+    aliases.remove(y_late, va[K5]);
+    aliases.remove(va[K], va[O]);
+    aliases.remove(va[K2], va[O2]);
+    aliases.remove(va[K3], va[O3]);
+    aliases.remove(va[K4], va[O4]);
+    aliases.remove(va[K5], va[O5]);
+    aliases.remove(va[U], va[T]);
+    aliases.remove(lone, va[T]);
+    aliases.remove(lone2, va[T]);
+    aliases.remove_title_memory(lone2);
+    std::printf("low title VA table: %d wrong\n", failures);
+    EXPECT(failures == 0);
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1744,6 +2193,7 @@ int main(int argc, char** argv) {
     const bool window_write_back_fault =
         window_write_back_tile || (argc == 2 && std::strcmp(argv[1], "--window-writeback-fault") == 0);
     const bool placed_write_back = argc == 2 && std::strcmp(argv[1], "--placed-writeback") == 0;
+    const bool low_table_va = argc == 2 && std::strcmp(argv[1], "--low-table-va") == 0;
     const bool keep_refill = argc == 2 && std::strcmp(argv[1], "--shadow-keep-refill") == 0;
     if (window_cap) {
         const char* cap = std::getenv("LEONIDA_TITLE_WINDOWS_MB");
@@ -1840,6 +2290,16 @@ int main(int argc, char** argv) {
         c.fence = fence.p;
         c.arena = rt::d3d12::device_arena_size(device.p);
         EXPECT(c.arena > 0);
+        if (low_table_va) {
+            if (check_low_title_vsharp(c)) return 1;
+            if (d.validation_errors()) {
+                std::fprintf(stderr, "%u validation errors\n", d.validation_errors());
+                return 1;
+            }
+            std::printf("low title VA table: raw V#s whose base is an arena number read the title's bytes, the layer's "
+                        "own V#s are never translated twice\n");
+            return 0;
+        }
         if (rebind) {
             range.NumDescriptors = 1;
             const auto narrow_blob = serialize(root_desc);

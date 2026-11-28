@@ -1698,6 +1698,35 @@ therefore replaces such an address, wherever it sees one, by the console VA of a
 | CBV and buffer SRV/UAV V#s the layer writes (`Create*View`, slot 70, counter V#s included) | when the descriptor is written |
 | Buffer V#s the title writes into a shader-visible CBV/SRV/UAV heap itself | before each `ExecuteCommandLists`, in place, for the tables the submitted lists bind and only the slots their root signatures declare |
 
+A V# base below the arena's size is ambiguous in that last row: it is the layer's own console VA (an arena offset), or the
+title's raw address when a title range registered a source at the same number (Wine maps xmem pages low, over live
+arena allocations). The number alone does not say, so provenance is kept by slot. Each CBV/SRV/UAV descriptor heap the
+layer makes (in the arena, or CPU-only like the staging heaps a title copies from) has a sparse record per 16-byte
+half of the words the layer itself wrote there: `Create*View`, a table slot a scan rebased (a retry, and a UAV
+counter half, included), and the destination of `CopyDescriptors`/`CopyDescriptorsSimple` from a slot that held
+recorded words (a copy of anything else drops the destination's record). A slot is the layer's only while it still
+holds exactly its recorded words; records are bounded by the live slots and go with their heap, so a destroyed
+heap's words mean nothing in a new heap at the same address. The layer's slots stay as they are and are never
+translated twice. Any other words whose base a registered source holds are the title's and are translated by that
+source, except where a live buffer of the title's (a committed or placed buffer: registered by VA in the context and
+backed in the arena at that number) is at the base: there the number keeps meaning that buffer, as before. A base no
+source holds is an arena offset as before. Writes the layer cannot observe get a conservative rule: the title writing
+a slot's recorded words over the same slot (bit for bit) leaves it the layer's; bytes it `memcpy`s from a slot of the
+layer's into a slot with no record, and an arena offset it wrote itself (from `GetGPUVirtualAddress`: the layer wrote
+no such words) that no live buffer of the title's is at, are the title's, as a number in the title's memory means its
+bytes (`arena_allocate`).
+
+The one case this leaves as it was is a raw title address that is the same number as a live buffer of the title's:
+its bytes are those of a V# composed from that buffer's `GetGPUVirtualAddress`, no record exists for either, and the
+layer reads the buffer. That needs a source registered over the buffer's number: `arena_allocate` keeps new buffers
+out of title memory registered earlier, but not out of a source alone (a source registered first, or a buffer made
+before it, collides). A window, a shadow, a descriptor heap or a hole is no buffer of the title's, so a raw address
+there is the title's. The alternative, reading the source whenever one covers the number, regresses every V# the
+title builds from a live buffer's address wherever a source is later registered over it; no observable separates the
+two. `d3d12_low_title_va_table` covers raw V#s in a hole, bit-identical words at distinct slots and heaps, repeated
+scans, API-written and copied views, counter halves, a retried slot, overwrite, heap reuse, and the live-buffer rows
+in both orders.
+
 The copies:
 - A **slot-133 buffer** whose pages cannot be imported is the per-submission shadow, and the shadow is an **arena
   range** when it fits. Its console VA is its arena offset, which holds in a root argument, in a V#'s 48 bits and in

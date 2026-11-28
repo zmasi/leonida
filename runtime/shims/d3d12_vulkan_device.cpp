@@ -4355,6 +4355,138 @@ struct DeviceState {
         --it;
         return addr < it->second && (addr-it->first) % kDescriptorSize == 0;
     }
+    // A buffer V# base below the arena's size is ambiguous in an ordinary descriptor heap: the console VA the layer
+    // wrote (an arena offset: a Create*View, or a table slot it rebased), or a raw address of the title's that is the
+    // same number, once a title range was registered there (xmem pages map low under Wine, over live arena
+    // allocations). The bytes cannot say which, so the layer keeps provenance by SLOT: each CBV/SRV/UAV heap it makes
+    // (in the arena or CPU-only, the staging heaps a title copies from) holds a sparse record per 16-byte half of the
+    // words the layer itself wrote there: a Create*View, a table slot a scan rebased (retries and counter halves
+    // included), or a CopyDescriptors/CopyDescriptorsSimple of such a slot. A slot is the layer's only while it still
+    // holds exactly its recorded words; a copy of anything else over it drops its record. Records are bounded by the
+    // live slots and go with their heap. Words in a slot with no matching record, whose base a registered source
+    // holds, are the title's, and the source says what they mean; a base no source holds is an arena offset as before.
+    // Writes nobody observes are the conservative cases: the title writing the recorded words over the same slot
+    // (bit for bit) leaves it the layer's, and bytes the title memcpy's from a slot of the layer's into a slot with
+    // no record (or an arena offset it wrote itself, from GetGPUVirtualAddress) are the title's, as a number in the
+    // title's memory means its bytes (arena_allocate). Neither reads an unbacked address.
+    using SlotWords = std::array<std::uint32_t, 4>;
+    struct SlotHeap {
+        std::uintptr_t begin, end;
+        std::unordered_map<std::uint32_t, SlotWords> layer;  // by 16-byte half
+    };
+    std::mutex slot_heap_mutex;
+    std::map<std::uintptr_t, SlotHeap> slot_heaps;  // by the heap's CPU address
+    std::atomic<std::size_t> slot_records{0};       // records in all of them: 0 skips every lookup
+    void slot_heap_add(const void* begin, std::size_t bytes) {
+        const auto at = reinterpret_cast<std::uintptr_t>(begin);
+        std::lock_guard lock(slot_heap_mutex);
+        auto& heap = slot_heaps[at];
+        slot_records.fetch_sub(heap.layer.size(), std::memory_order_relaxed);
+        heap = SlotHeap{at, at + bytes, {}};
+    }
+    void slot_heap_remove(const void* begin) {
+        std::lock_guard lock(slot_heap_mutex);
+        const auto it = slot_heaps.find(reinterpret_cast<std::uintptr_t>(begin));
+        if (it == slot_heaps.end()) return;
+        slot_records.fetch_sub(it->second.layer.size(), std::memory_order_relaxed);
+        slot_heaps.erase(it);
+    }
+    // slot_heap_mutex held. The heap holding `at`, or null.
+    SlotHeap* slot_heap_of(std::uintptr_t at) {
+        auto it = slot_heaps.upper_bound(at);
+        if (it == slot_heaps.begin()) return nullptr;
+        --it;
+        return at < it->second.end ? &it->second : nullptr;
+    }
+    void slot_record_set(SlotHeap& heap, std::uintptr_t at, const SlotWords* words) {
+        const auto key = std::uint32_t((at - heap.begin) / 16);
+        if (words) {
+            if (heap.layer.insert_or_assign(key, *words).second) slot_records.fetch_add(1, std::memory_order_relaxed);
+        } else if (heap.layer.erase(key)) {
+            slot_records.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+    // The layer wrote the buffer V# `w` at `slot` (a 16-byte half of a descriptor). `wrote` false: it wrote something
+    // else there (a guest address it left as the title's), so no record stays. Only a base below the arena's size is
+    // ever ambiguous, so only such words are recorded.
+    void note_issued_vsharp(const void* slot, const std::uint32_t* w, bool wrote = true) {
+        const auto at = reinterpret_cast<std::uintptr_t>(slot);
+        const std::uint64_t base = std::uint64_t(w[0]) | (std::uint64_t(w[1] & 0xFFFFu) << 32);
+        const bool low = wrote && base && w[2] && !(w[3] >> 30) && base < arena.size;
+        const SlotWords words{w[0], w[1], w[2], w[3]};
+        std::lock_guard lock(slot_heap_mutex);
+        if (auto* heap = slot_heap_of(at)) slot_record_set(*heap, at, low ? &words : nullptr);
+    }
+    // The API overwrote the descriptor at `slot` (32 bytes, both halves) with something it does not record as the
+    // layer's V# (a null or non-buffer view, a sampler, a texture view), or is about to record a new V# there: a
+    // record that survived would make identical bytes the title writes next read as the layer's.
+    void forget_slot_vsharps(std::uintptr_t slot) {
+        if (!slot_records.load(std::memory_order_relaxed)) return;
+        std::lock_guard lock(slot_heap_mutex);
+        if (auto* heap = slot_heap_of(slot))
+            for (std::uintptr_t half = 0; half < kDescriptorSize; half += 16) slot_record_set(*heap, slot + half, nullptr);
+    }
+    // `count` descriptors were memmoved by the API from `src` to `dst` (the bytes are already there): each destination
+    // half is the layer's where its source half was and still held the words copied, and is not otherwise. Taken in
+    // the order memmove copies, so an overlapping destination above the source does not read records it just wrote.
+    void copy_slot_provenance(std::uintptr_t dst, std::uintptr_t src, std::size_t count = 1) {
+        if (dst == src || !count || !slot_records.load(std::memory_order_relaxed)) return;
+        const bool backwards = dst > src && dst - src < count * kDescriptorSize;
+        std::lock_guard lock(slot_heap_mutex);
+        SlotHeap* to = nullptr;
+        const SlotHeap* from = nullptr;
+        for (std::size_t n = 0; n < count; ++n) {
+            const std::size_t i = backwards ? count - 1 - n : n;
+            const std::uintptr_t d = dst + i * kDescriptorSize, s = src + i * kDescriptorSize;
+            if (!to || d < to->begin || d >= to->end) to = slot_heap_of(d);
+            if (!to) continue;
+            if (!from || s < from->begin || s >= from->end) from = slot_heap_of(s);
+            for (std::uintptr_t half = 0; half < kDescriptorSize; half += 16) {
+                SlotWords words{};
+                bool layer = false;
+                if (from) {
+                    const auto it = from->layer.find(std::uint32_t((s + half - from->begin) / 16));
+                    if (it != from->layer.end()) {
+                        words = it->second;
+                        layer = !std::memcmp(words.data(), reinterpret_cast<const void*>(d + half), sizeof(words));
+                    }
+                }
+                slot_record_set(*to, d + half, layer ? &words : nullptr);
+            }
+        }
+    }
+    bool slot_issued(const void* slot, const std::uint32_t* w) {
+        if (!slot_records.load(std::memory_order_relaxed)) return false;
+        const auto at = reinterpret_cast<std::uintptr_t>(slot);
+        std::lock_guard lock(slot_heap_mutex);
+        const auto* heap = slot_heap_of(at);
+        if (!heap) return false;
+        const auto it = heap->layer.find(std::uint32_t((at - heap->begin) / 16));
+        return it != heap->layer.end() && !std::memcmp(it->second.data(), w, sizeof(SlotWords));
+    }
+    // Whether `base` is inside a live buffer of the title's own whose console VA is an arena offset (a committed or
+    // placed buffer: registered by VA in the context and backed in the arena at that same number). A slot-133 buffer
+    // sits at the title's address, and the arena's windows, shadows and descriptor heaps are no buffer of the title's.
+    bool user_buffer_at(std::uint64_t base) {
+        if (!context || !context->knows_buffer_va(base)) return false;
+        std::lock_guard lock(backing_mutex);
+        return gpu_backings.covers(arena.address + base, 1);
+    }
+    enum class LowVsharp { arena, issued, title };
+    // `w`, held at `slot`: a buffer V# whose base is below the arena's size. `title` for words a registered source
+    // holds that the layer did not write in this slot; `issued` for the layer's, which are not translated again. Words
+    // the title composed itself from GetGPUVirtualAddress of a live buffer, over which a source was registered
+    // afterwards (arena_allocate keeps buffers out of title memory registered before, not out of a source alone), are
+    // byte for byte what it writes from a raw address: nothing in the bytes or the slot tells them apart. Where a
+    // live buffer of the title's is at the number the number keeps meaning that buffer, as it always did (`arena`);
+    // a number with no such buffer (an arena hole, a window or a shadow) is the title's.
+    LowVsharp classify_low_vsharp(const void* slot, const std::uint32_t* w, std::uint64_t base,
+                                  leonida::TitleVaAliases& aliases) {
+        std::uint64_t mapped{}, room{};
+        if (!aliases.range_of(base, mapped, room) || mapped == base) return LowVsharp::arena;
+        if (slot_issued(slot, w)) return LowVsharp::issued;
+        return user_buffer_at(base) ? LowVsharp::arena : LowVsharp::title;
+    }
     // The buffer V#s of the table at `table_va` whose base is in the title's own memory get the address of a copy,
     // written in place: the title wrote them itself (or copied them), so no Create*View saw them. Images (T#s) and
     // null slots are skipped; so is a V# already in the arena, so a rewritten one is left alone next time.
@@ -4453,7 +4585,7 @@ struct DeviceState {
         }
         std::uint32_t retry[4] = {entry.words[0], entry.words[1], entry.words[2], words[3]};
         bool unbacked = false;
-        const bool rebased = rebase_title_vsharp(retry, aliases, true, &unbacked);
+        const bool rebased = rebase_title_vsharp(retry, aliases, true, &unbacked, words);
         if (!rebased && unbacked) return true;  // still nothing behind it: stays null, looked at again next scan
         words[0] = retry[0];
         words[1] = retry[1];
@@ -4465,16 +4597,21 @@ struct DeviceState {
     }
 
     // A buffer V# (its first four dwords at `w`) whose base is in the title's own memory gets the console VA of a GPU
-    // copy of that memory, in place. False for anything else: a null slot, an image, a V# already in the arena, or
-    // memory no copy could be made of. `unbacked` (when given) is set for the last case: title memory with neither a
-    // window nor a geometry copy behind it, which the caller writes as a zero-size range.
+    // copy of that memory, in place. False for anything else: a null slot, an image, a V# already in the arena (one
+    // whose base is below the arena's size is the title's instead when a registered source holds the base and the
+    // layer did not write those words: classify_low_vsharp), or memory no copy could be made of. `unbacked` (when
+    // given) is set for the last case: title memory with neither a window nor a geometry copy behind it, which the
+    // caller writes as a zero-size range. `slot`: where the words are kept when `w` is a copy of them (a retry).
     bool rebase_title_vsharp(std::uint32_t* w, leonida::TitleVaAliases& aliases, bool make_window = true,
-                             bool* unbacked = nullptr) {
+                             bool* unbacked = nullptr, const std::uint32_t* slot = nullptr) {
+        const void* const at_slot = slot ? slot : w;
         const std::uint32_t w0 = w[0], w1 = w[1], w2 = w[2], w3 = w[3];
         if (!(w0 | w1 | w2 | w3) || (w3 >> 30)) return false;  // null, or not a buffer V# (TYPE, dword 3 bits 30-31)
         const std::uint64_t base = std::uint64_t(w0) | (std::uint64_t(w1 & 0xFFFFu) << 32);
         std::uint64_t host{}, remaining{};
-        if (base < arena.size || (geometry.cap() && geometry.lookup(arena.address + base, host, remaining))) return false;
+        if (base < arena.size ? classify_low_vsharp(at_slot, w, base, aliases) != LowVsharp::title
+                              : geometry.cap() && geometry.lookup(arena.address + base, host, remaining))
+            return false;
         const std::uint32_t stride = (w1 >> 16) & 0x3FFFu;
         const std::uint64_t span = std::uint64_t(w2) * (stride ? stride : 1);
         // A V# the layer wrote for one of its own buffers that the driver put below the arena (an upload buffer in
@@ -4517,12 +4654,15 @@ struct DeviceState {
         // heap_base to.
         if (!to || to == base || (to >> 48)) {
             // The resolver (make_window) answers 0 for an address the device cannot reach, so a base it left as it
-            // is needs no second look; a heap scan only looked existing copies up and asks here.
-            if (unbacked) *unbacked = !to || (to >> 48) || (!make_window && !device_reachable(base));
+            // is needs no second look; a heap scan only looked existing copies up and asks here. A base below the
+            // arena's size is also an arena offset: with no copy for the title's meaning it keeps that one.
+            if (unbacked && base >= arena.size)
+                *unbacked = !to || (to >> 48) || (!make_window && !device_reachable(base));
             return false;
         }
         w[0] = std::uint32_t(to);
         w[1] = (w1 & 0xFFFF0000u) | std::uint32_t((to >> 32) & 0xFFFFu);
+        note_issued_vsharp(at_slot, w);  // the next scan finds these words in this slot again and leaves them
         return true;
     }
 
@@ -4734,6 +4874,11 @@ struct DeviceState {
     VsharpResult fix_vsharp(uint32_t* w, VsharpPath path, VsharpRecord* record = nullptr) {
         if ((w[3] >> 30) || !w[2]) return VsharpResult::unchanged; // image, empty slot or raw pointer
         const uint64_t base = uint64_t(w[0]) | (uint64_t(w[1] & 0xffff) << 32);
+        // Words the layer wrote in this very slot (a counter it rebased, or a Create*View's, or a copy of one) whose
+        // number a title source was registered at later are already console VAs: not translated again.
+        if (path == VsharpPath::table && base < arena.size &&
+            classify_low_vsharp(w, w, base, leonida::title_va_aliases()) == LowVsharp::issued)
+            return VsharpResult::unchanged;
         const uint32_t stride = (w[1] >> 16) & 0x3fffu;
         const uint64_t span = uint64_t(w[2]) * (stride ? stride : 1);
         const leonida::gfx10::BufferWords words{w[0], w[1], w[2], w[3]};
@@ -4765,6 +4910,7 @@ struct DeviceState {
         if ((to & ((1ull << 48) - 1)) == base) return VsharpResult::unchanged;
         w[0] = uint32_t(to);
         w[1] = (w[1] & 0xffff0000u) | uint32_t((to >> 32) & 0xffff);
+        if (path == VsharpPath::table) note_issued_vsharp(w, w);  // a later scan must not translate it again
         return VsharpResult::rebased;
     }
 
@@ -8774,6 +8920,10 @@ public:
             device_.cpu_view_heaps[begin] = begin + bytes;
             registered_cpu_views_ = true;
         }
+        if (cpu_ && desc_.Type == D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) {
+            device_.slot_heap_add(cpu_, std::size_t(bytes));
+            slot_provenance_ = true;
+        }
     }
 
     ~DescriptorHeap() override {
@@ -8783,6 +8933,7 @@ public:
             std::lock_guard lock(device_.visible_heap_mutex);
             device_.cpu_view_heaps.erase(reinterpret_cast<std::uintptr_t>(cpu_));
         }
+        if (slot_provenance_) device_.slot_heap_remove(cpu_);  // before its range can be handed out again
         if (in_arena_) {
             std::lock_guard lock(device_.visible_heap_mutex);
             device_.visible_heaps.erase(arena_offset_);
@@ -8831,6 +8982,7 @@ private:
     DeviceState& device_;
     D3D12_DESCRIPTOR_HEAP_DESC desc_;
     bool registered_cpu_views_ = false;
+    bool slot_provenance_ = false;  // DeviceState::slot_heaps holds this heap's slots
     std::unique_ptr<std::byte[]> storage_;
     std::uint8_t* cpu_ = nullptr;
     VkDeviceSize arena_offset_ = 0;
@@ -16228,6 +16380,7 @@ public:
             }
         } probe{state_, destination.ptr, unordered};
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        state_.forget_slot_vsharps(destination.ptr);
         if (unordered) {
             D3D12_UNORDERED_ACCESS_VIEW_DESC desc{};
             std::memcpy(&desc, view, sizeof(desc));
@@ -16245,6 +16398,7 @@ public:
     bool write_placed_texture_view(const std::uint32_t* resource_words, const std::uint32_t* view_words,
                                    std::uint64_t address, D3D12_CPU_DESCRIPTOR_HANDLE destination) {
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        state_.forget_slot_vsharps(destination.ptr);
         rt::xg_xs::ResourceDesc d{};
         std::memcpy(&d, resource_words, sizeof(d));
         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
@@ -16283,6 +16437,7 @@ public:
             return !v || std::strcmp(v, "0");
         }();
         std::memset(reinterpret_cast<void*>(dest.ptr), 0, kDescriptorSize);
+        state_.forget_slot_vsharps(dest.ptr);
         if (!enabled || !address) return false;
         rt::xg_xs::ResourceDesc d{};
         D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
@@ -16321,6 +16476,7 @@ public:
         const auto entry = state_.image_entries.find(result);
         if (entry != state_.image_entries.end() && entry->second.storage) return true;
         std::memset(reinterpret_cast<void*>(dest.ptr), 0, kDescriptorSize);
+        state_.forget_slot_vsharps(dest.ptr);
         return false;
     }
 
@@ -18700,9 +18856,10 @@ public:
                 ++s;
                 s_at = 0;
             } else {
-                std::memmove(reinterpret_cast<std::uint8_t*>(destinations[d].ptr) + std::size_t(d_at) * kDescriptorSize,
-                             reinterpret_cast<const std::uint8_t*>(sources[s].ptr) + std::size_t(s_at++) * kDescriptorSize,
-                             kDescriptorSize);
+                const SIZE_T to = destinations[d].ptr + SIZE_T(d_at) * kDescriptorSize;
+                const SIZE_T from = sources[s].ptr + SIZE_T(s_at++) * kDescriptorSize;
+                std::memmove(reinterpret_cast<void*>(to), reinterpret_cast<const void*>(from), kDescriptorSize);
+                state_.copy_slot_provenance(to, from);
                 state_.probe_api(destinations[d].ptr + SIZE_T(d_at++) * kDescriptorSize, 1);  // LOCAL DIAGNOSTIC
             }
         }
@@ -18714,6 +18871,7 @@ public:
         if (!destination.ptr || !source.ptr) return;
         std::memmove(reinterpret_cast<void*>(destination.ptr), reinterpret_cast<const void*>(source.ptr),
                      std::size_t(count) * kDescriptorSize);
+        state_.copy_slot_provenance(destination.ptr, source.ptr, count);
         state_.probe_api(destination.ptr, count);  // LOCAL DIAGNOSTIC
         state_.probe_view("CopyDescriptorsSimple", destination.ptr, count);
     }
@@ -18730,6 +18888,7 @@ public:
         if (!destination.ptr) return;
         ProbeApiWrite probe_note{state_, destination.ptr, 1, "CreateConstantBufferView"};  // LOCAL DIAGNOSTIC
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        state_.forget_slot_vsharps(destination.ptr);
         if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
         leonida::gfx10::Buffer buffer{};
         buffer.address = desc->BufferLocation;
@@ -18765,6 +18924,7 @@ public:
             words[3] = 0x0002403Cu;
         }
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        state_.note_issued_vsharp(reinterpret_cast<void*>(destination.ptr), words.data());
         if (leonida::fsdraw::enabled()) {  // LOCAL DIAGNOSTIC: the CBVs the title makes, where they go and what V# they get
             static std::atomic<std::uint64_t> made{0};
             const std::uint64_t n = ++made;
@@ -18858,6 +19018,8 @@ public:
         }
         const leonida::gfx10::BufferWords words = leonida::gfx10::encode(buffer);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        // The guest address of a console copy is the title's: nothing the layer wrote is recorded there.
+        state_.note_issued_vsharp(reinterpret_cast<void*>(destination.ptr), words.data(), !copy);
         return true;
     }
 
@@ -18872,6 +19034,7 @@ public:
         if (!destination.ptr) return;
         ProbeApiWrite probe_note{state_, destination.ptr, 1, "CreateShaderResourceView"};  // LOCAL DIAGNOSTIC
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        state_.forget_slot_vsharps(destination.ptr);
         const Resource* r = Resource::from<Resource>(resource);
         if (!r) {
             if (resource) stub("ID3D12Device::CreateShaderResourceView(resource from another device)");
@@ -19082,6 +19245,7 @@ public:
         }
         const g::BufferWords words = g::encode(buffer);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
+        state_.note_issued_vsharp(reinterpret_cast<void*>(destination.ptr), words.data());
         if (counter_va) {
             g::Buffer counter_buffer{};
             counter_buffer.address = state_.vsharp_address(counter_va, 4);
@@ -19091,6 +19255,7 @@ public:
             const g::BufferWords counter_words = g::encode(counter_buffer);
             std::memcpy(reinterpret_cast<char*>(destination.ptr) + sizeof(words), counter_words.data(),
                         sizeof(counter_words));
+            state_.note_issued_vsharp(reinterpret_cast<char*>(destination.ptr) + sizeof(words), counter_words.data());
         }
         return true;
     }
@@ -19103,6 +19268,7 @@ public:
         if (!destination.ptr) return;
         ProbeApiWrite probe_note{state_, destination.ptr, 1, "CreateUnorderedAccessView"};  // LOCAL DIAGNOSTIC
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
+        state_.forget_slot_vsharps(destination.ptr);
         const Resource* r = Resource::from<Resource>(resource);
         if (!r || !r->belongs_to(state_)) {
             if (resource) stub("ID3D12Device::CreateUnorderedAccessView(resource from another device)");
@@ -21230,6 +21396,7 @@ private:
             if (!registered && (g::multisampled(image.type) || storage_plane)) return;
         }
         // The CPU UAV used by ClearUnorderedAccessView is independent of set 0.
+        state_.forget_slot_vsharps(destination.ptr);
         std::memcpy(reinterpret_cast<void*>(destination.ptr), words.data(), sizeof(words));
         resource.note_shader_view();
     }
