@@ -86,8 +86,8 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
     if let Some(tls) = &info.tls
         && tls.callbacks_va != 0
     {
-        let at = file_span(&info, tls.directory_rva, TLS64_SIZE)
-            .ok_or(PrepareError::Patch("TLS directory is not file-backed"))?;
+        let at = file_span(&info, tls.directory_rva, TLS64_CALLBACKS_END)
+            .ok_or(PrepareError::Patch("TLS callback field is not file-backed"))?;
         let field_rva = tls
             .directory_rva
             .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
@@ -113,8 +113,10 @@ pub fn prepare(original: &[u8]) -> Result<PreparedImage, PrepareError> {
 
 /// Size of an IMAGE_IMPORT_DESCRIPTOR in the PE file.
 const IMPORT_DESCRIPTOR_SIZE: u32 = 20;
-/// Size of `IMAGE_TLS_DIRECTORY64` in the PE32+ format.
-const TLS64_SIZE: u32 = 40;
+/// End offset of `AddressOfCallBacks` (`+24..+32`) inside `IMAGE_TLS_DIRECTORY64`
+/// (trailing `SizeOfZeroFill` and `Characteristics` at `+32..+40` may sit in
+/// virtual zero-padding when `VirtualSize > SizeOfRawData`).
+const TLS64_CALLBACKS_END: u32 = layout::TLS64_ADDRESS_OF_CALLBACKS as u32 + 8;
 
 /// File offset of `[rva, rva + len)` when one section backs all `len` bytes.
 fn file_span(info: &ImageInfo, rva: u32, len: u32) -> Option<usize> {
@@ -176,6 +178,13 @@ fn dir64_relocations(bytes: &[u8], info: &ImageInfo) -> Vec<(usize, u32)> {
         };
         rva = next;
         left -= block;
+    }
+    if rva != 0 && left > 0 {
+        tracing::warn!(
+            rva = format_args!("{rva:#x}"),
+            left,
+            "base relocation walk stopped before the end of the directory"
+        );
     }
     out
 }
@@ -359,38 +368,102 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_tls_directory_not_fully_backed_in_section() {
+    fn tls_callbacks_field_must_be_file_backed_while_trailing_zero_fill_is_allowed() {
         const TLS_DIR: usize = 9;
-        // `.rdata` backs only 32 bytes (`0..32`), truncating the 40-byte
-        // `IMAGE_TLS_DIRECTORY64` (`SizeOfZeroFill` and `Characteristics` at
-        // `+32..+40` lie past the section's backed range).
-        let mut pe = synthetic_pe64(
+        // Case 1: `.rdata` has `VirtualSize = 28, SizeOfRawData = 0x200`, so
+        // `AddressOfCallBacks` (`+24..+32`) extends 4 bytes past `VirtualSize`.
+        let mut short_virtual = synthetic_pe64(
             0x600,
             0x3000,
             &[
-                (b".rdata\0\0", 0x1000, 32, 0x200, 32),
+                (b".rdata\0\0", 0x1000, 28, 0x200, 0x200),
                 (b".data\0\0\0", 0x2000, 0x40, 0x400, 0x200),
             ],
             &[(TLS_DIR, 0x1000, 40)],
         );
-        // `AddressOfCallBacks` points to an empty VA list in `.data` (`0x2000`).
         write_u64(
-            &mut pe,
+            &mut short_virtual,
             0x200 + layout::TLS64_ADDRESS_OF_CALLBACKS,
             0x0000_0001_4000_2000,
         )
         .unwrap();
-        let err = prepare(&pe).expect_err("truncated 32-byte TLS directory must fail");
+        let err = prepare(&short_virtual)
+            .expect_err("TLS callbacks field truncated at 28 bytes must fail");
         assert!(
-            matches!(err, PrepareError::Patch(_)),
-            "expected PrepareError::Patch, got {err:?}"
+            matches!(err, PrepareError::Pe(_) | PrepareError::Patch(_)),
+            "unexpected error: {err:?}"
+        );
+
+        // Case 2: `.rdata` has `VirtualSize = 40, SizeOfRawData = 32`, so
+        // `+0..+32` (including `AddressOfCallBacks` at `+24..+32`) is file-backed
+        // and `+32..+40` (`SizeOfZeroFill`, `Characteristics`) is zero-padded by
+        // the Windows PE loader.
+        let mut zero_tailed = synthetic_pe64(
+            0x600,
+            0x3000,
+            &[
+                (b".rdata\0\0", 0x1000, 40, 0x200, 32),
+                (b".data\0\0\0", 0x2000, 0x40, 0x400, 0x200),
+            ],
+            &[(TLS_DIR, 0x1000, 40)],
+        );
+        write_u64(
+            &mut zero_tailed,
+            0x200 + layout::TLS64_ADDRESS_OF_CALLBACKS,
+            0x0000_0001_4000_2000,
+        )
+        .unwrap();
+        let prepared = prepare(&zero_tailed).expect("32-byte file-backed TLS prefix must succeed");
+        assert_eq!(
+            layout::read_u64(&prepared.bytes, 0x200 + layout::TLS64_ADDRESS_OF_CALLBACKS),
+            Some(0)
         );
     }
 
     #[test]
-    fn relocation_scan_respects_section_bounds_and_odd_block_sizes() {
+    fn relocation_scan_walks_multiple_blocks_and_respects_section_bounds() {
         const TLS_DIR: usize = 9;
         let dir64_tls_callbacks = (10u16 << 12) | (layout::TLS64_ADDRESS_OF_CALLBACKS as u16);
+        let dir64_other = (10u16 << 12) | 0x0008;
+
+        // Positive multi-block case: Block 1 (16 bytes for page `0x3000`) is
+        // followed by Block 2 (12 bytes for page `0x1000`) carrying the TLS
+        // `AddressOfCallBacks` relocation alongside a neighboring relocation.
+        let mut multi = synthetic_pe64(
+            0x440,
+            0x4000,
+            &[
+                (b".rdata\0\0", 0x1000, 0x100, 0x200, 0x200),
+                (b".reloc\0\0", 0x2000, 0x20, 0x400, 0x20),
+                (b".data\0\0\0", 0x3000, 0x20, 0x420, 0x20),
+            ],
+            &[(TLS_DIR, 0x1000, 40), (dir::BASERELOC, 0x2000, 28)],
+        );
+        write_u64(
+            &mut multi,
+            0x200 + layout::TLS64_ADDRESS_OF_CALLBACKS,
+            0x0000_0001_4000_1040,
+        )
+        .unwrap();
+        // Block 1 at `0x400..0x410` (`PageRVA = 0x3000`, `SizeOfBlock = 16`).
+        write_u32(&mut multi, 0x400, 0x3000).unwrap();
+        write_u32(&mut multi, 0x404, 16).unwrap();
+        write_u16(&mut multi, 0x408, dir64_other).unwrap();
+        // Block 2 at `0x410..0x41c` (`PageRVA = 0x1000`, `SizeOfBlock = 12`).
+        write_u32(&mut multi, 0x410, 0x1000).unwrap();
+        write_u32(&mut multi, 0x414, 12).unwrap();
+        write_u16(&mut multi, 0x418, dir64_other).unwrap();
+        write_u16(&mut multi, 0x41a, dir64_tls_callbacks).unwrap();
+
+        let prepared_multi = prepare(&multi).unwrap();
+        let u16_at = |b: &[u8], at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+        assert_eq!(u16_at(&prepared_multi.bytes, 0x408), dir64_other);
+        assert_eq!(u16_at(&prepared_multi.bytes, 0x418), dir64_other);
+        assert_eq!(
+            u16_at(&prepared_multi.bytes, 0x41a),
+            0,
+            "second relocation block's TLS callback entry must be cleared to ABSOLUTE"
+        );
 
         // Case 1: `.reloc` is 0x10 bytes at file offset `0x400..0x410`, followed
         // immediately in the file by `.data` at `0x410..0x430`, while
