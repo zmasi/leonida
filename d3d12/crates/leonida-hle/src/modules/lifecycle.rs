@@ -93,8 +93,9 @@ pub extern "system" fn UnregisterAppConstrainedChangeNotification(registration: 
     constrained().retain(|&(id, ..)| id != registration);
 }
 
-/// The window procedure a title window had before ours.
+/// The window procedure a title window had before ours, and whether it expects ANSI messages.
 const TITLE_PROC: PCWSTR = w!("leonida.wndproc");
+const TITLE_ANSI: PCWSTR = w!("leonida.wndproc.ansi");
 
 pub extern "system" fn CreateWindowExW(
     ex_style: u32,
@@ -237,17 +238,41 @@ fn fit_into(area: &RECT, width: i32, height: i32) -> (i32, i32) {
     )
 }
 
-/// Puts our procedure in front of the title's.
+/// Puts our procedure in front of the title's, preserving ANSI vs Unicode mode.
 fn hook(hwnd: HWND) {
     if hwnd.is_null() {
         return;
     }
-    // SAFETY: a window this thread just created. The title's procedure is
-    // stored before ours can run.
+    // SAFETY: a window this thread just created. Capture whether its procedure
+    // is ANSI or Unicode before installing ours, and ignore duplicate hooks.
     unsafe {
-        let title = wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC);
-        wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void);
-        wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, window_proc as *const () as isize);
+        if !wm::GetPropW(hwnd, TITLE_PROC).is_null() {
+            return;
+        }
+        let unicode = wm::IsWindowUnicode(hwnd) != 0;
+        let title = if unicode {
+            wm::GetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC)
+        } else {
+            wm::GetWindowLongPtrA(hwnd, wm::GWLP_WNDPROC)
+        };
+        let ours = window_proc as *const () as isize;
+        if title == 0 || title == ours {
+            return;
+        }
+        if !unicode && wm::SetPropW(hwnd, TITLE_ANSI, std::ptr::without_provenance_mut(1)) == 0 {
+            return;
+        }
+        if wm::SetPropW(hwnd, TITLE_PROC, title as *mut c_void) == 0 {
+            if !unicode {
+                wm::RemovePropW(hwnd, TITLE_ANSI);
+            }
+            return;
+        }
+        if unicode {
+            wm::SetWindowLongPtrW(hwnd, wm::GWLP_WNDPROC, ours);
+        } else {
+            wm::SetWindowLongPtrA(hwnd, wm::GWLP_WNDPROC, ours);
+        }
     }
 }
 
@@ -281,14 +306,30 @@ extern "system" fn window_proc(
         unsafe { wm::SetCursor(std::ptr::null_mut()) };
         return 1;
     }
-    // SAFETY: the procedure `hook` stored, called the way the system would.
+    // SAFETY: the procedure `hook` stored, called with its original ANSI or
+    // Unicode character set; falls back to `DefWindowProcA/W` if absent.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);
+        let ansi = !wm::GetPropW(hwnd, TITLE_ANSI).is_null();
         if message == wm::WM_NCDESTROY {
             wm::RemovePropW(hwnd, TITLE_PROC);
+            if ansi {
+                wm::RemovePropW(hwnd, TITLE_ANSI);
+            }
+        }
+        if title.is_null() {
+            return if wm::IsWindowUnicode(hwnd) != 0 {
+                wm::DefWindowProcW(hwnd, message, wparam, lparam)
+            } else {
+                wm::DefWindowProcA(hwnd, message, wparam, lparam)
+            };
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
-        wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
+        if ansi {
+            wm::CallWindowProcA(title, hwnd, message, wparam, lparam)
+        } else {
+            wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
+        }
     }
 }
 
@@ -638,5 +679,115 @@ mod tests {
         }
         let seen = COMMANDS.with(|c| c.borrow().clone());
         assert_eq!(seen, [wm::SC_MINIMIZE as usize]);
+    }
+
+    static ANSI_TEXT: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+    extern "system" fn ansi_recording(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if message == wm::WM_SETTEXT && lparam != 0 {
+            // SAFETY: ANSI `WM_SETTEXT` passes a NUL-terminated narrow string in `lparam`.
+            let bytes = unsafe { std::ffi::CStr::from_ptr(lparam as *const _) }.to_bytes();
+            *ANSI_TEXT.lock().unwrap() = bytes.to_vec();
+        }
+        // SAFETY: default ANSI procedure for an ANSI window class.
+        unsafe { wm::DefWindowProcA(hwnd, message, wparam, lparam) }
+    }
+
+    #[test]
+    fn ansi_windows_stay_ansi_and_missing_title_proc_uses_default_proc() {
+        let class_name = c"LeonidaLifecycleAnsiTest";
+        let class = wm::WNDCLASSA {
+            style: 0,
+            lpfnWndProc: Some(ansi_recording),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: std::ptr::null_mut(),
+            hIcon: std::ptr::null_mut(),
+            hCursor: std::ptr::null_mut(),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
+            lpszClassName: class_name.as_ptr().cast(),
+        };
+        // SAFETY: registering a process-local ANSI test window class.
+        unsafe {
+            assert_ne!(wm::RegisterClassA(&class), 0);
+        }
+
+        let null = std::ptr::null_mut();
+        let hwnd = CreateWindowExA(
+            0,
+            class_name.as_ptr().cast(),
+            c"initial".as_ptr().cast(),
+            0,
+            0,
+            0,
+            16,
+            16,
+            null,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        assert!(!hwnd.is_null());
+
+        // SAFETY: `hwnd` is owned by this thread for the duration of the block.
+        unsafe {
+            assert_eq!(
+                wm::IsWindowUnicode(hwnd),
+                0,
+                "CreateWindowExA on an ANSI class must preserve ANSI window mode"
+            );
+
+            // Duplicate `hook` must not overwrite `TITLE_PROC` with `window_proc`.
+            hook(hwnd);
+            assert_eq!(
+                wm::GetPropW(hwnd, TITLE_PROC),
+                ansi_recording as *const () as *mut c_void
+            );
+
+            assert_ne!(wm::SetWindowTextA(hwnd, c"narrow-title".as_ptr().cast()), 0);
+            assert_eq!(ANSI_TEXT.lock().unwrap().as_slice(), b"narrow-title");
+            let mut narrow = [0u8; 32];
+            let n = wm::GetWindowTextA(hwnd, narrow.as_mut_ptr(), 32);
+            assert_eq!(&narrow[..n as usize], b"narrow-title");
+
+            // Simulate a late message after `WM_NCDESTROY` removed `TITLE_PROC`:
+            // `DefWindowProcA` answers `WM_QUERYOPEN` with 1 (whereas `CallWindowProcW(None, ...)` returns 0).
+            let saved = wm::RemovePropW(hwnd, TITLE_PROC);
+            assert_eq!(wm::SendMessageA(hwnd, wm::WM_QUERYOPEN, 0, 0), 1);
+            wm::SetPropW(hwnd, TITLE_PROC, saved);
+            wm::DestroyWindow(hwnd);
+            wm::UnregisterClassA(class_name.as_ptr().cast(), null);
+        }
+
+        // Unicode windows created via `CreateWindowExW` remain Unicode and fall back to `DefWindowProcW`.
+        let w_hwnd = CreateWindowExW(
+            0,
+            w!("STATIC"),
+            w!("wide"),
+            0,
+            0,
+            0,
+            16,
+            16,
+            null,
+            null,
+            null,
+            std::ptr::null(),
+        );
+        assert!(!w_hwnd.is_null());
+        // SAFETY: `w_hwnd` is owned by this thread.
+        unsafe {
+            assert_ne!(wm::IsWindowUnicode(w_hwnd), 0);
+            let saved = wm::RemovePropW(w_hwnd, TITLE_PROC);
+            assert_eq!(wm::SendMessageW(w_hwnd, wm::WM_QUERYOPEN, 0, 0), 1);
+            wm::SetPropW(w_hwnd, TITLE_PROC, saved);
+            wm::DestroyWindow(w_hwnd);
+        }
     }
 }
