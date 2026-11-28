@@ -450,6 +450,7 @@ fn sweep() {
     crate::shadow::let_go_idle();
     crate::texture::let_go_idle();
     crate::resource::let_go_idle();
+    trim_spare_indirects();
 }
 
 /// The number of the newest submission begun, and of the newest of which all
@@ -1325,12 +1326,14 @@ pub(crate) struct HostList {
     /// clamp uses instead when there is one: zeroed in the list before its
     /// first clamp, its notes copied to `budget` when the list closes.
     card_budget: OnceLock<Option<ID3D12Resource>>,
-    /// Device-local scratch buffer for clamped indirect arguments (`indirect`),
-    /// grown to the largest indirect execution recorded on the list.
-    indirect_args: Mutex<Option<(ID3D12Resource, u64)>>,
-    /// Scratch buffers of the batched clamps (`crate::indirect::batch`), and
-    /// how many batches of this recording have a place in them.
-    batch_args: Mutex<(Vec<ID3D12Resource>, u32)>,
+    /// Device-local scratch buffers for clamped indirect arguments (`indirect`),
+    /// taken from [`SPARE_INDIRECTS`] and returned when a closed recording
+    /// resets or drops.
+    indirect_args: Mutex<IndirectArgs>,
+    /// Device-local 64 KiB scratch buffers of the batched clamps
+    /// (`crate::indirect::batch`), taken from [`SPARE_INDIRECTS`] and returned
+    /// when a closed recording resets or drops.
+    batch_args: Mutex<BatchArgs>,
     /// Refreshes of host copies that a thread of ours is still finding, and
     /// where among the list's steps they belong ([`aside`]).
     coming: Mutex<Option<(usize, std::sync::Arc<aside::Coming>)>>,
@@ -2191,6 +2194,303 @@ fn read_backs_line(frames: f64) {
         b[3] as f64 / frames,
         bytes as f64 / (1 << 20) as f64,
         if read_back_pool() { "on" } else { "off" }
+    );
+}
+
+/// Whether lists share their device-local indirect-argument scratch buffers
+/// (`HostList::indirect_args` and `HostList::batch_args`): a recording takes
+/// 64 KiB-aligned unordered-access buffers as it needs them and returns them
+/// when a closed list is reset or dropped, while [`sweep`] trims buffers that
+/// stayed untouched across a sweep window.
+/// `LEONIDA_INDIRECT_ARGS_POOL=0`: each list keeps its own high-water buffers,
+/// as before (`LEONIDA_AB` can name it).
+fn indirect_args_pool() -> bool {
+    crate::toggled!("LEONIDA_INDIRECT_ARGS_POOL")
+}
+
+/// The most bytes of indirect-argument scratch buffers kept while no list holds
+/// them, and the tighter cap while local VRAM is at or above 85 % of its DXGI
+/// budget.
+const SPARE_INDIRECTS_MOST: u64 = 128 << 20;
+const SPARE_INDIRECTS_PRESSURED: u64 = 32 << 20;
+
+/// Cached by [`trim_spare_indirects`] once a second so [`HostList::reset`]
+/// avoids querying DXGI on every reset.
+static VRAM_PRESSURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn vram_pressured(video_memory: Option<[u64; 4]>) -> bool {
+    let Some([budget, used, ..]) = video_memory else {
+        return false;
+    };
+    budget > 0 && (u128::from(used) * 100) / u128::from(budget) >= 85
+}
+
+struct SpareUav(ID3D12Resource);
+
+// SAFETY: a D3D12 resource (free-threaded) in `COMMON` state that no open or
+// executing command list holds.
+unsafe impl Send for SpareUav {}
+
+struct IndirectBucket {
+    kept: Vec<SpareUav>,
+    /// The fewest buffers kept in this size bucket since the last trim: the
+    /// oldest that many were never taken during the window.
+    low: usize,
+}
+
+struct SpareIndirects {
+    buckets: std::collections::BTreeMap<u64, IndirectBucket>,
+    bytes: u64,
+}
+
+impl SpareIndirects {
+    const fn new() -> Self {
+        SpareIndirects {
+            buckets: std::collections::BTreeMap::new(),
+            bytes: 0,
+        }
+    }
+
+    fn take(&mut self, size: u64) -> Option<ID3D12Resource> {
+        let bucket = self.buckets.get_mut(&size)?;
+        let SpareUav(buffer) = bucket.kept.pop()?;
+        self.bytes -= size;
+        bucket.low = bucket.low.min(bucket.kept.len());
+        if bucket.kept.is_empty() {
+            self.buckets.remove(&size);
+        }
+        Some(buffer)
+    }
+
+    fn give(&mut self, buffer: ID3D12Resource, size: u64, most: u64) -> Option<ID3D12Resource> {
+        if size == 0 || self.bytes.saturating_add(size) > most {
+            return Some(buffer);
+        }
+        self.bytes += size;
+        self.buckets
+            .entry(size)
+            .or_insert(IndirectBucket {
+                kept: Vec::new(),
+                low: 0,
+            })
+            .kept
+            .push(SpareUav(buffer));
+        None
+    }
+
+    fn trim(&mut self, pressured: bool) -> (Vec<SpareUav>, u64) {
+        let mut freed = Vec::new();
+        let mut freed_bytes = 0u64;
+        self.buckets.retain(|&size, bucket| {
+            let n = if pressured { bucket.low } else { bucket.low.div_ceil(2) };
+            let n = n.min(bucket.kept.len());
+            if n > 0 {
+                freed.extend(bucket.kept.drain(..n));
+                let bytes = (n as u64) * size;
+                self.bytes -= bytes;
+                freed_bytes += bytes;
+            }
+            bucket.low = bucket.kept.len();
+            !bucket.kept.is_empty()
+        });
+        if pressured && self.bytes > SPARE_INDIRECTS_PRESSURED {
+            let sizes: Vec<u64> = self.buckets.keys().copied().rev().collect();
+            for size in sizes {
+                if self.bytes <= SPARE_INDIRECTS_PRESSURED {
+                    break;
+                }
+                if let Some(bucket) = self.buckets.get_mut(&size) {
+                    let excess = self.bytes - SPARE_INDIRECTS_PRESSURED;
+                    let n = (excess.div_ceil(size) as usize).min(bucket.kept.len());
+                    if n > 0 {
+                        freed.extend(bucket.kept.drain(..n));
+                        let bytes = (n as u64) * size;
+                        self.bytes -= bytes;
+                        freed_bytes += bytes;
+                        bucket.low = bucket.low.min(bucket.kept.len());
+                    }
+                    if bucket.kept.is_empty() {
+                        self.buckets.remove(&size);
+                    }
+                }
+            }
+        }
+        (freed, freed_bytes)
+    }
+
+    fn count(&self) -> usize {
+        self.buckets.values().map(|b| b.kept.len()).sum()
+    }
+}
+
+static SPARE_INDIRECTS: Mutex<SpareIndirects> = Mutex::new(SpareIndirects::new());
+
+/// Since the last frame-rate line: indirect-argument buffers made, taken from
+/// [`SPARE_INDIRECTS`], kept there at a list's reset or drop, let go there
+/// (pool full, pool off, or unclosed recording), and trimmed idle by [`sweep`].
+static INDIRECT_ARGS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+#[derive(Default)]
+struct IndirectArgs {
+    current: Option<(ID3D12Resource, u64)>,
+    /// Smaller buffers replaced mid-recording after [`HostList::indirect_common`]
+    /// recorded their transition back to `COMMON`.
+    replaced: Vec<(ID3D12Resource, u64)>,
+    /// True from the first [`HostList::indirect_scratch`] of a recording until
+    /// [`HostList::close`] transitions `current` to `COMMON` and closes the
+    /// D3D12 command list.
+    unclosed: bool,
+}
+
+impl IndirectArgs {
+    fn drain_for_reset(&mut self, pool_enabled: bool, dropping: bool) -> (Vec<(ID3D12Resource, u64)>, Vec<ID3D12Resource>) {
+        if self.unclosed {
+            self.unclosed = false;
+            let mut dirty: Vec<ID3D12Resource> = self.replaced.drain(..).map(|(b, _)| b).collect();
+            if let Some((b, _)) = self.current.take() {
+                dirty.push(b);
+            }
+            return (Vec::new(), dirty);
+        }
+        let mut clean = std::mem::take(&mut self.replaced);
+        if (pool_enabled || dropping)
+            && let Some(cur) = self.current.take()
+        {
+            clean.push(cur);
+        }
+        (clean, Vec::new())
+    }
+}
+
+impl Drop for IndirectArgs {
+    fn drop(&mut self) {
+        let pool_enabled = indirect_args_pool();
+        let (clean, dirty) = self.drain_for_reset(pool_enabled, true);
+        finish_indirect_uavs(clean, dirty, pool_enabled);
+    }
+}
+
+#[derive(Default)]
+struct BatchArgs {
+    buffers: Vec<ID3D12Resource>,
+    /// Batch slots handed out in the current open recording.
+    slots: u32,
+    /// Prefix of `buffers` (`..unclosed`) used in the current open recording
+    /// whose [`HostList::batches_common`] barrier has not yet been sealed by a
+    /// successful [`HostList::close`].
+    unclosed: usize,
+}
+
+impl BatchArgs {
+    fn drain_for_reset(&mut self, pool_enabled: bool, dropping: bool) -> (Vec<(ID3D12Resource, u64)>, Vec<ID3D12Resource>) {
+        use crate::indirect::batch::{JOBS, SLOT};
+        let size = u64::from(BATCHES * JOBS * SLOT);
+        self.slots = 0;
+        let unclosed = std::mem::take(&mut self.unclosed).min(self.buffers.len());
+        let dirty: Vec<ID3D12Resource> = self.buffers.drain(..unclosed).collect();
+        let clean = if pool_enabled || dropping {
+            self.buffers.drain(..).map(|b| (b, size)).collect()
+        } else {
+            Vec::new()
+        };
+        (clean, dirty)
+    }
+}
+
+impl Drop for BatchArgs {
+    fn drop(&mut self) {
+        let pool_enabled = indirect_args_pool();
+        let (clean, dirty) = self.drain_for_reset(pool_enabled, true);
+        finish_indirect_uavs(clean, dirty, pool_enabled);
+    }
+}
+
+fn take_indirect_uav(host: &Host, size: u64, label: impl FnOnce() -> String) -> Option<ID3D12Resource> {
+    if indirect_args_pool()
+        && let Some(buffer) = SPARE_INDIRECTS.lock().unwrap_or_else(|e| e.into_inner()).take(size)
+    {
+        INDIRECT_ARGS[1].fetch_add(1, Ordering::Relaxed);
+        return Some(buffer);
+    }
+    let buffer = host.uav_buffer(size)?;
+    name(&buffer, label);
+    INDIRECT_ARGS[0].fetch_add(1, Ordering::Relaxed);
+    Some(buffer)
+}
+
+fn finish_indirect_uavs(
+    clean: Vec<(ID3D12Resource, u64)>,
+    dirty: Vec<ID3D12Resource>,
+    pool_enabled: bool,
+) {
+    if !dirty.is_empty() {
+        INDIRECT_ARGS[3].fetch_add(dirty.len() as u64, Ordering::Relaxed);
+        for buffer in dirty {
+            retire_resource(buffer);
+        }
+    }
+    if clean.is_empty() {
+        return;
+    }
+    if !pool_enabled {
+        INDIRECT_ARGS[3].fetch_add(clean.len() as u64, Ordering::Relaxed);
+        drop(clean);
+        return;
+    }
+    let most = if VRAM_PRESSURED.load(Ordering::Relaxed) {
+        SPARE_INDIRECTS_PRESSURED
+    } else {
+        SPARE_INDIRECTS_MOST
+    };
+    let mut gone = Vec::new();
+    let mut kept = 0u64;
+    {
+        let mut spare = SPARE_INDIRECTS.lock().unwrap_or_else(|e| e.into_inner());
+        for (buffer, size) in clean {
+            match spare.give(buffer, size, most) {
+                None => kept += 1,
+                Some(buffer) => gone.push(buffer),
+            }
+        }
+    }
+    if kept > 0 {
+        INDIRECT_ARGS[2].fetch_add(kept, Ordering::Relaxed);
+    }
+    if !gone.is_empty() {
+        INDIRECT_ARGS[3].fetch_add(gone.len() as u64, Ordering::Relaxed);
+        drop(gone);
+    }
+}
+
+fn trim_spare_indirects() {
+    let pressured = vram_pressured(HOST.get().and_then(|h| h.as_ref()).and_then(Host::video_memory));
+    VRAM_PRESSURED.store(pressured, Ordering::Relaxed);
+    let (freed, _) = SPARE_INDIRECTS.lock().unwrap_or_else(|e| e.into_inner()).trim(pressured);
+    if !freed.is_empty() {
+        INDIRECT_ARGS[4].fetch_add(freed.len() as u64, Ordering::Relaxed);
+        drop(freed);
+    }
+}
+
+fn indirect_args_line(frames: f64) {
+    let c: [u64; 5] = [0, 1, 2, 3, 4].map(|i| INDIRECT_ARGS[i].swap(0, Ordering::Relaxed));
+    if c.iter().all(|&n| n == 0) {
+        return;
+    }
+    let (kept, bytes) = {
+        let spare = SPARE_INDIRECTS.lock().unwrap_or_else(|e| e.into_inner());
+        (spare.count(), spare.bytes)
+    };
+    tracing::info!(
+        "indirect argument buffers per frame: {:.1} made, {:.1} taken from those kept; at their lists' resets {:.1} kept, {:.1} let go, \
+         {:.1} trimmed idle; {kept} kept now, {:.1} MB (LEONIDA_INDIRECT_ARGS_POOL=0: kept per list, as before; now {})",
+        c[0] as f64 / frames,
+        c[1] as f64 / frames,
+        c[2] as f64 / frames,
+        c[3] as f64 / frames,
+        c[4] as f64 / frames,
+        bytes as f64 / (1 << 20) as f64,
+        if indirect_args_pool() { "on" } else { "off" }
     );
 }
 
@@ -4458,6 +4758,7 @@ fn late_line(frames: f64) {
     }
     card_steps::log(frames);
     read_backs_line(frames);
+    indirect_args_line(frames);
     dynamic_wait_line(frames);
     crate::draw::waits_line(frames);
     crate::watch::port_guard_line(frames);
@@ -7280,8 +7581,14 @@ impl HostList {
         let _closing = crate::timeline::span("closing a host list");
         self.twins_to_depth();
         self.textures_back();
-        let scratch = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        if let Some((scratch, _)) = scratch {
+        let scratch = self
+            .indirect_args
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .current
+            .as_ref()
+            .map(|(b, _)| b.clone());
+        if let Some(scratch) = scratch {
             self.indirect_common(&scratch);
         }
         self.batches_common();
@@ -7302,6 +7609,8 @@ impl HostList {
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
         }
+        self.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).unclosed = false;
+        self.batch_args.lock().unwrap_or_else(|e| e.into_inner()).unclosed = 0;
     }
 
     /// `work` finds, on a thread of ours, refreshes that belong at this
@@ -7335,6 +7644,19 @@ impl HostList {
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let pool_indirects = indirect_args_pool();
+        let (clean_ind, dirty_ind) = self
+            .indirect_args
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain_for_reset(pool_indirects, false);
+        let (clean_bat, dirty_bat) = self
+            .batch_args
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .drain_for_reset(pool_indirects, false);
+        finish_indirect_uavs(clean_ind, dirty_ind, pool_indirects);
+        finish_indirect_uavs(clean_bat, dirty_bat, pool_indirects);
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -8202,64 +8524,94 @@ impl HostList {
     }
 
     /// A device-local unordered-access buffer of at least `size` bytes for
-    /// clamped indirect arguments, reused across executions and resets of the
-    /// list. Smaller buffers replaced mid-list stay alive until
-    /// [`HostList::reset`].
+    /// clamped indirect arguments, shared across closed recordings via
+    /// [`SPARE_INDIRECTS`]. Smaller buffers replaced mid-list transition back
+    /// to `COMMON` immediately and return to the pool at [`HostList::reset`].
     pub(crate) fn indirect_scratch(&self, size: u64) -> Option<ID3D12Resource> {
         let needed = size.max(64 << 10);
-        let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((buffer, cap)) = &*slot
-            && *cap >= needed
-        {
-            return Some(buffer.clone());
-        }
-        let prev = slot.as_ref().map_or(0, |(_, cap)| *cap);
+        let prev = {
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((buffer, cap)) = &slot.current
+                && *cap >= needed
+            {
+                let buffer = buffer.clone();
+                slot.unclosed = true;
+                return Some(buffer);
+            }
+            slot.current.as_ref().map_or(0, |(_, cap)| *cap)
+        };
         let alloc = prev
             .saturating_mul(2)
             .max(needed)
             .next_multiple_of(64 << 10);
-        let buffer = host()?.uav_buffer(alloc)?;
-        name(&buffer, || format!("indirect arguments {alloc:#x}"));
-        let old = slot.replace((buffer.clone(), alloc));
-        drop(slot);
+        let buffer = take_indirect_uav(host()?, alloc, || format!("indirect arguments {alloc:#x}"))?;
+        let old = {
+            let mut slot = self.indirect_args.lock().unwrap_or_else(|e| e.into_inner());
+            slot.unclosed = true;
+            let old = slot.current.replace((buffer.clone(), alloc));
+            if let Some(old_pair) = &old {
+                slot.replaced.push(old_pair.clone());
+            }
+            old
+        };
         if let Some((old_buf, _)) = old {
             // It ends the list common, as every scratch buffer does.
             self.indirect_common(&old_buf);
-            self.keep(&old_buf);
         }
         Some(buffer)
     }
 
-    /// Where the next batch of clamped records goes: a device-local buffer
-    /// the list keeps from recording to recording, the batch's place in it
-    /// and the state the buffer is in. Every batch of a recording has a place
-    /// of its own: the executions before it may still read theirs.
+    /// Where the next batch of clamped records goes: a 64 KiB device-local
+    /// buffer taken from [`SPARE_INDIRECTS`], the batch's place in it and the
+    /// state the buffer is in. Every batch of a recording has a place of its
+    /// own: the executions before it may still read theirs.
     pub(crate) fn batch_place(&self) -> Option<(ID3D12Resource, u32, D3D12_RESOURCE_STATES)> {
         use crate::indirect::batch::{JOBS, SLOT};
-        let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
-        let (buffer, i) = ((args.1 / BATCHES) as usize, args.1 % BATCHES);
-        if buffer == args.0.len() {
-            let size = u64::from(BATCHES * JOBS * SLOT);
-            let made = host()?.uav_buffer(size)?;
-            name(&made, || format!("indirect batches {size:#x}"));
-            args.0.push(made);
+        {
+            let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+            let (buffer, i) = ((args.slots / BATCHES) as usize, args.slots % BATCHES);
+            if buffer < args.buffers.len() {
+                args.slots += 1;
+                args.unclosed = args.unclosed.max(buffer + 1);
+                let state = if i == 0 {
+                    D3D12_RESOURCE_STATE_COMMON
+                } else {
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+                };
+                return Some((args.buffers[buffer].clone(), i * JOBS * SLOT, state));
+            }
         }
-        args.1 += 1;
+        let size = u64::from(BATCHES * JOBS * SLOT);
+        let made = take_indirect_uav(host()?, size, || format!("indirect batches {size:#x}"))?;
+        let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
+        let (buffer, i) = ((args.slots / BATCHES) as usize, args.slots % BATCHES);
+        if buffer == args.buffers.len() {
+            args.buffers.push(made);
+        } else {
+            drop(made);
+        }
+        args.slots += 1;
+        args.unclosed = args.unclosed.max(buffer + 1);
         // (Its first batch finds it as the recording before left it:
         // `batches_common`.)
-        let state = if i == 0 { D3D12_RESOURCE_STATE_COMMON } else { D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT };
-        Some((args.0[buffer].clone(), i * JOBS * SLOT, state))
+        let state = if i == 0 {
+            D3D12_RESOURCE_STATE_COMMON
+        } else {
+            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT
+        };
+        Some((args.buffers[buffer].clone(), i * JOBS * SLOT, state))
     }
 
     /// Before the list closes: the scratch buffers of the batched clamps go
     /// back to the common state, where the next recording expects them.
     fn batches_common(&self) {
         let mut args = self.batch_args.lock().unwrap_or_else(|e| e.into_inner());
-        let used = std::mem::take(&mut args.1).div_ceil(BATCHES) as usize;
-        let barriers: Vec<D3D12_RESOURCE_BARRIER> = args.0[..used]
+        let used = (std::mem::take(&mut args.slots).div_ceil(BATCHES) as usize).min(args.buffers.len());
+        let barriers: Vec<D3D12_RESOURCE_BARRIER> = args.buffers[..used]
             .iter()
             .map(|b| transition(b, D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COMMON))
             .collect();
+        drop(args);
         if !barriers.is_empty() {
             // SAFETY: an open list and live buffers this recording left in
             // `INDIRECT_ARGUMENT`.
@@ -12780,6 +13132,206 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         assert_eq!(ram_idle_ms(Some(0)), 2_000);
         // Missing falls back to normal
         assert_eq!(ram_idle_ms(None), 10_000);
+    }
+
+    static INDIRECT_POOL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn host_lists_share_batch_and_indirect_arg_buffers_across_resets() {
+        use std::collections::HashSet;
+        use std::sync::atomic::Ordering;
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        let _guard = INDIRECT_POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        const LISTS: usize = 32;
+        const BATCH_CALLS: usize = 25; // 4 x 64 KiB batch buffers per recording
+        const IND_SIZE: u64 = 3 * (64 << 10); // 192 KiB indirect scratch per recording
+        let lists: Vec<super::HostList> = (0..LISTS).map(|_| host.new_list().unwrap()).collect();
+
+        let made_before = super::MADE[4].load(Ordering::Relaxed);
+        let bytes_before = super::MADE[5].load(Ordering::Relaxed);
+        let mut distinct = HashSet::new();
+        for _round in 0..2 {
+            for list in &lists {
+                for _ in 0..BATCH_CALLS {
+                    let (dst, _off, before) = list.batch_place().unwrap();
+                    distinct.insert(dst.as_raw() as usize);
+                    // SAFETY: open list and live buffer owned by this recording.
+                    unsafe {
+                        list.list.ResourceBarrier(&[
+                            super::transition(&dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                            super::transition(
+                                &dst,
+                                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                                D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                            ),
+                        ]);
+                    }
+                }
+                let ind = list.indirect_scratch(IND_SIZE).unwrap();
+                distinct.insert(ind.as_raw() as usize);
+                let before = list.indirect_state(&ind);
+                // SAFETY: open list and live scratch buffer owned by this recording.
+                unsafe {
+                    list.list.ResourceBarrier(&[
+                        super::transition(&ind, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                        super::transition(
+                            &ind,
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                            D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                        ),
+                    ]);
+                }
+                list.indirect_readable(&ind);
+                list.close();
+                assert_eq!(host.log_messages(), None, "debug layer error on close");
+                host.execute(&[list]);
+                list.reset();
+            }
+        }
+        let made_delta = super::MADE[4].load(Ordering::Relaxed) - made_before;
+        let bytes_delta = super::MADE[5].load(Ordering::Relaxed) - bytes_before;
+        assert_eq!(
+            distinct.len(),
+            5,
+            "expected exactly 5 distinct pooled UAV buffers (4 x 64 KiB + 1 x 192 KiB) across {LISTS} HostLists"
+        );
+        assert!(
+            made_delta <= 5,
+            "expected O(in_flight) <= 5 new UAV buffers across {LISTS} sequential HostLists, got {made_delta} ({bytes_delta} bytes)"
+        );
+        for list in &lists {
+            assert!(list.batch_args.lock().unwrap().buffers.is_empty());
+            assert!(list.indirect_args.lock().unwrap().current.is_none());
+        }
+    }
+
+    #[test]
+    fn reset_or_drop_without_close_retires_buffers_instead_of_poisoning_pool() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::Interface;
+        let _guard = INDIRECT_POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        const IND_SIZE: u64 = 5 * (64 << 10); // 320 KiB dedicated bucket
+
+        // 1. A list closed at the raw D3D12 level without `HostList::close()`
+        // leaves its buffers in `UNORDERED_ACCESS`; `reset()` must retire them
+        // rather than returning non-`COMMON` buffers to `SPARE_INDIRECTS`.
+        let bad = host.new_list().unwrap();
+        let (bad_batch, _, before_batch) = bad.batch_place().unwrap();
+        let bad_ind = bad.indirect_scratch(IND_SIZE).unwrap();
+        let bad_batch_raw = bad_batch.as_raw() as usize;
+        let bad_ind_raw = bad_ind.as_raw() as usize;
+        // SAFETY: open list and live buffers owned by `bad`.
+        unsafe {
+            bad.list.ResourceBarrier(&[
+                super::transition(&bad_batch, before_batch, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                super::transition(&bad_ind, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+            ]);
+            bad.list.Close().unwrap();
+        }
+        host.execute(&[&bad]);
+        bad.reset();
+        drop(bad);
+
+        // 2. Dropping an open list without `HostList::close()` must also retire
+        // its buffers rather than pooling them.
+        let unclosed_drop = host.new_list().unwrap();
+        let (drop_batch, _, _) = unclosed_drop.batch_place().unwrap();
+        let drop_ind = unclosed_drop.indirect_scratch(IND_SIZE).unwrap();
+        let drop_batch_raw = drop_batch.as_raw() as usize;
+        let drop_ind_raw = drop_ind.as_raw() as usize;
+        drop(unclosed_drop);
+
+        // 3. Subsequent recordings must not receive any of the unclosed buffers,
+        // and must execute cleanly with zero debug-layer state errors. Keep our
+        // test handles alive past `good`'s allocations so COM pointer addresses
+        // cannot be recycled even with `LEONIDA_BURY_LAG=0`.
+        let good = host.new_list().unwrap();
+        let (good_batch, _, good_before) = good.batch_place().unwrap();
+        let good_ind = good.indirect_scratch(IND_SIZE).unwrap();
+        assert_ne!(good_batch.as_raw() as usize, bad_batch_raw);
+        assert_ne!(good_batch.as_raw() as usize, drop_batch_raw);
+        assert_ne!(good_ind.as_raw() as usize, bad_ind_raw);
+        assert_ne!(good_ind.as_raw() as usize, drop_ind_raw);
+        drop((bad_batch, bad_ind, drop_batch, drop_ind));
+        // SAFETY: open list and live `COMMON` buffers.
+        unsafe {
+            good.list.ResourceBarrier(&[
+                super::transition(&good_batch, good_before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                super::transition(
+                    &good_batch,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                ),
+                super::transition(&good_ind, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),
+                super::transition(
+                    &good_ind,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
+                ),
+            ]);
+        }
+        good.indirect_readable(&good_ind);
+        good.close();
+        assert_eq!(host.log_messages(), None, "debug layer error on good list");
+        host.execute(&[&good]);
+        good.reset();
+    }
+
+    #[test]
+    fn idle_trim_reclaims_untouched_pooled_buffers_and_honors_vram_pressure() {
+        let _guard = INDIRECT_POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(host) = super::host() else {
+            return;
+        };
+        // 1. Deterministic `SpareIndirects` window & pressure behavior.
+        let size = 64 << 10;
+        let mut pool = super::SpareIndirects::new();
+        for _ in 0..4 {
+            let b = host.uav_buffer(size).unwrap();
+            assert!(pool.give(b, size, super::SPARE_INDIRECTS_MOST).is_none());
+        }
+        assert_eq!((pool.count(), pool.bytes), (4, 4 * size));
+        // First trim marks the start of an observation window (`low` was 0).
+        let (freed0, _) = pool.trim(false);
+        assert!(freed0.is_empty());
+        assert_eq!(pool.count(), 4);
+        // Pop 1 buffer and return it: 3 stayed untouched (`low == 3`).
+        let used = pool.take(size).unwrap();
+        assert!(pool.give(used, size, super::SPARE_INDIRECTS_MOST).is_none());
+        // Next trim halves the 3 untouched buffers (`ceil(3/2) == 2`), keeping 2.
+        let (freed1, bytes1) = pool.trim(false);
+        assert_eq!((freed1.len(), bytes1), (2, 2 * size));
+        assert_eq!((pool.count(), pool.bytes), (2, 2 * size));
+        drop(freed1);
+        // Under VRAM pressure (>= 85%), all untouched buffers drain in one step.
+        assert!(super::vram_pressured(Some([100, 85, 0, 0])));
+        assert!(!super::vram_pressured(Some([100, 84, 0, 0])));
+        let (freed2, bytes2) = pool.trim(true);
+        assert_eq!((freed2.len(), bytes2), (2, 2 * size));
+        assert_eq!((pool.count(), pool.bytes), (0, 0));
+        drop(freed2);
+
+        // 2. End-to-end live `trim_spare_indirects()` releases pooled COM ref.
+        const TRIM_SIZE: u64 = 7 * (64 << 10); // 448 KiB dedicated bucket
+        let list = host.new_list().unwrap();
+        let held = list.indirect_scratch(TRIM_SIZE).unwrap();
+        list.close();
+        host.execute(&[&list]);
+        list.reset();
+        // `SPARE_INDIRECTS` + `held` = 2 COM references.
+        assert_eq!(super::references(&held), 2, "pool must hold a reference after reset");
+        super::trim_spare_indirects(); // observes `held` in bucket (`low = 1`)
+        super::trim_spare_indirects(); // drains `ceil(1/2) = 1`
+        assert_eq!(super::references(&held), 1, "idle trim must release the pooled COM reference");
     }
 }
 
