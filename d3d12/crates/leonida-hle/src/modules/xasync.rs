@@ -1825,4 +1825,71 @@ mod tests {
             assert_eq!(XAsyncGetStatus(&mut block, false), E_ABORT);
         }
     }
+
+    #[test]
+    fn pending_with_completes_and_returns_payload_bytes() {
+        static CALLBACKS: AtomicU32 = AtomicU32::new(0);
+        extern "system" fn on_done(_: *mut AsyncBlock) {
+            CALLBACKS.fetch_add(1, Ordering::SeqCst);
+        }
+
+        let mut q = std::ptr::null();
+        assert_eq!(XTaskQueueCreate(1, 0, &mut q), S_OK);
+        let identity = 0x93 as *const c_void;
+        let expected = vec![0xde, 0xad, 0xbe, 0xef, 0x42];
+
+        let mut block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(on_done),
+            internal: [0; 4],
+        };
+        let payload = expected.clone();
+        assert_eq!(
+            pending_with(&mut block, identity, move || Ok(payload)),
+            S_OK
+        );
+        assert_eq!(XAsyncGetStatus(&mut block, true), S_OK);
+
+        let mut size = 0;
+        assert_eq!(XAsyncGetResultSize(&mut block, &mut size), S_OK);
+        assert_eq!(size, expected.len());
+        assert_eq!(CALLBACKS.load(Ordering::SeqCst), 0);
+        assert!(XTaskQueueDispatch(q, COMPLETION, 0));
+        assert_eq!(CALLBACKS.load(Ordering::SeqCst), 1);
+
+        let mut got = vec![0u8; expected.len()];
+        let mut used = 0;
+        assert_eq!(
+            XAsyncGetResult(
+                &mut block,
+                identity,
+                got.len(),
+                got.as_mut_ptr().cast(),
+                &mut used,
+            ),
+            S_OK
+        );
+        assert_eq!(used, expected.len());
+        assert_eq!(got, expected);
+        assert!(call(&mut block).is_none());
+
+        // Error path through `pending_with` also completes and cleans up.
+        let mut err_block = AsyncBlock {
+            queue: q,
+            context: std::ptr::null_mut(),
+            callback: Some(on_done),
+            internal: [0; 4],
+        };
+        assert_eq!(
+            pending_with(&mut err_block, identity, || Err(E_INVALIDARG)),
+            S_OK
+        );
+        assert_eq!(XAsyncGetStatus(&mut err_block, true), E_INVALIDARG);
+        assert!(XTaskQueueDispatch(q, COMPLETION, 0));
+        assert_eq!(CALLBACKS.load(Ordering::SeqCst), 2);
+        assert!(call(&mut err_block).is_none());
+
+        XTaskQueueCloseHandle(q);
+    }
 }
