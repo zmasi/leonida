@@ -11,15 +11,28 @@ use super::{Fields, Inst, Lower, Operand, Reg, Role, RootType, Source, V, Value,
 /// (`docs/design.md` and `tools/rdna2spirv.py`: unsigned 16-bit add/sub
 /// saturate to `[0, 0xFFFF]`; unmeasured ops stay `Unsupported`).
 pub(super) fn vop3_int16_clamps(name: &str) -> bool {
-    matches!(name, "v_add_nc_u16" | "v_sub_nc_u16" | "v_subrev_nc_u16")
+    matches!(name, "v_add_nc_u16" | "v_sub_nc_u16")
 }
 
 /// Whether VOP3P `clamp` is defined on packed 16-bit integer `op`
 /// (`docs/design.md`, `tools/pk16_diff.py`, and `tools/pk_int16_clamp_probe.py`:
 /// add/sub/mad saturate per half, `mul_lo_u16` and `min`/`max` are hardware
-/// no-ops on `gfx1036`, and unmeasured shifts stay `Unsupported`).
+/// no-ops on `gfx1036`, and unmeasured ops such as shifts stay `Unsupported`).
 pub(super) fn packed_int16_clamps(op: &str) -> bool {
-    !matches!(op, "lshlrev_b16" | "lshrrev_b16" | "ashrrev_i16")
+    matches!(
+        op,
+        "add_u16"
+            | "sub_u16"
+            | "mad_u16"
+            | "add_i16"
+            | "sub_i16"
+            | "mad_i16"
+            | "mul_lo_u16"
+            | "max_u16"
+            | "min_u16"
+            | "max_i16"
+            | "min_i16"
+    )
 }
 
 impl<'a> Lower<'a> {
