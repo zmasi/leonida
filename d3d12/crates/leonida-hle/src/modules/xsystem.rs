@@ -103,14 +103,17 @@ fn text(s: &str) -> [u8; 64] {
 /// A struct this large comes back through the caller's buffer, whose
 /// address is also the return value.
 extern "system" fn analytics_info(_: This, out: *mut AnalyticsInfo) -> *mut AnalyticsInfo {
+    if out.is_null() {
+        return out;
+    }
     let info = AnalyticsInfo {
         os: OS,
         hosting_os: OS,
         family: text("Xbox"),
         form: text(leonida_gpu::console::current().name()),
     };
-    // SAFETY: the caller passes room for the struct.
-    unsafe { out.write(info) };
+    // SAFETY: checked non-null; `write_unaligned` tolerates unaligned caller buffers.
+    unsafe { out.write_unaligned(info) };
     out
 }
 
@@ -168,27 +171,57 @@ mod device_type {
         }
     }
 
-    fn is(text: *const u16, expected: &str) -> bool {
+    fn wide_string(text: *const u16) -> Option<String> {
         if text.is_null() {
-            return false;
+            return None;
         }
-        // SAFETY: the title passes a NUL-terminated string.
-        let text = unsafe {
-            let len = (0..).take_while(|&i| *text.add(i) != 0).count();
-            String::from_utf16_lossy(std::slice::from_raw_parts(text, len))
-        };
-        text.eq_ignore_ascii_case(expected)
+        let mut units = Vec::new();
+        // SAFETY: the title passes a NUL-terminated UTF-16 string; `read_unaligned`
+        // tolerates unaligned caller pointers without forming `&[u16]`.
+        unsafe {
+            let mut i = 0;
+            loop {
+                let unit = text.add(i).read_unaligned();
+                if unit == 0 {
+                    break;
+                }
+                units.push(unit);
+                i += 1;
+            }
+        }
+        Some(String::from_utf16_lossy(&units))
+    }
+
+    fn is(text: *const u16, expected: &str) -> bool {
+        wide_string(text).is_some_and(|s| s.eq_ignore_ascii_case(expected))
+    }
+
+    fn is_key_path(text: *const u16, expected: &str) -> bool {
+        wide_string(text).is_some_and(|s| s.trim_end_matches('\\').eq_ignore_ascii_case(expected))
     }
 
     /// Opens our key for its path; the key has no subkeys. `None`: not
     /// ours, ask the host.
     fn open(root: Key, sub: *const u16, out: *mut Key) -> Option<u32> {
         if root == oem() {
-            return Some(FILE_NOT_FOUND);
+            if out.is_null() {
+                return Some(INVALID_PARAMETER);
+            }
+            // SAFETY: checked non-null when `sub` is present; reads one `u16` unaligned.
+            let empty = sub.is_null() || unsafe { sub.read_unaligned() == 0 };
+            if !empty {
+                return Some(FILE_NOT_FOUND);
+            }
+            // SAFETY: checked non-null; `write_unaligned` tolerates unaligned caller storage.
+            unsafe { out.write_unaligned(oem()) };
+            return Some(SUCCESS);
         }
-        if root == LOCAL_MACHINE && is(sub, KEY) && !out.is_null() {
-            // SAFETY: checked non-null; the title passes room for a key.
-            unsafe { out.write(oem()) };
+        if root == LOCAL_MACHINE && is_key_path(sub, KEY) {
+            if out.is_null() {
+                return Some(INVALID_PARAMETER);
+            }
+            // SAFETY: checked non-null; `write_unaligned` tolerates unaligned caller storage.
+            unsafe { out.write_unaligned(oem()) };
             return Some(SUCCESS);
         }
         None
@@ -231,22 +264,26 @@ mod device_type {
                 Key, *const u16, *mut u32, *mut u32, *mut u8, *mut u32,
             ) -> u32)(key, name, reserved, kind, data, size);
         }
+        if !reserved.is_null() {
+            return INVALID_PARAMETER;
+        }
         if !is(name, VALUE) {
             return FILE_NOT_FOUND;
         }
         if !data.is_null() && size.is_null() {
             return INVALID_PARAMETER;
         }
-        // SAFETY: the title passes valid or null pointers, sized by `size`.
+        // SAFETY: the title passes valid or null pointers, sized by `size`;
+        // `read_unaligned` / `write_unaligned` tolerate unaligned caller buffers.
         unsafe {
             if !kind.is_null() {
-                kind.write(DWORD);
+                kind.write_unaligned(DWORD);
             }
             if size.is_null() {
                 return SUCCESS;
             }
-            let room = size.read();
-            size.write(4);
+            let room = size.read_unaligned();
+            size.write_unaligned(4);
             if data.is_null() {
                 return SUCCESS;
             }
@@ -360,6 +397,111 @@ mod device_type {
             assert!(size > 0);
             assert_eq!(RegCloseKey(key), SUCCESS);
         }
+
+        #[test]
+        fn oem_key_reopens_validates_reserved_and_accepts_unaligned_pointers() {
+            // Trailing backslashes open our OEM key, and null `out` returns INVALID_PARAMETER.
+            assert_eq!(
+                RegOpenKeyW(LOCAL_MACHINE, w(KEY).as_ptr(), std::ptr::null_mut()),
+                INVALID_PARAMETER
+            );
+            assert_eq!(
+                RegOpenKeyExW(LOCAL_MACHINE, w(KEY).as_ptr(), 0, 1, std::ptr::null_mut()),
+                INVALID_PARAMETER
+            );
+            let mut key = std::ptr::null_mut();
+            let slashed = w(&format!(r"{KEY}\\"));
+            assert_eq!(
+                RegOpenKeyExW(LOCAL_MACHINE, slashed.as_ptr(), 0, 1, &mut key),
+                SUCCESS
+            );
+            assert_eq!(key, oem());
+
+            // Re-opening `oem()` with null or empty `sub` duplicates the pseudo handle,
+            // while null `out` returns INVALID_PARAMETER and non-empty `sub` returns FILE_NOT_FOUND.
+            assert_eq!(
+                RegOpenKeyExW(key, std::ptr::null(), 0, 1, std::ptr::null_mut()),
+                INVALID_PARAMETER
+            );
+            let mut dup_null = std::ptr::null_mut();
+            assert_eq!(
+                RegOpenKeyExW(key, std::ptr::null(), 0, 1, &mut dup_null),
+                SUCCESS
+            );
+            assert_eq!(dup_null, oem());
+            let empty = w("");
+            let mut dup_empty = std::ptr::null_mut();
+            assert_eq!(RegOpenKeyW(key, empty.as_ptr(), &mut dup_empty), SUCCESS);
+            assert_eq!(dup_empty, oem());
+
+            // Non-null `lpReserved` must return INVALID_PARAMETER ahead of value lookup.
+            let mut reserved = 0u32;
+            let mut size = 4u32;
+            let name = w(VALUE);
+            let missing_name = w("NoSuchValue");
+            assert_eq!(
+                RegQueryValueExW(
+                    key,
+                    name.as_ptr(),
+                    &mut reserved,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut size
+                ),
+                INVALID_PARAMETER
+            );
+            assert_eq!(
+                RegQueryValueExW(
+                    key,
+                    missing_name.as_ptr(),
+                    &mut reserved,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut size
+                ),
+                INVALID_PARAMETER
+            );
+
+            // Guaranteed odd-aligned UTF-16 strings and `kind` / `size` / `out` pointers.
+            let mut raw = [0u64; 32];
+            // SAFETY: byte-addressed offsets inside `raw`, guaranteed misaligned (`base` is 8-byte aligned).
+            unsafe {
+                let bytes = raw.as_mut_ptr().cast::<u8>();
+                let sub_u16 = bytes.add(1).cast::<u16>();
+                for (i, unit) in w(KEY).into_iter().enumerate() {
+                    sub_u16.add(i).write_unaligned(unit);
+                }
+                let out_key = bytes.add(131).cast::<Key>();
+                assert_eq!(RegOpenKeyW(LOCAL_MACHINE, sub_u16, out_key), SUCCESS);
+                assert_eq!(out_key.read_unaligned(), oem());
+
+                let val_u16 = bytes.add(147).cast::<u16>();
+                for (i, unit) in name.into_iter().enumerate() {
+                    val_u16.add(i).write_unaligned(unit);
+                }
+                let kind_ptr = bytes.add(193).cast::<u32>();
+                let size_ptr = bytes.add(201).cast::<u32>();
+                let data_ptr = bytes.add(209);
+                size_ptr.write_unaligned(4);
+                assert_eq!(
+                    RegQueryValueExW(
+                        oem(),
+                        val_u16,
+                        std::ptr::null_mut(),
+                        kind_ptr,
+                        data_ptr,
+                        size_ptr
+                    ),
+                    SUCCESS
+                );
+                assert_eq!(kind_ptr.read_unaligned(), DWORD);
+                assert_eq!(size_ptr.read_unaligned(), 4);
+                assert_eq!(
+                    data_ptr.cast::<u32>().read_unaligned(),
+                    console_mode(console::current())
+                );
+            }
+        }
     }
 }
 #[cfg(windows)]
@@ -396,5 +538,23 @@ mod tests {
         assert_eq!(size_of::<AnalyticsInfo>(), 0x90);
         assert_eq!(info.os.build, 22000);
         assert_eq!(&info.form[..14], b"Xbox Series X\0");
+    }
+
+    #[test]
+    fn analytics_info_handles_null_and_unaligned_output_buffers() {
+        type Get = extern "system" fn(This, *mut AnalyticsInfo) -> *mut AnalyticsInfo;
+        let get = method::<Get>(&ANALYTICS_OBJECT, 0x18);
+        assert!(get(&ANALYTICS_OBJECT, std::ptr::null_mut()).is_null());
+
+        let mut backing = [0u64; 20];
+        // SAFETY: `backing` holds 160 bytes (`>= 144 + 1`); `+1` guarantees odd misalignment.
+        unsafe {
+            let unaligned = backing.as_mut_ptr().cast::<u8>().add(1).cast::<AnalyticsInfo>();
+            let ret = get(&ANALYTICS_OBJECT, unaligned);
+            assert_eq!(ret, unaligned);
+            let info = unaligned.read_unaligned();
+            assert_eq!(info.os.build, 22000);
+            assert_eq!(&info.family[..5], b"Xbox\0");
+        }
     }
 }
