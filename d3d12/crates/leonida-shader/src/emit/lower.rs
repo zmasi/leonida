@@ -10540,28 +10540,40 @@ impl<'a> Lower<'a> {
     }
 
     /// Source `k` of a 16-bit operation in the low 16 bits (the rest 0):
-    /// op_sel (or an SDWA word select) picks the high half; inline float
-    /// constants are f16 values here.
-    fn half_src(&mut self, inst: &Inst, k: usize) -> Result<V, Why> {
+    /// op_sel (or an SDWA byte/word select) narrows the 32-bit operand;
+    /// `f16_const` reads inline float constants as f16 values rather than f32
+    /// bits, and `int_src` allows SDWA sign extension while rejecting abs/neg.
+    fn half_src(
+        &mut self,
+        inst: &Inst,
+        k: usize,
+        f16_const: bool,
+        int_src: bool,
+    ) -> Result<V, Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
         let op = *v.src.get(k).ok_or("a missing operand")?;
-        let mut high = v.opsel >> k & 1 != 0;
-        if let Some(sd) = v.sdwa {
-            match sd.src_sel.get(k).copied().unwrap_or(6) {
-                4 => {}
-                5 => high = true,
-                6 => {}
-                _ => return Err("a byte select on a 16-bit operation"),
-            }
+        if int_src && (v.abs >> k & 1 != 0 || v.neg >> k & 1 != 0) {
+            return Err("integer operand modifiers");
         }
         let x = match self.src0 {
             Some(x) if k == 0 => x,
-            _ => self.f16_operand(inst, &op)?,
+            _ if f16_const => self.f16_operand(inst, &op)?,
+            _ => self.operand(inst, &op)?,
         };
         let c = self.cur;
-        let x = if high {
+        let x = if let Some(sd) = v.sdwa {
+            let sext = sd.sext >> k & 1 != 0;
+            if !int_src && sext {
+                return Err("sign extension on a float operation");
+            }
+            match sd.src_sel.get(k).copied().unwrap_or(6) {
+                s @ 0..=5 => self.select_bits(x, s, sext),
+                6 => x,
+                _ => return Err("an SDWA source of a 16-bit operation"),
+            }
+        } else if v.opsel >> k & 1 != 0 {
             let k16 = self.s.m.i32(16);
             self.s.m.bin(c, Bin::LShr, x, k16)
         } else {
@@ -10576,7 +10588,7 @@ impl<'a> Lower<'a> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
         };
-        let h = self.half_src(inst, k)?;
+        let h = self.half_src(inst, k, true, false)?;
         let f32t = self.s.t.f32;
         let mut f = self
             .s
@@ -10592,8 +10604,8 @@ impl<'a> Lower<'a> {
     }
 
     /// Writes a 16-bit result (low bits of `x`) into the destination's low
-    /// half, or its high half with op_sel bit 3 (or an SDWA WORD_1 select);
-    /// the other half is kept (GFX10).
+    /// half, or its high half with op_sel bit 3 (or an SDWA byte/word/dword
+    /// select); the other half is kept outside SDWA (GFX10).
     fn write_half(&mut self, inst: &Inst, x: V, guard: Option<V>) -> Result<(), Why> {
         let Fields::Valu(v) = &inst.fields else {
             unreachable!()
@@ -10601,34 +10613,16 @@ impl<'a> Lower<'a> {
         let Some(Operand::Vector { reg, .. }) = v.dst else {
             return Err("a 16-bit result outside a VGPR");
         };
-        let mut high = v.opsel >> 3 & 1 != 0;
-        // SDWA: the word written, the other one kept (preserve) or zero
-        // (pad; a sign extension above the high word adds nothing).
-        let mut keep = true;
-        if let Some(sd) = v.sdwa {
-            match (sd.dst_sel, sd.dst_unused) {
-                (4, 2) => {}
-                (5, 2) => high = true,
-                (4 | 6, _) => keep = false,
-                (5, _) => (high, keep) = (true, false),
+        let r = match v.sdwa {
+            Some(sd) => match (sd.dst_sel, sd.dst_unused) {
+                (s @ 0..=5, u @ 0..=2) => self.place_bits(inst, Reg::V(reg), x, s, u),
+                (6, 0..=2) => {
+                    let low = self.s.m.i32(0xFFFF);
+                    self.s.m.bin(self.cur, Bin::And, x, low)
+                }
                 _ => return Err("an SDWA destination of a 16-bit operation"),
-            }
-        }
-        let c = self.cur;
-        let old = match inst.read(Reg::V(reg)).map(|o| self.i32_of(o)) {
-            Some(Ok(o)) if keep => o,
-            _ => self.s.m.i32(0),
-        };
-        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
-        let x = self.s.m.bin(c, Bin::And, x, low);
-        let r = if high {
-            let o = self.s.m.bin(c, Bin::And, old, low);
-            let x = self.s.m.bin(c, Bin::Shl, x, k16);
-            self.s.m.bin(c, Bin::Or, o, x)
-        } else {
-            let keep = self.s.m.i32(0xFFFF_0000);
-            let o = self.s.m.bin(c, Bin::And, old, keep);
-            self.s.m.bin(c, Bin::Or, o, x)
+            },
+            None => self.place_bits(inst, Reg::V(reg), x, 4 + (v.opsel >> 3 & 1), 2),
         };
         self.write_placed(inst, Reg::V(reg), r, guard);
         Ok(())
@@ -10796,7 +10790,7 @@ impl<'a> Lower<'a> {
         if float1.contains(&name) {
             let r = match name {
                 "v_cvt_f16_u16" | "v_cvt_f16_i16" => {
-                    let mut x = self.half_src(inst, 0)?;
+                    let mut x = self.half_src(inst, 0, false, true)?;
                     let op = if name == "v_cvt_f16_i16" {
                         let k16 = self.s.m.i32(16);
                         let t = self.s.m.bin(c, Bin::Shl, x, k16);
@@ -10873,7 +10867,10 @@ impl<'a> Lower<'a> {
             return Err("modifiers on a 16-bit integer operation");
         }
         let r = {
-            let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+            let (mut a, mut b) = (
+                self.half_src(inst, 0, false, true)?,
+                self.half_src(inst, 1, false, true)?,
+            );
             let k16 = self.s.m.i32(16);
             let sext = |l: &mut Self, x: V| {
                 let t = l.s.m.bin(c, Bin::Shl, x, k16);
@@ -10931,7 +10928,7 @@ impl<'a> Lower<'a> {
         };
         let c = self.cur;
         let k = |l: &mut Self, x: u32| l.s.m.i32(x);
-        let mut h = self.half_src(inst, 0)?;
+        let mut h = self.half_src(inst, 0, true, false)?;
         if v.abs & 1 != 0 {
             let m = k(self, 0x7FFF);
             h = self.s.m.bin(c, Bin::And, h, m);
@@ -11589,11 +11586,17 @@ impl<'a> Lower<'a> {
                 // Bit k of src1 tests class k: signalling NaN, quiet NaN,
                 // -inf, -normal, -denormal, -0, +0, +denormal, +normal, +inf.
                 let f16 = ty == "f16";
-                let x = if f16 {
+                let (x, mask) = if f16 {
                     let Fields::Valu(v) = &inst.fields else {
                         unreachable!()
                     };
-                    let mut h = self.half_src(inst, 0)?;
+                    if v.clamp || v.omod != 0 {
+                        return Err("modifiers on v_cmp_class_f16");
+                    }
+                    if v.sdwa.is_none() && v.opsel & 0b1010 != 0 {
+                        return Err("op_sel on v_cmp_class_f16");
+                    }
+                    let mut h = self.half_src(inst, 0, true, false)?;
                     if v.abs & 1 != 0 {
                         let m = self.s.m.i32(0x7FFF);
                         h = self.s.m.bin(c, Bin::And, h, m);
@@ -11602,12 +11605,11 @@ impl<'a> Lower<'a> {
                         let s = self.s.m.i32(0x8000);
                         h = self.s.m.bin(c, Bin::Xor, h, s);
                     }
-                    h
+                    (h, self.half_src(inst, 1, true, true)?)
                 } else {
                     let x = self.fsrc(inst, 0)?;
-                    self.as_int(x)
+                    (self.as_int(x), self.src(inst, 1)?)
                 };
-                let mask = self.src(inst, 1)?;
                 let k = |l: &mut Self, v: u32| l.s.m.i32(v);
                 let (exp_sh, sign_sh, exp_mask, mant_mask, quiet_bit) = if f16 {
                     (10, 15, 0x1F, 0x03FF, 0x0200)
@@ -11709,7 +11711,10 @@ impl<'a> Lower<'a> {
             }
             "u32" | "i32" | "u16" | "i16" => {
                 let (a, b) = if ty.ends_with("16") {
-                    let (mut a, mut b) = (self.half_src(inst, 0)?, self.half_src(inst, 1)?);
+                    let (mut a, mut b) = (
+                        self.half_src(inst, 0, false, true)?,
+                        self.half_src(inst, 1, false, true)?,
+                    );
                     if ty == "i16" {
                         let k16 = self.s.m.i32(16);
                         for x in [&mut a, &mut b] {
