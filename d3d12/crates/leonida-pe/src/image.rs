@@ -199,7 +199,7 @@ impl ImageInfo {
         };
         let delay_imports = parse_delay_imports(&file, size_of_image)?;
         let exports = parse_exports(&file, opt.image_base())?;
-        let tls = parse_tls(&file, data, opt.image_base(), size_of_image)?;
+        let tls = parse_tls(&file, &sections, data, opt.image_base(), size_of_image)?;
         let codeview = file.pdb_info()?.map(|cv| CodeViewInfo {
             pdb_path: String::from_utf8_lossy(cv.path()).into_owned(),
             guid: cv.guid(),
@@ -399,8 +399,35 @@ fn parse_exports(file: &PeFile64<'_>, image_base: u64) -> Result<Vec<ExportInfo>
         .collect()
 }
 
+fn section_mapped_len(section: &SectionInfo, size_of_image: u32) -> u32 {
+    let vs = if section.virtual_size == 0 {
+        section.file_size
+    } else {
+        section.virtual_size
+    };
+    vs.min(size_of_image.saturating_sub(section.rva))
+}
+
+fn read_virtual_u64(section: &SectionInfo, data: &[u8], mapped: u32, at: u32) -> Option<u64> {
+    let end = at.checked_add(8)?;
+    if end > mapped {
+        return None;
+    }
+    let backed = mapped.min(section.file_size);
+    let mut bytes = [0u8; 8];
+    for (i, slot) in bytes.iter_mut().enumerate() {
+        let pos = at + i as u32;
+        if pos < backed {
+            let file_at = section.file_offset.checked_add(pos)? as usize;
+            *slot = *data.get(file_at)?;
+        }
+    }
+    Some(u64::from_le_bytes(bytes))
+}
+
 fn parse_tls(
     file: &PeFile64<'_>,
+    sections: &[SectionInfo],
     data: &[u8],
     image_base: u64,
     size_of_image: u32,
@@ -415,33 +442,44 @@ fn parse_tls(
     if directory_rva >= size_of_image {
         return Err(PeError::Malformed("TLS directory outside the image".into()));
     }
-    let sections = file.section_table();
-    let tls = sections
-        .pe_data_at(data, directory_rva)
+    let (tls_sec, tls_off, tls_mapped) = sections
+        .iter()
+        .find_map(|s| {
+            let mapped = section_mapped_len(s, size_of_image);
+            let off = directory_rva.checked_sub(s.rva)?;
+            (off < mapped).then_some((s, off, mapped))
+        })
         .ok_or_else(|| PeError::Malformed("TLS directory outside of sections".into()))?;
-    let callbacks_va = layout::read_u64(tls, layout::TLS64_ADDRESS_OF_CALLBACKS)
+    let cb_off = tls_off
+        .checked_add(layout::TLS64_ADDRESS_OF_CALLBACKS as u32)
+        .ok_or_else(|| PeError::Malformed("truncated TLS directory".into()))?;
+    let callbacks_va = read_virtual_u64(tls_sec, data, tls_mapped, cb_off)
         .ok_or_else(|| PeError::Malformed("truncated TLS directory".into()))?;
 
     let mut callback_rvas = Vec::new();
     if callbacks_va != 0 {
         let array_rva = va_to_rva(callbacks_va, image_base, size_of_image)?;
-        let array = sections
-            .pe_data_at(data, array_rva)
+        let (arr_sec, mut at, arr_mapped) = sections
+            .iter()
+            .find_map(|s| {
+                let mapped = section_mapped_len(s, size_of_image);
+                let off = array_rva.checked_sub(s.rva)?;
+                (off < mapped).then_some((s, off, mapped))
+            })
             .ok_or_else(|| PeError::Malformed("TLS callback array outside of sections".into()))?;
-        let mut terminated = false;
-        for slot in array.as_chunks::<8>().0.iter().take(MAX_TLS_CALLBACKS + 1) {
-            let va = u64::from_le_bytes(*slot);
+        loop {
+            let va = read_virtual_u64(arr_sec, data, arr_mapped, at)
+                .ok_or_else(|| PeError::Malformed("unterminated TLS callback array".into()))?;
             if va == 0 {
-                terminated = true;
                 break;
             }
             if callback_rvas.len() == MAX_TLS_CALLBACKS {
-                break;
+                return Err(PeError::Malformed(format!(
+                    "TLS callback array exceeds {MAX_TLS_CALLBACKS} entries"
+                )));
             }
             callback_rvas.push(va_to_rva(va, image_base, size_of_image)?);
-        }
-        if !terminated {
-            return Err(PeError::Malformed("unterminated TLS callback array".into()));
+            at += 8;
         }
     }
     Ok(Some(TlsInfo {
@@ -782,5 +820,34 @@ mod tests {
         valid[0x240..0x248].copy_from_slice(&0x1_8000_1080u64.to_le_bytes());
         let info = ImageInfo::parse(&valid).unwrap();
         assert_eq!(info.tls.unwrap().callback_rvas, [0x1080]);
+
+        // Zero-fill terminator (`VirtualSize = 0x208 > SizeOfRawData = 0x200`) succeeds
+        // as mapped by the Windows PE loader.
+        let mut zero_fill_term = unterminated;
+        let sec = 0x58 + 240;
+        zero_fill_term[sec + 8..sec + 12].copy_from_slice(&0x208u32.to_le_bytes());
+        let info = ImageInfo::parse(&zero_fill_term)
+            .expect("0u64 terminator in virtual zero-fill must be accepted");
+        assert_eq!(info.tls.unwrap().callback_rvas, [0x1080]);
+
+        // Exceeding `MAX_TLS_CALLBACKS` reports the entry-limit error, not "unterminated".
+        let mut too_many = vec![0u8; 0x200 + 0x2400];
+        too_many[..0x200].copy_from_slice(&base_tls_image()[..0x200]);
+        let opt = 0x58;
+        too_many[opt + 56..opt + 60].copy_from_slice(&0x4000u32.to_le_bytes()); // SizeOfImage
+        too_many[sec + 8..sec + 12].copy_from_slice(&0x2400u32.to_le_bytes()); // VirtualSize
+        too_many[sec + 16..sec + 20].copy_from_slice(&0x2400u32.to_le_bytes()); // SizeOfRawData
+        too_many[0x200 + layout::TLS64_ADDRESS_OF_CALLBACKS
+            ..0x200 + layout::TLS64_ADDRESS_OF_CALLBACKS + 8]
+            .copy_from_slice(&0x1_8000_1040u64.to_le_bytes());
+        for i in 0..=MAX_TLS_CALLBACKS {
+            let slot = 0x240 + i * 8;
+            too_many[slot..slot + 8].copy_from_slice(&0x1_8000_1030u64.to_le_bytes());
+        }
+        let err = ImageInfo::parse(&too_many).expect_err("1025 callbacks must be rejected");
+        assert!(
+            err.to_string().contains("exceeds 1024 entries"),
+            "unexpected error message: {err}"
+        );
     }
 }
