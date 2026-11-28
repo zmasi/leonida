@@ -1,0 +1,26 @@
+GPU:        NVIDIA GeForce RTX 4050 Laptop GPU (Ada, device 0x28a1), subgroup 32..32
+Driver:     NVIDIA 610.47 (Windows 32.0.16.1047), Vulkan 1.4.341
+OS:         Windows 11 Pro 10.0.26300 x64
+Commit:     c023a365a93e5e3a75290ab70f68c8da4a227700 (main, 2026-11-24)
+Tools:      llvm-mc 23.1.6 (conda-forge), SPIRV-Tools v2026.4, CMake 4.5.1 + Ninja 1.13.2,
+            Clang 23.1.6 (llvm-mingw for the standalone tools; clang-cl + xwin MSVC 14.44
+            and Windows SDK 10.0.26100 for the runtime), Python 3.12.16
+run_gpu_tests.py: 257 shaders: 257 translated, 257 pass spirv-val
+            native:                 197/248 passed, 49 skipped, 2 failed
+            LEONIDA_W64_EMULATE=1:  229/248 passed, 17 skipped, 2 failed
+Failed:     cs_imgload_tfe and cs_imgload_d16_tfe in both modes; the same issue as #31.
+            #98 is the reported fix, but it was not independently rerun for this entry.
+Skipped:    native: 31 "no 64-wide compute subgroup", 1 "no 64-wide subgroup", 1
+            "cannot require a 64-wide fragment subgroup", and 16 cases documented as
+            run by d3d12_*_test / w64_graphics.py.
+            emulated: the same 16 delegated cases plus the 64-wide fragment case.
+ctest:      296/299 passed, 3 failed (12 skipped and 1 disabled)
+            d3d12_present fails in a -j 4 run but passes alone (1/1, 1.40 s).
+            loader_tls reports 7 TLS-check failures on this portable clang-cl/xwin build.
+            d3d12_execute_indirect_validation reports 5 WARP/hardware parity cases.
+Notes:
+- The standalone test programs and the full runtime were built from this checkout.
+  No machine-wide Visual Studio installation was used.
+- No game files, keys or proprietary data were used or included.
+- AI-assisted (Codex): ran the synthetic GPU suite native and with
+  LEONIDA_W64_EMULATE=1, then the full Windows ctest.

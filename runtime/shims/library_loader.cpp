@@ -12,6 +12,12 @@
 // registry doesn't serve returns NULL with ERROR_PROC_NOT_FOUND, as a real module would, and is logged once. Every
 // other module uses the same named shims as static imports, falling back to the host. Only images mapped by the
 // loader see these: they are bound through the registry, the runtime's own code calls the host directly.
+//
+// A module whose DLL is in LEONIDA_COMPAT_DIR comes first, as for static imports: LoadLibrary returns that DLL (the
+// handle the Loader's static imports use), GetModuleHandle returns it once loaded and NULL before, GetProcAddress on
+// it gives only its own exports, and FreeLibrary leaves it loaded. That holds for any name, ASCII or not, and for a
+// name with a directory only when it is the compat file itself; a DLL that Windows loaded from the folder as another
+// one's dependency counts too.
 #include <windows.h>
 
 #include <cstdio>
@@ -57,6 +63,16 @@ std::string narrow(const wchar_t* w) {
     std::string s;
     for (; w && *w; ++w) s += (*w < 0x80) ? static_cast<char>(*w) : '?';
     return s;
+}
+
+// An ANSI name widened through the code page, as LoadLibraryA does (empty for an empty name).
+std::wstring widen(const char* s) {
+    const int n = s && *s ? MultiByteToWideChar(CP_ACP, 0, s, -1, nullptr, 0) : 0;
+    if (n <= 1) return {};
+    std::wstring w(static_cast<size_t>(n), L'\0');
+    MultiByteToWideChar(CP_ACP, 0, s, -1, w.data(), n);
+    w.pop_back();  // the terminator
+    return w;
 }
 
 bool is_ascii(const wchar_t* w) {
@@ -139,6 +155,17 @@ namespace {
 constexpr DWORD kDataFileLoadFlags =
     LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE | LOAD_LIBRARY_AS_IMAGE_RESOURCE;
 
+// LEONIDA_COMPAT_DIR first, as for static imports (rt::Loader::resolve): a drop-in DLL owns its module, so a run-time
+// load gets the same Windows-loaded DLL, never the shim, and GetModuleHandle (`load` false) its handle once loaded.
+// Its handle is a real module handle. By the wide name, before the ASCII / wide split below, so a basename outside
+// ASCII reaches the folder too. `handled` when the folder claims the name.
+HMODULE compat_first(const std::wstring& name, bool load, DWORD flags, bool& handled) {
+    handled = false;
+    const std::wstring dll = module_name_w(name);
+    if (name.empty() || dll.empty()) return nullptr;
+    return reinterpret_cast<HMODULE>(compat_module(dll, name, load, static_cast<uint32_t>(flags), handled));
+}
+
 HMODULE load_shim_or_bundled(const std::string& path, DWORD flags, bool& handled) {
     handled = false;
     if (HMODULE h = owned_handle(path)) {
@@ -156,7 +183,8 @@ HMODULE load_shim_or_bundled(const std::string& path, DWORD flags, bool& handled
 HMODULE WINAPI load_library_a(LPCSTR name) {
     if (name) {
         bool handled = false;
-        HMODULE h = load_shim_or_bundled(name, 0, handled);
+        HMODULE h = compat_first(widen(name), true, 0, handled);
+        if (!handled) h = load_shim_or_bundled(name, 0, handled);
         if (handled) return h;
     }
     return LoadLibraryA(name);
@@ -175,7 +203,9 @@ HMODULE load_bundled_w(LPCWSTR name, DWORD flags, bool& handled) {
 HMODULE WINAPI load_library_w(LPCWSTR name) {
     if (name) {
         bool handled = false;
-        HMODULE h = ascii_basename(name) ? load_shim_or_bundled(narrow(name), 0, handled) : load_bundled_w(name, 0, handled);
+        HMODULE h = compat_first(name, true, 0, handled);
+        if (!handled)
+            h = ascii_basename(name) ? load_shim_or_bundled(narrow(name), 0, handled) : load_bundled_w(name, 0, handled);
         if (handled) return h;
     }
     return LoadLibraryW(name);
@@ -184,7 +214,8 @@ HMODULE WINAPI load_library_w(LPCWSTR name) {
 HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
     if (name && (flags & kDataFileLoadFlags) == 0) {
         bool handled = false;
-        HMODULE h = load_shim_or_bundled(name, flags, handled);
+        HMODULE h = compat_first(widen(name), true, flags, handled);
+        if (!handled) h = load_shim_or_bundled(name, flags, handled);
         if (handled) return h;
     }
     return LoadLibraryExA(name, file, flags);
@@ -193,17 +224,22 @@ HMODULE WINAPI load_library_ex_a(LPCSTR name, HANDLE file, DWORD flags) {
 HMODULE WINAPI load_library_ex_w(LPCWSTR name, HANDLE file, DWORD flags) {
     if (name && (flags & kDataFileLoadFlags) == 0) {
         bool handled = false;
-        HMODULE h = ascii_basename(name) ? load_shim_or_bundled(narrow(name), flags, handled)
-                                   : load_bundled_w(name, flags, handled);
+        HMODULE h = compat_first(name, true, flags, handled);
+        if (!handled)
+            h = ascii_basename(name) ? load_shim_or_bundled(narrow(name), flags, handled)
+                                     : load_bundled_w(name, flags, handled);
         if (handled) return h;
     }
     return LoadLibraryExW(name, file, flags);
 }
 
-// GetModuleHandle answers for an owned module as if it were loaded (the GDK may probe before it loads), and for any
+// GetModuleHandle answers for a LEONIDA_COMPAT_DIR module as Windows would (its handle once loaded, else NULL, never
+// the shim's pseudo-handle), for an owned module as if it were loaded (the GDK may probe before it loads), and for any
 // bundled package module already mapped by the native loader.
 HMODULE WINAPI get_module_handle_a(LPCSTR name) {
     if (name) {
+        bool compat = false;
+        if (HMODULE h = compat_first(widen(name), false, 0, compat); compat) return h;
         if (HMODULE h = owned_handle(name)) return h;
         const std::string dll = module_name(name);
         if (!dll.empty())
@@ -214,6 +250,8 @@ HMODULE WINAPI get_module_handle_a(LPCSTR name) {
 
 HMODULE WINAPI get_module_handle_w(LPCWSTR name) {
     if (name) {
+        bool compat = false;
+        if (HMODULE h = compat_first(name, false, 0, compat); compat) return h;
         if (ascii_basename(name)) {
             const std::string path = narrow(name);
             if (HMODULE h = owned_handle(path)) return h;
@@ -267,7 +305,9 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
         SetLastError(ERROR_PROC_NOT_FOUND);
         return nullptr;
     }
-    if (module) {
+    // A LEONIDA_COMPAT_DIR module's exports are its own: a name it lacks is not filled in from the shim of the same
+    // module name, as for its static imports.
+    if (module && !owns_compat_module_handle(module)) {
         const DWORD error = GetLastError();
         const std::string dll = host_module_name(module);
         void* shim = dll.empty() ? nullptr : find(dll, what);
@@ -280,6 +320,9 @@ FARPROC WINAPI get_proc_address(HMODULE module, LPCSTR name) {
 BOOL WINAPI free_library(HMODULE module) {
     if (pseudo(module)) return TRUE;   // owned modules are never unloaded
     if (owns_bundled_module_handle(module)) return TRUE;  // mapped modules stay live until ~Loader detaches them
+    // A run-time load of a LEONIDA_COMPAT_DIR module hands out the Loader's own reference, which static imports may
+    // be bound through: compat modules stay for the process lifetime.
+    if (owns_compat_module_handle(module)) return TRUE;
     return FreeLibrary(module);
 }
 

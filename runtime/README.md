@@ -111,15 +111,24 @@ bundled package DLLs and the host, and the DLL owns all of its module's imports:
 the unimplemented thunk, not to a shim, so one console DLL is never served by two implementations that do not share
 state. The binding is reported as `host`, and `[rt] compat: <dll> -> <path>` is printed once per DLL. A file in the
 folder that Windows refuses to load stops the run with the error code. Unset or empty: no change. The DLLs stay
-loaded for the process lifetime. Only static imports go through this step; a run-time `LoadLibrary` of the same name
-does not yet.
+loaded for the process lifetime. A run-time `LoadLibrary` of the same name (from a mapped image, through
+`shims/library_loader.cpp`) gets the same DLL and handle, ahead of the shim; `GetModuleHandle` answers it once loaded,
+`GetProcAddress` on it gives only its own exports, and `FreeLibrary` leaves it loaded. A file Windows refuses to load
+there fails that `LoadLibrary` with Windows' error instead of stopping the run. A name with a directory gets the
+compat DLL only when it is that file, any name outside ASCII is looked up as well, and `LoadLibraryEx` with
+`DONT_RESOLVE_DLL_REFERENCES` fails with `ERROR_NOT_SUPPORTED`, as for bundled DLLs. A DLL Windows loaded from the
+folder as another compat DLL's dependency is found by `GetModuleHandle` and `LoadLibrary` of its name, and
+`GetProcAddress` on it gives only its own exports. The folder's file names are listed once, when the loader starts:
+a file added during the run is not seen.
 
-It exists for drop-in implementations of console DLLs that have no shim here, such as the `AcpHal`, `chad`, `xapu`
-and `XCRDAPI` crates of [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) (GPL-3.0-or-later).
-Measured on the 1.0.2.1 executable at `867d922`: without the folder, `--dry-run` leaves 20 imports unimplemented
-(AcpHal 9, chad 5, xapu 5, XCRDAPI 1); with those four DLLs built from `f89e410`, it leaves 0, with the four
-package DLLs still mapped (`module=72`). Those DLLs run static initializers when Windows loads them, and with the
-defaults one of them hooks the process: the package DLLs mapped after it then fail to map. With
+It exists for drop-in implementations of console DLLs, such as the `AcpHal`, `chad`, `xapu` and `XCRDAPI` crates
+of [omonkeyz/xbox-emulator](https://github.com/omonkeyz/xbox-emulator) (GPL-3.0-or-later). All four modules now
+have a shim here as well (`shims/acphal.cpp`, `shims/xapu_queue.cpp` for `xapu.dll`, `shims/xapu_chad.cpp` for
+`chad.dll`, and `shims/dstorage.cpp` for `xcrdapi.dll`); a DLL in the folder replaces its module's shim, as above.
+Measured on the 1.0.2.1 executable at `867d922`, before those shims: without the folder, `--dry-run` leaves 20
+imports unimplemented (AcpHal 9, chad 5, xapu 5, XCRDAPI 1); with those four DLLs built from `f89e410`, it leaves 0,
+with the four package DLLs still mapped (`module=72`). Those DLLs run static initializers when Windows loads them,
+and with the defaults one of them hooks the process: the package DLLs mapped after it then fail to map. With
 `TOMBOX_GDK_EARLY=0 TOMBOX_GDK_RUNTIME=0 TOMBOX_OSHOST=0 TOMBOX_PAD=0 TOMBOX_TIMER_1MS=0` they map; their network
 guard stays on and denies all traffic. `loader_test` covers the step with a synthetic DLL (no game data).
 
@@ -286,7 +295,11 @@ Current limits, by design:
   (`shims/dstorage.cpp`, declarations in `shims/dstorage_xs_abi.h`). Files open through the `GAME:` mapping and the
   overlay; each queue reads file or memory ranges into memory in order on its own worker thread, inflating zlib
   requests (RFC 1950, `src/shader_library.h`'s inflater), and reports through status arrays, `ID3D12Fence` signals
-  and events. BCPack, swizzle and physical-page requests are not done yet.
+  and events. BCPack requests are decoded by `src/bcpack.cpp` (BC1, BC3, BC4, BC5, BC6H and BC7; BC2 requests fail
+  with `E_NOTIMPL` because no decoder is available yet), followed by the optional macro-unshuffle (swizzle), and
+  physical page numbers resolve through `xmem` when the request runs. These paths are on by default; with
+  `LEONIDA_DSTORAGE_EXTENDED=0`, requests that use BCPack, swizzle or physical page lists fail with `E_NOTIMPL`
+  when the queue processes them.
   See [docs/directstorage.md](../docs/directstorage.md) for the ABI evidence and what is unverified.
 
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
@@ -597,16 +610,20 @@ It prints counts only; on the 1.0.2.1 corpus all 26,503 containers resolve.
 own command line and turns its `exit` into the end of the run); CTest's `run_tiny_game` does that with a stand-in game.
 The game's `atexit` handlers and static destructors go to a table of the run's own (the CRT's process-wide one is
 shared with gta6rt): `exit` and a return from `main` run them newest first before the run ends, `_cexit` runs them and
-returns, and `_exit`, `quick_exit`, `ExitProcess` and `abort` skip them, as natively. `run_tiny_atexit` runs a stand-in
-program natively and through `--run` for each of those paths (and for `_exit` from a second thread during `exit`) and
-holds both to the Windows sequence (under Wine, whose CRT differs, a native difference is only reported). The
-executable's thread-local destructor callback (`_register_thread_local_exe_atexit_callback`) is kept by the run too:
-the host UCRT accepts one per process and fast-fails the second, and gta6rt's own startup registers the first. `exit`
-and `_cexit` call it once, as `(nullptr, DLL_PROCESS_DETACH, nullptr)`, before the atexit handlers, as the UCRT does,
-so the leaving thread's `thread_local` objects end before the static ones; `_exit`, `quick_exit`, `ExitProcess` and
-`abort` do not. Other threads' `thread_local` objects end through the loader's thread-detach notification, which calls
-the same function from the executable's TLS directory. `run_tiny_atexit` covers `exit` and `_cexit` with a
-`thread_local` object. `at_quick_exit` handlers are not covered (`quick_exit` runs none).
+returns, and `_exit`, `quick_exit`, `ExitProcess` and `abort` skip them, as natively. The game's `at_quick_exit`
+handlers (`_crt_at_quick_exit`) go to a second table of the run's own, which `quick_exit` runs newest first, and its
+thread-local destructor callback (`_register_thread_local_exe_atexit_callback`) is the run's too: `exit` and `_cexit`
+call it for the exiting thread before the `atexit` handlers, as the UCRT does. Registration and the cleanup of `exit`,
+`quick_exit` and `_cexit` (the thread-local callback, the table's drain and `_cexit`'s stream flush) hold one lock of
+the run's own, as the UCRT's exit lock: a second thread in `_cexit`, or registering during a drain, waits for it. A handler that lets a C++ exception escape ends the run as the UCRT's `terminate` would (exit code 3).
+`run_tiny_atexit` runs a stand-in program natively and through `--run` for each of those paths (and for `_exit`,
+`_cexit` and `at_quick_exit` from a second thread during a drain, and a handler that throws) and holds both to the
+Windows sequence (under Wine, whose CRT differs, a native difference is only reported). The thread-local destructor
+callback cannot stay with the host CRT: the host UCRT accepts one per process and fast-fails the second, and gta6rt's
+own startup registers the first. `exit` and `_cexit` call it as `(nullptr, DLL_PROCESS_DETACH, nullptr)`, so the
+leaving thread's `thread_local` objects end before the static ones; `_exit`, `quick_exit`, `ExitProcess` and `abort`
+do not. Other threads' `thread_local` objects end through the loader's thread-detach notification, which calls the
+same function from the executable's TLS directory.
 `run_tiny_frame` does it with a stand-in that imports `d3d12_xs.dll!D3D12XboxCreateDevice` and, with
 `LEONIDA_D3D12=vulkan`, clears a render target and reads it back on the Vulkan device: the loader, the game thread,
 the Xbox-ABI proxies and the device in one process (`test/fixtures/tiny_frame.cpp`; `test/check_tiny_frame.py` checks

@@ -1,0 +1,69 @@
+GPU:        Intel Iris Xe Graphics (Raptor Lake-P, Xe-LP / Gen12, PCI 8086:a7a0, integrated), Core i7-13700H
+Driver:     Intel 32.0.101.7092, Vulkan 1.4.323
+Subgroup:   8..32 (minSubgroupSize 8, maxSubgroupSize 32; default 32, requirable in the compute stage only)
+OS:         Windows 11 Pro 24H2 (build 26100.6584), D3D12 runtime 10.0.26100.5074
+Commit:     3aa975421 (main, 2026-11-24, after #571)
+Tools:      llvm-mc 23.1.6 (conda-forge llvm-tools, native Windows, AMDGPU target), SPIRV-Tools 2026.4 and
+            glslang 16.6.0 (conda-forge), CMake 4.3.1 + Ninja 1.13.2, MSVC 19.50.35728 (Build Tools 2026),
+            Python 3.14.10, Vulkan headers through -DLEONIDA_VULKAN_HEADERS_FETCH=ON (no Vulkan SDK installed)
+build.py:   284 shaders: 284 translated, 284 pass spirv-val (native and LEONIDA_W64_EMULATE=1);
+            283 of 283 with the four fallbacks below (ps_ij_computed is not built under the bary fallback)
+            wave64 VS/PS/GS on 32-wide subgroups: tier A: 11, tier B: 8, tier C: 13
+            not built: the six ms_* fixtures that need a DXBC container (run_gpu_tests.py builds them)
+check.py:   native:                 170 of 222 pass, 52 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  202 of 222 pass, 20 skipped, 0 failed
+            four fallbacks:         209 of 222 pass, 13 skipped, 0 failed
+run_gpu_tests.py: 261 shaders: 260 translated, 260 pass spirv-val
+            native:                 180/252 passed, 72 skipped, 0 failed
+            LEONIDA_W64_EMULATE=1:  211/252 passed, 41 skipped, 0 failed
+            four fallbacks:         224/252 passed, 28 skipped, 0 failed
+            ("four fallbacks" = LEONIDA_W64_EMULATE=1 LEONIDA_MESH_COMPUTE=1 LEONIDA_BARY_FALLBACK=1
+            LEONIDA_TEXOFF_FALLBACK=1, the path this GPU needs)
+ctest:      307 run (gameinput is disabled without SDL3): 281 passed, 17 skipped, 9 failed, in 391 s
+Failed:     GPU suite: none in any of the three configurations.
+            ctest, the same nine in two runs:
+            Only on this GPU (all five pass on the RTX 4060 Laptop of the same machine, NVIDIA 616.92):
+            - d3d12_clear_formats: 241 clears match WARP, 10 differ, all of them render-target clears of
+              R8G8B8A8_UNORM_SRGB and B8G8R8A8_UNORM_SRGB that come out one step low
+              (layer bb / WARP bc, layer 0c / WARP 0d, layer fe / WARP ff).
+            - d3d12_srgb_uav: the two sRGB RTV clears, the same step (texel bb 89 e1 ff, WARP bc 89 e1 ff);
+              the two UAV clears match WARP.
+            - d3d12_clear: "a NaN depth stays NaN": the layer clears to 0 where WARP keeps NaN (all 15 texels).
+              The 3D RTV, castable RTV and out-of-range depth cases of the same test match.
+            - d3d12_existing_heap: "vulkan slot-133 buffer line 219: SUCCEEDED(queue->Signal(fence.p, 1))";
+              the 8 OpenExistingHeapFromAddress cases against host WARP match.
+            - d3d12_buffer_tiles: "native D3D12 snapshot 1 tile 0: word 0 reads 0000000000, want 0x23456789
+              (16384 of 16384 words wrong)". It is the host side that reads zeros (old issue 9142 on a UHD 730,
+              and the Arc A770 record in #725).
+            On both GPUs of this machine, with the same messages:
+            - d3d12_vulkan_device: "line 5556: argument_mismatches <= 0"; its FORMAT_INFO (195), FORMAT_SUPPORT
+              (98), CheckFeatureSupport (43) and copy (75) comparisons all match the host.
+            - d3d12_texture_tiles: "alias tile 0 at (0,0): got 0x1cc0200, expected 0xcc020000" (line 239).
+            - d3d12_method_variants: "CreateReservedResource2, valid castable format on texture: ours 00000000,
+              host runtime 80070057".
+            - d3d12_root_args_validation: line 194, CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_BUNDLE) fails.
+Skipped:    GPU suite, native 72 = 16 documented "run by d3d12_*_test / w64_graphics.py" cases
+            + 31 compute tests that need a 64-wide subgroup (LEONIDA_W64_EMULATE=1 runs them and they pass)
+            + 6 mesh (no VK_EXT_mesh_shader; all six ms_* pass with LEONIDA_MESH_COMPUTE=1 and emulation)
+            + 5 shaderFloat64 (cs_div_fmas_f64, cs_div_fmas_f64_rt, cs_f64_add, ps_f64_mods, ps_f64_round)
+            + 4 barycentric (no VK_KHR_fragment_shader_barycentric; they pass with LEONIDA_BARY_FALLBACK=1)
+            + 3 VK_KHR_maintenance8 (they pass with LEONIDA_TEXOFF_FALLBACK=1)
+            + 3 shaderResourceMinLod (ps_texture_b_cl, ps_texture_cl, ps_texture_grad_cl_a16)
+            + 4 the device cannot run as written: ps_bitmask_perm (the fragment subgroup ran 16 wide),
+              ps_vcmpx_forms (fragment subgroups may run narrower than 32), ps_w64x_readlane (no 64-wide
+              fragment subgroup can be required), ps_ij_computed (no PerVertexKHR inputs).
+            With the four fallbacks 28 remain: the 16 "run by" cases, the 5 shaderFloat64, the 3
+            shaderResourceMinLod and the 4 the device cannot run as written.
+            ctest, 17 (no LEONIDA_GAME_DIR was set; the reasons were not collected): shader_library_corpus,
+            bink_decode, bink_abi, bink_play_headless, bink_audio, d3d12_boot_movie, d3d12_first_light,
+            fsr_dispatch, bvh_builder, vk_sync_validation, d3d12_queue_handover_two_queues,
+            d3d12_dxr_validation_khr, d3d12_sparse_queue_family_contract, d3d12_rgb9e5_rtv,
+            d3d12_conservative_tier3, d3d12_bindless_churn_validated, d3d12_mesh.
+Notes:
+- LEONIDA_VK_DEVICE=iris picks the iGPU over the RTX 4060 Laptop GPU and the three Dozen devices.
+- With the previous driver, Intel 31.0.101.4255 (Vulkan 1.3.240), the device reports shaderInt64 = false: on
+  867d922f0 run_gpu_tests.py gave 66/241 passed, 174 skipped (113 of them for shaderInt64) and 1 failed,
+  ps_ops8 (4096/4096 mismatches, first pixel got 0x0 0x7fffffff, want 0x80000000 0xbfffffff). Both are gone
+  with 101.7092. On that driver check.py also counted six exit-77 results as failures.
+- The four ctest failures that both GPUs share were not looked into further here.
+- No game files were used. AI-assisted: the runs and this record were made with a coding agent.

@@ -599,6 +599,11 @@ std::uintptr_t graphics_pipeline_id(ID3D12PipelineState* pipeline);
 // nothing). Compute: at SetPipelineState; graphics: at each draw, with the render-target slots it binds (bit per slot)
 // and whether it binds a depth buffer.
 void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool depth_bound);
+// A LEONIDA_STUB_PIPELINES compute or mesh stub that `device` (a command list's attached device; null: any) created,
+// without a pipeline and so without an id above: its dispatches or mesh draws record nothing. none for every other
+// PSO, including a stub of another device and a PSO of another implementation, whose draws stay recording errors.
+enum class StubPipelineKind : std::uint8_t { none, compute, mesh };
+StubPipelineKind stub_pipeline_kind(ID3D12PipelineState* pipeline, IUnknown* device);
 // What each stage of a Vulkan device's PSO asked for (src/subgroup_size.h), in creation order; null for another PSO.
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline);
 // The linked SPIR-V stage modules for a lazy pipeline (in recipe stages order); false when not a lazy pipeline.

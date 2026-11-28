@@ -5,10 +5,12 @@
 // The test prints which path each instruction took. No game files.
 #include <windows.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <initializer_list>
+#include <thread>
 #include <vector>
 
 #include "cpu_emulation.h"
@@ -334,10 +336,130 @@ void test_live(const ce::Host& host) {
     uint32_t marker = 0;
     check(run(wb, lines, &marker, &ex) && marker == 1, "clwb ran and execution continued after it");
     std::printf("clwb: %s\n", path(host.clwb));
+    if (!host.clwb) {
+        // Both sites were rewritten at their first #UD: CLFLUSHOPT (reg field 7) or the same-length NOP.
+        const auto rewritten = [&](int at) {
+            return (wb.mem[at] == 0xAE && (wb.mem[at + 1] & 0x38) == 0x38) ||
+                   (wb.mem[at] == 0x1F && (wb.mem[at + 1] & 0x38) == 0);
+        };
+        check(rewritten(4) && rewritten(8), "clwb sites rewritten in place");
+        check(wb.mem[10] == 0x01 && wb.mem[11] == 0x08, "the rewritten clwb keeps its SIB and displacement");
+        marker = 0;
+        check(run(wb, lines, &marker, &ex) && marker == 1, "the rewritten code runs again");
+    }
 
     // A #UD the handler does not know stays an illegal-instruction exception: ud2; ret
     Code ud({0x0F, 0x0B, 0xC3});
     check(!run(ud, nullptr, nullptr, &ex) && ex == STATUS_ILLEGAL_INSTRUCTION, "ud2 still faults");
+}
+
+// ---- CLWB rewritten in place, with the handler called on a made-up #UD ----
+// The #UD a CPU without CLWB raises is handed to the handler directly, so this runs on a host with CLWB too. A
+// thread whose #UD is handled after another thread rewrote the same site reads the new bytes: it must continue at
+// the site (the CPU runs the rewritten instruction), never pass the exception on. Each site is rewritten once.
+
+// The handler's answer to a #UD at `rip`, and the RIP it continues at; -2 when the handler itself faulted.
+LONG fake_ud(uint64_t rip, uint64_t* rip_after) {
+    EXCEPTION_RECORD record{};
+    record.ExceptionCode = DWORD(STATUS_ILLEGAL_INSTRUCTION);
+    record.ExceptionAddress = reinterpret_cast<void*>(rip);
+    CONTEXT context{};
+    context.Rip = rip;
+    EXCEPTION_POINTERS pointers{&record, &context};
+    __try {
+        const LONG r = ce::handler(&pointers);
+        *rip_after = context.Rip;
+        return r;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return -2;
+    }
+}
+
+bool call_at(const uint8_t* code, const void* in) {
+    __try {
+        reinterpret_cast<Fn>(const_cast<uint8_t*>(code))(in, nullptr);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+// clwb [rcx]; ret at `at` became CLFLUSHOPT [rcx] (reg field 7) or the NOP 0F 1F /0 with the same operand.
+bool clwb_rewritten(const uint8_t* at) {
+    return at[0] == 0x66 && at[1] == 0x0F && at[4] == 0xC3 && (at[3] & 0xC7) == 0x01 &&
+           ((at[2] == 0xAE && (at[3] & 0x38) == 0x38) || (at[2] == 0x1F && (at[3] & 0x38) == 0));
+}
+
+bool executable_read_only(const void* p) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    return VirtualQuery(p, &mbi, sizeof mbi) && mbi.Protect == PAGE_EXECUTE_READ;
+}
+
+void test_clwb_rewrite() {
+    char value[4]{};
+    if (GetEnvironmentVariableA("LEONIDA_CLWB_PATCH", value, sizeof(value)) > 0 && value[0] == '0') {
+        std::printf("clwb rewrite: skipped (LEONIDA_CLWB_PATCH=0)\n");
+        return;
+    }
+    constexpr int kSites = 2048, kStride = 8, kThreads = 16;
+    const std::size_t bytes = std::size_t(kSites + 1) * kStride;
+    auto* mem = static_cast<uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    check(mem != nullptr, "clwb rewrite: allocate the sites");
+    if (!mem) return;
+    for (int s = 0; s <= kSites; ++s) {  // clwb [rcx]; ret; int3 x3
+        const uint8_t site[kStride] = {0x66, 0x0F, 0xAE, 0x31, 0xC3, 0xCC, 0xCC, 0xCC};
+        std::memcpy(mem + std::size_t(s) * kStride, site, kStride);
+    }
+    DWORD old = 0;
+    VirtualProtect(mem, bytes, PAGE_EXECUTE_READ, &old);  // as the game's code: the handler must unprotect it
+    FlushInstructionCache(GetCurrentProcess(), mem, bytes);
+
+    // (a) The first #UD rewrites the site and continues at it, which then runs on any host.
+    uint8_t* const one = mem + std::size_t(kSites) * kStride;
+    const uint64_t rip = reinterpret_cast<uint64_t>(one);
+    const unsigned before = ce::clwb_sites().load();
+    uint64_t after = 0;
+    check(fake_ud(rip, &after) == EXCEPTION_CONTINUE_EXECUTION && after == rip,
+          "clwb rewrite: the first #UD continues at the site");
+    check(clwb_rewritten(one), "clwb rewrite: the site is rewritten, operand kept");
+    check(ce::clwb_sites().load() == before + 1, "clwb rewrite: the site is counted once");
+    check(executable_read_only(one), "clwb rewrite: the page is execute-read again");
+    alignas(64) static uint8_t line[64];
+    check(call_at(one, line), "clwb rewrite: the rewritten site runs");
+
+    // (b) A #UD handled after the site was rewritten (another thread's, in the game) continues at the site too.
+    after = 0;
+    check(fake_ud(rip, &after) == EXCEPTION_CONTINUE_EXECUTION && after == rip,
+          "clwb rewrite: a #UD on an already rewritten site continues at it");
+    check(ce::clwb_sites().load() == before + 1, "clwb rewrite: an already rewritten site is not counted again");
+
+    // (c) 16 threads take a #UD on each of 2048 fresh sites at once, in the same order so they meet on each site.
+    std::atomic<int> waiting{kThreads}, bad{0};
+    std::vector<std::thread> threads;
+    for (int t = 0; t < kThreads; ++t)
+        threads.emplace_back([&] {
+            waiting.fetch_sub(1);
+            while (waiting.load()) std::this_thread::yield();
+            for (int s = 0; s < kSites; ++s) {
+                const uint64_t at = reinterpret_cast<uint64_t>(mem + std::size_t(s) * kStride);
+                uint64_t continued = 0;
+                if (fake_ud(at, &continued) != EXCEPTION_CONTINUE_EXECUTION || continued != at) bad.fetch_add(1);
+            }
+        });
+    for (auto& t : threads) t.join();
+    if (bad.load()) std::fprintf(stderr, "clwb rewrite: %d of %d concurrent #UDs not continued at the site\n",
+                                 bad.load(), kThreads * kSites);
+    check(bad.load() == 0, "clwb rewrite: every concurrent #UD continues at its site");
+    const unsigned counted = ce::clwb_sites().load() - before - 1;
+    if (counted != unsigned(kSites)) std::fprintf(stderr, "clwb rewrite: %u sites counted for %d\n", counted, kSites);
+    check(counted == unsigned(kSites), "clwb rewrite: each concurrently hit site is counted once");
+    bool all = true;
+    for (int s = 0; s < kSites; ++s) all &= clwb_rewritten(mem + std::size_t(s) * kStride);
+    check(all, "clwb rewrite: every concurrently hit site is rewritten");
+    check(executable_read_only(mem) && executable_read_only(mem + bytes - 1),
+          "clwb rewrite: the pages are execute-read again");
+    std::printf("clwb rewrite: %d threads x %d sites\n", kThreads, kSites);
+    VirtualFree(mem, 0, MEM_RELEASE);
 }
 }  // namespace
 
@@ -350,6 +472,7 @@ int main() {
                 host.clwb);
     check(ce::install(), "install the handler");
     test_live(host);
+    test_clwb_rewrite();
     if (failures) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
         return 1;
