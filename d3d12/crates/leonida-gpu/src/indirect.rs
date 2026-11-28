@@ -2563,6 +2563,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// the host device.
     #[test]
     fn host_list_reuses_and_grows_scratch_across_submissions() {
+        let _pool_guard = crate::host::batch::INDIRECT_POOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(host) = super::host() else {
             return;
         };
@@ -2746,6 +2749,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// small record still runs.
     #[test]
     fn host_list_budget_starts_empty_at_each_submission() {
+        let _pool_guard = crate::host::batch::INDIRECT_POOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(host) = super::host() else {
             return;
         };
@@ -2931,6 +2937,9 @@ void main(uint3 g : SV_GroupID, uint i : SV_GroupIndex) {
     /// diagnostics build) no barrier names a state the buffer is not in.
     #[test]
     fn host_list_window_executions_need_no_barrier_of_their_own() {
+        let _pool_guard = crate::host::batch::INDIRECT_POOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let Some(host) = super::host() else {
             return;
         };
@@ -3482,6 +3491,9 @@ void main(uint3 g : SV_GroupID) {
         let Ok(list) = host.new_list() else {
             return;
         };
+        let _pool_guard = crate::host::batch::INDIRECT_POOL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let worker = compile_cs(&host.device, WORKER_CS).expect("worker shader must compile");
         let signature = one_argument(&host.device, 2, 12);
         let mut sources = Vec::new();
