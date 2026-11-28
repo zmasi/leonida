@@ -371,9 +371,11 @@ class JobsHandlingTest(unittest.TestCase):
                                     probe.assert_called_once_with("auto", mesh_compute=False)
                                     mock_preflight.assert_called_once_with(
                                         ["shaders"], os.path.abspath(work), False, None,
-                                        emulate=True, keep_emulated=True, fallbacks=(), jobs=6)
+                                        emulate=True, keep_emulated=True,
+                                        fallbacks=("--descriptor-hash=fnv1a_fmix32",), jobs=6)
                                     mock_shaders.assert_called_once_with(os.path.abspath(game), os.path.abspath(work), 6,
-                                                                         emulate=True, keep_emulated=True, fallbacks=())
+                                                                         emulate=True, keep_emulated=True,
+                                                                         fallbacks=("--descriptor-hash=fnv1a_fmix32",))
 
     def test_custom_jobs_forwarded_to_assets(self):
         with tempfile.TemporaryDirectory() as tmp:

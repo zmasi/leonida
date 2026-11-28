@@ -261,6 +261,17 @@ class FspxStage(unittest.TestCase):
         self.assertEqual(self.run_step(), [])
         self.assertFalse(os.path.exists(self.spirv))
 
+    def test_removed_dll_unpublishes_stale_pack_on_hash_change(self):
+        self.assertEqual(self.run_step(), ["fspx_unpack.py", "rdna2spirv.py"])
+        os.remove(self.dll)
+        flags = ("--descriptor-hash=fnv1a_fmix32",)
+        self.assertEqual(self.run_step(fallbacks=flags), [])
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "index.json")))
+        self.assertFalse(os.path.exists(os.path.join(self.spirv, "fspx_build.json")))
+        self.write_dll(program())
+        self.assertEqual(self.run_step(fallbacks=flags), ["fspx_unpack.py", "rdna2spirv.py"])
+        self.assertIn(flags[0], self.calls[1][1])
+
     def test_each_input_change_runs_it_again(self):
         self.run_step()
         self.assertEqual(self.run_step(signature="llvm-mc 24"), ["fspx_unpack.py", "rdna2spirv.py"])

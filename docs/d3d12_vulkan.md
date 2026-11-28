@@ -4930,12 +4930,11 @@ struct entry {               // 10 uints = 40 bytes
 ```
 
 - Hash: FNV-1a over the eight key dwords as dwords (not bytes): `h = 2166136261; h = (h ^ key[i]) * 16777619`.
-- Optional finalizer (`fnv1a_fmix32`): a module whose `index.json` meta says `"descriptor_hash": "fnv1a_fmix32"` runs
+- Finalizer (`fnv1a_fmix32`): a module whose `index.json` meta says `"descriptor_hash": "fnv1a_fmix32"` runs
   MurmurHash3's `fmix32` on that word before probing (`h ^= h >> 16; h *= 0x85EBCA6B; h ^= h >> 13; h *= 0xC2B2AE35;
-  h ^= h >> 16`, logical shifts). An absent key means bare `fnv1a`. `DescriptorTable` fixes one kind per table before its
-  first insert, taken from the modules' metas: all agree is that kind, mixed is the majority (the minority's lookups miss
-  to index 0), and `LEONIDA_DESCRIPTOR_HASH=fnv1a|fnv1a_fmix32` overrides. The two kinds' shared vectors are in
-  `runtime/test/descriptor_table_test.cpp`.
+  h ^= h >> 16`, logical shifts). An absent key means bare `fnv1a`. The two kinds' shared vectors are in
+  `runtime/test/descriptor_table_test.cpp`. How the builder and the runtime choose one kind for a device is below
+  ("Building and loading a pack").
 - Probe: `slot = (h + k) & mask` for `k = 0..7`; the first entry whose eight key dwords match yields its
   `index`; no match yields 0.
 - `kind` says which arrays that index is good for, because it was given out in the T#'s own dimension's index space
@@ -4966,6 +4965,27 @@ struct entry {               // 10 uints = 40 bytes
 - Inserts can come from several threads (view creation is often parallel). Serialise them with a mutex, or stage
   per-thread and merge at submit. The shader only reads the table, and D3D12 already forbids modifying a descriptor
   that an in-flight command list is using, so the same rule applies.
+
+**Building and loading a pack.** `make_game.py` defaults to `--descriptor-hash=fnv1a_fmix32` for the main
+shader pack and the FSPX, BVH, executable and pipeline-library sub-packs it builds; the standalone
+`tools/rdna2spirv.py` and the compute batch still default to bare `fnv1a`. The finalizer spreads keys with
+similar low bits over more slots: [@djrolfes reported](https://github.com/ProjectLeonida/mandy/issues/1608#issuecomment-7234980419)
+160 MiB of descriptor slots (4,194,304 slots, 25,415 entries) for legacy FNV-1a and 5 MiB (131,072 slots,
+31,926 entries) with fmix at the same checkpoint. The geometry budgets differed (2,048 MiB vs. 1,280 MiB), so
+this is an external observation, not an identical-settings benchmark. `--descriptor-hash=fnv1a` keeps the exact
+legacy flag set, so an otherwise up-to-date legacy build is reused as before; switching kinds reruns translation,
+not carving or disassembly of the main shaders. A build that omits the `shaders` stage does not convert
+existing packs.
+
+Before the table's first insert, the runtime chooses one hash for the whole device. It counts every census row
+in the main `index.json` and the optional `fspx`, `fspx_compute`, `fspx_gfx`, `bvh`, `exe` and `library`
+sub-indexes: absent, empty or unknown `descriptor_hash` metadata counts as legacy `fnv1a`, and a tie (or an
+empty census) also selects `fnv1a`. A mixed pack logs both counts and uses the majority. A minority module can probe
+the wrong slots and get fallback index 0. Rebuild every pack with the same hash. The builder refuses an
+incompatible `fspx_compute` or `fspx_gfx` index before rewriting its own packs (those two are externally
+supplied); regenerate that pack with the same hash or move it out of the shader directory.
+`LEONIDA_DESCRIPTOR_HASH=fnv1a|fnv1a_fmix32` overrides the runtime's choice only; it does not convert modules
+or make a mixed pack compatible.
 
 **Measured (D3D-56, `runtime/test/vk_descriptor_bench.cpp`).** Measured on an NVIDIA GeForce RTX 5080 (discrete, `0x10de:0x2c02`, subgroup 32, driver `NVIDIA 621.24`, Vulkan 1.4.357), Windows 11 Pro 26H2 (build 26300), revision `ec8ec4c9`, using 64-bit Vulkan GPU timestamps (`1.000 ns` period) against `leonida::DescriptorTable` (90% T# / 10% S#) with the exact `tools/rdna2spirv.py` `desc_probe` loop. Unless noted, dispatches run `4096 x 64` invocations x `64` iterations (`16.78M` single / `33.55M` T#+S# pair lookups); wave-uniform sweeps use `group_stride = iters` (`64`), `lane_stride = 0` so all distinct entries are visited (at 100k: `90,000` T#, `10,000` S#, `100,000` T#+S# pairs, `131,072` miss keys; `uniform_hot_tsharp` repeats `1` key and measures `2.6–4.4 us/1M` in `device_local`). This run includes `bc8e604`'s bounded slot relocation, so its 100k row is at the same `524,288`-slot geometry as the AMD RDNA3/RDNA4 tables below and directly comparable to them, and it refreshes an earlier pre-relocation RTX 5080 table. `device_local` and `host_device_local` are the median of 4 processes, `host_visible` one; every row is `timing_status=ok` with no dispatch auto-scaling:
 

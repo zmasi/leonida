@@ -7,8 +7,11 @@ Standard library only; no GPU, no Vulkan SDK, no game data: vulkaninfo and the t
     python -I tests/test_make_game_translator_flags.py
 """
 import argparse
+import contextlib
+import io
 import json
 import os
+from pathlib import Path
 import sys
 import tempfile
 import unittest
@@ -19,16 +22,19 @@ sys.path.insert(0, ROOT)
 import make_game  # noqa: E402
 
 ALL_FLAGS = ("--no-float-controls", "--bary-fallback", "--texel-offset-fallback", "--mesh-compute")
+FMIX_FLAGS = ("--descriptor-hash=fnv1a_fmix32",)
+LEGACY_ARG = "--descriptor-hash=fnv1a"
 
 
 class FallbackFlagsTest(unittest.TestCase):
     """fallback_flags(): the flags the parsed arguments ask for, in FALLBACK_FLAGS order."""
 
     def args_with(self, *flags):
-        return argparse.Namespace(**{attr: flag in flags for flag, attr in make_game.FALLBACK_FLAGS})
+        return argparse.Namespace(descriptor_hash="fnv1a",
+                                  **{attr: flag in flags for flag, attr in make_game.FALLBACK_FLAGS})
 
-    def test_none_by_default(self):
-        self.assertEqual(make_game.fallback_flags(self.args_with()), ())
+    def test_hash_defaults_even_without_a_namespace_attribute(self):
+        self.assertEqual(make_game.fallback_flags(argparse.Namespace()), FMIX_FLAGS)
 
     def test_each_flag_alone(self):
         for flag, _attr in make_game.FALLBACK_FLAGS:
@@ -97,6 +103,27 @@ class TranslateFallbacksTest(unittest.TestCase):
     def test_changing_fallbacks_discards_finished_shards(self):
         again = self.shards(fallbacks=("--mesh-compute", "--bary-fallback"), pre_parts=2)
         self.assertEqual(len(again), 2, again)       # the parts were translated with other flags
+
+    def test_switching_hash_discards_both_finished_shard_files(self):
+        legacy = make_game.fallback_flags(argparse.Namespace(descriptor_hash="fnv1a"))
+        default = make_game.fallback_flags(argparse.Namespace())
+        with tempfile.TemporaryDirectory() as folder:
+            spirv = Path(folder)
+            self.assertEqual(len(self.shards_in(folder, fallbacks=legacy)), 2)
+            for old, new in ((legacy, default), (default, legacy)):
+                with self.subTest(old=old, new=new):
+                    parts = [spirv / name for name in ("shard0.json", "index.part0.json",
+                                                       "shard1.json", "index.part1.json")]
+                    for part in parts:
+                        part.write_text("{}", encoding="utf-8")
+                    self.assertEqual(self.shards_in(folder, fallbacks=old), [])
+                    restarted = self.shards_in(folder, fallbacks=new)
+                    self.assertEqual(len(restarted), 2)
+                    for args in restarted:
+                        self.assertEqual(FMIX_FLAGS[0] in args, new == FMIX_FLAGS)
+                    self.assertFalse(any(part.exists() for part in parts))
+                    plan = json.loads((spirv / make_game.SHARD_PLAN).read_text(encoding="utf-8"))
+                    self.assertEqual(plan["fallbacks"], list(new))
 
 
 class FailedShardTest(unittest.TestCase):
@@ -186,17 +213,26 @@ class RecordedFlagsTest(unittest.TestCase):
         os.remove(os.path.join(self.spirv, "translator_flags.txt"))
         self.assertEqual(self.run_stage(fallbacks=("--bary-fallback",)), ["translate"])
 
+    def test_hash_reaches_all_builder_managed_substages(self):
+        with mock.patch.multiple(make_game, fspx_shaders=mock.DEFAULT, bvh_shaders=mock.DEFAULT,
+                                 library_shaders=mock.DEFAULT, exe_shaders=mock.DEFAULT) as stages:
+            self.run_stage(fallbacks=FMIX_FLAGS)
+            self.run_stage(fallbacks=())
+        for name, stage in stages.items():
+            with self.subTest(stage=name):
+                self.assertEqual([call.kwargs["fallbacks"] for call in stage.call_args_list], [FMIX_FLAGS, ()])
+
 
 class MainWiringTest(unittest.TestCase):
     """main() parses the fallback flags and hands the same tuple to preflight() and shaders()."""
 
     def run_main(self, *extra_argv, per_vertex=None, barycentric_fallback=None, max_push_constants=None,
-                 mesh_crash=False):
+                 mesh_crash=False, hash_args=(LEGACY_ARG,)):
         # An empty --out: main() reads the flags an existing translation was made with, and the default folder
         # is the user's own.
         out = tempfile.TemporaryDirectory()
         self.addCleanup(out.cleanup)
-        argv = ["make_game.py", "--stages", "shaders", "--out", out.name, "--no-tui", *extra_argv]
+        argv = ["make_game.py", "--stages", "shaders", "--out", out.name, "--no-tui", *hash_args, *extra_argv]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
                 mock.patch("make_game.choose_game", return_value=os.path.abspath("C:/dummy_game")), \
@@ -217,10 +253,10 @@ class MainWiringTest(unittest.TestCase):
         self.assertEqual(pre, ("--no-float-controls", "--bary-fallback", "--mesh-compute"))
         self.assertEqual(sh, pre)
 
-    def test_no_flags_by_default(self):
-        pre, sh = self.run_main()
-        self.assertEqual(pre, ())
-        self.assertEqual(sh, ())
+    def test_hash_default_and_explicit_choices_reach_both_stages(self):
+        self.assertEqual(self.run_main(hash_args=()), (FMIX_FLAGS,) * 2)
+        self.assertEqual(self.run_main(hash_args=FMIX_FLAGS), (FMIX_FLAGS,) * 2)
+        self.assertEqual(self.run_main(hash_args=(LEGACY_ARG,)), ((), ()))
 
     def test_f16_interp_fallback_follows_the_device(self):
         """On by itself where vk_subgroup_info says the GPU can't take PerVertexKHR inputs (MoltenVK), not where
@@ -318,7 +354,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
 
     AUTOMATIC = ("--f16-interp-fallback", "--pc-tail-ubo")
 
-    def build(self, *extra_argv, per_vertex, max_push_constants, mesh_crash=False):
+    def build(self, *extra_argv, per_vertex, max_push_constants, mesh_crash=False, hash_args=(LEGACY_ARG,)):
         """One `make_game.py --stages shaders` run: (the fallbacks of each translation it started, its log)."""
         translations, lines = [], []
 
@@ -335,7 +371,7 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
             self.touch(spirv, "index.json")
 
         argv = ["make_game.py", "--stages", "shaders", "--out", os.path.join(self.work, "out"),
-                "--work", self.work, *extra_argv]
+                "--work", self.work, "--no-tui", *hash_args, *extra_argv]
         with mock.patch.object(sys, "argv", argv), \
                 mock.patch("make_game.below_normal"), \
                 mock.patch("make_game.choose_game", return_value=os.path.join(self.work, "game")), \
@@ -397,6 +433,49 @@ class ProbeFailureKeepsAutomaticFlagsTest(RecordedFlagsTest):
         self.assertEqual(self.recorded(), "--no-float-controls --f16-interp-fallback")
         translations, _ = self.build(per_vertex=None, max_push_constants=None)
         self.assertEqual(translations, [("--f16-interp-fallback",)])
+
+    def build_hash(self, *args):
+        return self.build(hash_args=args, per_vertex=True, max_push_constants=256)[0]
+
+    def test_cli_hash_switch_retranslates_but_reuses_unchanged_legacy(self):
+        self.assertEqual(self.build_hash(LEGACY_ARG), [()])
+        os.remove(os.path.join(self.spirv, "translator_flags.txt"))
+        self.assertEqual(self.build_hash(LEGACY_ARG), [])
+        self.assertEqual(self.build_hash(), [FMIX_FLAGS])
+        self.assertEqual(self.recorded(), FMIX_FLAGS[0])
+        self.assertEqual(self.build_hash(*FMIX_FLAGS), [])
+        self.assertEqual(self.build_hash(LEGACY_ARG), [()])
+        self.assertEqual(self.recorded(), "")
+
+    def test_incompatible_external_pack_is_not_rewritten_or_mixed(self):
+        self.assertEqual(self.build_hash(LEGACY_ARG), [()])
+        main_index = Path(self.spirv) / "index.json"
+        old_index = main_index.read_bytes()
+        for folder, key in (("fspx_compute", "fspx_code_sha256"), ("fspx_gfx", "fssm_sha256")):
+            with self.subTest(folder=folder):
+                external = Path(self.spirv) / folder / "index.json"
+                external.parent.mkdir()
+                legacy = {"stage": "cs", key: "a" * 64, "descriptor_hash": "unknown"}
+                fmix = {**legacy, "descriptor_hash": "fnv1a_fmix32"}
+                external.write_text(json.dumps({"legacy": legacy}), encoding="utf-8-sig")
+                self.assertEqual(self.build_hash(LEGACY_ARG), [])
+                # A mix would fail with either choice; a majority is not compatibility.
+                external.write_text(json.dumps({"legacy": legacy, "fmix": fmix}), encoding="utf-8-sig")
+                old_external = external.read_bytes()
+                for options in ((), (LEGACY_ARG,)):
+                    with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+                        self.build_hash(*options)
+                    self.assertIn(str(external), err.getvalue())
+                    self.assertIn("Rebuild", err.getvalue())
+                    self.assertEqual(external.read_bytes(), old_external)
+                    self.assertEqual(main_index.read_bytes(), old_index)
+                    self.assertEqual(self.recorded(), "")
+                # Error-only rows do not participate in the runtime's census.
+                external.write_text(json.dumps({"fmix": fmix, "skipped": {"stage": "cs"}}), encoding="utf-8")
+                self.assertEqual(self.build_hash(), [FMIX_FLAGS])
+                self.assertEqual(self.build_hash(), [])
+                external.unlink()
+                self.assertEqual(self.build_hash(LEGACY_ARG), [()])
 
 
 if __name__ == "__main__":

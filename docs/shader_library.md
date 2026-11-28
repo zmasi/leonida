@@ -189,8 +189,16 @@ Run `tools/shader_library.py` with `--stages cs --disasm --jobs 2` and the carve
 kind-6 hashes with `--compute-hashes`. For an unpacked library with its input `index.json`, use the compute batch.
 
 ```sh
-python3 -I scripts/translate_pipeline_compute.py /path/to/unpacked --out /path/to/spirv/library --wave64-emulate
+python3 -I scripts/translate_pipeline_compute.py /path/to/unpacked --out /path/to/spirv/library \
+    --wave64-emulate --descriptor-hash=fnv1a_fmix32
 ```
+
+The example matches the `make_game.py` default. The standalone batch and `tools/rdna2spirv.py` default to bare
+`fnv1a`; pass `--descriptor-hash=fnv1a` instead when supplementing a legacy pack. Translate every sub-pack
+with the same hash as the main pack: the runtime picks [one hash for the whole descriptor
+table](d3d12_vulkan.md#51-descriptor-hash-table-details) from the modules' metadata. A module compiled for a
+different hash can miss a live key and return index 0. `make_game.py` refuses a mismatched `fspx_compute` or `fspx_gfx` index before
+rewriting its own packs.
 
 Use a dedicated output folder and a stable, trusted SPIRV-Tools installation on PATH. On Linux the two workers
 run at nice 19. Each has a 768 MiB address-space limit and uses one SPIRV-Tools process at a time (four processes

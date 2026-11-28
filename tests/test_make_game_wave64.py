@@ -337,7 +337,8 @@ class KeepEmulatedFlagTest(unittest.TestCase):
             keys = ("emulate", "keep_emulated", "fallbacks")
             self.assertEqual(tuple(preflight.call_args.kwargs[key] for key in keys),
                              tuple(sh.call_args.kwargs[key] for key in keys))
-            self.assertEqual(sh.call_args.kwargs["fallbacks"], ("--mesh-compute",) if mesh_compute else ())
+            expected = (("--mesh-compute",) if mesh_compute else ()) + ("--descriptor-hash=fnv1a_fmix32",)
+            self.assertEqual(sh.call_args.kwargs["fallbacks"], expected)
             return sh.call_args.kwargs["emulate"], sh.call_args.kwargs["keep_emulated"]
 
     def test_only_auto_keeps(self):
