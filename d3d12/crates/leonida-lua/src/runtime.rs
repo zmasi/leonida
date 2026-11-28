@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use leonida_menu::model::Value as MenuValue;
 use leonida_menu::mods::{ModItem, ModKind, ModPage};
 use leonida_menu::overlay::Cmd;
-use mlua::{Function, IntoLuaMulti, Lua, MultiValue};
+use mlua::{Function, IntoLuaMulti, Lua, MultiValue, Table};
 
 use crate::api;
 use crate::keys;
@@ -52,6 +52,7 @@ pub struct ModState {
     pub folder: PathBuf,
     /// Why it is off, once it is.
     pub error: Option<String>,
+    pub string_table: Option<Table>,
 }
 
 pub struct ItemDef {
@@ -103,6 +104,7 @@ impl Shared {
             return;
         }
         m.error = Some(why.to_owned());
+        m.string_table = None;
         let name = m.name.clone();
         self.platform
             .log(&name, &format!("disabled (the other mods go on): {why}"));
@@ -235,6 +237,7 @@ impl Runtime {
                 name: name.clone(),
                 folder: folder.to_path_buf(),
                 error: None,
+                string_table: None,
             });
             s.held.push(Vec::new());
             s.mods.len() - 1
@@ -264,6 +267,10 @@ impl Runtime {
         let code = std::fs::read(&path).map_err(|e| format!("cannot read {script}: {e}"))?;
         let env = api::build_env(&self.lua, &self.guard, &self.shared, idx, folder)
             .map_err(|e| format!("cannot set the mod up: {e}"))?;
+        let string_table = env.raw_get::<Table>("string").ok();
+        if let Some(m) = self.shared.borrow_mut().mods.get_mut(idx) {
+            m.string_table = string_table.clone();
+        }
         let function = self
             .lua
             .load(code)
@@ -279,17 +286,27 @@ impl Runtime {
             .into_function()
             .map_err(|e| e.to_string())?;
         self.guard.start(self.config.budget.load);
-        function.call::<()>(()).map_err(|e| e.to_string())
+        self.guard.set_active_string(string_table);
+        let res = function.call::<()>(()).map_err(|e| e.to_string());
+        self.guard.set_active_string(None);
+        res
     }
 
     /// Calls `function` for mod `idx` with `args`, within the call budget; an
     /// error switches the mod off.
     fn call(&self, idx: usize, function: &Function, args: impl IntoLuaMulti) {
-        if !self.shared.borrow().active(idx) {
-            return;
-        }
+        let string_table = {
+            let s = self.shared.borrow();
+            if !s.active(idx) {
+                return;
+            }
+            s.mods.get(idx).and_then(|m| m.string_table.clone())
+        };
         self.guard.start(self.config.budget.call);
-        if let Err(e) = function.call::<MultiValue>(args) {
+        self.guard.set_active_string(string_table);
+        let res = function.call::<MultiValue>(args);
+        self.guard.set_active_string(None);
+        if let Err(e) = res {
             self.shared.borrow_mut().disable(idx, &e.to_string());
         }
     }

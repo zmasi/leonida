@@ -1030,3 +1030,123 @@ fn the_example_mod_ships_disabled_and_runs_when_enabled() {
     assert!(log.iter().any(|l| l == "the F4 menu was opened"), "{log:?}");
     assert_eq!(status(&rt, "Example Lua mod"), Status::Running);
 }
+
+#[test]
+fn xpcall_handlers_do_not_run_after_the_time_budget_trips() {
+    let config = Config {
+        budget: Budget {
+            call: Duration::from_millis(50),
+            load: Duration::from_millis(200),
+        },
+    };
+    let xpcall_body_trip = r#"
+        leonida.on("frame", function()
+            local function nest(n)
+                if n == 0 then
+                    while true do end
+                end
+                xpcall(
+                    function() nest(n - 1) end,
+                    function(e)
+                        leonida.log("handler ran", n)
+                        for _ = 1, 100000 do end
+                    end
+                )
+            end
+            nest(8)
+        end)
+    "#;
+    let xpcall_handler_trip = r#"
+        leonida.on("frame", function()
+            local runs = 0
+            xpcall(
+                function() error("boom") end,
+                function()
+                    runs = runs + 1
+                    leonida.log("h_run", runs)
+                    local t0 = os.clock()
+                    while os.clock() - t0 < 0.25 do end
+                end
+            )
+        end)
+    "#;
+    let normal_xpcall = r#"
+        local ok, msg = xpcall(
+            function(x) error("plain:" .. x) end,
+            function(e) return "caught:" .. tostring(e) end,
+            7
+        )
+        local co = coroutine.create(function()
+            return xpcall(
+                function() return coroutine.yield("step1") end,
+                function(e) return e end
+            )
+        end)
+        local _, y1 = coroutine.resume(co)
+        local _, y2, y3 = coroutine.resume(co, "step2")
+        local bad_ok = pcall(xpcall, function() end, "not_a_fn")
+        leonida.log(ok, msg:find("caught:") ~= nil and msg:find("plain:7") ~= nil, y1, y2, y3, bad_ok)
+    "#;
+    let (_d, fake, mut rt) = rig_with(
+        &[
+            ("a_body", xpcall_body_trip),
+            ("b_handler", xpcall_handler_trip),
+            ("c_ok", normal_xpcall),
+        ],
+        config,
+    );
+    assert_eq!(fake.of("c_ok"), ["false true step1 true step2 false"]);
+
+    pass(&mut rt, 1);
+    for name in ["a_body", "b_handler"] {
+        assert!(
+            matches!(status(&rt, name), Status::Failed(w) if w.contains("time budget")),
+            "{name}: {:?}",
+            status(&rt, name)
+        );
+    }
+    assert!(
+        !fake.of("a_body").iter().any(|l| l.starts_with("handler ran")),
+        "xpcall error handler ran after budget tripped: {:?}",
+        fake.of("a_body")
+    );
+    assert_eq!(
+        fake.of("b_handler")
+            .iter()
+            .filter(|l| l.starts_with("h_run "))
+            .collect::<Vec<_>>(),
+        ["h_run 1"],
+        "xpcall re-entered handler after budget tripped inside handler: {:?}",
+        fake.of("b_handler")
+    );
+}
+
+#[test]
+fn string_methods_use_each_mods_own_string_table_and_hide_dump() {
+    let a = r#"
+        leonida.log("dump", type(("").dump), (pcall(function() return (""):dump(function() end) end)))
+        string.shout = function(s) return s:upper() .. "!" end
+        string.rep = function(s, n) return "A:" .. n end
+        local log = leonida.log
+        leonida.on("frame", function()
+            log("frame_a", ("hi"):shout(), ("x"):rep(3))
+        end)
+        leonida.log("load_a", ("hi"):shout(), ("x"):rep(3), load("return ('yo'):shout()")())
+    "#;
+    let b = r#"
+        local log = leonida.log
+        leonida.on("frame", function()
+            log("frame_b", type(("hi").shout), ("x"):rep(3), type(("").dump))
+        end)
+        leonida.log("load_b", type(("hi").shout), ("x"):rep(3), type(("").dump))
+    "#;
+    let (_d, fake, mut rt) = rig(&[("a", a), ("b", b)]);
+    assert_eq!(status(&rt, "a"), Status::Running, "{:?}", fake.of("a"));
+    assert_eq!(status(&rt, "b"), Status::Running, "{:?}", fake.of("b"));
+    assert_eq!(fake.of("a"), ["dump nil false", "load_a HI! A:3 YO!"]);
+    assert_eq!(fake.of("b"), ["load_b nil xxx nil"]);
+
+    pass(&mut rt, 1);
+    assert_eq!(fake.of("a"), ["dump nil false", "load_a HI! A:3 YO!", "frame_a HI! A:3"]);
+    assert_eq!(fake.of("b"), ["load_b nil xxx nil", "frame_b nil xxx nil"]);
+}

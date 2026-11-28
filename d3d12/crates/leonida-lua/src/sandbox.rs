@@ -15,7 +15,7 @@
 //! that loops or allocates without end; `pcall` and the like cannot swallow
 //! the budget's error.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -46,12 +46,14 @@ impl Default for Budget {
     }
 }
 
-/// The state's guard: the moment the running call must end by, and whether it
-/// went past it.
+/// The state's guard: the moment the running call must end by, whether it
+/// went past it, and how strings find the running mod's `string` table.
 #[derive(Clone)]
 pub struct Guard {
     deadline: Rc<Cell<Instant>>,
     tripped: Rc<Cell<bool>>,
+    active_string: Rc<RefCell<Option<Table>>>,
+    env_strings: Table,
 }
 
 impl Guard {
@@ -59,6 +61,11 @@ impl Guard {
     pub fn start(&self, limit: Duration) {
         self.tripped.set(false);
         self.deadline.set(Instant::now() + limit);
+    }
+
+    /// Sets the fallback `string` table for callbacks that capture no `_ENV`.
+    pub fn set_active_string(&self, table: Option<Table>) {
+        *self.active_string.borrow_mut() = table;
     }
 
     /// Time spent in a native function (a scan) does not count against the call.
@@ -83,9 +90,41 @@ pub fn new_lua() -> Result<(Lua, Guard)> {
         LuaOptions::default(),
     )?;
     lua.set_memory_limit(MEMORY_LIMIT)?;
+    let base_string: Table = lua.globals().get("string")?;
+    base_string.set("dump", Value::Nil)?;
+    let fallback_string = copy_table(&lua, &base_string, None, &["dump"])?;
+    let env_strings = lua.create_table()?;
+    let weak = lua.create_table()?;
+    weak.set("__mode", "k")?;
+    let _ = env_strings.set_metatable(Some(weak));
+    let active_string: Rc<RefCell<Option<Table>>> = Rc::new(RefCell::new(None));
+    let map_for_mt = env_strings.clone();
+    let active_for_mt = active_string.clone();
+    let mt: Table = lua.load("return getmetatable('')").eval()?;
+    mt.set(
+        "__index",
+        lua.create_function(move |lua, (_s, key): (Value, Value)| {
+            for level in 1..64 {
+                let Some(env) = lua.inspect_stack(level, |d| d.function().environment()) else {
+                    break;
+                };
+                if let Some(env) = env
+                    && let Value::Table(own) = map_for_mt.raw_get::<Value>(env)?
+                {
+                    return own.get::<Value>(key);
+                }
+            }
+            if let Some(own) = active_for_mt.borrow().clone() {
+                return own.get::<Value>(key);
+            }
+            fallback_string.get::<Value>(key)
+        })?,
+    )?;
     let guard = Guard {
         deadline: Rc::new(Cell::new(Instant::now() + Duration::from_secs(3600))),
         tripped: Rc::new(Cell::new(false)),
+        active_string,
+        env_strings,
     };
     let watch = guard.clone();
     lua.set_global_hook(
@@ -190,12 +229,22 @@ pub fn mod_env(lua: &Lua, guard: &Guard, print: impl Fn(&str) + 'static) -> Resu
         }
         Ok(args)
     })?;
+    let watch_trip = guard.clone();
+    let tripped = lua.create_function(move |_, ()| Ok(watch_trip.tripped()))?;
     let co: Table = env.get("coroutine")?;
     let (pcall, xpcall, resume) = lua
         .load(
-            "local pcall, xpcall, resume, check = ...
+            "local pcall, xpcall, resume, check, tripped = ...
              return function(f, ...) return check(pcall(f, ...)) end,
-                    function(f, h, ...) return check(xpcall(f, h, ...)) end,
+                    function(f, h, ...)
+                        if type(h) ~= 'function' then
+                            return check(xpcall(f, h, ...))
+                        end
+                        return check(xpcall(f, function(err)
+                            if tripped() then return err end
+                            return h(err)
+                        end, ...))
+                    end,
                     function(c, ...) return check(resume(c, ...)) end",
         )
         .set_name("=sandbox")
@@ -204,14 +253,19 @@ pub fn mod_env(lua: &Lua, guard: &Guard, print: impl Fn(&str) + 'static) -> Resu
             env.get::<Function>("xpcall")?,
             co.get::<Function>("resume")?,
             check,
+            tripped,
         ))?;
     env.set("pcall", pcall)?;
     env.set("xpcall", xpcall)?;
     co.set("resume", resume)?;
 
     // The string metatable is shared by every string: a mod sees a copy that
-    // points at its own `string` table.
+    // points at its own `string` table, and string method syntax resolves
+    // through `guard.env_strings` to that same table.
     let own_string: Table = env.get("string")?;
+    guard.env_strings.raw_set(env.clone(), own_string.clone())?;
+    let own_for_load = own_string.clone();
+    let map_for_load = guard.env_strings.clone();
     let original: Function = env.get("getmetatable")?;
     env.set(
         "getmetatable",
@@ -273,11 +327,20 @@ pub fn mod_env(lua: &Lua, guard: &Guard, print: impl Fn(&str) + 'static) -> Resu
                     }
                 };
                 let name = name.unwrap_or_else(|| "=(load)".to_owned());
+                let chosen = match env {
+                    Some(custom) => {
+                        if matches!(map_for_load.raw_get::<Value>(custom.clone())?, Value::Nil) {
+                            map_for_load.raw_set(custom.clone(), own_for_load.clone())?;
+                        }
+                        custom
+                    }
+                    None => target.clone(),
+                };
                 let compiled = lua
                     .load(source)
                     .set_name(name)
                     .set_mode(ChunkMode::Text)
-                    .set_environment(env.unwrap_or_else(|| target.clone()))
+                    .set_environment(chosen)
                     .into_function();
                 Ok(match compiled {
                     Ok(f) => (Value::Function(f), None),
