@@ -22,12 +22,12 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, c_char, c_void};
 use std::os::windows::fs::FileExt;
 use std::os::windows::io::FromRawHandle;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
+use std::sync::{Condvar, Mutex, MutexGuard, OnceLock, RwLock};
 
 use leonida_formats::bcpack::{self, Tables};
 
@@ -48,6 +48,9 @@ const E_OUTOFMEMORY: HRESULT = 0x8007_000E_u32 as i32;
 const END_OF_FILE: HRESULT = 0x8007_0026_u32 as i32;
 /// `HRESULT_FROM_WIN32(ERROR_INVALID_DATA)`: a bad compressed stream.
 const INVALID_DATA: HRESULT = 0x8007_000D_u32 as i32;
+const FILE_NOT_OPEN: HRESULT = 0x8924_000B_u32 as i32;
+const INVALID_FILE_HANDLE: HRESULT = 0x8924_0017_u32 as i32;
+const ERROR_RECORD_BYTES: usize = 656;
 
 type Out = *mut *mut c_void;
 
@@ -87,11 +90,17 @@ impl<T> Instance<T> {
 }
 
 extern "system" fn add_ref_instance<T>(this: *const Instance<T>) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
     // SAFETY: an instance we created and the title still holds.
     unsafe { &*this }.refs.fetch_add(1, Ordering::Relaxed) + 1
 }
 
 extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
     // SAFETY: as above.
     let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
     if left == 0 {
@@ -99,6 +108,96 @@ extern "system" fn release<T>(this: *mut Instance<T>) -> u32 {
         drop(unsafe { Box::from_raw(this) });
     }
     left
+}
+
+/// Live `Instance<File>` addresses created by [`open_file`], so requests and
+/// `IDStorageFileX` calls reject foreign or already-released pointers instead
+/// of dereferencing them.
+static LIVE_FILES: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+
+extern "system" fn add_ref_file(this: *const Instance<File>) -> u32 {
+    let Some(file) = live_file(this.cast()) else {
+        return 0;
+    };
+    // SAFETY: `file` holds a live reference; leak it to transfer ownership to
+    // the caller and read back the updated count.
+    let raw = file.0;
+    std::mem::forget(file);
+    unsafe { &*raw }.refs.load(Ordering::Relaxed)
+}
+
+extern "system" fn release_file(this: *mut Instance<File>) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    let key = this as usize;
+    let left = {
+        let mut live = LIVE_FILES.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(set) = live.as_mut() else {
+            return 0;
+        };
+        if !set.contains(&key) {
+            return 0;
+        }
+        // SAFETY: `key` is registered in `LIVE_FILES` and has not reached 0 yet.
+        let left = unsafe { &*this }.refs.fetch_sub(1, Ordering::AcqRel) - 1;
+        if left == 0 {
+            set.remove(&key);
+        }
+        left
+    };
+    if left == 0 {
+        WALLS_FILES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(addr, _)| *addr != key);
+        // SAFETY: the last reference; created by `Instance::create` in `open_file`.
+        drop(unsafe { Box::from_raw(this) });
+    }
+    left
+}
+
+/// An owned reference to a live [`Instance<File>`].
+struct FileRef(*mut Instance<File>);
+
+// SAFETY: `Instance<File>` is refcounted and synchronized internally.
+unsafe impl Send for FileRef {}
+// SAFETY: as above.
+unsafe impl Sync for FileRef {}
+
+impl FileRef {
+    fn state(&self) -> &File {
+        // SAFETY: `FileRef` holds a live reference count on `self.0`.
+        &unsafe { &*self.0 }.state
+    }
+}
+
+impl Drop for FileRef {
+    fn drop(&mut self) {
+        release_file(self.0);
+    }
+}
+
+fn live_file(ptr: *const c_void) -> Option<FileRef> {
+    if ptr.is_null() {
+        return None;
+    }
+    let key = ptr as usize;
+    let live = LIVE_FILES.lock().unwrap_or_else(|e| e.into_inner());
+    if !live.as_ref().is_some_and(|s| s.contains(&key)) {
+        return None;
+    }
+    // SAFETY: `key` is in `LIVE_FILES`, which `release_file` removes under the
+    // same lock when `refs` hits 0.
+    let refs = &unsafe { &*ptr.cast::<Instance<File>>() }.refs;
+    let mut r = refs.load(Ordering::Relaxed);
+    while r != 0 {
+        match refs.compare_exchange_weak(r, r + 1, Ordering::Acquire, Ordering::Relaxed) {
+            Ok(_) => return Some(FileRef(ptr.cast_mut().cast())),
+            Err(now) => r = now,
+        }
+    }
+    None
 }
 
 fn iid_text(iid: *const Guid) -> String {
@@ -122,7 +221,7 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     const GENERIC_READ: u32 = 0x8000_0000;
     const FILE_SHARE_READ: u32 = 1;
     const OPEN_EXISTING: u32 = 3;
-    if path.is_null() {
+    if path.is_null() || out.is_null() {
         return E_INVALIDARG;
     }
     // Goes through `files`, so paths on our virtual drives work too.
@@ -150,10 +249,26 @@ extern "system" fn open_file(_: Factory, path: *const u16, iid: *const Guid, out
     // SAFETY: a handle we just opened and nobody else owns.
     let file = unsafe { std::fs::File::from_raw_handle(handle) };
     let files = Files::new(file, Io::chosen());
-    let file = Instance::create(Object::new("dstorage file", &FILE_VTABLE), File { files, name: kept.clone() });
+    let file = Instance::create(
+        Object::new("dstorage file", &FILE_VTABLE),
+        File {
+            files: RwLock::new(Some(files)),
+            open: Mutex::new(FileOpen {
+                closed: false,
+                pending: 0,
+            }),
+            idle: Condvar::new(),
+            name: kept.clone(),
+        },
+    );
     if stream_log::on() {
         stream_log::line(format_args!("F\t{:x}\t{kept}", file as usize));
     }
+    LIVE_FILES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashSet::new)
+        .insert(file as usize);
     WALLS_FILES.lock().unwrap_or_else(|e| e.into_inner()).push((file as usize, kept));
     put(out, file)
 }
@@ -166,6 +281,9 @@ extern "system" fn create_status_array(
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
+    if out.is_null() {
+        return E_INVALIDARG;
+    }
     tracing::info!(
         capacity,
         name = text(name),
@@ -182,8 +300,18 @@ extern "system" fn create_status_array(
 }
 
 /// The queue's description: as in 2020 (source type, capacity, priority,
-/// name), plus a field the title sets to 1.
+/// name), plus `DSTORAGE_QUEUE_OPTIONS` (the title sets `AutoSubmitDisabled` = 1).
 #[repr(C)]
+#[derive(Clone, Copy)]
+struct QueueDesc0 {
+    source_type: u64,
+    capacity: u16,
+    priority: i8,
+    name: *const c_char,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct QueueDesc {
     source_type: u64,
     capacity: u16,
@@ -192,16 +320,42 @@ struct QueueDesc {
     unknown: u64,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QueueInfo {
+    desc: QueueDesc0,
+    empty_slot_count: u16,
+    request_count_until_auto_submit: u16,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct QueueInfo1 {
+    desc: QueueDesc,
+    empty_slot_count: u16,
+    request_count_until_auto_submit: u16,
+}
+
+const _: () = {
+    assert!(size_of::<QueueDesc0>() == 24);
+    assert!(size_of::<QueueDesc>() == 32);
+    assert!(size_of::<QueueInfo>() == 32);
+    assert!(size_of::<QueueInfo1>() == 40);
+    assert!(std::mem::offset_of!(QueueInfo, empty_slot_count) == 24);
+    assert!(std::mem::offset_of!(QueueInfo1, empty_slot_count) == 32);
+};
+
 extern "system" fn create_queue(
     _: Factory,
     desc: *const QueueDesc,
     iid: *const Guid,
     out: Out,
 ) -> HRESULT {
-    // SAFETY: the title passes its description (null tolerated).
-    let Some(desc) = (unsafe { desc.as_ref() }) else {
+    if desc.is_null() || out.is_null() {
         return E_INVALIDARG;
-    };
+    }
+    // SAFETY: checked non-null; read unaligned from caller memory.
+    let desc = unsafe { desc.read_unaligned() };
     let name = text(desc.name);
     tracing::info!(
         source = desc.source_type,
@@ -218,12 +372,12 @@ extern "system" fn create_queue(
     let mut lanes = scheduler.lock();
     let id = lanes.next_id;
     lanes.next_id += 1;
-    let lane = Lane::new(desc.priority, desc.capacity);
+    let lane = Lane::new(desc.priority, desc.capacity, desc.unknown);
     lanes.lanes.insert(id, lane);
     drop(lanes);
     put(
         out,
-        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id }),
+        Instance::create(Object::new("dstorage queue", &QUEUE_VTABLE), Queue { id, desc }),
     )
 }
 
@@ -277,9 +431,57 @@ static FACTORY_VTABLE: Methods<16> = Methods([
 // Files.
 
 struct File {
-    files: Files,
+    files: RwLock<Option<Files>>,
+    open: Mutex<FileOpen>,
+    idle: Condvar,
     /// The path the title opened it by (Leonida: the button prompt movie is found by archive and offset).
     name: String,
+}
+
+struct FileOpen {
+    closed: bool,
+    pending: u32,
+}
+
+/// A submitted request's active read lease on a [`File`], keeping `Close()`
+/// waiting until the request finishes or its queue closes.
+struct SubmittedFile(FileRef);
+
+impl SubmittedFile {
+    fn state(&self) -> &File {
+        self.0.state()
+    }
+}
+
+impl Drop for SubmittedFile {
+    fn drop(&mut self) {
+        self.0.state().end_submitted();
+    }
+}
+
+impl File {
+    fn begin_submitted(file: FileRef) -> Result<SubmittedFile, FileRef> {
+        let closed = {
+            let mut open = file.state().open.lock().unwrap_or_else(|e| e.into_inner());
+            if !open.closed {
+                open.pending += 1;
+            }
+            open.closed
+        };
+        if closed {
+            Err(file)
+        } else {
+            Ok(SubmittedFile(file))
+        }
+    }
+
+    fn end_submitted(&self) {
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        open.pending -= 1;
+        if open.pending == 0 {
+            self.idle.notify_all();
+        }
+    }
 }
 
 /// How files are read (`LEONIDA_DSTORAGE_IO`).
@@ -441,7 +643,10 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     /// Read at a time.
     const MOST: usize = 1 << 20;
     let sector = SECTOR as u64;
-    if offset % sector == 0 && out.len() % SECTOR == 0 && out.as_ptr() as usize % SECTOR == 0 {
+    if offset.is_multiple_of(sector)
+        && out.len().is_multiple_of(SECTOR)
+        && (out.as_ptr() as usize).is_multiple_of(SECTOR)
+    {
         return read_overlapped(file, out, offset);
     }
     thread_local! {
@@ -459,12 +664,67 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     })
 }
 
+/// Waits for submitted reads on `this` to finish, then closes its OS handles.
+/// Unsubmitted or later requests fail with `FILE_NOT_OPEN`.
+extern "system" fn close_file(this: *const Instance<File>) {
+    let Some(file) = live_file(this.cast()) else {
+        return;
+    };
+    {
+        let mut open = file.state().open.lock().unwrap_or_else(|e| e.into_inner());
+        open.closed = true;
+        while open.pending != 0 {
+            open = file
+                .state()
+                .idle
+                .wait(open)
+                .unwrap_or_else(|e| e.into_inner());
+        }
+    }
+    let closed_files = file
+        .state()
+        .files
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .take();
+    drop(closed_files);
+}
+
+/// Returns a fresh caller-owned `HANDLE` (`ReOpenFile`), or
+/// `INVALID_HANDLE_VALUE` once the file is closed.
+extern "system" fn file_get_handle(this: *const Instance<File>) -> *mut c_void {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{
+        ERROR_INVALID_HANDLE, GENERIC_READ, INVALID_HANDLE_VALUE, SetLastError,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, ReOpenFile};
+
+    let Some(file) = live_file(this.cast()) else {
+        // SAFETY: Win32 thread-local error code.
+        unsafe { SetLastError(ERROR_INVALID_HANDLE) };
+        return INVALID_HANDLE_VALUE;
+    };
+    if file.state().open.lock().unwrap_or_else(|e| e.into_inner()).closed {
+        // SAFETY: as above.
+        unsafe { SetLastError(ERROR_INVALID_HANDLE) };
+        return INVALID_HANDLE_VALUE;
+    }
+    let guard = file.state().files.read().unwrap_or_else(|e| e.into_inner());
+    let Some(files) = guard.as_ref() else {
+        // SAFETY: as above.
+        unsafe { SetLastError(ERROR_INVALID_HANDLE) };
+        return INVALID_HANDLE_VALUE;
+    };
+    // SAFETY: `files.first` is open while `guard` is held.
+    unsafe { ReOpenFile(files.first.as_raw_handle(), GENERIC_READ, FILE_SHARE_READ, 0) }
+}
+
 static FILE_VTABLE: Methods<8> = Methods([
     missing::<0> as *const (),
-    add_ref_instance::<File> as *const (),
-    release::<File> as *const (),
-    missing::<3> as *const (),
-    missing::<4> as *const (),
+    add_ref_file as *const (),    // 0x08
+    release_file as *const (),    // 0x10
+    close_file as *const (),      // 0x18
+    file_get_handle as *const (), // 0x20
     missing::<5> as *const (),
     missing::<6> as *const (),
     missing::<7> as *const (),
@@ -484,6 +744,9 @@ type Array = *mut Instance<StatusArray>;
 /// The result of the requests before entry `index`: pending, the first
 /// failure, or success.
 extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
+    if this.is_null() {
+        return E_INVALIDARG;
+    }
     // SAFETY: an array we created and the title still holds.
     let entries = &unsafe { &*this }.state.entries;
     entries
@@ -494,6 +757,9 @@ extern "system" fn status_result(this: Array, index: u32) -> HRESULT {
 /// The title polls this (entry 0, a `Sleep(1)` loop) and never
 /// reads the result itself.
 extern "system" fn is_complete(this: Array, index: u32) -> bool {
+    if this.is_null() {
+        return true;
+    }
     let done = status_result(this, index) != E_PENDING;
     if done && stream_log::on() {
         // SAFETY: as above.
@@ -515,9 +781,10 @@ static STATUS_VTABLE: Methods<5> = Methods([
 
 // Queues.
 
-/// A queue object: its lane in the scheduler.
+/// A queue object: its lane in the scheduler and creation description.
 struct Queue {
     id: u64,
+    desc: QueueDesc,
 }
 
 impl Drop for Queue {
@@ -572,22 +839,23 @@ struct Lanes {
 struct Lane {
     class: usize,
     capacity: usize,
+    options: u64,
     /// Bytes started, for round robin among the lanes of a class.
     clock: u64,
     /// Enqueued, not yet submitted.
     unsubmitted: Vec<Command>,
-    /// Submitted, by sequence number: reads not started, status entries
-    /// not written, reads running, and failures not yet reported.
+    /// Submitted, by sequence number: reads not started, status/event
+    /// notifications not fired, reads running, and failures not yet reported.
     reads: VecDeque<(u64, Read)>,
-    statuses: VecDeque<(u64, Status)>,
+    notifications: VecDeque<(u64, Notification)>,
     running: BTreeSet<u64>,
     failures: BTreeMap<u64, HRESULT>,
     closed: bool,
 }
 
-// SAFETY: requests point into title memory and our own objects, which stay
-// valid until the title has seen them complete; status arrays count their
-// references atomically.
+// SAFETY: requests point into title memory and our own refcounted objects,
+// which stay valid until completion; status arrays and file instances count
+// their references atomically, and duplicated event handles are owned alone.
 unsafe impl Send for Lane {}
 
 /// A read a worker runs.
@@ -595,6 +863,7 @@ struct Job {
     lane: u64,
     seq: u64,
     request: Request,
+    file: FileSource,
     note: Note,
     staging: u64,
 }
@@ -778,7 +1047,7 @@ pub(crate) mod stream_log {
 fn work(scheduler: &'static Scheduler) {
     let mut lanes = scheduler.lock();
     loop {
-        let Some(job) = lanes.start() else {
+        let Some(mut job) = lanes.start() else {
             lanes = scheduler.work.wait(lanes).unwrap_or_else(|e| e.into_inner());
             continue;
         };
@@ -786,13 +1055,16 @@ fn work(scheduler: &'static Scheduler) {
         let started = std::time::Instant::now();
         let traced = Traced::start(&job);
         let reading = leonida_gpu::timeline::span("streaming: a request");
-        let result = execute(&job.request);
+        let result = execute_job(&job.request, &job.file);
         reading.end();
         walls_request(&job.request, &result, started);
         stream_log::request(&job, started, &result);
         if let Some(traced) = traced {
             traced.end(&job, &result);
         }
+        // Release the file lease outside `scheduler.lanes` and after
+        // `walls_request` has read `WALLS_FILES`.
+        job.file = FileSource::Memory;
         lanes = scheduler.lock();
         lanes.finish(&job, result);
         lanes.count(&job, started);
@@ -848,14 +1120,13 @@ impl Lanes {
             .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
-        let &(seq, Read { request, note }) = lane.reads.front()?;
-        let staging = staging_bytes(&request);
+        let staging = staging_bytes(&lane.reads.front()?.1.request);
         if self.staged > 0 && self.staged + staging > self.staging {
             self.starved = true;
             self.refused += 1;
             return None;
         }
-        lane.reads.pop_front();
+        let (seq, Read { request, file, note }) = lane.reads.pop_front()?;
         lane.running.insert(seq);
         self.staged += staging;
         let size = u64::from(request.destination_size.max(request.source_size)).max(1);
@@ -867,6 +1138,7 @@ impl Lanes {
             lane: id,
             seq,
             request,
+            file,
             note,
             staging,
         })
@@ -910,10 +1182,16 @@ impl Lanes {
             self.next_seq += 1;
             match command {
                 Command::Read(mut read) => {
+                    read.file = read.file.submit();
                     read.note.submitted(&read.request, early);
                     lane.reads.push_back((seq, read));
                 }
-                Command::Status(status) => lane.statuses.push_back((seq, status)),
+                Command::Status(status) => {
+                    lane.notifications.push_back((seq, Notification::Status(status)));
+                }
+                Command::Event(event) => {
+                    lane.notifications.push_back((seq, Notification::Event(event)));
+                }
             }
         }
         lane.flush();
@@ -921,47 +1199,63 @@ impl Lanes {
 }
 
 impl Lane {
-    fn new(priority: i8, capacity: u16) -> Lane {
+    fn new(priority: i8, capacity: u16, options: u64) -> Lane {
         Lane {
             class: priority.clamp(-1, 1).wrapping_add(1) as usize,
             capacity: usize::from(capacity),
+            options,
             clock: 0,
             unsubmitted: Vec::new(),
             reads: VecDeque::new(),
-            statuses: VecDeque::new(),
+            notifications: VecDeque::new(),
             running: BTreeSet::new(),
             failures: BTreeMap::new(),
             closed: false,
         }
     }
 
-    /// Requests and status entries held, submitted or not.
+    /// Requests and notifications held, submitted or not.
     fn entries(&self) -> usize {
-        self.unsubmitted.len() + self.reads.len() + self.statuses.len() + self.running.len()
+        self.unsubmitted.len() + self.reads.len() + self.notifications.len() + self.running.len()
     }
 
-    /// Writes the status entries whose earlier reads have all finished.
+    /// Fires status and event entries in queue order once their earlier reads
+    /// have all finished.
     fn flush(&mut self) {
-        while let Some(&(seq, _)) = self.statuses.front() {
+        use windows_sys::Win32::System::Threading::SetEvent;
+        while let Some(&(seq, _)) = self.notifications.front() {
             let waiting = self.reads.front().map(|r| r.0);
             if waiting.into_iter().chain(self.running.first().copied()).any(|s| s < seq) {
                 return;
             }
-            let Some((_, status)) = self.statuses.pop_front() else {
+            let Some((_, notification)) = self.notifications.pop_front() else {
                 return;
             };
-            let later = self.failures.split_off(&seq);
-            let first = std::mem::replace(&mut self.failures, later)
-                .into_values()
-                .next();
-            if stream_log::on() {
-                let at = stream_log::now();
-                stream_log::line(format_args!("S\t{:x}\t{seq}\t{}\t{at}", status.array as usize, status.enqueued));
-                status.written().store(at, Ordering::Relaxed);
+            match notification {
+                Notification::Status(status) => {
+                    let later = self.failures.split_off(&seq);
+                    let first = std::mem::replace(&mut self.failures, later)
+                        .into_values()
+                        .next();
+                    if stream_log::on() {
+                        let at = stream_log::now();
+                        stream_log::line(format_args!(
+                            "S\t{:x}\t{seq}\t{}\t{at}",
+                            status.array as usize, status.enqueued
+                        ));
+                        status.written().store(at, Ordering::Relaxed);
+                    }
+                    status
+                        .entry()
+                        .store(first.unwrap_or(S_OK), Ordering::Release);
+                }
+                Notification::Event(event) => {
+                    if !event.0.is_null() {
+                        // SAFETY: a duplicated Win32 event handle owned by `event`.
+                        unsafe { SetEvent(event.0) };
+                    }
+                }
             }
-            status
-                .entry()
-                .store(first.unwrap_or(S_OK), Ordering::Release);
         }
     }
 }
@@ -989,9 +1283,9 @@ fn close_lane(id: u64) {
         return;
     };
     lane.closed = true;
-    lane.unsubmitted.clear();
-    lane.reads.clear();
-    lane.statuses.clear(); // releases their arrays
+    let unsubmitted = std::mem::take(&mut lane.unsubmitted);
+    let reads = std::mem::take(&mut lane.reads);
+    let notifications = std::mem::take(&mut lane.notifications);
     while lanes.lanes.get(&id).is_some_and(|l| !l.running.is_empty()) {
         lanes = scheduler
             .finished
@@ -1000,6 +1294,8 @@ fn close_lane(id: u64) {
     }
     lanes.lanes.remove(&id);
     scheduler.finished.notify_all();
+    drop(lanes);
+    drop((unsubmitted, reads, notifications));
 }
 
 /// A read request as the title builds it, 0x48 bytes.
@@ -1040,12 +1336,68 @@ const PAGE: usize = 64 * 1024;
 enum Command {
     Read(Read),
     Status(Status),
+    Event(EventHandle),
 }
 
-/// An enqueued request, and what the trace knows of it.
-#[derive(Clone, Copy)]
+enum Notification {
+    Status(Status),
+    Event(EventHandle),
+}
+
+/// A duplicated Win32 event handle owned by an enqueued `EnqueueSetEvent`.
+struct EventHandle(*mut c_void);
+
+// SAFETY: a Win32 kernel handle duplicated for this process.
+unsafe impl Send for EventHandle {}
+
+impl Drop for EventHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: duplicated by `DuplicateHandle` and owned solely here.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+}
+
+/// Validated source backing for a [`Read`] request.
+enum FileSource {
+    Memory,
+    Null,
+    Invalid,
+    Live(FileRef),
+    Submitted(SubmittedFile),
+    Closed(#[allow(dead_code)] FileRef),
+}
+
+impl FileSource {
+    fn from_request(request: &Request) -> FileSource {
+        if request.options & MEMORY_SOURCE != 0 {
+            FileSource::Memory
+        } else if request.source.is_null() {
+            FileSource::Null
+        } else {
+            match live_file(request.source) {
+                Some(file) => FileSource::Live(file),
+                None => FileSource::Invalid,
+            }
+        }
+    }
+
+    fn submit(self) -> FileSource {
+        match self {
+            FileSource::Live(file) => match File::begin_submitted(file) {
+                Ok(submitted) => FileSource::Submitted(submitted),
+                Err(closed) => FileSource::Closed(closed),
+            },
+            other => other,
+        }
+    }
+}
+
+/// An enqueued request, its validated file lease, and what the trace knows of it.
 struct Read {
     request: Request,
+    file: FileSource,
     note: Note,
 }
 
@@ -1123,7 +1475,7 @@ fn trace_batch(queue: u64, commands: &[Command], early: bool) {
     let reads = || {
         commands.iter().filter_map(|c| match c {
             Command::Read(read) => Some(read),
-            Command::Status(_) => None,
+            Command::Status(_) | Command::Event(_) => None,
         })
     };
     let (mut to_pages, mut filled, mut empty) = (0, 0, 0);
@@ -1268,15 +1620,20 @@ impl Status {
 }
 
 extern "system" fn enqueue_request(this: QueueRef, request: *const Request) {
-    // SAFETY: the title passes its request (null tolerated).
-    let Some(&request) = (unsafe { request.as_ref() }) else {
+    if this.is_null() || request.is_null() {
         return;
-    };
+    }
+    // SAFETY: checked non-null; copied before returning to the title.
+    let request = unsafe { request.read_unaligned() };
+    let file = FileSource::from_request(&request);
     let note = Note::enqueued(&request);
-    queue(this, Command::Read(Read { request, note }));
+    queue(this, Command::Read(Read { request, file, note }));
 }
 
 extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
+    if this.is_null() {
+        return;
+    }
     // SAFETY: the title passes an array we created (null tolerated).
     let Some(entries) = (unsafe { array.as_ref() }).map(|a| &a.state.entries) else {
         return;
@@ -1289,6 +1646,114 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     add_ref_instance(array);
     let enqueued = stream_log::now();
     queue(this, Command::Status(Status { array, index, enqueued }));
+}
+
+extern "system" fn enqueue_set_event(this: QueueRef, handle: *mut c_void) {
+    use windows_sys::Win32::Foundation::{
+        DUPLICATE_SAME_ACCESS, DuplicateHandle, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    if this.is_null() {
+        return;
+    }
+    let mut dup = std::ptr::null_mut();
+    // Reject null and pseudo-handles (`INVALID_HANDLE_VALUE` == -1 ==
+    // `GetCurrentProcess()`, `GetCurrentThread()` == -2) before duplicating.
+    if !handle.is_null() && handle != INVALID_HANDLE_VALUE && (handle as isize) > 0 {
+        // SAFETY: duplicating a caller-supplied kernel handle within our own
+        // process; invalid handles fail cleanly leaving `dup` null.
+        let ok = unsafe {
+            let process = GetCurrentProcess();
+            DuplicateHandle(process, handle, process, &mut dup, 0, 0, DUPLICATE_SAME_ACCESS)
+        };
+        if ok == 0 {
+            dup = std::ptr::null_mut();
+        }
+    }
+    queue(this, Command::Event(EventHandle(dup)));
+}
+
+/// Returns null (`nullptr`), `IDStorageQueueX::GetErrorEvent`'s failure
+/// sentinel, rather than `missing`'s `E_NOTIMPL` (`0x80004001`) pseudo-handle.
+extern "system" fn get_error_event(_: QueueRef) -> *mut c_void {
+    std::ptr::null_mut()
+}
+
+/// Clears `DSTORAGE_ERROR_RECORD` (`FailureCount = 0`, `CommandType = NONE`)
+/// so callers never read uninitialized stack bytes from this `void` method.
+extern "system" fn retrieve_error_record(_: QueueRef, record: *mut u8) {
+    if record.is_null() {
+        return;
+    }
+    let mut empty = [0u8; ERROR_RECORD_BYTES];
+    empty[12..16].copy_from_slice(&(-1i32).to_le_bytes());
+    // SAFETY: checked non-null; `DSTORAGE_ERROR_RECORD` is 656 bytes.
+    unsafe { std::ptr::copy_nonoverlapping(empty.as_ptr(), record, ERROR_RECORD_BYTES) };
+}
+
+fn queue_info1(this: QueueRef) -> Option<QueueInfo1> {
+    if this.is_null() {
+        return None;
+    }
+    // SAFETY: a queue instance created by `create_queue`.
+    let q = &unsafe { &*this }.state;
+    let usable = usize::from(q.desc.capacity.saturating_sub(1));
+    let (used, unsubmitted, closed) = match scheduler() {
+        Some(scheduler) => {
+            let lanes = scheduler.lock();
+            match lanes.lanes.get(&q.id) {
+                Some(lane) => (lane.entries(), lane.unsubmitted.len(), lane.closed),
+                None => (0, 0, true),
+            }
+        }
+        None => (0, 0, true),
+    };
+    let empty_slot_count = usable.saturating_sub(used) as u16;
+    let auto_submit = !closed && half_submits() && q.desc.unknown & 1 == 0;
+    let half = (usize::from(q.desc.capacity) / 2).max(1);
+    let request_count_until_auto_submit = if auto_submit {
+        half.saturating_sub(unsubmitted) as u16
+    } else {
+        0
+    };
+    Some(QueueInfo1 {
+        desc: q.desc,
+        empty_slot_count,
+        request_count_until_auto_submit,
+    })
+}
+
+extern "system" fn query(this: QueueRef, info: *mut QueueInfo) {
+    if info.is_null() {
+        return;
+    }
+    let Some(full) = queue_info1(this) else {
+        return;
+    };
+    let out = QueueInfo {
+        desc: QueueDesc0 {
+            source_type: full.desc.source_type,
+            capacity: full.desc.capacity,
+            priority: full.desc.priority,
+            name: full.desc.name,
+        },
+        empty_slot_count: full.empty_slot_count,
+        request_count_until_auto_submit: full.request_count_until_auto_submit,
+    };
+    // SAFETY: checked non-null; `write_unaligned` avoids alignment assumptions.
+    unsafe { info.write_unaligned(out) };
+}
+
+extern "system" fn query1(this: QueueRef, info: *mut QueueInfo1) {
+    if info.is_null() {
+        return;
+    }
+    let Some(full) = queue_info1(this) else {
+        return;
+    };
+    // SAFETY: checked non-null; `write_unaligned` avoids alignment assumptions.
+    unsafe { info.write_unaligned(full) };
 }
 
 /// Whether a queue submits itself once half of it is enqueued
@@ -1311,15 +1776,20 @@ fn half_submits() -> bool {
 /// that is full of commands nobody submitted submits itself, since nothing
 /// else could make room.
 fn queue(this: QueueRef, command: Command) {
+    if this.is_null() {
+        return;
+    }
     // SAFETY: a queue we created and the title still holds.
     let id = unsafe { &*this }.state.id;
     let Some(scheduler) = scheduler() else {
         return;
     };
+    // Bound before `lanes` so an early return drops `lanes` first, then `command`.
+    let mut command = Some(command);
     let mut lanes = scheduler.lock();
     loop {
         let Some(lane) = lanes.lanes.get(&id).filter(|l| !l.closed) else {
-            return; // closed: dropped (a status releases its array)
+            return; // closed: dropped outside `lanes`
         };
         // One slot stays free, as the console's count of empty slots says.
         if lane.entries() + 1 < lane.capacity.max(2) {
@@ -1343,8 +1813,10 @@ fn queue(this: QueueRef, command: Command) {
     let Some(lane) = lanes.lanes.get_mut(&id) else {
         return;
     };
-    lane.unsubmitted.push(command);
-    if half_submits() && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
+    if let Some(cmd) = command.take() {
+        lane.unsubmitted.push(cmd);
+    }
+    if half_submits() && lane.options & 1 == 0 && lane.unsubmitted.len() >= (lane.capacity / 2).max(1) {
         lanes.submit(id, true);
         scheduler.work.notify_all();
     }
@@ -1354,6 +1826,9 @@ fn queue(this: QueueRef, command: Command) {
 /// the pages are mapped just before, also those under addresses without a
 /// list (memory only the CPU sees).
 extern "system" fn submit(this: QueueRef) {
+    if this.is_null() {
+        return;
+    }
     let _called = leonida_gpu::timeline::span("the title's DirectStorage Submit");
     // SAFETY: as above.
     let id = unsafe { &*this }.state.id;
@@ -1371,12 +1846,21 @@ extern "system" fn submit(this: QueueRef) {
 /// completes, and this returns once the reads already running have
 /// finished. The title calls this, not `Release`.
 extern "system" fn close(this: QueueRef) {
+    if this.is_null() {
+        return;
+    }
     // SAFETY: as above.
     close_lane(unsafe { &*this }.state.id);
 }
 
-/// Reads, inflates and/or unpacks, and writes one request.
+#[cfg(test)]
 fn execute(request: &Request) -> Result<(), HRESULT> {
+    let source = FileSource::from_request(request).submit();
+    execute_job(request, &source)
+}
+
+/// Reads, inflates and/or unpacks, and writes one request.
+fn execute_job(request: &Request, file_source: &FileSource) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1395,14 +1879,29 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
     if options & !(ZLIB | BCPACK | PAGE_DESTINATION | MEMORY_SOURCE) != 0 {
         return Err(fail(E_NOTIMPL, "unsupported options"));
     }
-    if request.source.is_null() || request.destination.is_null() {
-        return Err(fail(E_INVALIDARG, "no source or destination"));
+    if request.destination.is_null() {
+        return Err(fail(E_INVALIDARG, "no destination"));
     }
+    let submitted_file = match file_source {
+        FileSource::Memory => {
+            if request.source.is_null() {
+                return Err(fail(E_INVALIDARG, "no source"));
+            }
+            None
+        }
+        FileSource::Null => return Err(fail(E_INVALIDARG, "no file")),
+        FileSource::Invalid | FileSource::Live(_) => {
+            return Err(fail(INVALID_FILE_HANDLE, "invalid file handle"));
+        }
+        FileSource::Closed(_) => return Err(fail(FILE_NOT_OPEN, "file closed")),
+        FileSource::Submitted(file) => Some(file.state()),
+    };
     let bc = ((options & BCPACK) >> 1) as u8;
     let size = request.destination_size as usize;
     // Leonida: the button prompt movie, while a PlayStation pad is in use (`glyphs`).
     if options & (ZLIB | BCPACK | MEMORY_SOURCE) == ZLIB
-        && let Some(movie) = glyph_movie(request)
+        && let Some(file) = submitted_file
+        && let Some(movie) = glyph_movie(request, file)
     {
         return into_destination(request, size, |out| {
             let n = movie.len().min(out.len());
@@ -1416,11 +1915,13 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        return into_destination(request, size, |out| {
+            read_into(request, submitted_file, out).map(|()| size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
-    let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
+    let source = read_source(request, submitted_file).map_err(|hr| fail(hr, "reading the source"))?;
     // The console's order: zlib first, then BCPack.
     let source = if bc != 0 && options & ZLIB != 0 {
         let mut packed = vec![0; request.intermediate_size as usize];
@@ -1446,10 +1947,13 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
 }
 
 /// The replacement for the title's button prompt movie, when this request reads it.
-fn glyph_movie(request: &Request) -> Option<&'static [u8]> {
-    // SAFETY: a file object we created; the title keeps it open.
-    let file = unsafe { &*request.source.cast::<Instance<File>>() };
-    super::glyphs::replacement(&file.state.name, request.offset, request.destination_size, super::gameinput::active_family)
+fn glyph_movie(request: &Request, file: &File) -> Option<&'static [u8]> {
+    super::glyphs::replacement(
+        &file.name,
+        request.offset,
+        request.destination_size,
+        super::gameinput::active_family,
+    )
 }
 
 /// Inflates a zlib stream into `out`, returning the bytes written. A stream
@@ -1541,7 +2045,7 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 
 /// A compressed request's source: borrowed from memory, or read from the
 /// file.
-fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
+fn read_source(request: &Request, file: Option<&File>) -> Result<Cow<'static, [u8]>, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `size` bytes until completion.
@@ -1549,7 +2053,7 @@ fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
         return Ok(Cow::Borrowed(bytes));
     }
     let mut bytes = vec![0; size];
-    read_into(request, &mut bytes)?;
+    read_into(request, file, &mut bytes)?;
     Ok(Cow::Owned(bytes))
 }
 
@@ -1560,23 +2064,29 @@ static READING: AtomicU64 = AtomicU64::new(0);
 const READ_RETRIES: u32 = 8;
 
 /// Fills `out` (the source size) from the request's file or memory.
-fn read_into(request: &Request, out: &mut [u8]) -> Result<(), HRESULT> {
+fn read_into(request: &Request, file: Option<&File>, out: &mut [u8]) -> Result<(), HRESULT> {
     if request.options & MEMORY_SOURCE != 0 {
         // SAFETY: the title's source holds `out.len()` bytes until completion.
         out.copy_from_slice(unsafe { std::slice::from_raw_parts(request.source.cast(), out.len()) });
         return Ok(());
     }
-    // SAFETY: a file object we created; the title keeps it open.
-    let files = &unsafe { &*request.source.cast::<Instance<File>>() }
-        .state
-        .files;
+    let Some(file) = file else {
+        return Err(INVALID_FILE_HANDLE);
+    };
     let started = std::time::Instant::now();
     let (mut done, mut tries) = (0, 0);
     let result = loop {
         if done == out.len() {
             break Ok(());
         }
-        let error = match files.read_at(&mut out[done..], request.offset + done as u64) {
+        let attempt = {
+            let guard = file.files.read().unwrap_or_else(|e| e.into_inner());
+            let Some(files) = guard.as_ref() else {
+                break Err(FILE_NOT_OPEN);
+            };
+            files.read_at(&mut out[done..], request.offset + done as u64)
+        };
+        let error = match attempt {
             Ok(0) => break Err(END_OF_FILE),
             Ok(n) => {
                 done += n;
@@ -1757,21 +2267,22 @@ fn page_list(list: *const usize, offset: usize, len: usize) -> Vec<usize> {
     pages
 }
 
-/// Slots by the 2020 order, which the argument shapes at
-/// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
-static QUEUE_VTABLE: Methods<12> = Methods([
+/// Slots in `IDStorageQueueX2` order (`0x00..=0x68`).
+static QUEUE_VTABLE: Methods<14> = Methods([
     missing::<0> as *const (),
     add_ref_instance::<Queue> as *const (),
     release::<Queue> as *const (),
-    enqueue_request as *const (), // 0x18
-    enqueue_status as *const (),  // 0x20
-    missing::<5> as *const (),    // 0x28 (2020: fence signal)
-    submit as *const (),          // 0x30
-    missing::<7> as *const (),    // 0x38 (2020: cancel by tag)
-    close as *const (),           // 0x40
-    missing::<9> as *const (),    // 0x48 (2020: error event)
-    missing::<10> as *const (),   // 0x50 (2020: error record)
-    missing::<11> as *const (),   // 0x58 (2020: queue info)
+    enqueue_request as *const (),       // 0x18
+    enqueue_status as *const (),        // 0x20
+    missing::<5> as *const (),          // 0x28 (fence signal)
+    submit as *const (),                // 0x30
+    missing::<7> as *const (),          // 0x38 (cancel by tag)
+    close as *const (),                 // 0x40
+    get_error_event as *const (),       // 0x48
+    retrieve_error_record as *const (), // 0x50
+    query as *const (),                 // 0x58
+    enqueue_set_event as *const (),     // 0x60
+    query1 as *const (),                // 0x68
 ]);
 
 pub(crate) fn module() -> HleModule {
@@ -2166,7 +2677,7 @@ mod tests {
         for round in 0..2 {
             for mode in [Io::One, Io::Handles, Io::Overlapped, Io::Direct] {
                 let file = Files::open_for_test(&path, mode);
-                let at: Vec<u64> = (0..READS).map(|_| random() % (len - SIZE as u64) & !15).collect();
+                let at: Vec<u64> = (0..READS).map(|_| (random() % (len - SIZE as u64)) & !15).collect();
                 for pass in ["cold", "again"] {
                     let next = std::sync::atomic::AtomicUsize::new(0);
                     let busy = AtomicU64::new(0);
@@ -2247,15 +2758,19 @@ mod tests {
         (r.destination_size, r.source_size) = (size, size);
         let lane = lanes.lanes.get_mut(&id).unwrap();
         let note = Note::default();
-        lane.unsubmitted.push(Command::Read(Read { request: r, note }));
+        lane.unsubmitted.push(Command::Read(Read {
+            request: r,
+            file: FileSource::Null,
+            note,
+        }));
     }
 
     #[test]
     fn priorities_share_by_bytes_about_tenfold() {
         let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 4096));
-        l.lanes.insert(1, Lane::new(1, 4096));
-        l.lanes.insert(2, Lane::new(2, 4096)); // real-time: as high
+        l.lanes.insert(0, Lane::new(0, 4096, 1));
+        l.lanes.insert(1, Lane::new(1, 4096, 1));
+        l.lanes.insert(2, Lane::new(2, 4096, 1)); // real-time: as high
         for _ in 0..400 {
             for id in 0..3 {
                 read(&mut l, id, 0, 4096);
@@ -2277,7 +2792,7 @@ mod tests {
     #[test]
     fn staging_bounds_compressed_bytes_in_flight() {
         let mut l = lanes(100);
-        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(0, Lane::new(0, 64, 1));
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, ZLIB, 60);
         read(&mut l, 0, 0, 1000); // raw: straight to its destination
@@ -2299,7 +2814,7 @@ mod tests {
     #[test]
     fn a_status_waits_for_every_earlier_read() {
         let mut l = lanes(STAGING);
-        l.lanes.insert(0, Lane::new(0, 64));
+        l.lanes.insert(0, Lane::new(0, 64, 1));
         let array = status_array(2).cast::<Instance<StatusArray>>();
         let status = |index| {
             add_ref_instance(array);
@@ -2571,5 +3086,214 @@ mod tests {
         assert_eq!(inflate(&bad_body, &mut out), Err(INVALID_DATA));
         assert_eq!(inflate(&packed, &mut out), Ok(plain.len()));
         assert_eq!(out, plain);
+    }
+
+    #[test]
+    fn queue_x2_and_file_vtable_slots_follow_the_console_abi() {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT};
+        use windows_sys::Win32::Storage::FileSystem::ReadFile;
+        use windows_sys::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+        #[repr(C)]
+        struct AbiQueueInfo {
+            source_type: u64,
+            capacity: u16,
+            priority: i8,
+            name: *const c_char,
+            empty_slot_count: u16,
+            request_count_until_auto_submit: u16,
+        }
+
+        #[repr(C)]
+        struct AbiQueueInfo1 {
+            source_type: u64,
+            capacity: u16,
+            priority: i8,
+            name: *const c_char,
+            options: u64,
+            empty_slot_count: u16,
+            request_count_until_auto_submit: u16,
+        }
+
+        assert_eq!(size_of::<AbiQueueInfo>(), 32);
+        assert_eq!(size_of::<AbiQueueInfo1>(), 40);
+
+        let contents = pattern(4096);
+        let (_dir, file) = file_with(&contents);
+        let queue = new_queue(0);
+        let array = status_array(2);
+
+        // 0x48 GetErrorEvent returns null (never E_NOTIMPL 0x80004001 as a HANDLE).
+        let get_error_event: extern "system" fn(*mut c_void) -> HANDLE = call(queue, 0x48);
+        assert!(get_error_event(queue).is_null());
+
+        // 0x50 RetrieveErrorRecord zeroes FailureCount and marks CommandType = NONE (-1).
+        let retrieve_error: extern "system" fn(*mut c_void, *mut u8) = call(queue, 0x50);
+        let mut rec = [0xCCu8; 656];
+        retrieve_error(queue, rec.as_mut_ptr());
+        assert_eq!(u32::from_le_bytes(rec[0..4].try_into().unwrap()), 0);
+        assert_eq!(i32::from_le_bytes(rec[12..16].try_into().unwrap()), -1);
+
+        // 0x58 Query and 0x68 Query1 populate DSTORAGE_QUEUE_INFO / INFO1.
+        let query: extern "system" fn(*mut c_void, *mut AbiQueueInfo) = call(queue, 0x58);
+        let query1: extern "system" fn(*mut c_void, *mut AbiQueueInfo1) = call(queue, 0x68);
+        let mut info = AbiQueueInfo {
+            source_type: 99,
+            capacity: 0,
+            priority: 7,
+            name: std::ptr::null(),
+            empty_slot_count: 0,
+            request_count_until_auto_submit: 99,
+        };
+        query(queue, &mut info);
+        assert_eq!((info.source_type, info.capacity, info.priority, info.empty_slot_count), (0, 0x80, 0, 0x7f));
+
+        let mut out = vec![0u8; 256];
+        enqueue(queue, &request(0, out.as_mut_ptr().cast(), 256, file, 128, 256));
+        enqueue_status(queue, array, 0);
+
+        let mut info1 = AbiQueueInfo1 {
+            source_type: 99,
+            capacity: 0,
+            priority: 7,
+            name: std::ptr::null(),
+            options: 0,
+            empty_slot_count: 0,
+            request_count_until_auto_submit: 99,
+        };
+        query1(queue, &mut info1);
+        assert_eq!(
+            (info1.source_type, info1.capacity, info1.options, info1.empty_slot_count, info1.request_count_until_auto_submit),
+            (0, 0x80, 1, 0x7d, 0)
+        );
+
+        // 0x60 EnqueueSetEvent duplicates the caller handle and signals in queue order
+        // after earlier reads and status entries have been published.
+        let set_event: extern "system" fn(*mut c_void, HANDLE) = call(queue, 0x60);
+        // SAFETY: Win32 event handles created and closed in this test.
+        unsafe {
+            let closed_ev = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            set_event(queue, closed_ev);
+            CloseHandle(closed_ev);
+            let reused_candidate = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
+            let live_ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            set_event(queue, std::ptr::null_mut());
+            set_event(queue, INVALID_HANDLE_VALUE);
+            set_event(queue, live_ev);
+            enqueue_status(queue, array, 1);
+            void(queue, 0x30);
+
+            assert_eq!(WaitForSingleObject(live_ev, 5000), WAIT_OBJECT_0);
+            assert_eq!(result(array, 0), S_OK, "earlier status published before event signaled");
+            assert_eq!(out, contents[128..384]);
+            assert_eq!(wait(array, 1), S_OK, "null event does not fail following status");
+            assert_eq!(WaitForSingleObject(reused_candidate, 0), WAIT_TIMEOUT);
+            CloseHandle(reused_candidate);
+            CloseHandle(live_ev);
+        }
+
+        // File 0x20 GetHandle returns an independent readable handle while open,
+        // and INVALID_HANDLE_VALUE once File 0x18 Close has run.
+        let get_handle: extern "system" fn(*mut c_void) -> HANDLE = call(file, 0x20);
+        let h = get_handle(file);
+        assert_ne!(h, INVALID_HANDLE_VALUE);
+        assert_ne!(h as usize, E_NOTIMPL as u32 as usize);
+        let mut via_handle = [0u8; 64];
+        let mut got = 0u32;
+        // SAFETY: `h` is a freshly reopened Win32 file handle owned by the caller.
+        let ok = unsafe { ReadFile(h, via_handle.as_mut_ptr(), 64, &mut got, std::ptr::null_mut()) };
+        // SAFETY: closing caller-owned handle.
+        unsafe { CloseHandle(h) };
+        assert_ne!(ok, 0);
+        assert_eq!(got, 64);
+        assert_eq!(via_handle, contents[..64]);
+
+        void(file, 0x18); // IDStorageFileX::Close
+        assert_eq!(get_handle(file), INVALID_HANDLE_VALUE);
+
+        let release_obj: extern "system" fn(*mut c_void) -> u32 = call(queue, 0x10);
+        let release_file_fn: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        let release_arr: extern "system" fn(*mut c_void) -> u32 = call(array, 0x10);
+        assert_eq!(release_obj(queue), 0);
+        assert_eq!(release_file_fn(file), 0);
+        assert_eq!(release_arr(array), 0);
+    }
+
+    #[test]
+    fn releasing_or_closing_a_file_keeps_in_flight_reads_safe_and_refuses_stale_handles() {
+        const INVALID_FILE_HANDLE: HRESULT = 0x8924_0017_u32 as i32;
+        const FILE_NOT_OPEN: HRESULT = 0x8924_000B_u32 as i32;
+
+        let plain = pattern(16_384);
+        let packed = compress_zlib(&plain);
+        let (_dir, file) = file_with(&packed);
+        let file_addr = file as usize;
+        let (queue, array) = (new_queue(0), status_array(4));
+
+        // 1. Enqueue 64 ZLIB reads, Submit, and immediately Release the file
+        // while workers are still reading and inflating from it.
+        let mut outs = vec![vec![0u8; plain.len()]; 64];
+        for out in &mut outs {
+            let r = request(ZLIB, out.as_mut_ptr().cast(), plain.len(), file, 0, packed.len());
+            enqueue(queue, &r);
+        }
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+
+        let release_file_fn: extern "system" fn(*mut c_void) -> u32 = call(file, 0x10);
+        release_file_fn(file);
+        // Churn heap allocations of the same Instance size class while workers run.
+        let churn: Vec<*mut c_void> = (0..32).map(|_| status_array(2)).collect();
+
+        assert_eq!(wait(array, 0), S_OK);
+        for out in &outs {
+            assert_eq!(out, &plain);
+        }
+        for c in churn {
+            let rel: extern "system" fn(*mut c_void) -> u32 = call(c, 0x10);
+            rel(c);
+        }
+        assert!(
+            !WALLS_FILES.lock().unwrap().iter().any(|(addr, _)| *addr == file_addr),
+            "released file entry removed from WALLS_FILES once reads finish"
+        );
+
+        // 2. A foreign object (status array) or the already-released file pointer
+        // is refused as E_DSTORAGE_INVALID_FILE_HANDLE without dereferencing it.
+        let mut scratch = [0u8; 16];
+        enqueue(queue, &request(0, scratch.as_mut_ptr().cast(), 16, array, 0, 16));
+        enqueue_status(queue, array, 1);
+        enqueue(queue, &request(0, scratch.as_mut_ptr().cast(), 16, file, 0, 16));
+        enqueue_status(queue, array, 2);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 1), INVALID_FILE_HANDLE);
+        assert_eq!(wait(array, 2), INVALID_FILE_HANDLE);
+
+        // 3. IDStorageFileX::Close waits for submitted reads to finish, while an
+        // unsubmitted read submitted afterward fails with E_DSTORAGE_FILE_NOT_OPEN.
+        let raw = pattern(512);
+        let (_dir2, file2) = file_with(&raw);
+        let mut first = [0u8; 128];
+        let mut second = [0u8; 128];
+        enqueue(queue, &request(0, first.as_mut_ptr().cast(), 128, file2, 0, 128));
+        enqueue_status(queue, array, 3);
+        void(queue, 0x30);
+        enqueue(queue, &request(0, second.as_mut_ptr().cast(), 128, file2, 0, 128));
+        void(file2, 0x18); // Close: waits for `first`, leaves `second` unsubmitted
+        assert_eq!(first, raw[..128]);
+        assert_eq!(wait(array, 3), S_OK);
+
+        let array2 = status_array(1);
+        enqueue_status(queue, array2, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array2, 0), FILE_NOT_OPEN);
+        assert_eq!(second, [0u8; 128]);
+
+        let rel_q: extern "system" fn(*mut c_void) -> u32 = call(queue, 0x10);
+        let rel_a: extern "system" fn(*mut c_void) -> u32 = call(array, 0x10);
+        assert_eq!(rel_q(queue), 0);
+        assert_eq!(release_file_fn(file2), 0);
+        assert_eq!(rel_a(array), 0);
+        assert_eq!(rel_a(array2), 0);
     }
 }
