@@ -22,6 +22,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::ffi::{CStr, c_char, c_void};
+use std::mem::MaybeUninit;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Mutex;
 
@@ -67,6 +68,19 @@ const WSAID_WSASENDMSG: Guid = Guid(
     0x43ca,
     [0x84, 0xa7, 0x0d, 0xee, 0x44, 0xcf, 0x60, 0x6d],
 );
+static LOOPBACK_V4_W: [u16; 10] = [
+    b'1' as u16,
+    b'2' as u16,
+    b'7' as u16,
+    b'.' as u16,
+    b'0' as u16,
+    b'.' as u16,
+    b'0' as u16,
+    b'.' as u16,
+    b'1' as u16,
+    0,
+];
+static LOOPBACK_V6_W: [u16; 4] = [b':' as u16, b':' as u16, b'1' as u16, 0];
 
 type Socket = usize;
 type Handle = *mut c_void;
@@ -317,20 +331,8 @@ pub extern "system" fn WSAConnectByNameW(
     if !reachable_name(parsed.as_deref()) {
         return 0;
     }
-    let mut loopback_v4: [u16; 10] = [
-        b'1' as u16,
-        b'2' as u16,
-        b'7' as u16,
-        b'.' as u16,
-        b'0' as u16,
-        b'.' as u16,
-        b'0' as u16,
-        b'.' as u16,
-        b'1' as u16,
-        0,
-    ];
     let node = if parsed.as_deref().is_some_and(localhost_name) {
-        loopback_v4.as_mut_ptr().cast_const()
+        LOOPBACK_V4_W.as_ptr()
     } else {
         node
     };
@@ -487,7 +489,7 @@ pub extern "system" fn WSAIoctl(
         if let Some(ours) = wrapped {
             if output.is_null()
                 || (output_len as usize) < size_of::<usize>()
-                || returned.is_null()
+                || (returned.is_null() && overlapped.is_null())
             {
                 wsa_error(WSAEFAULT);
                 return SOCKET_ERROR;
@@ -495,9 +497,15 @@ pub extern "system" fn WSAIoctl(
             // Write our wrapper to `output` before calling the host so an IOCP
             // consumer never observes the raw provider pointer, and pass heap
             // scratch to the host in case overlapped completion is deferred.
-            // SAFETY: `output` has at least `size_of::<usize>()` bytes and `returned` is non-null.
-            let previous = unsafe { output.cast::<usize>().read_unaligned() };
-            unsafe { output.cast::<usize>().write_unaligned(ours) };
+            // Preserve the caller's bytes via `MaybeUninit<usize>` so synchronous
+            // errors restore `output` without reading an uninitialized `usize`.
+            // SAFETY: `output` has at least `size_of::<usize>()` writable bytes.
+            let previous = unsafe { output.cast::<MaybeUninit<usize>>().read_unaligned() };
+            unsafe {
+                output
+                    .cast::<MaybeUninit<usize>>()
+                    .write_unaligned(MaybeUninit::new(ours));
+            }
             let answer = Box::into_raw(Box::new(HostExtensionAnswer {
                 pointer: 0,
                 returned: 0,
@@ -514,15 +522,23 @@ pub extern "system" fn WSAIoctl(
                 completion,
             );
             if rc == 0 {
-                unsafe { returned.write_unaligned(size_of::<usize>() as u32) };
+                if !returned.is_null() {
+                    // SAFETY: `returned` was checked non-null above; write unaligned.
+                    unsafe { returned.write_unaligned(size_of::<usize>() as u32) };
+                }
                 drop(unsafe { Box::from_raw(answer) });
                 return 0;
             }
             let err = wsa_last_error();
             if err == WSA_IO_PENDING {
+                wsa_error(err);
                 return rc;
             }
-            unsafe { output.cast::<usize>().write_unaligned(previous) };
+            unsafe {
+                output
+                    .cast::<MaybeUninit<usize>>()
+                    .write_unaligned(previous);
+            }
             drop(unsafe { Box::from_raw(answer) });
             wsa_error(err);
             return rc;
@@ -666,6 +682,19 @@ fn narrow_lookup_node(node: *const c_char, parsed: Option<&str>, hints: *const c
     }
 }
 
+fn wide_lookup_node(node: *const u16, parsed: Option<&str>, hints: *const c_void) -> *const u16 {
+    let (flags, family) = hints_flags_family(hints);
+    if flags & AI_NUMERICHOST == 0 && parsed.is_some_and(localhost_name) {
+        if family == i32::from(AF_INET6) {
+            LOOPBACK_V6_W.as_ptr()
+        } else {
+            LOOPBACK_V4_W.as_ptr()
+        }
+    } else {
+        node
+    }
+}
+
 fn blocked_lookup(result: *mut *mut c_void, cancel: *mut Handle) -> i32 {
     if !result.is_null() {
         // SAFETY: a non-null result points to the caller's output slot.
@@ -704,29 +733,7 @@ pub extern "system" fn GetAddrInfoW(
     if !resolvable(parsed.as_deref(), true) {
         return blocked_lookup(result, std::ptr::null_mut());
     }
-    let mut loopback_v4: [u16; 10] = [
-        b'1' as u16,
-        b'2' as u16,
-        b'7' as u16,
-        b'.' as u16,
-        b'0' as u16,
-        b'.' as u16,
-        b'0' as u16,
-        b'.' as u16,
-        b'1' as u16,
-        0,
-    ];
-    let mut loopback_v6: [u16; 4] = [b':' as u16, b':' as u16, b'1' as u16, 0];
-    let (flags, family) = hints_flags_family(hints);
-    let node = if flags & AI_NUMERICHOST == 0 && parsed.as_deref().is_some_and(localhost_name) {
-        if family == i32::from(AF_INET6) {
-            loopback_v6.as_mut_ptr().cast_const()
-        } else {
-            loopback_v4.as_mut_ptr().cast_const()
-        }
-    } else {
-        node
-    };
+    let node = wide_lookup_node(node, parsed.as_deref(), hints);
     host!("ws2_32.dll", "GetAddrInfoW": extern "system" fn(*const u16, *const u16, *const c_void, *mut *mut c_void) -> i32)(
         node, service, hints, result,
     )
@@ -770,29 +777,7 @@ pub extern "system" fn GetAddrInfoExW(
     if !resolvable(parsed.as_deref(), true) {
         return blocked_lookup(result, handle);
     }
-    let mut loopback_v4: [u16; 10] = [
-        b'1' as u16,
-        b'2' as u16,
-        b'7' as u16,
-        b'.' as u16,
-        b'0' as u16,
-        b'.' as u16,
-        b'0' as u16,
-        b'.' as u16,
-        b'1' as u16,
-        0,
-    ];
-    let mut loopback_v6: [u16; 4] = [b':' as u16, b':' as u16, b'1' as u16, 0];
-    let (flags, family) = hints_flags_family(hints);
-    let name = if flags & AI_NUMERICHOST == 0 && parsed.as_deref().is_some_and(localhost_name) {
-        if family == i32::from(AF_INET6) {
-            loopback_v6.as_mut_ptr().cast_const()
-        } else {
-            loopback_v4.as_mut_ptr().cast_const()
-        }
-    } else {
-        name
-    };
+    let name = wide_lookup_node(name, parsed.as_deref(), hints);
     host!("ws2_32.dll", "GetAddrInfoExW": extern "system" fn(*const u16, *const u16, u32, *const c_void, *const c_void, *mut *mut c_void, *const c_void, *mut c_void, *const c_void, *mut Handle) -> i32)(
         name, service, namespace, provider, hints, result, timeout, overlapped, completion, handle,
     )
@@ -1438,6 +1423,65 @@ mod tests {
         assert!(loopback(resolved.ip()) && resolved.is_ipv6());
         free_ai(v6_res);
 
+        // Wide `localhost.` lookups via `GetAddrInfoW` and `GetAddrInfoExW` resolve
+        // to `::1` under `AF_INET6` and `127.0.0.1` under `AF_INET` using `'static`
+        // wide loopback literals.
+        #[repr(C)]
+        struct AddrInfoEx {
+            flags: i32,
+            family: i32,
+            socktype: i32,
+            protocol: i32,
+            addrlen: usize,
+            canonname: *mut u16,
+            addr: *mut u8,
+            blob: *mut c_void,
+            bloblen: usize,
+            provider: *const c_void,
+            next: *mut AddrInfoEx,
+        }
+        let free_ai_w = host!("ws2_32.dll", "FreeAddrInfoW": extern "system" fn(*mut c_void));
+        let free_ai_ex_w = host!("ws2_32.dll", "FreeAddrInfoExW": extern "system" fn(*mut c_void));
+        let localhost_w: Vec<u16> = "localhost.\0".encode_utf16().collect();
+        let port_w: Vec<u16> = "80\0".encode_utf16().collect();
+        let mut v6_res_w = std::ptr::null_mut::<c_void>();
+        assert_eq!(
+            GetAddrInfoW(
+                localhost_w.as_ptr(),
+                port_w.as_ptr(),
+                (&raw const v6_hints).cast(),
+                &mut v6_res_w,
+            ),
+            0
+        );
+        let ai_w = unsafe { &*v6_res_w.cast::<AddrInfo>() };
+        let resolved_w = socket_addr(ai_w.addr, ai_w.addrlen as i32).unwrap();
+        assert!(loopback(resolved_w.ip()) && resolved_w.is_ipv6());
+        free_ai_w(v6_res_w);
+
+        let mut v4_ex_hints: AddrInfoEx = unsafe { std::mem::zeroed() };
+        v4_ex_hints.family = i32::from(AF_INET);
+        let mut v4_res_ex_w = std::ptr::null_mut::<c_void>();
+        assert_eq!(
+            GetAddrInfoExW(
+                localhost_w.as_ptr(),
+                port_w.as_ptr(),
+                0,
+                std::ptr::null(),
+                (&raw const v4_ex_hints).cast(),
+                &mut v4_res_ex_w,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null_mut(),
+            ),
+            0
+        );
+        let ai_ex_w = unsafe { &*v4_res_ex_w.cast::<AddrInfoEx>() };
+        let resolved_ex_w = socket_addr(ai_ex_w.addr, ai_ex_w.addrlen as i32).unwrap();
+        assert_eq!(resolved_ex_w.ip(), IpAddr::from(HOME));
+        free_ai_ex_w(v4_res_ex_w);
+
         let mut num_hints: AddrInfo = unsafe { std::mem::zeroed() };
         num_hints.flags = TEST_AI_NUMERICHOST;
         let mut num_res = std::ptr::dangling_mut::<c_void>();
@@ -1504,6 +1548,54 @@ mod tests {
             SOCKET_ERROR
         );
         assert_eq!(last_error(), TEST_WSAEFAULT);
+
+        // Overlapped `WSAIoctl` permits `returned == null` (`lpcbBytesReturned` is
+        // optional when `lpOverlapped != null`) and initializes an uninit `output`.
+        let mut uninit_fn = MaybeUninit::<usize>::uninit();
+        let mut overlapped = [0usize; 4];
+        let ioctl_rc = WSAIoctl(
+            s,
+            SIO_GET_EXTENSION_FUNCTION_POINTER,
+            (&raw const guid).cast(),
+            16,
+            uninit_fn.as_mut_ptr().cast(),
+            size_of::<usize>() as u32,
+            std::ptr::null_mut(),
+            (&raw mut overlapped).cast(),
+            std::ptr::null(),
+        );
+        if ioctl_rc != 0 {
+            assert_eq!(ioctl_rc, SOCKET_ERROR);
+            assert_eq!(last_error(), WSA_IO_PENDING);
+            let get_overlapped = host!("ws2_32.dll", "WSAGetOverlappedResult": extern "system" fn(Socket, *mut c_void, *mut u32, i32, *mut u32) -> i32);
+            let (mut xfer, mut flags) = (0u32, 0u32);
+            assert_ne!(
+                get_overlapped(s, (&raw mut overlapped).cast(), &mut xfer, 1, &mut flags),
+                0
+            );
+        }
+        assert_eq!(
+            unsafe { uninit_fn.assume_init() },
+            connect_ex as *const () as usize
+        );
+
+        // Synchronous socket failure on an uninitialized `output` slot must not read
+        // an uninitialized `usize`, and on an initialized slot preserves its value.
+        let mut uninit_err = MaybeUninit::<usize>::uninit();
+        assert_eq!(
+            WSAIoctl(
+                INVALID_SOCKET,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                (&raw const guid).cast(),
+                16,
+                uninit_err.as_mut_ptr().cast(),
+                size_of::<usize>() as u32,
+                &mut ret_bytes,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            ),
+            SOCKET_ERROR
+        );
 
         let sentinel = 0xDEAD_BEEF_CAFE_BABE_usize;
         fn_slot = sentinel;
