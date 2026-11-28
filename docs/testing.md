@@ -574,6 +574,13 @@ only for `check.py`, the shaders read the tail from push constants the programs 
 (`LEONIDA_MESH_COMPUTE=1`) isn't combined with it yet: its vertex shader still reads the output address from push
 constants, so those tests skip.
 
+## Mesh shaders with their waves in series
+
+`LEONIDA_MESH_SERIAL_WAVES=1` for `run_gpu_tests.py`, together with `LEONIDA_W64_EMULATE=1`, translates the mesh
+shaders with `--mesh-serial-waves` (`docs/design.md`, "Mesh shaders with their waves in series"): the ones that
+qualify run one pass per wave in 64 invocations. The `ms_*` tests must pass with and without it;
+`ms_w64x_wave_votes` is the one whose two waves take different branches and both give the triangle a vertex. `ms_w64x_wave_loops` is the one whose two waves run a loop of different length (5 and 9 iterations), each iteration reading a wave-wide count, so under emulation the waves reach different numbers of barriers.
+
 ## GPUs without mesh shaders (NVIDIA Pascal and older)
 
 Without `VK_EXT_mesh_shader`, the `ms_*` tests are skipped; that's expected, not a failure. To test the path that

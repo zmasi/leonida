@@ -80,6 +80,15 @@ class EnvironmentVariablesTest(unittest.TestCase):
         self.assertEqual(missing, [], "read by the code and named in no .md file:\n" + "\n".join(
             f"  {variable} ({where})" for variable, where in missing))
 
+    def test_the_pipeline_order_log_switch_is_read_and_documented_where_the_cache_is(self):
+        # RT-PIPELINE-PREWARM-ORDER: off by default, so a person has to find it next to the cache variables.
+        found = variables_read(self.sources)
+        self.assertIn("LEONIDA_PIPELINE_ORDER_LOG", found)
+        self.assertTrue(found["LEONIDA_PIPELINE_ORDER_LOG"].startswith("runtime/shims/d3d12_vulkan_device.cpp:"))
+        for page in ("runtime/README.md", "docs/d3d12_vulkan.md"):
+            self.assertIn("LEONIDA_PIPELINE_ORDER_LOG", self.pages[page], page)
+        self.assertIn("pipeline_order.log", self.pages["runtime/README.md"])
+
     def test_an_undocumented_variable_is_reported(self):
         sources = {"runtime/shims/x.cpp": 'GetEnvironmentVariableA("LEONIDA_ONE", s, n);\n'
                                           'kName[] = L"LEONIDA_TWO";\n// LEONIDA_COMMENT is not a literal\n',

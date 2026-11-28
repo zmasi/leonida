@@ -17,6 +17,8 @@
 // An update buffers its writes and deletes; SubmitUpdate writes every new blob to "<blob>~", then renames each over
 // its blob and removes the deleted ones, so a failed write leaves the container as it was.
 //
+// LEONIDA_TRACE_XGAMESAVE=1 logs one "[rt] xgamesave:" line per call (see "Tracing" below).
+//
 // ASSUMPTION (no executable yet): the quota is a fixed 1 GiB (the GDK says the per-user quota "is not a fixed size");
 // a blob name is at most 256 bytes (GS_MAX_BLOB_NAME_SIZE is not on the public pages); GetContainerInfo of a
 // container that does not exist returns S_OK without calling the callback; ReadBlobData with blobNames = nullptr
@@ -25,6 +27,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -223,6 +226,90 @@ template <class T> bool live_as(const std::unordered_set<const void*>& set, cons
 template <class T> uint64_t serial_of(const std::unordered_set<const void*>& set, const T* h) {
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     return live(set, h) ? h->serial : 0;
+}
+
+// ---- Tracing (LEONIDA_TRACE_XGAMESAVE=1) ----
+//
+// One line per XGameSave* and XGameSaveFiles* call: the call, its handles, container and blob names, sizes and
+// HRESULT, after "t=<ms since the process started> tid=<thread>". An async call also logs when begin() schedules its
+// job (XAsyncSchedule), when the work starts on the queue (with how long it waited), when it completes, and when the
+// title collects the result with the ...Result call. Blob contents are never logged. Off, a call pays one relaxed
+// load; the names are only looked up while tracing.
+
+using TraceSink = void (*)(const char* line);
+std::atomic<int> g_trace{-1};                    // -1: LEONIDA_TRACE_XGAMESAVE not read yet
+std::atomic<TraceSink> g_trace_sink{nullptr};    // tests: the lines go here instead of stderr
+
+bool tracing() {
+    int on = g_trace.load(std::memory_order_relaxed);
+    if (on < 0) {
+        char value[8] = {};
+        const DWORD n = GetEnvironmentVariableA("LEONIDA_TRACE_XGAMESAVE", value, static_cast<DWORD>(sizeof(value)));
+        int expected = -1;
+        g_trace.compare_exchange_strong(expected, n == 1 && value[0] == '1' ? 1 : 0, std::memory_order_relaxed);
+        on = g_trace.load(std::memory_order_relaxed);
+    }
+    return on > 0;
+}
+
+uint64_t filetime_ticks(const FILETIME& t) { return (static_cast<uint64_t>(t.dwHighDateTime) << 32) | t.dwLowDateTime; }
+
+// Milliseconds since the process was created, the clock the other "t=" figures of a run are read against.
+uint64_t trace_ms() {
+    static const uint64_t start = [] {
+        FILETIME created{}, exited{}, kernel{}, user{};
+        if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return filetime_ticks(created);
+        FILETIME now{};
+        GetSystemTimePreciseAsFileTime(&now);
+        return filetime_ticks(now);
+    }();
+    FILETIME now{};
+    GetSystemTimePreciseAsFileTime(&now);
+    const uint64_t ticks = filetime_ticks(now);
+    return ticks > start ? (ticks - start) / 10000 : 0;
+}
+
+void trace(const char* format, ...) {
+    char body[3072];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(body, sizeof(body), format, args);
+    va_end(args);
+    char line[3200];
+    std::snprintf(line, sizeof(line), "[rt] xgamesave: t=%llums tid=%lu %s\n", static_cast<unsigned long long>(trace_ms()),
+                  static_cast<unsigned long>(GetCurrentThreadId()), body);
+    if (const TraceSink sink = g_trace_sink.load(std::memory_order_acquire)) {
+        sink(line);
+    } else {
+        std::fputs(line, stderr);
+    }
+}
+
+#define TRACE(...)                        \
+    do {                                  \
+        if (tracing()) trace(__VA_ARGS__); \
+    } while (0)
+
+const char* or_null(const char* s) { return s ? s : "(null)"; }
+unsigned long hr_bits(HRESULT hr) { return static_cast<unsigned long>(hr); }
+
+// "a","b",... for the first eight names, then "+n".
+std::string quoted_names(const std::vector<std::string>& names) {
+    std::string out;
+    for (size_t i = 0; i < names.size() && i < 8; ++i) out += (i ? ",\"" : "\"") + names[i] + "\"";
+    if (names.size() > 8) out += ",+" + std::to_string(names.size() - 8);
+    return out.empty() ? std::string("(none)") : out;
+}
+
+// The name of a live container, "?" for a handle that is not one (it is never read through then).
+std::string container_label(const XGameSaveContainer* c) {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    return live(g_containers, c) ? "\"" + c->name + "\"" : std::string("?");
+}
+std::string update_label(const XGameSaveUpdate* u) {
+    std::lock_guard<std::recursive_mutex> lock(g_mutex);
+    if (!live(g_updates, u) || !live_as(g_containers, u->container, u->container_serial)) return "?";
+    return "\"" + u->container->name + "\" ops=" + std::to_string(u->ops.size()) + " bytes=" + std::to_string(u->bytes);
 }
 
 // ---- Files ----
@@ -564,6 +651,11 @@ struct Job {
     int64_t quota = 0;
     std::vector<BlobRead> blobs;
     std::string folder;
+    // tracing only
+    const char* name = "";   // the *Async function
+    std::string label;       // its arguments, as the trace lines show them
+    const XAsyncBlock* title_async = nullptr;   // the title's block: XAsync hands the provider a copy of its own
+    uint64_t scheduled_ms = 0;
 };
 
 const char kInitIdentity = 0, kQuotaIdentity = 0, kDeleteIdentity = 0, kReadIdentity = 0, kSubmitIdentity = 0,
@@ -628,11 +720,31 @@ HRESULT do_work(Job& job, size_t& size) {
 HRESULT CALLBACK job_provider(XAsyncOp op, const XAsyncProviderData* data) {
     auto* job = static_cast<Job*>(data->context);
     switch (op) {
-    case XAsyncOp::Begin:
-        return XAsyncSchedule(data->async, 0);
+    case XAsyncOp::Begin: {
+        if (!tracing()) return XAsyncSchedule(data->async, 0);
+        // Logged before the call, so it comes before the "run" line; the work may run, complete and free the job
+        // before XAsyncSchedule returns, so a failure is logged from copies. `async` is the title's block (the one
+        // its *Async and ...Result calls pass), so the lines of one job can be matched up.
+        const char* name = job->name;
+        const void* async = job->title_async;
+        job->scheduled_ms = trace_ms();
+        trace("%s schedule async=%p %s", name, async, job->label.c_str());
+        const HRESULT hr = XAsyncSchedule(data->async, 0);
+        if (FAILED(hr)) trace("%s schedule async=%p failed hr=0x%08lX", name, async, hr_bits(hr));
+        return hr;
+    }
     case XAsyncOp::DoWork: {
+        const bool traced = tracing();
+        const uint64_t started = traced ? trace_ms() : 0;
+        if (traced)
+            trace("%s run async=%p %s waited=%llums", job->name, static_cast<const void*>(job->title_async),
+                  job->label.c_str(), static_cast<unsigned long long>(started - std::min(started, job->scheduled_ms)));
         size_t size = 0;
         const HRESULT hr = do_work(*job, size);
+        if (traced)   // before XAsyncComplete, which may free the job
+            trace("%s complete async=%p %s hr=0x%08lX size=%zu work=%llums", job->name,
+                  static_cast<const void*>(job->title_async), job->label.c_str(), hr_bits(hr), SUCCEEDED(hr) ? size : 0,
+                  static_cast<unsigned long long>(trace_ms() - started));
         XAsyncComplete(data->async, hr, SUCCEEDED(hr) ? size : 0);
         return S_OK;
     }
@@ -667,13 +779,19 @@ HRESULT CALLBACK job_provider(XAsyncOp op, const XAsyncProviderData* data) {
     }
 }
 
-HRESULT begin(XAsyncBlock* async, Job* job, const char* name) {
-    if (!async) {
+// `label`: the job's arguments for the trace lines, made only while tracing.
+HRESULT begin(XAsyncBlock* async, Job* job, const char* name, const std::string& label = {}) {
+    job->name = name;
+    job->label = label;
+    job->title_async = async;
+    HRESULT hr = E_POINTER;
+    if (async) {
+        hr = XAsyncBegin(async, job, job->identity, name, job_provider);
+        if (FAILED(hr)) delete job;
+    } else {
         delete job;
-        return E_POINTER;
     }
-    const HRESULT hr = XAsyncBegin(async, job, job->identity, name, job_provider);
-    if (FAILED(hr)) delete job;
+    TRACE("%s async=%p %s hr=0x%08lX", name, static_cast<void*>(async), label.c_str(), hr_bits(hr));
     return hr;
 }
 
@@ -681,38 +799,55 @@ HRESULT begin(XAsyncBlock* async, Job* job, const char* name) {
 
 // 3: HRESULT XGameSaveInitializeProvider(XUserHandle requestingUser, const char* configurationId, bool syncOnDemand,
 //                                         XGameSaveProviderHandle* provider)
-HRESULT STDMETHODCALLTYPE save_init(void*, XUserHandle user, const char* config_id, bool, XGameSaveProviderHandle* out) {
-    return open_provider(user, config_id, out);
+HRESULT STDMETHODCALLTYPE save_init(void*, XUserHandle user, const char* config_id, bool sync,
+                                    XGameSaveProviderHandle* out) {
+    const HRESULT hr = open_provider(user, config_id, out);
+    TRACE("XGameSaveInitializeProvider user=%p config=\"%s\" syncOnDemand=%d provider=%p hr=0x%08lX", user,
+          or_null(config_id), sync ? 1 : 0, out ? static_cast<void*>(*out) : nullptr, hr_bits(hr));
+    return hr;
 }
 
 // 4: HRESULT XGameSaveInitializeProviderAsync(XUserHandle, const char* configurationId, bool syncOnDemand, XAsyncBlock*)
 HRESULT STDMETHODCALLTYPE save_init_async(void*, XUserHandle user, const char* config_id, bool, XAsyncBlock* async) {
-    if (!user || !config_id) return E_INVALIDARG;
+    if (!user || !config_id) {
+        TRACE("XGameSaveInitializeProviderAsync async=%p user=%p config=\"%s\" hr=0x%08lX", static_cast<void*>(async),
+              user, or_null(config_id), hr_bits(E_INVALIDARG));
+        return E_INVALIDARG;
+    }
     auto* job = new Job{&kInitIdentity};
     job->user = user;
     job->text = config_id;
-    return begin(async, job, "XGameSaveInitializeProviderAsync");
+    return begin(async, job, "XGameSaveInitializeProviderAsync",
+                 tracing() ? "config=\"" + job->text + "\"" : std::string());
 }
 
 // 5: HRESULT XGameSaveInitializeProviderResult(XAsyncBlock* async, XGameSaveProviderHandle* provider)
 HRESULT STDMETHODCALLTYPE save_init_result(void*, XAsyncBlock* async, XGameSaveProviderHandle* out) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    return XAsyncGetResult(async, &kInitIdentity, sizeof(*out), out, nullptr);
+    const HRESULT hr = XAsyncGetResult(async, &kInitIdentity, sizeof(*out), out, nullptr);
+    TRACE("XGameSaveInitializeProviderResult async=%p provider=%p hr=0x%08lX", static_cast<void*>(async),
+          static_cast<void*>(*out), hr_bits(hr));
+    return hr;
 }
 
 // 6: void XGameSaveCloseProvider(XGameSaveProviderHandle provider)
 void STDMETHODCALLTYPE save_close_provider(void*, XGameSaveProviderHandle p) {
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        if (!p || g_providers.erase(p) == 0) return;
+        const bool open = p && g_providers.erase(p) != 0;
+        TRACE("XGameSaveCloseProvider provider=%p%s", static_cast<void*>(p), open ? "" : " (not open)");
+        if (!open) return;
     }
     delete p;
 }
 
 // 7: HRESULT XGameSaveGetRemainingQuota(XGameSaveProviderHandle provider, int64_t* remainingQuota)
 HRESULT STDMETHODCALLTYPE save_quota(void*, XGameSaveProviderHandle p, int64_t* remaining) {
-    return remaining_quota(p, remaining);
+    const HRESULT hr = remaining_quota(p, remaining);
+    TRACE("XGameSaveGetRemainingQuota provider=%p remaining=%lld hr=0x%08lX", static_cast<void*>(p),
+          SUCCEEDED(hr) ? static_cast<long long>(*remaining) : 0ll, hr_bits(hr));
+    return hr;
 }
 
 // 8: HRESULT XGameSaveGetRemainingQuotaAsync(XGameSaveProviderHandle provider, XAsyncBlock* async)
@@ -720,39 +855,81 @@ HRESULT STDMETHODCALLTYPE save_quota_async(void*, XGameSaveProviderHandle p, XAs
     auto* job = new Job{&kQuotaIdentity};
     job->provider = p;
     job->serial = serial_of(g_providers, p);
-    return begin(async, job, "XGameSaveGetRemainingQuotaAsync");
+    char label[64] = {};
+    if (tracing()) std::snprintf(label, sizeof(label), "provider=%p", static_cast<void*>(p));
+    return begin(async, job, "XGameSaveGetRemainingQuotaAsync", label);
 }
 
 // 9: HRESULT XGameSaveGetRemainingQuotaResult(XAsyncBlock* async, int64_t* remainingQuota)
 HRESULT STDMETHODCALLTYPE save_quota_result(void*, XAsyncBlock* async, int64_t* remaining) {
     if (!remaining) return E_POINTER;
-    return XAsyncGetResult(async, &kQuotaIdentity, sizeof(*remaining), remaining, nullptr);
+    const HRESULT hr = XAsyncGetResult(async, &kQuotaIdentity, sizeof(*remaining), remaining, nullptr);
+    TRACE("XGameSaveGetRemainingQuotaResult async=%p remaining=%lld hr=0x%08lX", static_cast<void*>(async),
+          SUCCEEDED(hr) ? static_cast<long long>(*remaining) : 0ll, hr_bits(hr));
+    return hr;
 }
 
 // 10: HRESULT XGameSaveDeleteContainer(XGameSaveProviderHandle provider, const char* containerName)
 HRESULT STDMETHODCALLTYPE save_delete(void*, XGameSaveProviderHandle p, const char* name) {
-    return delete_container(p, name);
+    const HRESULT hr = delete_container(p, name);
+    TRACE("XGameSaveDeleteContainer provider=%p container=\"%s\" hr=0x%08lX", static_cast<void*>(p), or_null(name),
+          hr_bits(hr));
+    return hr;
 }
 
 // 11: HRESULT XGameSaveDeleteContainerAsync(XGameSaveProviderHandle provider, const char* containerName, XAsyncBlock*)
 HRESULT STDMETHODCALLTYPE save_delete_async(void*, XGameSaveProviderHandle p, const char* name, XAsyncBlock* async) {
-    if (!valid_container_name(name)) return E_GS_INVALID_CONTAINER_NAME;
+    if (!valid_container_name(name)) {
+        TRACE("XGameSaveDeleteContainerAsync async=%p provider=%p container=\"%s\" hr=0x%08lX",
+              static_cast<void*>(async), static_cast<void*>(p), or_null(name), hr_bits(E_GS_INVALID_CONTAINER_NAME));
+        return E_GS_INVALID_CONTAINER_NAME;
+    }
     auto* job = new Job{&kDeleteIdentity};
     job->provider = p;
     job->serial = serial_of(g_providers, p);
     job->text = name;
-    return begin(async, job, "XGameSaveDeleteContainerAsync");
+    char label[64] = {};
+    if (tracing()) std::snprintf(label, sizeof(label), "provider=%p", static_cast<void*>(p));
+    return begin(async, job, "XGameSaveDeleteContainerAsync",
+                 tracing() ? std::string(label) + " container=\"" + job->text + "\"" : std::string());
 }
 
 // 12: HRESULT XGameSaveDeleteContainerResult(XAsyncBlock* async)
 HRESULT STDMETHODCALLTYPE save_delete_result(void*, XAsyncBlock* async) {
-    return XAsyncGetResult(async, &kDeleteIdentity, 0, nullptr, nullptr);
+    const HRESULT hr = XAsyncGetResult(async, &kDeleteIdentity, 0, nullptr, nullptr);
+    TRACE("XGameSaveDeleteContainerResult async=%p hr=0x%08lX", static_cast<void*>(async), hr_bits(hr));
+    return hr;
+}
+
+// The enumerations count what they hand the title, for the trace.
+struct ContainerCounter {
+    ContainerInfoCallback cb;
+    void* context;
+    uint32_t calls;
+    uint64_t bytes;
+};
+bool CALLBACK count_container(const XGameSaveContainerInfo* info, void* context) {
+    auto* c = static_cast<ContainerCounter*>(context);
+    ++c->calls;
+    c->bytes += info->totalSize;
+    return c->cb(info, c->context);
+}
+struct BlobCounter {
+    BlobInfoCallback cb;
+    void* context;
+    uint32_t calls;
+    uint64_t bytes;
+};
+bool CALLBACK count_blob(const XGameSaveBlobInfo* info, void* context) {
+    auto* c = static_cast<BlobCounter*>(context);
+    ++c->calls;
+    c->bytes += info->size;
+    return c->cb(info, c->context);
 }
 
 // 13: HRESULT XGameSaveGetContainerInfo(XGameSaveProviderHandle, const char* containerName, void* context,
 //                                       XGameSaveContainerInfoCallback* callback)
-HRESULT STDMETHODCALLTYPE save_container_info(void*, XGameSaveProviderHandle p, const char* name, void* context,
-                                              ContainerInfoCallback cb) {
+HRESULT get_container_info(XGameSaveProviderHandle p, const char* name, void* context, ContainerInfoCallback cb) {
     if (!cb) return E_INVALIDARG;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
@@ -766,31 +943,51 @@ HRESULT STDMETHODCALLTYPE save_container_info(void*, XGameSaveProviderHandle p, 
     cb(&info, context);
     return S_OK;
 }
+HRESULT STDMETHODCALLTYPE save_container_info(void*, XGameSaveProviderHandle p, const char* name, void* context,
+                                              ContainerInfoCallback cb) {
+    if (!tracing() || !cb) return get_container_info(p, name, context, cb);
+    ContainerCounter counter{cb, context, 0, 0};
+    const HRESULT hr = get_container_info(p, name, &counter, count_container);
+    trace("XGameSaveGetContainerInfo provider=%p container=\"%s\" found=%u size=%llu hr=0x%08lX",
+          static_cast<void*>(p), or_null(name), counter.calls, static_cast<unsigned long long>(counter.bytes),
+          hr_bits(hr));
+    return hr;
+}
 
-// 14: HRESULT XGameSaveEnumerateContainerInfo(XGameSaveProviderHandle, void* context, XGameSaveContainerInfoCallback*)
-HRESULT STDMETHODCALLTYPE save_enum_containers(void*, XGameSaveProviderHandle p, void* context, ContainerInfoCallback cb) {
+HRESULT enumerate_container_info(XGameSaveProviderHandle p, std::string_view prefix, void* context,
+                                 ContainerInfoCallback cb) {
     if (!cb) return E_INVALIDARG;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
-    enumerate_containers(p->user_dir, {}, context, cb);
+    enumerate_containers(p->user_dir, prefix, context, cb);
     return S_OK;
+}
+HRESULT traced_enumerate_container_info(const char* call, XGameSaveProviderHandle p, const char* prefix, void* context,
+                                        ContainerInfoCallback cb) {
+    const std::string_view pre = prefix ? std::string_view(prefix) : std::string_view{};
+    if (!tracing() || !cb) return enumerate_container_info(p, pre, context, cb);
+    ContainerCounter counter{cb, context, 0, 0};
+    const HRESULT hr = enumerate_container_info(p, pre, &counter, count_container);
+    trace("%s provider=%p prefix=\"%s\" containers=%u size=%llu hr=0x%08lX", call, static_cast<void*>(p),
+          prefix ? prefix : "", counter.calls, static_cast<unsigned long long>(counter.bytes), hr_bits(hr));
+    return hr;
+}
+
+// 14: HRESULT XGameSaveEnumerateContainerInfo(XGameSaveProviderHandle, void* context, XGameSaveContainerInfoCallback*)
+HRESULT STDMETHODCALLTYPE save_enum_containers(void*, XGameSaveProviderHandle p, void* context, ContainerInfoCallback cb) {
+    return traced_enumerate_container_info("XGameSaveEnumerateContainerInfo", p, nullptr, context, cb);
 }
 
 // 15: HRESULT XGameSaveEnumerateContainerInfoByName(XGameSaveProviderHandle, const char* containerNamePrefix,
 //                                                   void* context, XGameSaveContainerInfoCallback*)
 HRESULT STDMETHODCALLTYPE save_enum_containers_by_name(void*, XGameSaveProviderHandle p, const char* prefix,
                                                        void* context, ContainerInfoCallback cb) {
-    if (!cb) return E_INVALIDARG;
-    std::lock_guard<std::recursive_mutex> lock(g_mutex);
-    if (!live(g_providers, p)) return E_GS_HANDLE_EXPIRED;
-    enumerate_containers(p->user_dir, prefix ? std::string_view(prefix) : std::string_view{}, context, cb);
-    return S_OK;
+    return traced_enumerate_container_info("XGameSaveEnumerateContainerInfoByName", p, prefix, context, cb);
 }
 
 // 16: HRESULT XGameSaveCreateContainer(XGameSaveProviderHandle, const char* containerName, XGameSaveContainerHandle*).
 // The folder appears when the first update is submitted.
-HRESULT STDMETHODCALLTYPE save_create_container(void*, XGameSaveProviderHandle p, const char* name,
-                                                XGameSaveContainerHandle* out) {
+HRESULT create_container(XGameSaveProviderHandle p, const char* name, XGameSaveContainerHandle* out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
@@ -802,11 +999,22 @@ HRESULT STDMETHODCALLTYPE save_create_container(void*, XGameSaveProviderHandle p
     *out = c;
     return S_OK;
 }
+HRESULT STDMETHODCALLTYPE save_create_container(void*, XGameSaveProviderHandle p, const char* name,
+                                                XGameSaveContainerHandle* out) {
+    const HRESULT hr = create_container(p, name, out);
+    TRACE("XGameSaveCreateContainer provider=%p container=\"%s\" handle=%p hr=0x%08lX", static_cast<void*>(p),
+          or_null(name), out ? static_cast<void*>(*out) : nullptr, hr_bits(hr));
+    return hr;
+}
 
 // 17: void XGameSaveCloseContainer(XGameSaveContainerHandle context)
 void STDMETHODCALLTYPE save_close_container(void*, XGameSaveContainerHandle c) {
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
+        if (tracing()) {
+            trace("XGameSaveCloseContainer handle=%p container=%s", static_cast<void*>(c),
+                  live(g_containers, c) ? container_label(c).c_str() : "? (not open)");
+        }
         if (!c || g_containers.erase(c) == 0) return;
     }
     delete c;
@@ -823,23 +1031,52 @@ HRESULT enumerate_blobs(XGameSaveContainerHandle c, std::string_view prefix, voi
     }
     return S_OK;
 }
+HRESULT traced_enumerate_blobs(const char* call, XGameSaveContainerHandle c, const char* prefix, void* context,
+                               BlobInfoCallback cb) {
+    const std::string_view pre = prefix ? std::string_view(prefix) : std::string_view{};
+    if (!tracing() || !cb) return enumerate_blobs(c, pre, context, cb);
+    BlobCounter counter{cb, context, 0, 0};
+    const std::string label = container_label(c);
+    const HRESULT hr = enumerate_blobs(c, pre, &counter, count_blob);
+    trace("%s handle=%p container=%s prefix=\"%s\" blobs=%u size=%llu hr=0x%08lX", call, static_cast<void*>(c),
+          label.c_str(), prefix ? prefix : "", counter.calls, static_cast<unsigned long long>(counter.bytes),
+          hr_bits(hr));
+    return hr;
+}
 
 // 18: HRESULT XGameSaveEnumerateBlobInfo(XGameSaveContainerHandle, void* context, XGameSaveBlobInfoCallback*)
 HRESULT STDMETHODCALLTYPE save_enum_blobs(void*, XGameSaveContainerHandle c, void* context, BlobInfoCallback cb) {
-    return enumerate_blobs(c, {}, context, cb);
+    return traced_enumerate_blobs("XGameSaveEnumerateBlobInfo", c, nullptr, context, cb);
 }
 
 // 19: HRESULT XGameSaveEnumerateBlobInfoByName(XGameSaveContainerHandle, const char* blobNamePrefix, void* context,
 //                                              XGameSaveBlobInfoCallback*)
 HRESULT STDMETHODCALLTYPE save_enum_blobs_by_name(void*, XGameSaveContainerHandle c, const char* prefix, void* context,
                                                   BlobInfoCallback cb) {
-    return enumerate_blobs(c, prefix ? std::string_view(prefix) : std::string_view{}, context, cb);
+    return traced_enumerate_blobs("XGameSaveEnumerateBlobInfoByName", c, prefix, context, cb);
+}
+
+// "name":size,... of the blobs a read handed the title (names and sizes only).
+std::string read_blobs_label(const XGameSaveBlob* blobs, uint32_t count) {
+    std::string out;
+    for (uint32_t i = 0; i < count && i < 8; ++i)
+        out += (i ? ",\"" : "\"") + std::string(or_null(blobs[i].info.name)) + "\":" + std::to_string(blobs[i].info.size);
+    if (count > 8) out += ",+" + std::to_string(count - 8);
+    return out.empty() ? std::string("(none)") : out;
+}
+
+// The names a title asks to read, "(all)" for blobNames = nullptr.
+std::string requested_names(const char* const* names, uint32_t count) {
+    if (!names) return "(all)";
+    std::vector<std::string> list;
+    for (uint32_t i = 0; i < count; ++i) list.emplace_back(or_null(names[i]));
+    return quoted_names(list);
 }
 
 // 20: HRESULT XGameSaveReadBlobData(XGameSaveContainerHandle, const char** blobNames, uint32_t* countOfBlobs,
 //                                   size_t blobsSize, XGameSaveBlob* blobData)
-HRESULT STDMETHODCALLTYPE save_read(void*, XGameSaveContainerHandle c, const char** names, uint32_t* count,
-                                    size_t size, XGameSaveBlob* out) {
+HRESULT read_blob_data(XGameSaveContainerHandle c, const char** names, uint32_t* count, size_t size,
+                       XGameSaveBlob* out) {
     if (!count || !out) return E_POINTER;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_containers, c)) return E_GS_HANDLE_EXPIRED;
@@ -850,6 +1087,16 @@ HRESULT STDMETHODCALLTYPE save_read(void*, XGameSaveContainerHandle c, const cha
     pack(blobs, out, size);
     *count = static_cast<uint32_t>(blobs.size());
     return S_OK;
+}
+HRESULT STDMETHODCALLTYPE save_read(void*, XGameSaveContainerHandle c, const char** names, uint32_t* count,
+                                    size_t size, XGameSaveBlob* out) {
+    if (!tracing()) return read_blob_data(c, names, count, size, out);
+    const std::string label = container_label(c), wanted = requested_names(names, names && count ? *count : 0);
+    const HRESULT hr = read_blob_data(c, names, count, size, out);
+    trace("XGameSaveReadBlobData handle=%p container=%s names=%s buffer=%zu read=%s hr=0x%08lX",
+          static_cast<void*>(c), label.c_str(), wanted.c_str(), size,
+          SUCCEEDED(hr) ? read_blobs_label(out, *count).c_str() : "(none)", hr_bits(hr));
+    return hr;
 }
 
 // 21: HRESULT XGameSaveReadBlobDataAsync(XGameSaveContainerHandle, const char** blobNames, uint32_t countOfBlobs,
@@ -863,11 +1110,20 @@ HRESULT STDMETHODCALLTYPE save_read_async(void*, XGameSaveContainerHandle c, con
     for (uint32_t i = 0; names && i < count; ++i) {
         if (!valid_blob_name(names[i])) {
             delete job;
+            TRACE("XGameSaveReadBlobDataAsync async=%p handle=%p hr=0x%08lX", static_cast<void*>(async),
+                  static_cast<void*>(c), hr_bits(E_INVALIDARG));
             return E_INVALIDARG;
         }
         job->names.emplace_back(names[i]);
     }
-    return begin(async, job, "XGameSaveReadBlobDataAsync");
+    std::string label;
+    if (tracing()) {
+        char handle[48];
+        std::snprintf(handle, sizeof(handle), "handle=%p", static_cast<void*>(c));
+        label = std::string(handle) + " container=" + container_label(c) +
+                " names=" + (job->all_blobs ? std::string("(all)") : quoted_names(job->names));
+    }
+    return begin(async, job, "XGameSaveReadBlobDataAsync", label);
 }
 
 // 22: HRESULT XGameSaveReadBlobDataResult(XAsyncBlock* async, size_t blobsSize, XGameSaveBlob* blobData,
@@ -880,12 +1136,13 @@ HRESULT STDMETHODCALLTYPE save_read_result(void*, XAsyncBlock* async, size_t siz
     if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) || hr == E_NOT_SUFFICIENT_BUFFER)
         hr = E_GS_PROVIDED_BUFFER_TOO_SMALL;
     if (SUCCEEDED(hr)) *count = t_read_count;
+    TRACE("XGameSaveReadBlobDataResult async=%p buffer=%zu read=%s hr=0x%08lX", static_cast<void*>(async), size,
+          SUCCEEDED(hr) ? read_blobs_label(out, *count).c_str() : "(none)", hr_bits(hr));
     return hr;
 }
 
 // 23: HRESULT XGameSaveCreateUpdate(XGameSaveContainerHandle, const char* containerDisplayName, XGameSaveUpdateHandle*)
-HRESULT STDMETHODCALLTYPE save_create_update(void*, XGameSaveContainerHandle c, const char* display_name,
-                                             XGameSaveUpdateHandle* out) {
+HRESULT create_update(XGameSaveContainerHandle c, const char* display_name, XGameSaveUpdateHandle* out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
@@ -896,19 +1153,30 @@ HRESULT STDMETHODCALLTYPE save_create_update(void*, XGameSaveContainerHandle c, 
     *out = u;
     return S_OK;
 }
+HRESULT STDMETHODCALLTYPE save_create_update(void*, XGameSaveContainerHandle c, const char* display_name,
+                                             XGameSaveUpdateHandle* out) {
+    if (!tracing()) return create_update(c, display_name, out);
+    const std::string label = container_label(c);
+    const HRESULT hr = create_update(c, display_name, out);
+    trace("XGameSaveCreateUpdate handle=%p container=%s display=\"%s\" update=%p hr=0x%08lX", static_cast<void*>(c),
+          label.c_str(), or_null(display_name), out ? static_cast<void*>(*out) : nullptr, hr_bits(hr));
+    return hr;
+}
 
 // 24: void XGameSaveCloseUpdate(XGameSaveUpdateHandle context)
 void STDMETHODCALLTYPE save_close_update(void*, XGameSaveUpdateHandle u) {
     {
         std::lock_guard<std::recursive_mutex> lock(g_mutex);
-        if (!u || g_updates.erase(u) == 0) return;
+        const bool open = u && g_updates.erase(u) != 0;
+        TRACE("XGameSaveCloseUpdate update=%p%s", static_cast<void*>(u), open ? "" : " (not open)");
+        if (!open) return;
     }
     delete u;
 }
 
 // 25: HRESULT XGameSaveSubmitBlobWrite(XGameSaveUpdateHandle, const char* blobName, const uint8_t* data, size_t size).
 // One write or delete per blob per update; the update (and so each blob) stays within GS_MAX_BLOB_SIZE.
-HRESULT STDMETHODCALLTYPE save_write(void*, XGameSaveUpdateHandle u, const char* name, const uint8_t* data, size_t size) {
+HRESULT submit_blob_write(XGameSaveUpdateHandle u, const char* name, const uint8_t* data, size_t size) {
     if (!valid_blob_name(name) || (!data && size)) return E_INVALIDARG;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_updates, u)) return E_GS_HANDLE_EXPIRED;
@@ -918,9 +1186,15 @@ HRESULT STDMETHODCALLTYPE save_write(void*, XGameSaveUpdateHandle u, const char*
     u->bytes += size;
     return S_OK;
 }
+HRESULT STDMETHODCALLTYPE save_write(void*, XGameSaveUpdateHandle u, const char* name, const uint8_t* data, size_t size) {
+    const HRESULT hr = submit_blob_write(u, name, data, size);
+    TRACE("XGameSaveSubmitBlobWrite update=%p blob=\"%s\" size=%zu hr=0x%08lX", static_cast<void*>(u), or_null(name),
+          size, hr_bits(hr));
+    return hr;
+}
 
 // 26: HRESULT XGameSaveSubmitBlobDelete(XGameSaveUpdateHandle, const char* blobName)
-HRESULT STDMETHODCALLTYPE save_delete_blob(void*, XGameSaveUpdateHandle u, const char* name) {
+HRESULT submit_blob_delete(XGameSaveUpdateHandle u, const char* name) {
     if (!valid_blob_name(name)) return E_INVALIDARG;
     std::lock_guard<std::recursive_mutex> lock(g_mutex);
     if (!live(g_updates, u)) return E_GS_HANDLE_EXPIRED;
@@ -928,31 +1202,58 @@ HRESULT STDMETHODCALLTYPE save_delete_blob(void*, XGameSaveUpdateHandle u, const
     u->ops.emplace(name, Op{false, {}});
     return S_OK;
 }
+HRESULT STDMETHODCALLTYPE save_delete_blob(void*, XGameSaveUpdateHandle u, const char* name) {
+    const HRESULT hr = submit_blob_delete(u, name);
+    TRACE("XGameSaveSubmitBlobDelete update=%p blob=\"%s\" hr=0x%08lX", static_cast<void*>(u), or_null(name),
+          hr_bits(hr));
+    return hr;
+}
 
 // 27: HRESULT XGameSaveSubmitUpdate(XGameSaveUpdateHandle update)
-HRESULT STDMETHODCALLTYPE save_submit(void*, XGameSaveUpdateHandle u) { return submit_update(u); }
+HRESULT STDMETHODCALLTYPE save_submit(void*, XGameSaveUpdateHandle u) {
+    if (!tracing()) return submit_update(u);
+    const std::string label = update_label(u);
+    const uint64_t started = trace_ms();
+    const HRESULT hr = submit_update(u);
+    trace("XGameSaveSubmitUpdate update=%p container=%s hr=0x%08lX work=%llums", static_cast<void*>(u), label.c_str(),
+          hr_bits(hr), static_cast<unsigned long long>(trace_ms() - started));
+    return hr;
+}
 
 // 28: HRESULT XGameSaveSubmitUpdateAsync(XGameSaveUpdateHandle update, XAsyncBlock* async)
 HRESULT STDMETHODCALLTYPE save_submit_async(void*, XGameSaveUpdateHandle u, XAsyncBlock* async) {
     auto* job = new Job{&kSubmitIdentity};
     job->update = u;
     job->serial = serial_of(g_updates, u);
-    return begin(async, job, "XGameSaveSubmitUpdateAsync");
+    std::string label;
+    if (tracing()) {
+        char handle[48];
+        std::snprintf(handle, sizeof(handle), "update=%p", static_cast<void*>(u));
+        label = std::string(handle) + " container=" + update_label(u);
+    }
+    return begin(async, job, "XGameSaveSubmitUpdateAsync", label);
 }
 
 // 29: HRESULT XGameSaveSubmitUpdateResult(XAsyncBlock* async)
 HRESULT STDMETHODCALLTYPE save_submit_result(void*, XAsyncBlock* async) {
-    return XAsyncGetResult(async, &kSubmitIdentity, 0, nullptr, nullptr);
+    const HRESULT hr = XAsyncGetResult(async, &kSubmitIdentity, 0, nullptr, nullptr);
+    TRACE("XGameSaveSubmitUpdateResult async=%p hr=0x%08lX", static_cast<void*>(async), hr_bits(hr));
+    return hr;
 }
 
 // 30: HRESULT XGameSaveFilesGetFolderWithUiAsync(XUserHandle requestingUser, const char* configurationId,
 //                                                XAsyncBlock* async): a folder of its own, <root>\files\<configId>.
 HRESULT STDMETHODCALLTYPE files_folder_async(void*, XUserHandle user, const char* config_id, XAsyncBlock* async) {
-    if (!user || !config_id) return E_INVALIDARG;
+    if (!user || !config_id) {
+        TRACE("XGameSaveFilesGetFolderWithUiAsync async=%p user=%p config=\"%s\" hr=0x%08lX",
+              static_cast<void*>(async), user, or_null(config_id), hr_bits(E_INVALIDARG));
+        return E_INVALIDARG;
+    }
     auto* job = new Job{&kFolderIdentity};
     job->user = user;
     job->text = config_id;
-    return begin(async, job, "XGameSaveFilesGetFolderWithUiAsync");
+    return begin(async, job, "XGameSaveFilesGetFolderWithUiAsync",
+                 tracing() ? "config=\"" + job->text + "\"" : std::string());
 }
 
 // 31: HRESULT XGameSaveFilesGetFolderWithUiResult(XAsyncBlock* async, size_t folderSize, char* folderResult)
@@ -961,12 +1262,14 @@ HRESULT STDMETHODCALLTYPE files_folder_result(void*, XAsyncBlock* async, size_t 
     HRESULT hr = XAsyncGetResult(async, &kFolderIdentity, size, folder, nullptr);
     if (hr == HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER) || hr == E_NOT_SUFFICIENT_BUFFER)
         hr = E_GS_PROVIDED_BUFFER_TOO_SMALL;
+    TRACE("XGameSaveFilesGetFolderWithUiResult async=%p buffer=%zu folder=\"%s\" hr=0x%08lX",
+          static_cast<void*>(async), size, SUCCEEDED(hr) ? folder : "", hr_bits(hr));
     return hr;
 }
 
 // 32: HRESULT XGameSaveFilesGetRemainingQuota(XUserHandle requestingUser, const char* configurationId,
 //                                             int64_t* remainingQuota)
-HRESULT STDMETHODCALLTYPE files_quota(void*, XUserHandle user, const char* config_id, int64_t* remaining) {
+HRESULT files_remaining_quota(XUserHandle user, const char* config_id, int64_t* remaining) {
     if (!remaining) return E_POINTER;
     if (!user || !config_id) return E_INVALIDARG;
     const fs::path root = save_root();
@@ -977,6 +1280,12 @@ HRESULT STDMETHODCALLTYPE files_quota(void*, XUserHandle user, const char* confi
         if (e.is_regular_file(ec)) used += static_cast<uint64_t>(e.file_size(ec));
     *remaining = used >= kQuotaBytes ? 0 : static_cast<int64_t>(kQuotaBytes - used);
     return S_OK;
+}
+HRESULT STDMETHODCALLTYPE files_quota(void*, XUserHandle user, const char* config_id, int64_t* remaining) {
+    const HRESULT hr = files_remaining_quota(user, config_id, remaining);
+    TRACE("XGameSaveFilesGetRemainingQuota user=%p config=\"%s\" remaining=%lld hr=0x%08lX", user, or_null(config_id),
+          SUCCEEDED(hr) ? static_cast<long long>(*remaining) : 0ll, hr_bits(hr));
+    return hr;
 }
 
 // ---- The object ----
@@ -1067,6 +1376,12 @@ bool xgameruntime_gamesave_query(const GUID& class_id, REFIID interface_id, void
     if (class_id != kSaveClass) return false;
     *hr = query(interface_id, out);
     return true;
+}
+
+// For tests: turns LEONIDA_TRACE_XGAMESAVE on and sends its lines to `sink` instead of stderr; nullptr turns it off.
+void xgameruntime_gamesave_trace_for_test(void (*sink)(const char* line)) {
+    g_trace_sink.store(sink, std::memory_order_release);
+    g_trace.store(sink ? 1 : 0, std::memory_order_relaxed);
 }
 
 // For tests: the provider, container and update handles a title holds open.

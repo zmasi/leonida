@@ -34,9 +34,13 @@ class PackAliasTest(unittest.TestCase):
                 before = source.read_bytes()
                 output = root / "packed.zip"
                 output.write_bytes(before)
-                aliases = {os.path.normcase(str(source)), os.path.normcase(str(output))}
+                # same_report_path hands samefile the names realpath gave it, which are not the ones tempfile
+                # spelled where the temporary folder is reached through a link (macOS: /var is /private/var).
+                def resolved(path):
+                    return os.path.normcase(os.path.realpath(path))
+                aliases = {resolved(source), resolved(output)}
                 def samefile(a, b):
-                    return {os.path.normcase(str(a)), os.path.normcase(str(b))} == aliases
+                    return {resolved(a), resolved(b)} == aliases
                 with mock.patch("report_paths.os.path.samefile", side_effect=samefile):
                     with self.assertRaisesRegex(mods.ModsError, "aliases a file"):
                         mods.pack_mod(str(root / "mods"), "sample", str(output), True)

@@ -113,6 +113,11 @@ Reported by others: [#1608, comment 7184700506](https://github.com/ubiquitariani
   are the report's pack; a native wave64 pack builds them in seconds each ([above](#settings-every-platform-needs)).
   Where they still take minutes, `gta6rt --precompile-pipelines --big-threads N` bounds how many build at once (each
   held about 3.5 GB of host memory on an RTX 4070 Ti) and `--skip-listed` leaves the listed ones out.
+  Between the two: `LEONIDA_ASYNC_PIPELINES=1` with `LEONIDA_ASYNC_MIN_BYTES=2097152` builds only the pipelines of
+  2 MiB of SPIR-V or more asynchronously (the ray-tracing programs above), and the smaller lighting and post programs
+  where they are needed, as with `=0` ([d3d12_vulkan.md](d3d12_vulkan.md), "Only the large ones asynchronous"). Whether
+  that draws the world without the skip list: TBD. `LEONIDA_ASYNC_MIN_BYTES_GRAPHICS=0` with it leaves every graphics
+  pipeline asynchronous, so the draw thread does not stop presenting to build graphics variants in place.
 - **Command:** TBD.
 - **What to expect:** the opening night street from about 650 s, at 0.1-0.2 frames/s, no device loss through 934 s.
   The black stretch before it is graphics pipelines of 1-2.6 MB SPIR-V compiling one at a time, 5-10 s each.

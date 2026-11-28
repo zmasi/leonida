@@ -37,6 +37,7 @@ or MUBUF and MTBUF disagree, 2 on a harness error (a control failed, a kernel wi
 hardware oracle is unavailable or the GPU is not GFX10. Nothing here reads game files.
 """
 import argparse
+import functools
 import json
 import os
 import struct
@@ -117,25 +118,39 @@ def is_denorm16(h):
     return (h & 0x7C00) == 0 and (h & 0x3FF) != 0
 
 
-def models16(kind, n, v):
-    """{rule: f16 bits} for one input, plus each rule with a denormal result flushed (rule + '_flush')."""
+@functools.lru_cache(maxsize=None)
+def _models16(kind, n, v):
     x = quotient(kind, n, v)
     rcp = to_f32(Fraction(1, (1 << n) - 1) if kind == "unorm" else Fraction(1, (1 << (n - 1)) - 1))
     s = (v - (1 << n) if v >> (n - 1) else v) if kind == "snorm" else v
     prod = max(to_f32(s * rcp), Fraction(-1))
-    out = {"rte": f16_bits(to_f16(x)), "rtz": f16_bits(to_f16(x, True)), "f32_rte": f16_bits(to_f16(to_f32(x))),
-           "f32_rtz": f16_bits(to_f16(to_f32(x), True)), "mul_rte": f16_bits(to_f16(prod))}
-    for r in RULES16:
-        out[r + "_flush"] = (out[r] & 0x8000) if is_denorm16(out[r]) else out[r]
-    return out
+    bits = (f16_bits(to_f16(to_f32(x))), f16_bits(to_f16(to_f32(x), True)), f16_bits(to_f16(x)),
+            f16_bits(to_f16(x, True)), f16_bits(to_f16(prod)))                    # RULES16 order
+    return bits + tuple((b & 0x8000) if is_denorm16(b) else b for b in bits)    # a tuple: a third of a dict
 
 
-def models32(kind, n, v):
+KEYS16 = RULES16 + tuple(r + "_flush" for r in RULES16)
+
+
+def models16(kind, n, v):
+    """{rule: f16 bits} for one input, plus each rule with a denormal result flushed (rule + '_flush').
+    The exact arithmetic runs once per input: a sweep, classify() and the tests ask for the same 16-bit values
+    several times (about 955,000 calls for 131,000 inputs in tests/test_d16_format_probe.py). A copy each call,
+    so a caller that edits the dict cannot change what the next one gets."""
+    return dict(zip(KEYS16, _models16(kind, n, v)))
+
+
+@functools.lru_cache(maxsize=None)
+def _models32(kind, n, v):
     x = quotient(kind, n, v)
     rcp = to_f32(Fraction(1, (1 << n) - 1) if kind == "unorm" else Fraction(1, (1 << (n - 1)) - 1))
     s = (v - (1 << n) if v >> (n - 1) else v) if kind == "snorm" else v
-    return {"f32_rte": f32_bits(to_f32(x)), "f32_rtz": f32_bits(to_f32(x, True)),
-            "mul_f32": f32_bits(max(to_f32(s * rcp), Fraction(-1)))}
+    return f32_bits(to_f32(x)), f32_bits(to_f32(x, True)), f32_bits(max(to_f32(s * rcp), Fraction(-1)))
+
+
+def models32(kind, n, v):
+    """{rule: f32 bits} for one input; cached like models16."""
+    return dict(zip(RULES32, _models32(kind, n, v)))
 
 
 # ---- kernels ----

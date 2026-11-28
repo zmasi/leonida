@@ -83,6 +83,16 @@ int test_title_pool_extent_bounds() {
     EXPECT(leonida::title_pool_extent(pool_lo, pool_hi, pool_lo + 0x28000, pool_hi, kAlign, kMiB, second));
     EXPECT(first.start == pool_lo + 0x20000 && first.size == 0xE0000);
     EXPECT(second.start == first.start && second.size == first.size);
+
+    const auto source = pool_lo + 0x28000;
+    const auto twin = source + 2 * kMiB;
+    EXPECT(leonida::clip_title_pool_extent(first, source, twin, source - 0x4000, source + 0x60000,
+                                          twin - 0x10000, twin + 0x10000));
+    EXPECT(first.start == source - 0x4000 && first.size == 0x14000);
+    EXPECT(!leonida::clip_title_pool_extent(second, source, twin, source + 1, pool_hi,
+                                           twin - 0x10000, twin + 0x10000));
+    EXPECT(!leonida::clip_title_pool_extent(second, source, twin, pool_lo, pool_hi, twin, twin));
+    EXPECT(second.start == pool_lo + 0x20000 && second.size == 0xE0000);
     return 0;
 }
 

@@ -25,6 +25,10 @@
 // argument buffer, the image and the indirect dispatch's output (which also shows that exactly the 3 groups the
 // first dispatch asked for ran).
 // Set LEONIDA_VK_VALIDATION=1 to run under VK_LAYER_KHRONOS_validation (0 errors required).
+// --async-small-waits: LEONIDA_ASYNC_PIPELINES=1 with LEONIDA_ASYNC_MIN_BYTES over both modules (and the warm-up off), and
+// every job of the compile worker held until the results are read: both pipelines are under the threshold, so the
+// dispatches build them where they are needed, as with asynchronous builds off. The same words must match, and no build
+// may have reached the worker. Without the threshold the held worker would leave both dispatches skipped.
 #include "vk_test_device.h"
 #include "d3d12_test_shaders.h"
 #include "../shims/d3d12_com.h"
@@ -34,6 +38,8 @@
 #include "../src/vulkan_indirect_clamp.h"
 
 #include <array>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
 
 #ifndef LEONIDA_TEST_M4_DIR
@@ -99,6 +105,13 @@ Reference reference() {
 
 int main(int argc, char** argv) {
     const bool check_journal = argc == 2 && std::strcmp(argv[1], "--check-async-journal") == 0;
+    const bool small_waits = argc == 2 && std::strcmp(argv[1], "--async-small-waits") == 0;
+    if (small_waits) {  // before the first PSO: the runtime reads these once
+        _putenv_s("LEONIDA_ASYNC_PIPELINES", "1");
+        _putenv_s("LEONIDA_STRICT_REPLAY", "0");
+        _putenv_s("LEONIDA_COMPUTE_WARMUP", "0");
+        _putenv_s("LEONIDA_ASYNC_MIN_BYTES", "1073741824");  // 1 GiB: over any module
+    }
     vktest::Device d;
     d.queue_count_wanted = 2;   // the copy queue and the compute queue each get a VkQueue where the family has two
     const auto device_status = d.initialize();
@@ -143,6 +156,28 @@ int main(int argc, char** argv) {
                                                            reinterpret_cast<void**>(&device.p), /*console_lists=*/false)));
         rt::d3d12::set_device_outer(inner, device.p);
         EXPECT(rt::d3d12::bindless_set(device.p) != VK_NULL_HANDLE);
+
+        // --async-small-waits: every compile-worker job is counted and held until `release` (or the end of this scope,
+        // before the device goes, so a failed check does not leave the device's teardown waiting for a held build).
+        std::atomic<unsigned> worker_jobs{0};
+        struct HeldWorker {
+            HANDLE release = nullptr;
+            ~HeldWorker() {
+                if (!release) return;
+                SetEvent(release);
+                rt::d3d12::PipelineCompiler::instance().set_job_probe(nullptr);
+                CloseHandle(release);
+            }
+        } held;
+        if (small_waits) {
+            EXPECT(rt::d3d12::async_replay_compile());
+            held.release = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+            EXPECT(held.release != nullptr);
+            rt::d3d12::PipelineCompiler::instance().set_job_probe([&worker_jobs, release = held.release](const void*) {
+                worker_jobs.fetch_add(1);
+                WaitForSingleObject(release, INFINITE);
+            });
+        }
 
         // [0] four 32-bit constants (s4..s7), [1] a table of five UAVs (s8, its 32-bit VA): the console compute layout
         // (D3D-448). The fixtures are built with LEONIDA_USER_DATA_SHIFT=4 (runtime/CMakeLists.txt).
@@ -396,6 +431,16 @@ int main(int argc, char** argv) {
         }
         CloseHandle(event);
         EXPECT(copy_fence->GetCompletedValue() >= 2 && compute_fence->GetCompletedValue() >= 1);
+        if (small_waits) {
+            const unsigned jobs = worker_jobs.load();
+            if (jobs) std::fprintf(stderr, "%u build(s) went to the compile worker under LEONIDA_ASYNC_MIN_BYTES\n", jobs);
+            EXPECT(jobs == 0);
+            // Both modules are under the threshold, so neither is asynchronous.
+            EXPECT(!rt::d3d12::async_replay_compile(false,
+                library.spirv_bytes(*library.find("cs", leonida::sha256_hex(fill)))));
+            EXPECT(!rt::d3d12::async_replay_compile(false,
+                library.spirv_bytes(*library.find("cs", leonida::sha256_hex(indirect)))));
+        }
 
         void* mapped = nullptr;
         EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));

@@ -601,7 +601,11 @@ class MainTest(unittest.TestCase):
         self.assertIn("[PASS] ok", out)
 
     def timed(self, name, *, props=None, code=0, sleep=0.3):
-        """A test that logs when it starts and ends, to see which tests overlapped."""
+        """A test that logs when it starts and ends, to see which tests overlapped. Each test has its own log:
+        appends from several processes to one file are not atomic on Windows, so a shared log loses or merges
+        lines when tests run at the same time."""
+        timing = self.root / "timing"
+        timing.mkdir(exist_ok=True)
         (self.artifact / f"{name}.py").write_text(
             "import os, sys, time\n"
             "log = os.environ['TIMING_LOG']\n"
@@ -610,14 +614,15 @@ class MainTest(unittest.TestCase):
             f"open(log, 'a').write('{name} end %r\\n' % time.monotonic())\n"
             f"sys.exit({code})\n", encoding="utf-8", newline="\n")
         props = dict(props or {})
-        props["ENVIRONMENT"] = ["TIMING_LOG=" + str(self.root / "timing.log")]
+        props["ENVIRONMENT"] = ["TIMING_LOG=" + str(timing / f"{name}.log")]
         return ctest_entry(name, self.command(f"{name}.py"), props)
 
     def intervals(self):
         spans: dict[str, list[float]] = {}
-        for line in (self.root / "timing.log").read_text(encoding="utf-8").splitlines():
-            name, _, when = line.split()
-            spans.setdefault(name, []).append(float(when))
+        for log in sorted((self.root / "timing").glob("*.log")):
+            for line in log.read_text(encoding="utf-8").splitlines():
+                name, _, when = line.split()
+                spans.setdefault(name, []).append(float(when))
         return spans
 
     @staticmethod

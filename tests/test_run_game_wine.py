@@ -11,7 +11,6 @@ folders are empty files and folders made by the test. The run must reach the sum
 extra gta6rt arguments passed. PATH holds only the stubs and the few real commands the script uses, so the machine's
 own Wine and KWin are never started. POSIX only; no game files.
 """
-import fcntl
 import os
 import shutil
 import subprocess
@@ -151,6 +150,10 @@ class RunGameWineTest(unittest.TestCase):
         self.assertIn("--visible needs DISPLAY", p.stderr)
 
     def test_a_held_lock_stops_a_second_run(self):
+        # POSIX only, like the launcher: the class-level skip above keeps this off Windows, where `fcntl` does not exist
+        # and a module-level import of it made the file fail to load before the skip could run.
+        import fcntl
+
         with open(self.lock, "w", encoding="utf-8", newline="\n") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
             p = self.run_script(*self.inputs(), "--visible")

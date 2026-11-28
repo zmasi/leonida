@@ -569,7 +569,16 @@ trio (23-25). What the slots must answer is still **not measured**; that is the 
   and `XGameSaveGetContainerInfo` of a missing container returns `S_OK` without a callback. `syncOnDemand` is
   ignored: nothing syncs offline.
 
-`xgameruntime_gamesave_test` drives every slot against a temporary `LEONIDA_SAVE_DIR`.
+`LEONIDA_TRACE_XGAMESAVE=1` logs every call of these slots as one `[rt] xgamesave:` line on stderr, with the
+milliseconds since the process started and the thread: the handles, container and blob names, sizes and
+HRESULT, never the blob contents. An async call (`InitializeProvider`, `GetRemainingQuota`, `DeleteContainer`,
+`ReadBlobData`, `SubmitUpdate`, `FilesGetFolderWithUi`) logs four more lines: `schedule` when `XAsyncSchedule` is
+called, `run` when the work starts on the title's queue (`waited=` is the gap), `complete` with its HRESULT and
+the `...Result` call that collects it. A job that waits behind a stalled queue, or a result the title never
+collects, then shows in a run's log. Unset, nothing is logged beyond the one line when the provider opens.
+
+`xgameruntime_gamesave_test` drives every slot against a temporary `LEONIDA_SAVE_DIR`. With the trace on, it
+checks the lines of a write and a read.
 
 `XStoreImpl` (`runtime/shims/xgameruntime_store.cpp`), from the same layout; the game-license struct is measured
 on the executable, the rest is not:

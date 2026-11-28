@@ -281,6 +281,22 @@ inline bool build_texture(const ResourceDesc& desc, Texture& texture) {
     return true;
 }
 
+// The bytes from the texture's base that hold the mips from `first` on (the whole texture for 0). Only a 2D texture of
+// one slice stores its chain from the smallest mips to the largest, so only there is a part of it a prefix.
+inline uint64_t mip_chain_bytes(const Texture& t, unsigned first) {
+    const auto& plane = t.layout.plane[0];
+    if (!first || first >= t.layout.mips || t.layout.dimension != kTexture2D || t.array != 1) return t.layout.size;
+    if (first >= plane.standard_mips) return t.layout.alignment;  // the tail is one block
+    return plane.mips[first].offset + plane.mips[first].size;
+}
+
+// The first mip that is held, with every smaller one, by the `bytes` readable bytes from the texture's base; the mip
+// count when not even the smallest is.
+inline unsigned first_mip_within(const Texture& t, uint64_t bytes) {
+    for (unsigned m = 0; m < t.layout.mips; ++m)
+        if (mip_chain_bytes(t, m) <= bytes) return m;
+    return t.layout.mips;
+}
 
 // These RB+ equation rows come directly from AMD addrlib. The other two
 // non-XOR modes already have equations in Leonida's GFX10 detiler.

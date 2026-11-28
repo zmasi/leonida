@@ -52,14 +52,22 @@ jobs:
       # A docs-only diff still needs the tests that read those documents, because `check` is skipped for it: every
       # tests/test_docs_*.py (links, the design.md contract rows, list items, the repository paths a document
       # names) and the i18n index, which checks docs/i18n/README.md. All are standard library only and read only
-      # tracked files. tests/test_ci_registration.py fails when a tests/test_docs_*.py is not run here.
+      # tracked files. Other test files read a document too: the design.md row check, the exe checklist's notes in
+      # docs/*.md, and the clone address the README gives (make_game.py's hint, the dashboard's --github default);
+      # those run here, the last three as the single cases that read it. tests/test_ci_registration.py fails when a
+      # tests/test_docs_*.py, or another test that reads a document, is not run here.
       - name: Check documentation when only documentation changed
         if: steps.paths.outputs.docs-only == 'true'
         run: |
-          for t in tests/test_docs_*.py tests/test_i18n_index.py; do
+          for t in tests/test_docs_*.py tests/test_i18n_index.py tests/test_design_contract_rows.py; do
             echo "== $t"
             python3 -I "$t" || exit 1
           done
+          echo "== document cases of other test files"
+          python3 -I tests/test_exe_checklist.py ExeChecklist.test_this_repository || exit 1
+          python3 -I tests/test_make_game_preflight.py \
+            PreflightPrerequisiteTest.test_ensure_submodule_names_the_clone_command_the_readme_gives || exit 1
+          python3 -I tests/test_progress_dashboard.py Github.test_default_repo_is_the_one_the_readme_clones || exit 1
 
   check:
     needs: change-scope
@@ -86,19 +94,14 @@ jobs:
       - name: Tests (standard library only, no game data)
         shell: bash
         run: |
-          # Run every file, then fail: stopping at the first failure would hide the files after it.
-          failed=()
+          # Keep the pytest selection predicate, but run the selected files two at a time.
+          # The runner reports every failure instead of stopping at the first one.
           while IFS= read -r t; do
             if grep -Eq "$PYTEST_FILE_MARKERS" "$t" || ! grep -q '__main__' "$t"; then
               continue
             fi
-            echo "== $t"
-            python -I "$t" || failed+=("$t")
-          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort)  # pytest-based files run in the translator-tests job
-          if (( ${#failed[@]} )); then
-            for t in "${failed[@]}"; do echo "::error file=$t::$t failed"; done
-            exit 1
-          fi
+            printf '%s\n' "$t"
+          done < <(find tests -path 'tests/semantic' -prune -o -type f -name 'test_*.py' -print | LC_ALL=C sort) | python -I scripts/run_standalone_tests.py -j 2
       - name: Build rpf9dump
         run: dotnet build tools/rpf9dump/rpf9dump.csproj -c Release
       - name: Test TTPF export retry

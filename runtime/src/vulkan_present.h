@@ -212,7 +212,7 @@ public:
         const VkDevice device = context_.device();
         {
             std::lock_guard lock(context_.submit_mutex());
-            const SubmitMutex::SubmitTurn turn(context_.submit_mutex());  // a queue operation: the compile gate
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             context_.observe_result(vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle (present)");
             // A WSI layer may perform a device-wide idle while destroying the swapchain.
             // Keep that implicit idle serialized with submits from every context queue.
@@ -650,8 +650,9 @@ private:
         {
             std::lock_guard lock(context_.submit_mutex());
             // One turn of the compile gate for the submit and the present after it: no pipeline create enters the
-            // driver between the two (queue_submit's own turn nests inside this one).
-            const SubmitMutex::SubmitTurn turn(context_.submit_mutex());  // a queue operation: the compile gate
+            // driver between the two (queue_submit's own turn nests inside this one). Not a probe: it also covers
+            // finish_startup_frame's fence wait and the present; the nested turn probes the vkQueueSubmit alone.
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             submitted = context_.observe_result(context_.queue_submit(queue_, 1, &submit_info, frame.done),
                                                 "vkQueueSubmit (present)");
             if (submitted == VK_SUCCESS) context_.note_image_work_locked();
@@ -1083,7 +1084,7 @@ private:
         const VkDevice device = context_.device();
         {
             std::lock_guard lock(context_.submit_mutex());
-            const SubmitMutex::SubmitTurn turn(context_.submit_mutex());  // a queue operation: the compile gate
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             // The old swapchain's images and semaphores may still be in use.
             context_.observe_result(vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle (present)");
             release(swapchain_);
@@ -1174,7 +1175,7 @@ private:
             return true;
         {
             std::lock_guard lock(context_.submit_mutex());
-            const SubmitMutex::SubmitTurn turn(context_.submit_mutex());  // a queue operation: the compile gate
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             // The old target may still be in use.
             context_.observe_result(context_.vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle (present)");
         }
@@ -1531,7 +1532,7 @@ private:
         const VkDevice device = context_.device();
         {
             std::lock_guard lock(context_.submit_mutex());
-            const SubmitMutex::SubmitTurn turn(context_.submit_mutex());  // a queue operation: the compile gate
+            const SubmitMutex::SubmitTurn turn(context_.submit_mutex(), false);  // a queue operation: the compile gate
             // The old swapchain's images and semaphores may still be in use.
             context_.observe_result(vk.vkQueueWaitIdle(queue_), "vkQueueWaitIdle (present)");
         }

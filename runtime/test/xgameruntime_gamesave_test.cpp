@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,7 @@
 
 namespace rt::shims {
 long xgameruntime_gamesave_open_handles();
+void xgameruntime_gamesave_trace_for_test(void (*sink)(const char* line));
 }
 
 namespace {
@@ -116,6 +118,26 @@ bool CALLBACK on_blob(const BlobInfo* info, void* context) {
     seen->names.emplace_back(info->name);
     seen->sizes.push_back(info->size);
     return true;
+}
+
+// The LEONIDA_TRACE_XGAMESAVE lines, collected from whichever thread the shim logs on.
+std::mutex g_trace_mutex;
+std::vector<std::string> g_trace;
+void on_trace(const char* line) {
+    std::lock_guard<std::mutex> lock(g_trace_mutex);
+    g_trace.emplace_back(line);
+}
+std::vector<std::string> trace_lines() {
+    std::lock_guard<std::mutex> lock(g_trace_mutex);
+    return g_trace;
+}
+// The index of the first line holding every one of `parts`, -1 for none.
+int trace_index(const std::vector<std::string>& lines, const char* a, const char* b = "", const char* c = "") {
+    for (size_t i = 0; i < lines.size(); ++i)
+        if (lines[i].find(a) != std::string::npos && lines[i].find(b) != std::string::npos &&
+            lines[i].find(c) != std::string::npos)
+            return static_cast<int>(i);
+    return -1;
 }
 
 }  // namespace
@@ -463,6 +485,85 @@ int main() {
         check(read_blob(rollback_dir, L"b~b~") == "KEPT_B", "the failed update keeps the backup it did not write");
 
         at<Close>(save, 17)(save, rc);
+    }
+
+    // ---- LEONIDA_TRACE_XGAMESAVE: one line per call, async jobs from schedule to result, never blob contents ----
+    {
+        rt::shims::xgameruntime_gamesave_trace_for_test(on_trace);
+        std::string content;
+        while (content.size() < 300) content += "TRACE-CONTENT-MARKER ";
+        content.resize(300);
+        Handle tc = nullptr, tu = nullptr;
+        at<Create>(save, 16)(save, provider, "traced", &tc);
+        at<Create>(save, 23)(save, tc, "Traced", &tu);
+        at<Write>(save, 25)(save, tu, "slot", reinterpret_cast<const uint8_t*>(content.data()), content.size());
+        XAsyncBlock tsubmit{};
+        const bool submitted = at<WithAsync>(save, 28)(save, tu, &tsubmit) == S_OK && finished(&tsubmit) &&
+                               at<AsyncOnly>(save, 29)(save, &tsubmit) == S_OK;
+        const char* tnames[] = {"slot"};
+        uint32_t tcount = 1;
+        std::vector<uint64_t> tbuf(1024);
+        const bool read_sync = at<Read>(save, 20)(save, tc, tnames, &tcount, tbuf.size() * 8,
+                                                  reinterpret_cast<Blob*>(tbuf.data())) == S_OK;
+        XAsyncBlock tread{};
+        uint32_t tacount = 0;
+        const bool read_async = at<ReadAsync>(save, 21)(save, tc, tnames, 1, &tread) == S_OK && finished(&tread) &&
+                                at<ReadResult>(save, 22)(save, &tread, tbuf.size() * 8,
+                                                         reinterpret_cast<Blob*>(tbuf.data()), &tacount) == S_OK &&
+                                tacount == 1;
+        at<Close>(save, 24)(save, tu);
+        at<Close>(save, 17)(save, tc);
+        at<ByName>(save, 10)(save, provider, "traced");
+        rt::shims::xgameruntime_gamesave_trace_for_test(nullptr);
+        const size_t traced_lines = trace_lines().size();
+        int64_t untraced = 0;
+        at<Quota>(save, 7)(save, provider, &untraced);
+        const std::vector<std::string> lines = trace_lines();
+        for (const std::string& l : lines) std::printf("  %s", l.c_str());
+
+        check(submitted && read_sync && read_async, "a traced write and read through the offline provider succeed");
+        bool formed = !lines.empty(), contents = false;
+        for (const std::string& l : lines) {
+            formed = formed && l.rfind("[rt] xgamesave: t=", 0) == 0 && l.find("ms tid=") != std::string::npos &&
+                     !l.empty() && l.back() == '\n';
+            contents = contents || l.find("TRACE-CONTENT") != std::string::npos;
+        }
+        check(formed, "every trace line is \"[rt] xgamesave: t=<ms>ms tid=<thread> ...\"");
+        check(!contents, "no trace line holds blob contents");
+        check(trace_index(lines, "XGameSaveCreateContainer provider=", "container=\"traced\" handle=", "hr=0x00000000") >= 0,
+              "CreateContainer is traced with the container name, its handle and the HRESULT");
+        check(trace_index(lines, "XGameSaveCreateUpdate handle=", "container=\"traced\" display=\"Traced\"", "hr=0x00000000") >= 0,
+              "CreateUpdate is traced with the container and display name");
+        check(trace_index(lines, "XGameSaveSubmitBlobWrite update=", "blob=\"slot\" size=300", "hr=0x00000000") >= 0,
+              "SubmitBlobWrite is traced with the blob name and size");
+        const int scheduled = trace_index(lines, "XGameSaveSubmitUpdateAsync schedule async=", "container=\"traced\" ops=1 bytes=300");
+        const int ran = trace_index(lines, "XGameSaveSubmitUpdateAsync run async=", "waited=");
+        const int completed = trace_index(lines, "XGameSaveSubmitUpdateAsync complete async=", "hr=0x00000000", "work=");
+        const int collected = trace_index(lines, "XGameSaveSubmitUpdateResult async=", "hr=0x00000000");
+        check(trace_index(lines, "XGameSaveSubmitUpdateAsync async=", "hr=0x00000000") >= 0,
+              "SubmitUpdateAsync's own HRESULT is traced");
+        check(scheduled >= 0 && ran > scheduled && completed > ran && collected > completed,
+              "SubmitUpdateAsync is traced when scheduled, when its work runs, when it completes and when collected");
+        char block[48];
+        std::snprintf(block, sizeof(block), "async=%p ", static_cast<void*>(&tsubmit));
+        check(scheduled >= 0 && ran >= 0 && completed >= 0 && collected >= 0 &&
+                  lines[scheduled].find(block) != std::string::npos && lines[ran].find(block) != std::string::npos &&
+                  lines[completed].find(block) != std::string::npos && lines[collected].find(block) != std::string::npos,
+              "the four lines of one async job name the title's XAsyncBlock");
+        check(trace_index(lines, "XGameSaveReadBlobData handle=", "names=\"slot\"", "read=\"slot\":300 hr=0x00000000") >= 0,
+              "ReadBlobData is traced with the names asked for and the blob sizes read");
+        const int rscheduled = trace_index(lines, "XGameSaveReadBlobDataAsync schedule async=", "names=\"slot\"");
+        const int rran = trace_index(lines, "XGameSaveReadBlobDataAsync run async=", "waited=");
+        const int rcompleted = trace_index(lines, "XGameSaveReadBlobDataAsync complete async=", "hr=0x00000000");
+        const int rcollected = trace_index(lines, "XGameSaveReadBlobDataResult async=", "read=\"slot\":300", "hr=0x00000000");
+        check(rscheduled >= 0 && rran > rscheduled && rcompleted > rran && rcollected > rcompleted,
+              "ReadBlobDataAsync is traced from schedule to the Result call, which names the blob and its size");
+        check(trace_index(lines, "XGameSaveCloseUpdate update=") >= 0 &&
+                  trace_index(lines, "XGameSaveCloseContainer handle=", "container=\"traced\"") >= 0 &&
+                  trace_index(lines, "XGameSaveDeleteContainer provider=", "container=\"traced\"", "hr=0x00000000") >= 0,
+              "the closes and the container delete are traced");
+        check(lines.size() == traced_lines && trace_index(lines, "XGameSaveGetRemainingQuota ") < 0,
+              "with the trace off again, a call logs nothing");
     }
 
     at<Close>(save, 6)(save, provider);

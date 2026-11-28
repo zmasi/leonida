@@ -111,6 +111,16 @@ python -I tools/rdna2spirv.py <work>/shaders/dxbc/disasm --out <scratch> --shard
 Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`. Report translated and
 `spirv-val`-valid counts before and after; a change that lowers either is a regression.
 
+## Runtime traps
+
+- **No `thread_local` with a destructor in `gta6rt.exe`.** It makes the loader register a thread-exit callback with
+  the shared C runtime, which accepts one per process; the title's own registration then fails and the title aborts
+  with `0xC0000409` before its first frame. Keep per-thread scratch in the thread's own frame (a worker's loop) or
+  in a plain-data `thread_local`.
+- **A console method that returns a struct by value** takes a hidden return pointer as its first argument (RCX)
+  and `this` in RDX, as MSVC does for COM methods returning structs (`GetCustomHeapProperties`, `GetDesc`-style
+  slots); a proxy that reads RCX as `this` faults on a null vtable.
+
 ## Conventions
 
 - Python tools run with `python -I` and use only the standard library unless a file says otherwise; the exceptions
@@ -121,3 +131,5 @@ Shard runs write `index.part*.json`; merge them into `index.json` with `--merge`
   input gives the same bytes on every platform; `tests/test_text_write_line_endings.py` catches a writer that forgets.
 - Keep `make_game.py` working on Windows first: paths through `os.path`, no bash in the build.
 - In the pull request, say that it was AI-assisted, what you tested and on which GPU and driver.
+- How agents share results, ask each other for a test on a machine they do not have and say how sure a claim is:
+  [docs/agent_collaboration.md](docs/agent_collaboration.md).
