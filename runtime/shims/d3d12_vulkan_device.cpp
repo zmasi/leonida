@@ -40,6 +40,7 @@
 #include "../src/rgba4_fragment.h"
 #include "../src/dual_source_fragment.h"
 #include "../src/rect_list_geometry.h"
+#include "../src/stub_pipeline.h"
 #include "../src/uav_clear.h"
 #include "../src/vulkan_bindless.h"
 #include "../src/vulkan_memory.h"
@@ -12160,6 +12161,7 @@ public:
         }
         return registered_ && (is_graphics_==graphics);
     }
+    StubPipelineKind stub_kind() const { return native_owner_ ? native_owner_->stub_kind() : stub_kind_; }
     bool compute() const { return pending_stream_kind_==2 || (registered_ && !is_graphics_); }
     bool graphics() const { return native_owner_ ? native_owner_->graphics() : pending_stream_kind_==1 || (registered_ && is_graphics_); }
     const std::vector<leonida::SubgroupRequest>& subgroup_requests() const {
@@ -12178,17 +12180,54 @@ public:
     // does for mesh PSOs), drawn by DispatchMesh. A nonempty PC AS still needs a task-stage translation.
     // `back_masks`, from a DEPTH_STENCIL2 subobject, are the back face's stencil masks; without it both faces take
     // the description's.
-    // LEONIDA_STUB_PIPELINES=1 (diagnostic): a pipeline whose translated shader is missing is created without a
-    // Vulkan pipeline. It is never registered, so SetPipelineState leaves no PSO bound and its draws and dispatches
-    // are recorded as no-ops (D3D-482). No game shader runs; the boot gets past a title that refuses to go on when
-    // pipeline creation fails.
+    // LEONIDA_STUB_PIPELINES=1 (diagnostic): a pipeline whose translated shader is missing does not fail. No game
+    // shader runs; the boot gets past a title that refuses to go on when pipeline creation fails.
+    //   - A graphics pipeline with a vertex stage (MVP-GPU-04) is a real Vulkan pipeline built from the stages in
+    //     src/stub_pipeline.h, registered like any other, so its draws run through replay and the validation layer.
+    //     Its vertex stage puts every vertex outside the clip volume: the draw rasterizes nothing. With
+    //     LEONIDA_STUB_PIPELINES=color it covers the viewport instead and writes leonida::stub_colour to every render
+    //     target, so the passes that are stubbed show on screen; the title's cull, depth, stencil, blend and logic-op
+    //     state are off for it (the write mask stays).
+    //   - A compute or mesh pipeline is created without a Vulkan pipeline and never registered, so SetPipelineState
+    //     leaves no PSO bound and its dispatches and draws are recorded as no-ops (D3D-482).
     static bool stub_pipelines() {
         wchar_t v[8] = {};
         const DWORD n = GetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", v, 8);
         return n > 0 && n < 8 && v[0] != L'0';
     }
-    HRESULT stub_or(HRESULT hr, const char* what) {
+    static bool stub_pipelines_cover() {
+        wchar_t v[8] = {};
+        const DWORD n = GetEnvironmentVariableW(L"LEONIDA_STUB_PIPELINES", v, 8);
+        return n > 0 && n < 8 && _wcsicmp(v, L"color") == 0;
+    }
+    // The pixel-stage output a stub writes for a render-target format: integer for the UINT and SINT formats.
+    static leonida::StubOutput stub_output(DXGI_FORMAT format) {
+        switch (vulkan_format(format, false).format) {
+        case VK_FORMAT_UNDEFINED: return leonida::StubOutput::none;
+        case VK_FORMAT_R8_UINT: case VK_FORMAT_R8G8_UINT: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R16_UINT:
+        case VK_FORMAT_R16G16_UINT: case VK_FORMAT_R16G16B16A16_UINT: case VK_FORMAT_R32_UINT: case VK_FORMAT_R32G32_UINT:
+        case VK_FORMAT_R32G32B32A32_UINT: case VK_FORMAT_A2B10G10R10_UINT_PACK32:
+            return leonida::StubOutput::uint_;
+        case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_R16_SINT:
+        case VK_FORMAT_R16G16_SINT: case VK_FORMAT_R16G16B16A16_SINT: case VK_FORMAT_R32_SINT: case VK_FORMAT_R32G32_SINT:
+        case VK_FORMAT_R32G32B32A32_SINT:
+            return leonida::StubOutput::sint_;
+        default: return leonida::StubOutput::float_;
+        }
+    }
+    // The stage table's stand-in entry for a stub stage: no bindings, no inputs, no code base, no subgroup request.
+    static const leonida::ShaderEntry& stub_entry() {
+        static const leonida::ShaderEntry entry = [] {
+            leonida::ShaderEntry e;
+            e.name = "LEONIDA_STUB_PIPELINES";
+            return e;
+        }();
+        return entry;
+    }
+    // `kind` is what the stub is to the command list (stub_pipeline_kind): its dispatches or mesh draws record nothing.
+    HRESULT stub_or(HRESULT hr, const char* what, StubPipelineKind kind) {
         if (!stub_pipelines()) return hr;
+        stub_kind_ = kind;
         static std::atomic<unsigned> stubbed{0};
         const unsigned n = ++stubbed;
         if (n == 1 || (n & (n - 1)) == 0)
@@ -12315,7 +12354,14 @@ public:
             return E_INVALIDARG;
         }
         const leonida::ShaderLibrary* library = device_.library();
-        if (!library) return stub_or(E_FAIL, "graphics");
+        // LEONIDA_STUB_PIPELINES: a vertex pipeline with a missing translation takes the built-in stages below.
+        const bool can_stub = !mesh && stub_pipelines();
+        bool stubbed = false;
+        if (!library) {
+            // Without the built-in stages (a mesh pipeline), stub_or makes it a mesh stub, or refuses with the switch off.
+            if (!can_stub) return stub_or(E_FAIL, "mesh", StubPipelineKind::mesh);
+            stubbed = true;
+        }
 
         struct Stage {
             const char* name;
@@ -12333,10 +12379,16 @@ public:
         static_assert(std::size(stages) <= std::size(decltype(recipe_.required_sizes){}),
                       "Recipe::required_sizes needs an entry per graphics stage");
         unsigned packed_color_mask=0;
+        // A LEONIDA_STUB_PIPELINES=color stub turns blending and logic ops off (below), so the packed fallback's refusal
+        // of them waits until it is known whether this pipeline is such a stub.
+        bool packed_blend_refused=false;
         for(unsigned i=0;i<desc.NumRenderTargets;++i) {
             if(desc.RTVFormats[i]==DXGI_FORMAT_B4G4R4A4_UNORM && !device_.color_attachment_usable(VK_FORMAT_A4R4G4B4_UNORM_PACK16)) {
                 const auto& blend=desc.BlendState.RenderTarget[desc.BlendState.IndependentBlendEnable?i:0];
-                if(blend.BlendEnable||blend.LogicOpEnable)return E_NOTIMPL;
+                if(blend.BlendEnable||blend.LogicOpEnable) {
+                    if(!can_stub||!stub_pipelines_cover())return E_NOTIMPL;
+                    packed_blend_refused=true;
+                }
                 packed_color_mask|=1u<<i;
             }
         }
@@ -12382,6 +12434,7 @@ public:
                                                 desc.RasterizerState.SlopeScaledDepthBias,
                                                 desc.RasterizerState.DepthBiasClamp,packed16_fallback?65535.0f:16777215.0f};
         for (Stage& stage : stages) {
+            if (stubbed) break;
             if (!stage.code.pShaderBytecode || !stage.code.BytecodeLength) continue;  // no PS: depth only
             const std::span<const std::uint8_t> raw_bytes{
                 static_cast<const std::uint8_t*>(stage.code.pShaderBytecode), stage.code.BytecodeLength};
@@ -12400,7 +12453,11 @@ public:
                         std::fprintf(stderr, "[rt] d3d12: missing %s in graphics PSO %s (RTs %u, RT0 %d, DSV %d)\n",
                                      stage.name, pipeline_key(desc).c_str(), desc.NumRenderTargets,
                                      int(desc.RTVFormats[0]), int(desc.DSVFormat));
-                    return stub_or(E_INVALIDARG, "graphics");
+                    if (can_stub) {
+                        stubbed = true;
+                        break;
+                    }
+                    return stub_or(E_INVALIDARG, "mesh", StubPipelineKind::mesh);
                 }
             } else if (leonida::fspx_bare_program(raw_bytes)) {
                 // Slot 57 (DeserializeGraphicsPipelineStateX): bare RDNA2 program indexed by fspx_code_sha256 in
@@ -12415,7 +12472,11 @@ public:
                 if (!stage.entry) {
                     std::fprintf(stderr, "[rt] d3d12: no translated %s for FSPX code sha256 %s (%zu B)\n",
                                  stage.name, hash.c_str(), raw_bytes.size());
-                    return stub_or(E_INVALIDARG, "graphics");
+                    if (can_stub) {
+                        stubbed = true;
+                        break;
+                    }
+                    return stub_or(E_INVALIDARG, "mesh", StubPipelineKind::mesh);
                 }
             } else {
                 log_once("shader bytecode holds no FSSM or FSPX program; bytes", int(stage.code.BytecodeLength));
@@ -12475,6 +12536,33 @@ public:
                 return stream_unsupported("FullyCoveredEXT needs an enabled Tier 3 shader ABI and device properties; stage", int(stage.bit));
             }
         }
+        const bool stub_cover = stubbed && stub_pipelines_cover();  // also overrides the fixed-function state below
+        if (packed_blend_refused && !stub_cover) return E_NOTIMPL;  // translated after all: the refusal stands
+        if (stubbed) {
+            // The built-in vertex and pixel stages replace the whole stage table: no geometry stage, no set 0, no code
+            // base, nothing read from the input layout. The rasterizer keeps the description's depth bias (no D24
+            // fragment patch), and the colour needs no 4-bit quantisation (exact in every UNORM format).
+            const bool cover = stub_cover;
+            static std::atomic<unsigned> stubbed_count{0};
+            const unsigned n = ++stubbed_count;
+            if (n == 1 || (n & (n - 1)) == 0)
+                std::fprintf(stderr, "[rt] d3d12: LEONIDA_STUB_PIPELINES: graphics pipeline without a translated shader "
+                                     "uses the built-in %s stages (%u so far)\n", cover ? "colour" : "empty", n);
+            std::vector<leonida::StubOutput> outputs(desc.NumRenderTargets, leonida::StubOutput::none);
+            for (UINT i = 0; i < desc.NumRenderTargets; ++i) outputs[i] = stub_output(desc.RTVFormats[i]);
+            for (Stage& stage : stages) {
+                stage.entry = nullptr;
+                stage.fssm.clear();
+                stage.words.clear();
+            }
+            stages[0].entry = &stub_entry();
+            stages[0].words = leonida::stub_vertex_stage(cover, topology_type == D3D12_PRIMITIVE_TOPOLOGY_TYPE_POINT);
+            stages[2].entry = &stub_entry();
+            stages[2].words = leonida::stub_pixel_stage(outputs);
+            uses_bindless = false;
+            code_stage = nullptr;
+            depth24_fragment = false;
+        }
         if (std::getenv("LEONIDA_LOG_EXE_PIPELINES")) log_exe_pipeline(stages[0].entry, stages[2].entry, desc);
         // --f16-interp-fallback (SHADER-378): align/synthesize VS decoded f16 halves for this (VS, PS) pair before
         // creating the shader modules so colliding PS and high-param producers link within MoltenVK's 30 locations.
@@ -12498,7 +12586,7 @@ public:
         }
         // A lazy pipeline keeps where each stage's words come from, not the words or a module: build() makes them
         // again, the same way, and drops them once the pipeline exists.
-        lazy_ = lazy_graphics_pipelines();
+        lazy_ = !stubbed && lazy_graphics_pipelines();  // a lazy build reads its stages from the library again
         depth24_bias_ = depth24_bias;
         rgba4_mask_ = packed_color_mask;
         // A stage that declares a storage image or buffer it may write needs a device feature outside compute
@@ -12718,7 +12806,7 @@ public:
 
         VkPipelineMultisampleStateCreateInfo multisample{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
         multisample.rasterizationSamples = VkSampleCountFlagBits(samples);
-        const VkSampleMask sample_mask = desc.SampleMask;
+        VkSampleMask sample_mask = desc.SampleMask;  // all samples for a =color stub (below)
         multisample.pSampleMask = &sample_mask;
         multisample.alphaToCoverageEnable = desc.BlendState.AlphaToCoverageEnable;
 
@@ -12773,6 +12861,22 @@ public:
             if (unsigned(first.LogicOp) > D3D12_LOGIC_OP_OR_INVERTED) return E_INVALIDARG;
             blend.logicOpEnable = VK_TRUE;
             blend.logicOp = logic_op(first.LogicOp);
+        }
+        // LEONIDA_STUB_PIPELINES=color: the cover triangle has one fixed winding at z = 0 and the pixel stage writes
+        // one colour, so the title's state would often hide it: the D3D12 default back-face cull, wireframe fill, a
+        // zero sample mask, a reverse-Z GREATER test against a clear of 0, a failing stencil test, SRC1 blend factors
+        // (the stub writes no second output), a logic op. All of that is off for the stub; the write mask stays, so a
+        // target the title does not write keeps its contents.
+        if (stub_cover) {
+            raster.polygonMode = VK_POLYGON_MODE_FILL;
+            raster.cullMode = VK_CULL_MODE_NONE;
+            sample_mask = ~VkSampleMask{0};
+            multisample.alphaToCoverageEnable = VK_FALSE;
+            depth.depthTestEnable = VK_FALSE;
+            depth.depthWriteEnable = VK_FALSE;
+            depth.stencilTestEnable = VK_FALSE;
+            for (auto& b : blends) b.blendEnable = VK_FALSE;
+            blend.logicOpEnable = VK_FALSE;
         }
 
         // State that needs a Vulkan feature the device did not enable (VulkanDeviceInfo::features) is refused, rather
@@ -13016,7 +13120,7 @@ public:
             return E_INVALIDARG;
         }
         const leonida::ShaderLibrary* library = device_.library();
-        if (!library) return stub_or(E_FAIL, "compute");
+        if (!library) return stub_or(E_FAIL, "compute", StubPipelineKind::compute);
         // A binding-free entry wins over one with bindings for the same program (pick_entry).
         // An FSPX program from a container is matched on its kind-0 state too; a bare kind-6 program whose
         // translations differ is ambiguous without that state and is refused (program_candidates).
@@ -13034,7 +13138,7 @@ public:
             std::fprintf(stderr, "[rt] d3d12: no translated compute shader for %s sha256 %s\n",
                          fspx ? (program.state.empty() ? "FSPX kind-6" : "FSPX kind-6 and kind-0") : "FSSM",
                          leonida::sha256_hex(program.bytes).c_str());
-            return stub_or(E_INVALIDARG, "compute");
+            return stub_or(E_INVALIDARG, "compute", StubPipelineKind::compute);
         }
         // Set 0 (bindless images, samplers, the descriptor hash table): the device keeps it, and a pipeline whose
         // shader declares bindings has it in its layout and has it bound at every dispatch.
@@ -13811,6 +13915,7 @@ private:
     bool registered_ = false;
     bool unregistered_ = false;  // taken out of the context's registry (unregister)
     bool is_graphics_ = false;
+    StubPipelineKind stub_kind_ = StubPipelineKind::none;  // set by stub_or: a compute or mesh stub (never registered)
     std::vector<leonida::SubgroupRequest> subgroup_requests_;  // one per stage, in creation order
     unsigned pending_stream_kind_=0;
     std::once_flag resolve_stream_once_;
@@ -21819,6 +21924,12 @@ void request_pipeline_build(std::uintptr_t id, std::uint32_t bound_targets, bool
     // The id is the PSO's own ID3D12PipelineState pointer (PipelineState::id), which the list keeps a reference to.
     auto* pso = static_cast<PipelineState*>(reinterpret_cast<ID3D12PipelineState*>(id));
     pso->request_early(bound_targets, depth_bound);
+}
+
+StubPipelineKind stub_pipeline_kind(ID3D12PipelineState* pipeline, IUnknown* device) {
+    const PipelineState* p = PipelineState::from<PipelineState>(pipeline);
+    if (!p || (device && p->attached_device() != device)) return StubPipelineKind::none;
+    return p->stub_kind();
 }
 
 const std::vector<leonida::SubgroupRequest>* pipeline_subgroup_requests(ID3D12PipelineState* pipeline) {

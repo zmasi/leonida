@@ -69,6 +69,14 @@ struct BundledModuleOps {
     // (library_loader's W entries use them when a name has a character outside ASCII). Either may be null.
     void* (*find_loaded_w)(void* ctx, const std::wstring& basename);
     void* (*load_bundled_w)(void* ctx, const std::wstring& basename, uint32_t flags, bool& handled);
+    // LEONIDA_COMPAT_DIR at run time. compat_module: `handled` when the folder holds `basename` (`name` is what the
+    // caller gave: a name with a directory counts only when it is that file), which then owns the module ahead of
+    // any shim; the result is its handle (loaded first when `load`, with the LoadLibraryEx `flags`, else null until
+    // something loaded it), or null with the Windows error set when it cannot be loaded. owns_compat_handle: whether
+    // `module` is a DLL from that folder, whose exports are its own. Either may be null.
+    void* (*compat_module)(void* ctx, const std::wstring& basename, const std::wstring& name, bool load,
+                           uint32_t flags, bool& handled);
+    bool (*owns_compat_handle)(void* ctx, void* module);
 };
 void add_bundled_loader(void* ctx, const BundledModuleOps* ops);
 void remove_bundled_loader(void* ctx);
@@ -79,6 +87,9 @@ void* find_loaded_bundled_module_w(const std::wstring& basename);
 void* load_bundled_module_w(const std::wstring& basename, uint32_t flags, bool& handled);
 void* get_bundled_proc_address(void* module, const std::string& sym, bool& owns_handle);
 bool owns_bundled_module_handle(void* module);
+void* compat_module(const std::wstring& basename, const std::wstring& name, bool load, uint32_t flags,
+                    bool& handled);
+bool owns_compat_module_handle(void* module);
 
 // Title-exported __XMemAllocationHooks__ (GDK XMEM_ALLOCATION_HOOKS): the console runtime routes internal
 // allocations (including D3D12 descriptor heaps) through these callbacks when the mapped image exports the struct.
