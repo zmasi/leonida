@@ -494,8 +494,9 @@ class Program:
             stride, base, off = op["addr"]
             lines += self.asm_addr(stride, base)
         if k == "cmpst" and op["cmp_hit"]:
-            # compare value = the word currently in memory for every lane (so the store happens): read it first
-            lines += [f"ds_read_b32 v{op['src']}, v{ADDR} offset:{op['addr'][2]}", "s_waitcnt lgkmcnt(0)"]
+            # compare value = the word currently in memory for every lane (so the store happens): read it first,
+            # then close the barrier epoch so GPU-AV SharedMemoryDataRace does not pair this OpLoad with the atomic
+            lines += [f"ds_read_b32 v{op['src']}, v{ADDR} offset:{op['addr'][2]}", "s_waitcnt lgkmcnt(0)", "s_barrier"]
         if k in ("bpermute", "permute"):
             lines += [f"v_mul_u32_u24_e32 v{ADDR}, {op['mul']}, v0", f"v_add_nc_u32_e32 v{ADDR}, {op['add']}, v{ADDR}",
                       f"v_lshlrev_b32_e32 v{ADDR}, 2, v{ADDR}"]
