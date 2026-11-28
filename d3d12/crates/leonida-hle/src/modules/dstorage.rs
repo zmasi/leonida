@@ -441,7 +441,10 @@ fn read_direct(file: &std::fs::File, out: &mut [u8], offset: u64) -> std::io::Re
     /// Read at a time.
     const MOST: usize = 1 << 20;
     let sector = SECTOR as u64;
-    if offset % sector == 0 && out.len() % SECTOR == 0 && out.as_ptr() as usize % SECTOR == 0 {
+    if offset.is_multiple_of(sector)
+        && out.len().is_multiple_of(SECTOR)
+        && (out.as_ptr() as usize).is_multiple_of(SECTOR)
+    {
         return read_overlapped(file, out, offset);
     }
     thread_local! {
@@ -1241,6 +1244,26 @@ impl Traced {
     }
 }
 
+trait PendingStatus {
+    fn mark_pending(&self);
+}
+
+impl PendingStatus for Command {
+    fn mark_pending(&self) {
+        if let Command::Status(status) = self {
+            status.entry().store(E_PENDING, Ordering::Release);
+        }
+    }
+}
+
+impl PendingStatus for Option<Command> {
+    fn mark_pending(&self) {
+        if let Some(command) = self {
+            command.mark_pending();
+        }
+    }
+}
+
 /// A status entry to write, holding a reference on its array.
 struct Status {
     array: Array,
@@ -1281,11 +1304,10 @@ extern "system" fn enqueue_status(this: QueueRef, array: Array, index: u32) {
     let Some(entries) = (unsafe { array.as_ref() }).map(|a| &a.state.entries) else {
         return;
     };
-    let Some(entry) = entries.get(index as usize) else {
+    if entries.get(index as usize).is_none() {
         tracing::warn!(index, "dstorage: status entry out of range");
         return;
-    };
-    entry.store(E_PENDING, Ordering::Release);
+    }
     add_ref_instance(array);
     let enqueued = stream_log::now();
     queue(this, Command::Status(Status { array, index, enqueued }));
@@ -1323,6 +1345,7 @@ fn queue(this: QueueRef, command: Command) {
         };
         // One slot stays free, as the console's count of empty slots says.
         if lane.entries() + 1 < lane.capacity.max(2) {
+            command.mark_pending();
             break;
         }
         if !lane.unsubmitted.is_empty() && lane.reads.is_empty() && lane.running.is_empty() {
@@ -1544,9 +1567,13 @@ fn load_bcpack_tables() -> Result<Tables, String> {
 fn read_source(request: &Request) -> Result<Cow<'static, [u8]>, HRESULT> {
     let size = request.source_size as usize;
     if request.options & MEMORY_SOURCE != 0 {
-        // SAFETY: the title's source holds `size` bytes until completion.
+        if size == 0 {
+            return Ok(Cow::Owned(Vec::new()));
+        }
+        // SAFETY: the title's source holds `size` bytes until completion; copy
+        // before `into_destination` forms `&mut [u8]` over an overlapping buffer.
         let bytes = unsafe { std::slice::from_raw_parts(request.source.cast(), size) };
-        return Ok(Cow::Borrowed(bytes));
+        return Ok(Cow::Owned(bytes.to_vec()));
     }
     let mut bytes = vec![0; size];
     read_into(request, &mut bytes)?;
@@ -1617,15 +1644,32 @@ fn into_destination(
     len: usize,
     mut fill: impl FnMut(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
+    let raw_memory = request.options & (MEMORY_SOURCE | ZLIB | BCPACK) == MEMORY_SOURCE;
     if request.options & PAGE_DESTINATION == 0 {
         // Raw reads land through the kernel, which does not fault into the
         // GPU side's guard on title buffers; open them first, and until the
         // bytes are there.
         let writing = leonida_gpu::kernel_writing(request.destination as usize, len);
-        // SAFETY: the title's destination holds `destination_size` bytes, at
-        // least `len`, and nothing else writes it until completion.
-        let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
-        let filled = fill(out).map(drop);
+        let filled = if raw_memory {
+            if len > 0 {
+                // SAFETY: `execute` validated non-null `source` and `destination`;
+                // `std::ptr::copy` (`memmove`) handles overlapping ranges without
+                // forming aliasing `&[u8]` / `&mut [u8]` slices.
+                unsafe {
+                    std::ptr::copy(
+                        request.source.cast::<u8>(),
+                        request.destination.cast::<u8>(),
+                        len,
+                    );
+                }
+            }
+            Ok(())
+        } else {
+            // SAFETY: the title's destination holds `destination_size` bytes, at
+            // least `len`, and nothing else writes it until completion.
+            let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+            fill(out).map(drop)
+        };
         drop(writing);
         // Again now that the bytes are there: a texture looked at in between
         // was uploaded without them (`xmem::pages_written`).
@@ -1636,6 +1680,16 @@ fn into_destination(
         }
         return filled;
     }
+    // Snapshot a raw memory source before opening a physical-page view that
+    // may alias the same backing section page as `request.source`.
+    let staged_raw = raw_memory.then(|| {
+        if len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: `execute` validated non-null `source` of `len` bytes.
+            unsafe { std::slice::from_raw_parts(request.source.cast::<u8>(), len) }.to_vec()
+        }
+    });
     let offset = (request.page_offset & 0xffff) as usize;
     let list = request.destination.cast();
     let mut pages = page_list(list, offset, len);
@@ -1644,7 +1698,14 @@ fn into_destination(
     // (Said aloud: by the title's protocol a submitted request's list stays
     // as it is.)
     for _ in 0..3 {
-        into_pages(&pages, offset, len, &mut fill)?;
+        if let Some(staged) = &staged_raw {
+            into_pages(&pages, offset, len, |out| {
+                out.copy_from_slice(staged);
+                Ok(staged.len())
+            })?;
+        } else {
+            into_pages(&pages, offset, len, &mut fill)?;
+        }
         let now = read_list(list, offset, len);
         if now == pages || !super::xmem::pages_known(&now, offset, len) {
             break;
@@ -1980,6 +2041,183 @@ mod tests {
         void(queue, 0x30);
         assert_eq!(wait(array, 0), S_OK);
         assert_eq!(out, plain);
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn overlapping_and_inplace_memory_sources_preserve_input_bytes() {
+        // 1. Tail-placed in-place ZLIB | MEMORY_SOURCE: compressed stream sits
+        // at the end of the destination buffer and inflates over itself.
+        let plain = pattern(70_000);
+        let packed = compress_zlib(&plain);
+        assert!(packed.len() < plain.len());
+        let (queue, array) = (new_queue(1), status_array(4));
+        let mut inplace = vec![0u8; plain.len()];
+        let tail = plain.len() - packed.len();
+        inplace[tail..].copy_from_slice(&packed);
+        let r_zlib = request(
+            ZLIB | MEMORY_SOURCE,
+            inplace.as_mut_ptr().cast(),
+            plain.len(),
+            inplace[tail..].as_ptr().cast(),
+            0,
+            packed.len(),
+        );
+        enqueue(queue, &r_zlib);
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        assert_eq!(inplace, plain);
+
+        // 2. Overlapping raw MEMORY_SOURCE forward shift (`dst > src`, memmove)
+        // and backward shift (`dst < src`).
+        let seed = pattern(128);
+        let mut forward = seed.clone();
+        let r_fwd = request(
+            MEMORY_SOURCE,
+            forward[16..].as_mut_ptr().cast(),
+            64,
+            forward.as_ptr().cast(),
+            0,
+            64,
+        );
+        enqueue(queue, &r_fwd);
+        enqueue_status(queue, array, 1);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 1), S_OK);
+        assert_eq!(&forward[16..80], &seed[..64]);
+
+        let mut backward = seed.clone();
+        let r_bwd = request(
+            MEMORY_SOURCE,
+            backward.as_mut_ptr().cast(),
+            64,
+            backward[16..].as_ptr().cast(),
+            0,
+            64,
+        );
+        enqueue(queue, &r_bwd);
+        enqueue_status(queue, array, 2);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 2), S_OK);
+        assert_eq!(&backward[..64], &seed[16..80]);
+
+        // 3. Overlapping BCPack | MEMORY_SOURCE into the same backing buffer.
+        with_test_tables();
+        let mut bc_buf = [0u8; 96];
+        bc_buf[..88].copy_from_slice(&BC4_STREAM);
+        let r_bc = request(
+            (4 << 1) | MEMORY_SOURCE,
+            bc_buf[80..].as_mut_ptr().cast(),
+            16,
+            bc_buf.as_ptr().cast(),
+            0,
+            88,
+        );
+        enqueue(queue, &r_bc);
+        enqueue_status(queue, array, 3);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 3), S_OK);
+        assert_eq!(&bc_buf[80..96], &bc4_blocks());
+
+        // 4. Overlapping raw MEMORY_SOURCE -> PAGE_DESTINATION within the same
+        // physical page (source is a title view of the destination page).
+        use crate::modules::xmem;
+        let (mut page, mut count) = ([0usize; 1], 1);
+        assert_eq!(xmem::XMemAllocatePhysicalPages(0, &mut count, page.as_mut_ptr()), 1);
+        let mapped = xmem::XMemVirtualAlloc(
+            std::ptr::null_mut(),
+            PAGE,
+            0x2000 | 0x2040_0000,
+            0,
+            0x04,
+        );
+        assert!(!mapped.is_null());
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, page.as_ptr()), mapped);
+        // SAFETY: `mapped` is one 64 KiB read-write page.
+        unsafe { std::ptr::copy_nonoverlapping(seed.as_ptr(), mapped.cast::<u8>(), seed.len()) };
+        let page_array = status_array(1);
+        let mut r_page = request(
+            PAGE_DESTINATION | MEMORY_SOURCE,
+            page.as_mut_ptr().cast(),
+            64,
+            mapped.cast(),
+            0,
+            64,
+        );
+        r_page.page_offset = 16;
+        enqueue(queue, &r_page);
+        enqueue_status(queue, page_array, 0);
+        void(queue, 0x30);
+        assert_eq!(wait(page_array, 0), S_OK);
+        // SAFETY: `mapped` remains mapped read-write.
+        let page_seen = unsafe { std::slice::from_raw_parts(mapped.cast::<u8>(), 96) };
+        assert_eq!(&page_seen[16..80], &seed[..64]);
+        assert_eq!(xmem::XMemMapPhysicalPages(mapped, 1, std::ptr::null()), mapped);
+        assert_eq!(xmem::XMemFreePhysicalPages(1, page.as_ptr()), 1);
+        void(queue, 0x40);
+    }
+
+    #[test]
+    fn enqueue_status_sets_pending_only_when_queued_on_an_open_lane() {
+        use windows_sys::Win32::System::Memory::{
+            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, PAGE_READWRITE, VirtualAlloc,
+            VirtualFree, VirtualProtect,
+        };
+
+        // 1. Enqueuing a status on an already-closed queue drops the command
+        // without stranding the status slot at `E_PENDING`.
+        let (closed_q, closed_arr) = (new_queue(1), status_array(1));
+        assert_eq!(result(closed_arr, 0), S_OK);
+        void(closed_q, 0x40);
+        enqueue_status(closed_q, closed_arr, 0);
+        assert_eq!(result(closed_arr, 0), S_OK);
+
+        // 2. When `enqueue_status` blocks on a full queue (`capacity = 3` -> 2
+        // usable slots: 1 guarded read + 1 status) waiting for an in-flight
+        // batch using the same status slot to finish, the new batch's
+        // `E_PENDING` store happens after space opens rather than being
+        // overwritten by the earlier batch's completion.
+        let plain = pattern(4096);
+        let (_dir, file) = file_with(&plain);
+        let create: extern "system" fn(*mut c_void, *const QueueDesc, *const Guid, Out) -> HRESULT =
+            call(factory(), 0x50);
+        let desc = QueueDesc {
+            source_type: 0,
+            capacity: 3,
+            priority: 1,
+            name: c"status-race".as_ptr(),
+            unknown: 1,
+        };
+        let mut queue = std::ptr::null_mut();
+        assert_eq!(create(factory(), &desc, std::ptr::null(), &mut queue), S_OK);
+        let array = status_array(1);
+
+        // SAFETY: fresh 4 KiB page guarded read-only until `unblock` opens it.
+        let guarded = unsafe {
+            VirtualAlloc(std::ptr::null(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY)
+        } as usize;
+        assert_ne!(guarded, 0);
+        enqueue(queue, &request(0, guarded as *mut c_void, 4096, file, 0, 4096));
+        enqueue_status(queue, array, 0);
+        void(queue, 0x30);
+
+        let unblock = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            let mut old = 0;
+            // SAFETY: `guarded` is our 4 KiB allocation.
+            unsafe { VirtualProtect(guarded as *const c_void, 4096, PAGE_READWRITE, &mut old) }
+        });
+
+        // Blocks on the 2/2 full queue until batch 1 finishes and flushes `array[0]`.
+        enqueue_status(queue, array, 0);
+        assert_eq!(result(array, 0), E_PENDING, "second status must remain pending until submitted");
+        assert_ne!(unblock.join().unwrap(), 0);
+        void(queue, 0x30);
+        assert_eq!(wait(array, 0), S_OK);
+        void(queue, 0x40);
+        // SAFETY: no worker accesses `guarded` after queue completion and close.
+        unsafe { VirtualFree(guarded as *mut c_void, 0, MEM_RELEASE) };
     }
 
     #[test]
@@ -2166,7 +2404,7 @@ mod tests {
         for round in 0..2 {
             for mode in [Io::One, Io::Handles, Io::Overlapped, Io::Direct] {
                 let file = Files::open_for_test(&path, mode);
-                let at: Vec<u64> = (0..READS).map(|_| random() % (len - SIZE as u64) & !15).collect();
+                let at: Vec<u64> = (0..READS).map(|_| (random() % (len - SIZE as u64)) & !15).collect();
                 for pass in ["cold", "again"] {
                     let next = std::sync::atomic::AtomicUsize::new(0);
                     let busy = AtomicU64::new(0);
