@@ -184,7 +184,7 @@ fn heap_bytes<'a>(apu: u32, len: usize) -> Option<&'a mut [u8]> {
     let heap = lock(&HEAP);
     let (&start, &host) = heap.by_apu.range(..=apu).next_back()?;
     let offset = (apu - start) as usize;
-    (offset + len <= heap.blocks[&host].size)
+    (offset.checked_add(len)? <= heap.blocks[&host].size)
         // SAFETY: inside a live heap block, which the title and the audio
         // hardware share like on the console.
         .then(|| unsafe { std::slice::from_raw_parts_mut((host + offset) as *mut u8, len) })
@@ -883,10 +883,16 @@ extern "system" fn submit(
         state.post(COMMAND_COMPLETED, &done);
     }
     if notification != 0
-        && let Some(word) = heap_unmap(notification)
+        && let Some(word) = heap_bytes(notification, 4)
     {
-        // SAFETY: a u32 in a heap block, which the title reads as volatile.
-        unsafe { word.cast::<u32>().write_volatile(1) };
+        // All four bytes inside one heap block, written one at a time: the
+        // title may name a misaligned word, which is written all the same
+        // (as `runtime/shims/acphal.cpp` does).
+        for (byte, value) in word.iter_mut().zip(1u32.to_le_bytes()) {
+            // SAFETY: a byte of a live heap block, which the title reads as
+            // volatile.
+            unsafe { std::ptr::write_volatile(byte, value) };
+        }
     }
     S_OK
 }
@@ -1339,6 +1345,57 @@ mod tests {
         // No loops left: both frames whole, and on to the third.
         assert_eq!(step(third), 4 * subframe);
         ApuFree(input);
+    }
+
+    /// A notification word must lie whole inside one heap block. One that
+    /// starts in a block's last bytes is left alone (the store used to run
+    /// past the allocation), and a misaligned one inside a block is written
+    /// byte by byte, as `runtime/shims/acphal.cpp` does.
+    #[test]
+    fn notification_words_stay_inside_their_block() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 6, 4, 1), S_OK);
+        let bytes = ptr.cast::<u8>();
+        // SAFETY: the 6 bytes just allocated.
+        unsafe { bytes.write_bytes(0xaa, 6) };
+        let mut acp = std::ptr::null_mut();
+        assert_eq!(AcpHalCreate(&mut acp), S_OK);
+        // SAFETY: just created.
+        let m = unsafe { (*acp).vtable };
+        let notify = |at: u32| {
+            assert_eq!((m.submit)(acp, 12, 0, u32::MAX, std::ptr::null(), at), S_OK);
+        };
+        // SAFETY: the 6 bytes allocated above, still live.
+        let read = || unsafe { std::slice::from_raw_parts(bytes, 6) }.to_vec();
+
+        // Bytes 4..8 of a 6-byte block: not all of them inside.
+        notify(apu + 4);
+        assert_eq!(read(), [0xaa; 6], "a word past the block's end is not written");
+        // Bytes 1..5: inside, misaligned.
+        notify(apu + 1);
+        assert_eq!(read(), [0xaa, 1, 0, 0, 0, 0xaa]);
+        // Bytes 0..4: inside and aligned.
+        // SAFETY: as above.
+        unsafe { bytes.write_bytes(0xaa, 6) };
+        notify(apu);
+        assert_eq!(read(), [1, 0, 0, 0, 0xaa, 0xaa]);
+
+        (m.release)(acp);
+        ApuFree(ptr);
+    }
+
+    /// A length that would overflow past the end of the address space is
+    /// refused, not added up.
+    #[test]
+    fn heap_bytes_refuses_lengths_that_overflow() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut ptr, mut apu) = (std::ptr::null_mut(), 0);
+        assert_eq!(ApuAlloc(&mut ptr, &mut apu, 16, 16, 1), S_OK);
+        assert!(heap_bytes(apu + 1, usize::MAX).is_none());
+        assert!(heap_bytes(apu + 1, 15).is_some());
+        assert!(heap_bytes(apu + 1, 16).is_none());
+        ApuFree(ptr);
     }
 
     #[test]
