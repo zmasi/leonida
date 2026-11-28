@@ -35,9 +35,14 @@ hardware oracle is unavailable or the GPU is not GFX10. Nothing here reads game 
 import argparse
 import json
 import os
+import stat
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from file_mode import published_mode  # noqa: E402
+import replace_retry  # noqa: E402
 
 SEED = 0x5A5A5A5A
 SENTINEL = 0xDEAD0000
@@ -245,15 +250,22 @@ def self_test():
     return 1 if fails else 0
 
 
+def _resolve_output_target(path):
+    out_path = os.path.abspath(path)
+    target = os.path.realpath(out_path) if os.path.islink(out_path) else out_path
+    return out_path, target
+
+
 def validate_json_path(path):
     """Return an error string if `path` cannot be used as a --json output file, or None."""
-    if not path or not path.strip():
+    if not isinstance(path, str) or not path or not path.strip():
         return "--json path must not be empty"
     if "\x00" in path:
         return "--json path contains a NUL byte"
-    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+    out_path, target = _resolve_output_target(path)
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(out_path) or os.path.isdir(target):
         return f"--json path is a directory: {path}"
-    cur = os.path.dirname(os.path.abspath(path))
+    cur = os.path.dirname(target)
     while cur:
         if os.path.isdir(cur):
             break
@@ -263,22 +275,67 @@ def validate_json_path(path):
         if nxt == cur:
             break
         cur = nxt
+    if os.path.exists(target):
+        try:
+            fd = os.open(target, os.O_WRONLY)
+            os.close(fd)
+        except OSError as e:
+            return f"cannot write --json {path}: {e.strerror or e}"
     return None
 
 
 def write_json_report(path, report):
-    """Create missing parent directories and write `report` as LF-terminated JSON, or return an error string."""
-    parent = os.path.dirname(os.path.abspath(path))
+    """Create missing parent directories and write `report` atomically as LF-terminated JSON, or return an error string."""
+    err = validate_json_path(path)
+    if err:
+        return err
+    _, target = _resolve_output_target(path)
+    try:
+        text = json.dumps(report, indent=1, allow_nan=False) + "\n"
+    except (TypeError, ValueError) as e:
+        return f"cannot serialize --json {path}: {e}"
+    try:
+        st = os.stat(target) if os.path.exists(target) else None
+    except OSError as e:
+        return f"cannot write --json {path}: {e.strerror or e}"
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        try:
+            with open(target, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            return None
+        except OSError as e:
+            return f"cannot write --json {path}: {e.strerror or e}"
+    parent = os.path.dirname(target)
     if parent:
         try:
             os.makedirs(parent, exist_ok=True)
         except OSError as e:
             return f"cannot create directory for --json {path}: {e.strerror or e}"
+    tmp_path = None
+    fd = None
     try:
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+        fd, tmp_path = tempfile.mkstemp(prefix=".image_d16_probe.", suffix=".tmp", dir=parent or ".")
+        f_obj = open(fd, "w", encoding="utf-8", newline="\n")
+        fd = None
+        with f_obj as f:
+            f.write(text)
+            f.flush()
+        os.chmod(tmp_path, published_mode(target))
+        replace_retry.replace(tmp_path, target)
+        tmp_path = None
     except OSError as e:
         return f"cannot write --json {path}: {e.strerror or e}"
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     return None
 
 
@@ -292,11 +349,19 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
-    dims = [d for d in a.dims.split(",") if d]
-    fmts = [f for f in a.formats.split(",") if f]
+    raw_dims = [d.strip() for d in a.dims.split(",")]
+    raw_fmts = [f.strip() for f in a.formats.split(",")]
+    if not raw_dims or any(not d for d in raw_dims):
+        ap.error(f"empty or malformed --dims: {a.dims!r}")
+    if not raw_fmts or any(not f for f in raw_fmts):
+        ap.error(f"empty or malformed --formats: {a.formats!r}")
+    dims = list(dict.fromkeys(raw_dims))
+    fmts = list(dict.fromkeys(raw_fmts))
     bad = [d for d in dims if d not in DIMS] + [f for f in fmts if f not in FORMATS]
-    if bad or not dims or not fmts:
-        ap.error("unknown or empty: " + ", ".join(bad or ["--dims/--formats"]))
+    if bad:
+        ap.error("unknown: " + ", ".join(bad))
+    if a.hw_arch is not None and not a.hw_arch.strip():
+        ap.error("--hw-arch must not be empty")
     if a.json is not None:
         err = validate_json_path(a.json)
         if err:
@@ -310,7 +375,11 @@ def main(argv=None):
         return 77
     rc = 0
     try:
-        if asm.family(oracle.arch) != "gfx10":
+        try:
+            fam = asm.family(oracle.arch)
+        except ValueError:
+            fam = None
+        if fam != "gfx10":
             print(f"hardware oracle unavailable: {oracle.arch} is not GFX10; the T# here is GFX10's (RDNA2)")
             return 77
         print(f"hardware oracle: {oracle.device}")
@@ -320,27 +389,37 @@ def main(argv=None):
         for uid, (d, f) in enumerate(cases):
             count = geometry(d, f)[3]
             kernels.append(asm.Kernel(kernel_lines(d, f, uid), 32, count, count * 4, raw=True))
-        for (d, f), got in zip(cases, oracle.run(kernels)):
-            name = f"{d} {f}"
-            if isinstance(got, str):
-                print(f"harness error: {name}: {got}")
-                rc = 2
-                continue
-            e = classify(d, f, got)
-            report["cases"][name] = e
-            if e["control"]:
-                rc = 2
-                for c in e["control"][:4]:
-                    print(f"harness error: {name}: {c}")
-            if e["forms_differ"] and rc != 2:
-                rc = 1
-            for form, s in e["forms"].items():
-                m = ", ".join(f"{r} {k}/{e['texels']}" for r, k in s["match"].items())
-                hh = s["high_half"] if isinstance(s["high_half"], str) else \
-                    ", ".join(f"{k} {v}" for k, v in s["high_half"].items())
-                print(f"{name:<18} {form:<15} {m}; high half: {hh}")
-            if e["forms_differ"]:
-                print(f"{name}: image_load and image_load_mip differ on {e['forms_differ']} texels")
+        raw_results = oracle.run(kernels)
+        if len(raw_results) != len(cases):
+            print(f"harness error: expected {len(cases)} kernel results, got {len(raw_results)}")
+            rc = 2
+        else:
+            for (d, f), got in zip(cases, raw_results):
+                name = f"{d} {f}"
+                if isinstance(got, str):
+                    print(f"harness error: {name}: {got}")
+                    rc = 2
+                    continue
+                want_words = geometry(d, f)[3] * 4
+                if len(got) != want_words:
+                    print(f"harness error: {name}: expected {want_words} words, got {len(got)}")
+                    rc = 2
+                    continue
+                e = classify(d, f, got)
+                report["cases"][name] = e
+                if e["control"]:
+                    rc = 2
+                    for c in e["control"][:4]:
+                        print(f"harness error: {name}: {c}")
+                if e["forms_differ"] and rc != 2:
+                    rc = 1
+                for form, s in e["forms"].items():
+                    m = ", ".join(f"{r} {k}/{e['texels']}" for r, k in s["match"].items())
+                    hh = s["high_half"] if isinstance(s["high_half"], str) else \
+                        ", ".join(f"{k} {v}" for k, v in s["high_half"].items())
+                    print(f"{name:<18} {form:<15} {m}; high half: {hh}")
+                if e["forms_differ"]:
+                    print(f"{name}: image_load and image_load_mip differ on {e['forms_differ']} texels")
     except RuntimeError as e:
         print(f"harness error: {e}")
         return 2

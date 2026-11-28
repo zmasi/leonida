@@ -282,6 +282,164 @@ class SummaryTests(unittest.TestCase):
             with open(os.path.join(src, "cs_tri.s"), encoding="utf-8") as f:
                 self.assertIn("image_bvh", f.read())
 
+    def test_v_cmpx_e32_does_not_clobber_sgpr_source_and_e64_product_reader(self):
+        # v_cmpx_*_e32 reads a[0] (an SGPR source), never writes it: descriptor literals and saved EXEC masks survive.
+        (site,) = analyse(
+            *DESC_LITERALS,
+            "v_cmpx_ne_u32_e32 s9, v0",
+            CALL32,
+            "s_mov_b32 s41, exec_lo",
+            "v_cmpx_eq_u32_e32 s41, v31",
+            "v_mov_b32_e32 v6, 0",
+            "s_andn2_wrexec_b32 s42, s41",
+            "v_cmp_eq_u32_e32 vcc_lo, v32, v6",
+            "s_mov_b32 exec_lo, s41",
+            "v_mul_i32_i24_sdwa v24, sext(v5), v30 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:WORD_1 src1_sel:DWORD",
+            "v_cmpx_gt_i32_e64 exec_lo, 0, v24",
+            "s_endpgm",
+        )
+        self.assertEqual(site["desc"][1], 0x7F800000)
+        self.assertIn((2, "raw_integer", "all"), [e[1:4] for e in site["reads"]])
+        self.assertEqual([p[1:] for p in site["product_reads"]], [("v_cmpx_gt_i32 with 0", "all")])
+
+    def test_modified_v_rcp_f32_does_not_tag_ratio_reciprocal(self):
+        for rcp in (
+            "v_rcp_f32_e64 v20, |v5|",
+            "v_rcp_f32_e64 v20, -v5",
+            "v_rcp_f32_e64 v20, v5 clamp",
+        ):
+            (site,) = analyse(CALL32, rcp, "v_mul_f32_e32 v21, v4, v20", "s_endpgm")
+            self.assertEqual(reads(site), {(1, "raw_float"), (0, "raw_float")}, rcp)
+
+    def test_high_half_operand_requires_vgpr_and_handles_both_operands(self):
+        # SGPR or immediate in operand 1 must not read VGPR v5 or crash with KeyError.
+        (site,) = analyse(
+            CALL32,
+            "v_mul_i32_i24_sdwa v24, sext(s5), v30 dst_sel:DWORD src0_sel:WORD_1 src1_sel:DWORD",
+            "v_mul_i32_i24_sdwa v25, sext(1), v30 dst_sel:DWORD src0_sel:WORD_1 src1_sel:DWORD",
+            "v_cmp_gt_i32_e32 vcc_lo, 0, v24",
+            "v_cmp_gt_i32_e32 vcc_lo, 0, v25",
+            "s_endpgm",
+        )
+        self.assertEqual(site["product_reads"], [])
+
+        # Both operands high-half with word 1 in operand 2: product still tracks H cleanly on every path.
+        (site2,) = analyse(
+            CALL32,
+            "v_mul_i32_i24_sdwa v24, sext(v30), sext(v5) dst_sel:DWORD src0_sel:WORD_1 src1_sel:WORD_1",
+            "v_cmp_gt_i32_e32 vcc_lo, 0, v24",
+            "s_endpgm",
+        )
+        self.assertEqual(reads(site2), {(1, "high_half")})
+        self.assertEqual([p[1:] for p in site2["product_reads"]], [("v_cmp_gt_i32 with 0", "all")])
+
+    def test_is_copy_and_imm32_edge_cases(self):
+        self.assertFalse(census.is_copy({
+            "op": "v_swap_b32",
+            "args": [{"k": "vgpr", "r": 4, "n": 1, "neg": True}, {"k": "vgpr", "r": 5, "n": 1}],
+            "mods": [],
+        }))
+        self.assertIsNone(census.imm32({"k": "fimm", "v": 1e40}))
+
+    def test_blocks_of_non_contiguous_gap_empty_and_load_program_bad_hex(self):
+        self.assertEqual(census.blocks_of([]), ([], []))
+        self.assertEqual(census.analyse([]), [])
+        # A 4-byte gap between 0x104 and 0x200 must start a new block with no fall-through across the gap.
+        insns = [
+            {"op": "v_mov_b32_e32", "args": [{"k": "vgpr", "r": 0, "n": 1}, {"k": "imm", "v": 0}],
+             "mods": [], "enc": "00000000", "pc": 0x100},
+            {"op": "s_endpgm", "args": [], "mods": [], "enc": "00000000", "pc": 0x200},
+        ]
+        blocks, succ = census.blocks_of(insns)
+        self.assertEqual(([len(b) for b in blocks], succ), ([1, 1], [[], []]))
+
+        # Malformed hex encoding in a listing with embedded data words must Skip instead of crashing with ValueError.
+        with tempfile.TemporaryDirectory() as root:
+            disasm = os.path.join(root, "disasm")
+            fssm = os.path.join(root, "fssm")
+            os.makedirs(disasm)
+            os.makedirs(fssm)
+            with open(os.path.join(fssm, "cs_badhex.fssm"), "wb") as f:
+                f.write(bytes(0x40))
+            bad_path = os.path.join(disasm, "cs_badhex.s")
+            with open(bad_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("; cs_badhex.fssm code 0x0..0x8\n"
+                        "\t" + CALL32 + " ; encoding: [0xzz]\n"
+                        "\t; invalid instruction encoding\n")
+            with self.assertRaises(census.Skip):
+                census.load_program(bad_path)
+
+    def test_cli_overwrite_guards_atomic_write_trailing_lf_and_oserror(self):
+        with tempfile.TemporaryDirectory() as root:
+            src = os.path.join(root, "disasm")
+            fssm = os.path.join(root, "fssm")
+            os.makedirs(src)
+            os.makedirs(fssm)
+            self.directory(src, {"cs_tri": listing(*DESC_LITERALS, CALL32, *TRIANGLE, "s_endpgm")})
+            idx_path = os.path.join(root, "index.json")
+            with open(idx_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("[]\n")
+            fssm_path = os.path.join(fssm, "cs_tri.fssm")
+            with open(fssm_path, "wb") as f:
+                f.write(b"FSSM")
+            hardlink = os.path.join(root, "linked.json")
+            os.link(os.path.join(src, "cs_tri.s"), hardlink)
+
+            for bad_out in (idx_path, fssm_path, hardlink):
+                with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                    census.main([src, "--out", bad_out])
+            with open(idx_path, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), "[]\n")
+            with open(fssm_path, "rb") as f:
+                self.assertEqual(f.read(), b"FSSM")
+
+            # Normal write ends with a single LF.
+            out_dir = os.path.join(root, "out")
+            os.makedirs(out_dir)
+            out_path = os.path.join(out_dir, "report.json")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(census.main([src, "--out", out_path]), 0)
+            with open(out_path, "rb") as f:
+                data = f.read()
+            self.assertTrue(data.endswith(b"\n"))
+
+            # Atomic write failure must keep previous contents and clean up temp file.
+            with open(out_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": 1}\n')
+            orig_replace = census.replace_retry.replace
+
+            def boom(src_p, dst_p, **kw):
+                raise OSError("disk full")
+
+            census.replace_retry.replace = boom
+            try:
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    rc = census.main([src, "--out", out_path])
+                self.assertEqual(rc, 2)
+                self.assertIn("ERROR: cannot write", err.getvalue())
+            finally:
+                census.replace_retry.replace = orig_replace
+            with open(out_path, "r", encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": 1}\n')
+            self.assertEqual(os.listdir(out_dir), ["report.json"])
+
+            # OSError during scan_directory must report ERROR and exit 2.
+            orig_scan = census.scan_directory
+
+            def bad_scan(_):
+                raise OSError("unreadable")
+
+            census.scan_directory = bad_scan
+            try:
+                err = io.StringIO()
+                with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    rc = census.main([src])
+                self.assertEqual(rc, 2)
+                self.assertIn("ERROR: cannot read", err.getvalue())
+            finally:
+                census.scan_directory = orig_scan
+
 
 if __name__ == "__main__":
     unittest.main()

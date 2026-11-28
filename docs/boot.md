@@ -264,7 +264,7 @@ order. It maps each question to the event to look for; it does not answer them.
 | 11 | `CheckFeatureSupport` answers | the call's `ok`/`failed` and the `[rt]` feature-id line; the answer itself is not logged yet |
 | 12 | Async compute / copy queues | queue creation and cross-queue fences |
 | 13 | 144-byte push constants | device creation `[rt]` line; `push_constants_need_fallback` when the device reports fewer |
-| 14 | Two code-base stages in one PSO | PSO creation log; the index metadata (`uses_code_base`) |
+| 14 | Two code-base stages in one PSO | answered without a trace: the pipeline library pairs the stages, and `tools/pso_code_base_pairs.py` counts 0 of 25,471 (`uses_code_base` per stage comes from the index metadata) |
 | 15 | `ExecuteIndirect` signatures | `CreateCommandSignature` and `ExecuteIndirect` calls |
 | 16 | UAV counters and typed buffer formats | UAV descs and V# format logs; formats outside `Gen.FORMATS` read 0 |
 | 17 | Upload/readback resources reaching shaders | `CreateCommittedResource` heap types and the VB/IB/descriptor that points at one |

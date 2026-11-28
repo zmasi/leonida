@@ -14,7 +14,8 @@ stage, a table of state blobs and a table of native RDNA2 programs. Layout (docs
           P x 8     (offset, size) into the code section, 256-byte aligned
           blob section, then code section; the file ends exactly there
 
-A missing stage is program 0xFFFFFFFF. Stage slots: 0 pixel, 1 vertex, 2 mesh (6 is used once and not identified).
+A missing stage is program 0xFFFFFFFF. Stage slots: 0 pixel, 1 vertex, 2 mesh (slot 6 appears in the 2 records that
+have pixel, vertex and slot 6, with no stage blob, and is not identified).
 A compute state blob has the 28-byte layout of an FSPX kind-0 entry (tools/fspx_unpack.py), and every program starts
 with the same 36-byte hash prologue as an FSPX program, so the programs are written in the layout fspx_unpack.py uses
 and tools/rdna2spirv.py reads (fspx/<name>.code, fspx/<name>.json, index.json). A compute program also gets its

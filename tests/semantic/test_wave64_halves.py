@@ -1370,14 +1370,34 @@ class PixelShaders(unittest.TestCase):
                 if tier in ("A", "B"):
                     self.assertEqual(w32, w64)
                 else:
-                    self.assertNotEqual(w32, w64)
+                    none_diff = False
+                    for lane in range(64):
+                        x, y = _ps_xy(lane)
+                        exp = ref_fn(y * 64 + x)
+                        if w32[lane] is None:
+                            self.assertEqual(exp, (wg.CLEAR,) * 4, f"{name} wave32 lane {lane} was killed")
+                            continue
+                        for c in range(4):
+                            if exp[c] is not None:
+                                self.assertEqual(w32[lane][c], exp[c], f"{name} wave32 lane {lane} c{c}")
+                            elif w64[lane] is None or w32[lane][c] != w64[lane][c]:
+                                none_diff = True
+                    self.assertTrue(none_diff, f"{name}: tier C did not differ in any partition-dependent channel")
                 if "VKH_HEAP" in env:
-                    self.assertEqual(mem64[0], 16)
-                    self.assertEqual(mem32[0], 16)
-                    slots64 = {mem64[0x100 + 4 * k] for k in range(16)}
-                    slots32 = {mem32[0x100 + 4 * k] for k in range(16)}
-                    self.assertEqual(len(slots64), 16)
-                    self.assertEqual(slots64, slots32)
+                    expected_slots = {
+                        _ps_xy(lane)[1] * 64 + _ps_xy(lane)[0] + 1
+                        for lane in range(64)
+                        if _ps_xy(lane)[0] % 4 == 1
+                    }
+                    n_slots = len(expected_slots)
+                    self.assertEqual(mem64[0], n_slots)
+                    self.assertEqual(mem32[0], n_slots)
+                    slots64 = {mem64[0x100 + 4 * k] for k in range(n_slots)}
+                    slots32 = {mem32[0x100 + 4 * k] for k in range(n_slots)}
+                    self.assertEqual(slots64, expected_slots)
+                    self.assertEqual(slots32, expected_slots)
+                    self.assertNotIn(0x100 + 4 * n_slots, mem64)
+                    self.assertNotIn(0x100 + 4 * n_slots, mem32)
 
 
 class VcmpxDppExec(unittest.TestCase):

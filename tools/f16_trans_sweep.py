@@ -32,14 +32,19 @@ import argparse
 import functools
 import json
 import os
+import stat
 import struct
 import sys
+import tempfile
 from decimal import ROUND_HALF_EVEN, Decimal, localcontext
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+from file_mode import published_mode  # noqa: E402
+import replace_retry  # noqa: E402
 
 OPS = ("v_exp_f16", "v_log_f16", "v_rcp_f16", "v_rsq_f16", "v_sqrt_f16", "v_sin_f16", "v_cos_f16")
 
@@ -250,8 +255,10 @@ def check_modes(oracle, modes):
             f"{STORE32[asm.family(oracle.arch)]} v20, v1, s[2:3]", "s_endpgm"]
     kernels = [asm.Kernel(body, w, 1, 1, raw=True, mode=MODES[m]) for m in modes for w in (32, 64)]
     got = oracle.run(kernels, words=1)
+    if len(got) != len(kernels):
+        raise RuntimeError(f"MODE probe: expected {len(kernels)} kernel results, got {len(got)}")
     for k, (m, w) in enumerate((m, w) for m in modes for w in (32, 64)):
-        if isinstance(got[k], str) or got[k][0] & 0x3FF != mode_word(MODES[m]):
+        if isinstance(got[k], str) or len(got[k]) < 1 or got[k][0] & 0x3FF != mode_word(MODES[m]):
             raise RuntimeError(f"MODE probe: {m} wave{w} reads back {got[k]!r}, expected "
                                f"0x{mode_word(MODES[m]):x}; the kernel descriptor's float mode was not applied")
 
@@ -262,6 +269,8 @@ def sweep(oracle, op, mode, wave):
     kernels = [asm.Kernel(kernel_lines(op, j * PER_KERNEL, oracle.arch), wave, THREADS, PER_KERNEL // 2, raw=True,
                           mode=MODES[mode]) for j in range(65536 // PER_KERNEL)]
     got = oracle.run(kernels, words=PER_KERNEL // 2)
+    if len(got) != len(kernels):
+        raise RuntimeError(f"{op} {mode} wave{wave}: expected {len(kernels)} kernel results, got {len(got)}")
     out = []
     for j, words in enumerate(got):
         if isinstance(words, str) or len(words) != PER_KERNEL // 2:
@@ -385,15 +394,22 @@ def self_test():
     return 0
 
 
+def _resolve_output_target(path):
+    out_path = os.path.abspath(path)
+    target = os.path.realpath(out_path) if os.path.islink(out_path) else out_path
+    return out_path, target
+
+
 def validate_json_path(path):
     """Return an error string if `path` cannot be used as a --json output file, or None."""
-    if not path or not path.strip():
+    if not isinstance(path, str) or not path or not path.strip():
         return "--json path must not be empty"
     if "\x00" in path:
         return "--json path contains a NUL byte"
-    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(path):
+    out_path, target = _resolve_output_target(path)
+    if path.endswith(os.sep) or (os.altsep and path.endswith(os.altsep)) or os.path.isdir(out_path) or os.path.isdir(target):
         return f"--json path is a directory: {path}"
-    cur = os.path.dirname(os.path.abspath(path))
+    cur = os.path.dirname(target)
     while cur:
         if os.path.isdir(cur):
             break
@@ -403,22 +419,67 @@ def validate_json_path(path):
         if nxt == cur:
             break
         cur = nxt
+    if os.path.exists(target):
+        try:
+            fd = os.open(target, os.O_WRONLY)
+            os.close(fd)
+        except OSError as e:
+            return f"cannot write --json {path}: {e.strerror or e}"
     return None
 
 
 def write_json_report(path, report):
-    """Create missing parent directories and write `report` as LF-terminated JSON, or return an error string."""
-    parent = os.path.dirname(os.path.abspath(path))
+    """Create missing parent directories and write `report` atomically as LF-terminated JSON, or return an error string."""
+    err = validate_json_path(path)
+    if err:
+        return err
+    _, target = _resolve_output_target(path)
+    try:
+        text = json.dumps(report, indent=1, allow_nan=False) + "\n"
+    except (TypeError, ValueError) as e:
+        return f"cannot serialize --json {path}: {e}"
+    try:
+        st = os.stat(target) if os.path.exists(target) else None
+    except OSError as e:
+        return f"cannot write --json {path}: {e.strerror or e}"
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        try:
+            with open(target, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            return None
+        except OSError as e:
+            return f"cannot write --json {path}: {e.strerror or e}"
+    parent = os.path.dirname(target)
     if parent:
         try:
             os.makedirs(parent, exist_ok=True)
         except OSError as e:
             return f"cannot create directory for --json {path}: {e.strerror or e}"
+    tmp_path = None
+    fd = None
     try:
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+        fd, tmp_path = tempfile.mkstemp(prefix=".f16_trans_sweep.", suffix=".tmp", dir=parent or ".")
+        f_obj = open(fd, "w", encoding="utf-8", newline="\n")
+        fd = None
+        with f_obj as f:
+            f.write(text)
+            f.flush()
+        os.chmod(tmp_path, published_mode(target))
+        replace_retry.replace(tmp_path, target)
+        tmp_path = None
     except OSError as e:
         return f"cannot write --json {path}: {e.strerror or e}"
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     return None
 
 
@@ -433,19 +494,24 @@ def main(argv=None):
     a = ap.parse_args(argv)
     if a.self_test:
         return self_test()
-    ops = [o.strip() for o in a.ops.split(",") if o.strip()]
-    modes = [m.strip() for m in a.modes.split(",") if m.strip()]
+    raw_ops = [o.strip() for o in a.ops.split(",")]
+    raw_modes = [m.strip() for m in a.modes.split(",")]
+    raw_waves = [w.strip() for w in a.waves.split(",")]
+    for option, values in (("--ops", raw_ops), ("--modes", raw_modes), ("--waves", raw_waves)):
+        if not values or any(not v for v in values):
+            ap.error(f"{option} must select at least one non-empty value")
+    ops = list(dict.fromkeys(raw_ops))
+    modes = list(dict.fromkeys(raw_modes))
     try:
-        waves = [int(w.strip()) for w in a.waves.split(",") if w.strip()]
+        waves = list(dict.fromkeys(int(w) for w in raw_waves))
     except ValueError:
         ap.error("--waves must contain only 32 and/or 64")
-    for option, values in (("--ops", ops), ("--modes", modes), ("--waves", waves)):
-        if not values:
-            ap.error(f"{option} must select at least one value")
     bad = [o for o in ops if o not in OPS] + [m for m in modes if m not in MODES] + [str(w) for w in waves
                                                                                     if w not in (32, 64)]
     if bad:
         ap.error("unknown: " + ", ".join(bad))
+    if a.hw_arch is not None and not a.hw_arch.strip():
+        ap.error("--hw-arch must not be empty")
     if a.json is not None:
         err = validate_json_path(a.json)
         if err:

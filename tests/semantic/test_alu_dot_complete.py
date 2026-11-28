@@ -244,8 +244,8 @@ class HalfDotF32Tests(unittest.TestCase):
             ("op_sel:[1,0,0] op_sel_hi:[0,1,1]", (1, 0, 0), (0, 1, 1), (0, 0, 0), (0, 0, 0), False),
             ("neg_lo:[1,0,0] neg_hi:[0,1,0]", (0, 0, 0), (1, 1, 1), (1, 0, 0), (0, 1, 0), False),
             ("neg_lo:[0,0,1]", (0, 0, 0), (1, 1, 1), (0, 0, 1), (0, 0, 0), False),
-            ("clamp", (0, 0, 0), (1, 1, 1), (0, 0, 0), (0, 0, 0), True),
-            ("neg_lo:[1,1,1] clamp", (0, 0, 0), (1, 1, 1), (1, 1, 1), (0, 0, 0), True),
+            ("clamp", (0, 0, 0), (1, 1, 1), (0, 0, 0), (0, 0, 0), False),
+            ("neg_lo:[1,1,1] clamp", (0, 0, 0), (1, 1, 1), (1, 1, 1), (0, 0, 0), False),
         ]
         for mods, sel, selhi, nlo, nhi, clamp in cases:
             with self.subTest(mods=mods):
@@ -256,6 +256,22 @@ class HalfDotF32Tests(unittest.TestCase):
                     f"v_dot2_f32_f16 v0, v1, v2, v3 {mods}",
                 ])[0]
                 self.assertEqual(got, ref_dot2_f32_f16(s0, s1, acc, sel, selhi, nlo, nhi, clamp=clamp))
+
+        # Hardware-confirmed on AMD RDNA2 (gfx1036): VOP3P v_dot2_f32_f16 clamp is a hardware no-op
+        # (+3.0f, -3.0f, +inf, NaN all pass through unclamped).
+        for label, a_w, b_w, c_w, want in (
+            ("pos_gt_1", 0x3C003C00, 0x3C003C00, 0x3F800000, 0x40400000),   # +3.0f
+            ("neg_lt_0", 0xBC00BC00, 0x3C003C00, 0xBF800000, 0xC0400000),   # -3.0f
+            ("pos_inf",  0x7C003C00, 0x3C003C00, 0x00000000, 0x7F800000),   # +inf
+        ):
+            with self.subTest(v_dot2_f32_f16_clamp_noop=label):
+                got = run_ps([
+                    f"v_mov_b32 v1, {a_w:#x}",
+                    f"v_mov_b32 v2, {b_w:#x}",
+                    f"v_mov_b32 v3, {c_w:#x}",
+                    "v_dot2_f32_f16 v0, v1, v2, v3 clamp",
+                ])[0]
+                self.assertEqual(got, want)
 
         # v_dot2c_f32_f16 clamp
         got_c = run_ps([

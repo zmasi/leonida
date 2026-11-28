@@ -19,13 +19,18 @@ from fractions import Fraction
 import json
 import math
 import os
+import stat
 import struct
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.dont_write_bytecode = True
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+
+from file_mode import published_mode  # noqa: E402
+import replace_retry  # noqa: E402
 
 OPS: tuple[str, ...] = ("v_cvt_pknorm_i16_f16", "v_cvt_pknorm_u16_f16")
 _OPCODES: dict[str, int] = {"v_cvt_pknorm_i16_f16": 0x12, "v_cvt_pknorm_u16_f16": 0x13}
@@ -302,6 +307,31 @@ def evaluate_results(ops: list[str], waves: list[int], meta, raw_results, *, exh
     sweep_halves: dict[tuple[int, str, bool, bool, int], list[int]] = {}
     case_words: dict[tuple[int, str, bool], list[int]] = {}
     harness_errors: list[dict] = []
+    if len(raw_results) != len(meta):
+        return {
+            "exhaustive": exhaustive,
+            "sweep_words": 0,
+            "sweep_halves": 0,
+            "case_words": 0,
+            "total_words": 0,
+            "mismatches": 0,
+            "wave_diffs": 0,
+            "clamp_diffs": 0,
+            "raw_omod_diffs": 0,
+            "harness_errors": [{
+                "kind": "batch",
+                "wave": 0,
+                "op": "*",
+                "clamp": False,
+                "dhi": False,
+                "half": 0,
+                "error": f"expected {len(meta)} kernel results, got {len(raw_results)}",
+            }],
+            "first_mismatches": [],
+            "first_wave_diffs": [],
+            "first_clamp_diffs": [],
+            "first_raw_omod_diffs": [],
+        }
 
     for entry, res in zip(meta, raw_results):
         kind, wave, op, clamp, dhi, half = entry
@@ -525,16 +555,93 @@ def evaluate_results(ops: list[str], waves: list[int], meta, raw_results, *, exh
     }
 
 
+def _has_trailing_sep(path: str) -> bool:
+    seps = tuple(s for s in (os.sep, os.altsep) if s)
+    return path.endswith(seps)
+
+
+def _resolve_output_target(path: str) -> tuple[str, str]:
+    out_path = os.path.abspath(path)
+    target = os.path.realpath(out_path) if os.path.islink(out_path) else out_path
+    return out_path, target
+
+
+def _check_json_writable(path: str) -> str | None:
+    """Check non-directory parent blockers and existing unwritable targets before GPU work."""
+    _, target = _resolve_output_target(path)
+    parent = os.path.dirname(target)
+    probe = parent
+    while probe and not os.path.exists(probe):
+        nxt = os.path.dirname(probe)
+        if nxt == probe:
+            break
+        probe = nxt
+    if probe and os.path.exists(probe) and not os.path.isdir(probe):
+        return f"parent path is not a directory: {probe}"
+    if os.path.exists(target):
+        try:
+            fd = os.open(target, os.O_WRONLY)
+            os.close(fd)
+        except OSError as exc:
+            return exc.strerror or str(exc)
+    return None
+
+
 def write_report(path: str, doc: dict) -> bool:
-    """Write JSON report with LF line endings, creating parent folders."""
+    """Write JSON report with LF line endings atomically, creating parent folders."""
+    if not isinstance(path, str) or not path.strip():
+        print("ERROR: cannot write empty --json path", file=sys.stderr)
+        return False
+    out_path, target = _resolve_output_target(path)
+    if _has_trailing_sep(path) or os.path.isdir(out_path) or os.path.isdir(target):
+        print(f"ERROR: cannot write {path}: path is a directory", file=sys.stderr)
+        return False
     try:
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(doc, f, indent=1)
-            f.write("\n")
+        text = json.dumps(doc, indent=1, allow_nan=False) + "\n"
+    except (TypeError, ValueError) as exc:
+        print(f"ERROR: cannot serialize JSON report for {path}: {exc}", file=sys.stderr)
+        return False
+    try:
+        st = os.stat(target) if os.path.exists(target) else None
+    except OSError as exc:
+        print(f"ERROR: cannot write {path}: {exc}", file=sys.stderr)
+        return False
+    if st is not None and not stat.S_ISREG(st.st_mode):
+        try:
+            with open(target, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            return True
+        except OSError as exc:
+            print(f"ERROR: cannot write {path}: {exc}", file=sys.stderr)
+            return False
+    parent = os.path.dirname(target)
+    tmp_path = None
+    try:
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".cvt_pknorm_f16_probe.", suffix=".tmp", dir=parent or ".")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+                f.flush()
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        os.chmod(tmp_path, published_mode(target))
+        replace_retry.replace(tmp_path, target)
+        tmp_path = None
     except OSError as e:
         print(f"ERROR: cannot write {path}: {e}", file=sys.stderr)
         return False
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     return True
 
 
@@ -602,15 +709,31 @@ def main(argv=None) -> int:
     if a.self_test:
         return self_test()
 
-    ops = [o.strip() for o in a.ops.split(",") if o.strip()]
-    wave_tokens = [w.strip() for w in a.waves.split(",") if w.strip()]
+    raw_ops = [o.strip() for o in a.ops.split(",")]
+    raw_waves = [w.strip() for w in a.waves.split(",")]
+    if not raw_ops or any(not o for o in raw_ops):
+        ap.error(f"empty or malformed --ops: {a.ops!r}")
+    if not raw_waves or any(not w for w in raw_waves):
+        ap.error(f"empty or malformed --waves: {a.waves!r}")
+    ops = list(dict.fromkeys(raw_ops))
+    wave_tokens = list(dict.fromkeys(raw_waves))
     bad_ops = [o for o in ops if o not in OPS]
     bad_waves = [w for w in wave_tokens if w not in ("32", "64")]
-    if bad_ops or bad_waves or not ops or not wave_tokens:
-        ap.error("unknown or empty: " + ", ".join(bad_ops + bad_waves or ["--ops/--waves"]))
+    if bad_ops or bad_waves:
+        ap.error("unknown: " + ", ".join(bad_ops + bad_waves))
     waves = [int(w) for w in wave_tokens]
-    if a.json and os.path.isdir(a.json):
-        ap.error(f"--json {a.json} is a folder, not a file")
+    if a.hw_arch is not None and not a.hw_arch.strip():
+        ap.error("--hw-arch must not be empty")
+    if a.json is not None:
+        if not a.json.strip():
+            ap.error("--json path must not be empty")
+        out_path, target = _resolve_output_target(a.json)
+        if _has_trailing_sep(a.json) or os.path.isdir(out_path) or os.path.isdir(target):
+            ap.error(f"--json {a.json} is a folder, not a file")
+        werr = _check_json_writable(a.json)
+        if werr:
+            print(f"ERROR: cannot write {a.json}: {werr}", file=sys.stderr)
+            return 2
     exhaustive = not a.no_exhaustive
 
     from hw_oracle import asm, runner
@@ -622,7 +745,11 @@ def main(argv=None) -> int:
         return 77
 
     try:
-        if asm.family(oracle.arch) != "gfx10":
+        try:
+            fam = asm.family(oracle.arch)
+        except ValueError:
+            fam = None
+        if fam != "gfx10":
             print(f"hardware oracle unavailable: {oracle.arch} is not GFX10")
             return 77
         print(f"hardware oracle: {oracle.device} ({oracle.arch})")
@@ -644,7 +771,7 @@ def main(argv=None) -> int:
         "cases": len(CASES),
         **summary,
     }
-    if a.json and not write_report(a.json, report):
+    if a.json is not None and not write_report(a.json, report):
         return 2
 
     if summary["harness_errors"]:

@@ -157,6 +157,11 @@ instruction family per file; the list below describes some of them, not every fi
   `ds_read2st64_b32`) and runs 32 lanes in lockstep; the 16 words come from a byte-level LDS model of the ISA rules
   and match what an RTX 4070 SUPER (driver 610.88) wrote. Three SPIR-V sabotages (zero-extending `_i8`/`_i16`, no
   high-half shift for `_d16_hi`, `st64` offset in dwords) must change the result.
+- `test_ds_permute_eager.py` (SHADER-PERMUTE-EAGER) checks that `ds_permute_b32` stores both subgroup shuffles of each
+  source lane before a select reads them, in a wave32 and a wave64 compute shader and a pixel shader, with
+  `test_dpp_eager_subgroup.py`'s model of SPIRV-Cross's single-use forwarding; the module with the stores taken out
+  again has all 64 shuffles in a ternary's arm. It also runs the stored form against `test_ds_permute.py`'s ISA
+  model with EXEC narrowed, sources that are off and a collision.
 - `test_negative_controls.py` sabotages the translated SPIR-V text and requires the result to change.
 - `test_mutations.py` sabotages a temporary copy of `tools/` (13 regressions across SDWA, min3/max3, `v_bfe_i32`,
   `v_pk_fma_f16`, `v_fma_f16 op_sel`, `v_subrev_co_ci_u32`, `v_cmpx_eq_u64`, `v_mul_i32_i24`, `v_ffbh_i32`,
@@ -180,6 +185,11 @@ instruction family per file; the list below describes some of them, not every fi
   the four operand words of its header and expects the header's eight words, and checks that every register one of
   its multiply-adds reads comes from `s4..s7`: with three literal operands the f16 one was a compile-time constant,
   which MoltenVK 1.4.2 gets wrong (`docs/testing.md`, Known problems).
+- `test_valu_div_fixup.py` runs hand-written `v_div_fixup_f32` listings through the translator and asserts the
+  pure-integer lowering's op order, classification constants and NaN priority (`NaN(S2)` above `NaN(S1)` above
+  `0/0`, read off the dataflow) on the emitted SPIR-V, then one word per measured rule through
+  `spirv_mini_interp` (TEST-545: it replaces a hand-written Python model of the fixup that never ran the
+  translator, so it passed whatever the translator did).
 - `test_fixtures.py` checks `tests/semantic/fixtures/disasm/*.s` equals what `regen_fixtures.py` makes from
   `runtime/test/shaders/*.asm` (`python tests/semantic/regen_fixtures.py` rewrites them).
 - `test_dpp_eager_subgroup.py` (SHADER-529) checks that no DPP ballot or shuffle is left where SPIRV-Cross

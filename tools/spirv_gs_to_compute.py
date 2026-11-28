@@ -50,14 +50,34 @@ def _assembly_lines(text):
     return (line.removesuffix("\n") for line in io.StringIO(text, newline=None))
 
 
+def _strip_comment(text: str) -> str:
+    """Return `text` up to any `;` comment outside double-quoted string literals."""
+    in_str = False
+    escaped = False
+    for idx, ch in enumerate(text):
+        if in_str:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == ";":
+            return text[:idx].rstrip()
+    return text.rstrip()
+
+
 def parse(text):
     """defs: id -> (opcode, operands) for '%id = OpX ...' lines; deco: id -> its OpDecorate operand strings."""
     defs, deco = {}, {}
     for ln in _assembly_lines(text):
-        m = re.match(r"\s*(%\w+) = (Op\w+)(.*)$", ln)
+        code = _strip_comment(ln)
+        m = re.match(r"\s*(%\w+)\s*=\s*(Op\w+)(.*)$", code)
         if m:
             defs[m.group(1)] = (m.group(2), m.group(3).split())
-        m = re.match(r"\s*OpDecorate (%\w+) (.*)$", ln)
+        m = re.match(r"\s*OpDecorate\s+(%\w+)\s+(.*)$", code)
         if m:
             deco.setdefault(m.group(1), []).append(m.group(2))
     return defs, deco
@@ -75,7 +95,7 @@ def layout_of(text):
         raise Unsupported("not a geometry shader")
     main = ep.group(1)
     modes = re.findall(rf"^\s*OpExecutionMode {re.escape(main)} (.*)$", text, re.M)
-    modes = [m.split() for m in modes]
+    modes = [_strip_comment(m).split() for m in modes]
     verts_in = next((IN_VERTS[m[0]] for m in modes if m[0] in IN_VERTS), None)
     topology = next((OUT_TOPOLOGY[m[0]] for m in modes if m[0] in OUT_TOPOLOGY), None)
     max_verts = next((int(m[1]) for m in modes if m[0] == "OutputVertices"), None)
@@ -202,30 +222,40 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
         return f"%gsc_t{count}"
 
     out = []
+    has_shader_cap = any(_strip_comment(l).strip() == "OpCapability Shader" for l in _assembly_lines(text))
     entry_label = None
     cur_block = None
     emit_split = set()
     block_tail = {}
     derived = {}            # pointer id from an input or output -> the storage class it has now ("sb" or "pv")
     main_start = None
+    in_other_func = False
     state = "header"        # header -> main_entry -> main_vars -> main -> other
     for ln in _assembly_lines(text):
         s = ln.strip()
-        if s == "OpCapability Geometry":
+        code = _strip_comment(s)
+        if code == "OpCapability Geometry":
+            if not has_shader_cap:
+                out.append("OpCapability Shader")
+                has_shader_cap = True
             continue
-        m = re.match(r"OpEntryPoint Geometry (%\w+) (\"[^\"]*\")(.*)$", s)
+        m = re.match(r'OpEntryPoint Geometry (%\w+) ("(?:\\.|[^"\\])*")(.*)$', code)
         if m:
             iface = [v for v in m.group(3).split() if v not in gone] + capture_interface
             out += [f"OpEntryPoint GLCompute {m.group(1)} {m.group(2)} {' '.join(iface)}",
                     f"OpExecutionMode {m.group(1)} LocalSize {LOCAL_SIZE} 1 1"]
             continue
         # Floating-point controls apply to compute too.
-        m = re.match(rf"OpExecutionMode {re.escape(main)} (\w+)\b", s)
+        m = re.match(rf"OpExecutionMode {re.escape(main)} (\w+)\b", code)
         if m and m.group(1) not in FLOAT_CONTROL_MODES:
             continue
-        m = re.match(r"Op(?:Decorate|MemberDecorate|Name) (%\w+)\b", s)
+        m = re.match(r"Op(?:Decorate|MemberDecorate|Name|DecorateId|DecorateString|DecorateStringGOOGLE) (%\w+)\b", code)
         if m and m.group(1) in gone:
             continue
+        if code.startswith("OpDecorateId "):
+            for tok in code.split()[3:]:
+                if tok in gone:
+                    raise Unsupported(f"unhandled decoration reference to {tok}: {code}")
         if re.match(r"OpGroupDecorate\s", s):
             instruction, sep, comment = s.partition(";")
             opcode, group, *targets = instruction.split()
@@ -236,7 +266,7 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
                 rewritten = " ".join((opcode, group, *live_targets))
                 out.append(rewritten + f" {sep}{comment}" if sep else rewritten)
             continue
-        m = re.match(r"(%\w+) = (Op\w+)", s)
+        m = re.match(r"(%\w+)\s*=\s*(Op\w+)", code)
         if decos and m and m.group(2).startswith("OpType"):
             out += decos            # decorations end where the first type begins
             decos = []
@@ -249,28 +279,37 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             if m.group(1) == main:
                 state = "main_entry"
                 main_start = len(out)
+                in_other_func = False
+            else:
+                in_other_func = True
             out.append(ln)
             continue
-        if s == "OpFunctionEnd":
+        if code == "OpFunctionEnd":
             if state in ("main", "main_vars") and main_start is not None and block_tail:
                 # Any block split by the primitive-count check or by OpEmitVertex now terminates in its final
                 # merge label; update every OpPhi predecessor (including loop-header back-edges) to that label.
                 for idx in range(main_start, len(out)):
-                    m_phi = re.match(r"^(\s*%\w+\s*=\s*OpPhi\s+%\w+)\s+(.*)$", out[idx])
+                    phi_code = _strip_comment(out[idx])
+                    phi_tail = out[idx][len(phi_code):]
+                    m_phi = re.match(r"^(\s*%\w+\s*=\s*OpPhi\s+%\w+)\s+(.*)$", phi_code)
                     if m_phi:
                         ops = m_phi.group(2).split()
                         ops[1::2] = [block_tail.get(lbl, lbl) for lbl in ops[1::2]]
-                        out[idx] = f"{m_phi.group(1)} {' '.join(ops)}"
+                        out[idx] = f"{m_phi.group(1)} {' '.join(ops)}" + phi_tail
             state = "other"
             cur_block = None
-        if state == "main_entry" and re.match(r"%\w+ = OpLabel$", s):
+            in_other_func = False
+        if state == "main_entry" and re.match(r"%\w+\s*=\s*OpLabel$", code):
             state = "main_vars"
-            entry_label = s.split()[0]
+            entry_label = code.split()[0]
             cur_block = entry_label
             out.append(ln)
             continue
+        if state == "main_vars" and not code:
+            out.append(ln)
+            continue
         # OpLine and OpNoLine can be intermixed with the entry block's local variables.
-        if state == "main_vars" and not re.match(r"(?:%\w+ = OpVariable |OpLine |OpNoLine$)", s):
+        if state == "main_vars" and not re.match(r"(?:%\w+\s*=\s*OpVariable |OpLine |OpNoLine$)", code):
             # after the entry block's variables: p = GlobalInvocationId.x; return when p >= primitive_count
             state = "main"
             out += [f"%gsc_gidv = OpLoad {v3u} %gsc_gid", f"%gsc_prim = OpCompositeExtract {uint} %gsc_gidv 0",
@@ -283,21 +322,35 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
                     f"%gsc_metabase = OpIMul {uint} %gsc_prim {k(mv + 1)}"]
             block_tail[entry_label] = "%gsc_body"
         if state not in ("main", "main_vars"):
+            if in_other_func:
+                if code in ("OpEmitVertex", "OpEndPrimitive", "OpEmitStreamVertex", "OpEndStreamPrimitive") \
+                        or code.startswith(("OpEmitStreamVertex ", "OpEndStreamPrimitive ")):
+                    raise Unsupported(f"{code} in non-entry function")
+                for v in sorted(gone):
+                    if re.search(rf"{re.escape(v)}\b", code):
+                        raise Unsupported(f"unhandled use of {v} in non-entry function: {code}")
             out.append(ln)
             continue
         # ---- the body of main ----
-        m_lbl = re.match(r"(%\w+) = OpLabel$", s)
+        m_lbl = re.match(r"(%\w+)\s*=\s*OpLabel$", code)
         if m_lbl:
             cur_block = m_lbl.group(1)
             out.append(ln)
             continue
-        m = re.match(r"(%\w+) = Op(?:InBounds)?AccessChain (%\w+) (%\w+) (.*)$", s)
+        m = re.match(r"(%\w+)\s*=\s*Op(?:InBounds)?AccessChain (%\w+) (%\w+)(?:\s+(.*))?$", code)
         if m and m.group(3) in in_slot:
-            idx = m.group(4).split()
+            idx = (m.group(4) or "").split()
+            if not idx:
+                raise Unsupported(f"unhandled use of {m.group(3)}: {code}")
             vtx = idx[0]
-            if defs.get(vtx, (None, [None]))[1][:1] != [uint]:
+            vtx_ty = defs.get(vtx, (None, [None]))[1][:1]
+            if vtx_ty != [uint]:
+                ty_def = defs.get(vtx_ty[0]) if vtx_ty and vtx_ty[0] is not None else None
                 vtx = tmp()
-                out.append(f"{vtx} = OpBitcast {uint} {idx[0]}")
+                if ty_def is not None and ty_def[0] == "OpTypeInt" and ty_def[1][:1] != ["32"]:
+                    out.append(f"{vtx} = OpUConvert {uint} {idx[0]}")
+                else:
+                    out.append(f"{vtx} = OpBitcast {uint} {idx[0]}")
             a, b, c = tmp(), tmp(), tmp()
             ptr = "%gsc_ptr_sb_f" if m.group(2) in float_ptrs else "%gsc_ptr_sb_v4"
             out += [f"{a} = OpIAdd {uint} %gsc_inbase {vtx}", f"{b} = OpIMul {uint} {a} {k(nin)}",
@@ -307,35 +360,42 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
             continue
         if m and m.group(3) in out_vars:
             ptr = "%gsc_ptr_pv_f" if m.group(2) in float_ptrs else "%gsc_ptr_pv_v4"
-            out.append(f"{m.group(1)} = OpAccessChain {ptr} {out_vars[m.group(3)]} {m.group(4)}")
+            tail = f" {m.group(4)}" if m.group(4) else ""
+            out.append(f"{m.group(1)} = OpAccessChain {ptr} {out_vars[m.group(3)]}{tail}")
             derived[m.group(1)] = "pv"
             continue
         # A pointer made from one of those (a further access chain, or a copy) points into the same buffer or
         # private variable, so its result type takes that storage class too, not the old Input / Output (old #4126).
-        m = re.match(r"(%\w+) = (Op(?:InBounds)?(?:Ptr)?AccessChain|OpCopyObject) (%\w+) (%\w+)(.*)$", s)
+        m = re.match(r"(%\w+)\s*=\s*(Op(?:InBounds)?(?:Ptr)?AccessChain|OpCopyObject) (%\w+) (%\w+)(.*)$", code)
         if m and m.group(4) in derived:
             pointee = defs.get(m.group(3), (None, []))[1][1:2]
             if pointee not in ([v4], [f32]):
-                raise Unsupported(f"pointer into a geometry input or output of an unhandled type: {s}")
+                raise Unsupported(f"pointer into a geometry input or output of an unhandled type: {code}")
             sc = derived[m.group(4)]
             ptr = f"%gsc_ptr_{sc}_{'v4' if pointee == [v4] else 'f'}"
             out.append(f"{m.group(1)} = {m.group(2)} {ptr} {m.group(4)}{m.group(5)}")
             derived[m.group(1)] = sc
             continue
-        m = re.match(r"(%\w+) = OpLoad (%\w+) (%\w+)(?:\s+.*)?$", s)
+        m = re.match(r"(%\w+)\s*=\s*OpLoad (%\w+) (%\w+)(?:\s+.*)?$", code)
         if m and builtins.get(m.group(3)) in ("PrimitiveId", "InvocationId"):
             val = "%gsc_prim" if builtins[m.group(3)] == "PrimitiveId" else k(0)
             out.append(f"{m.group(1)} = OpBitcast {m.group(2)} {val}" if m.group(2) != uint
                        else f"{m.group(1)} = OpCopyObject {uint} {val}")
             continue
         for v in list(in_slot) + list(out_vars) + sorted(gone - set(in_slot) - set(out_vars)):
-            if re.search(rf"{re.escape(v)}\b", s):
-                m2 = re.match(rf"OpStore {re.escape(v)} (%\w+)(?:\s+.*)?$", s)
-                if v in out_vars and m2:
-                    s = f"OpStore {out_vars[v]} {m2.group(1)}"
+            if re.search(rf"{re.escape(v)}\b", code):
+                m_st = re.match(rf"OpStore {re.escape(v)} (%\w+)(\s+.*)?$", code)
+                if v in out_vars and m_st:
+                    code = f"OpStore {out_vars[v]} {m_st.group(1)}" + (m_st.group(2) or "")
+                    s = code
                     break
-                raise Unsupported(f"unhandled use of {v}: {s}")
-        if s == "OpEmitVertex":
+                m_ld = re.match(rf"(%\w+)\s*=\s*OpLoad (%\w+) {re.escape(v)}(\s+.*)?$", code)
+                if v in out_vars and m_ld:
+                    code = f"{m_ld.group(1)} = OpLoad {m_ld.group(2)} {out_vars[v]}" + (m_ld.group(3) or "")
+                    s = code
+                    break
+                raise Unsupported(f"unhandled use of {v}: {code}")
+        if code == "OpEmitVertex":
             # Guard stores and counter increment on n < OutputVertices so over-emitting drops extra vertices
             # instead of overflowing into primitive p+1's record/meta slots; %gsc_n stays <= mv for OpEndPrimitive
             # and OpReturn as well (SHADER-617).
@@ -363,23 +423,24 @@ def rewrite(text: str, *, version: tuple[int, int] = (1, 5)) -> tuple[str, dict[
                 block_tail[cur_block] = lbl_end
                 emit_split.add(cur_block)
             continue
-        if s == "OpEndPrimitive":
+        if code == "OpEndPrimitive":
             # flag the last emitted vertex: meta[base + 1 + (n - 1)]; with none emitted this writes the count slot,
             # which the final store overwrites
             n, d, q = tmp(), tmp(), tmp()
             out += [f"{n} = OpLoad {uint} %gsc_n", f"{d} = OpIAdd {uint} %gsc_metabase {n}",
                     f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} {d}", f"OpStore {q} {k(1)}"]
             continue
-        if s == "OpReturn":
+        if code == "OpReturn":
             n, q = tmp(), tmp()
             out += [f"{n} = OpLoad {uint} %gsc_n",
                     f"{q} = OpAccessChain %gsc_ptr_sb_u %gsc_meta {k(0)} %gsc_metabase", f"OpStore {q} {n}"]
-        if s.startswith("OpLoopMerge ") and cur_block in emit_split:
+        if code.startswith("OpLoopMerge ") and cur_block in emit_split:
             # Splitting a loop header with OpSelectionMerge moves OpLoopMerge into the merge block while
             # back-edges still target the original header label, violating SPIR-V structured CFG rules.
             raise Unsupported("OpEmitVertex in a loop header before OpLoopMerge")
-        if s in ("OpKill", "OpTerminateInvocation", "OpReturnValue"):
-            raise Unsupported(s)
+        if code in ("OpKill", "OpTerminateInvocation", "OpReturnValue", "OpEmitStreamVertex", "OpEndStreamPrimitive") \
+                or code.startswith(("OpEmitStreamVertex ", "OpEndStreamPrimitive ")):
+            raise Unsupported(code)
         out.append(s)
     public = {key: lay[key] for key in ("verts_in", "max_verts", "topology", "inputs", "outputs")}
     public["local_size"] = LOCAL_SIZE

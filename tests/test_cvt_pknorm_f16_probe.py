@@ -287,6 +287,95 @@ class MockedCLITests(unittest.TestCase):
                 pr.main(["--json", tmp])
             self.assertEqual(cm.exception.code, 2)
 
+    def test_malformed_and_duplicate_ops_waves_and_empty_args(self):
+        for bad_args in (
+            ["--ops", "v_cvt_pknorm_i16_f16,"],
+            ["--ops", ",v_cvt_pknorm_i16_f16"],
+            ["--ops", "v_cvt_pknorm_i16_f16,,v_cvt_pknorm_u16_f16"],
+            ["--waves", "32,"],
+            ["--waves", "32,,64"],
+            ["--hw-arch", ""],
+            ["--hw-arch", "   "],
+            ["--json", ""],
+            ["--json", "   "],
+        ):
+            with self.subTest(args=bad_args):
+                with mock.patch.object(runner, "open_oracle") as open_mock, redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as cm:
+                        pr.main(bad_args)
+                self.assertEqual(cm.exception.code, 2)
+                open_mock.assert_not_called()
+
+        oracle = FakeOracle()
+        with tempfile.TemporaryDirectory() as tmp:
+            rep = Path(tmp) / "dedup.json"
+            rc, _, err = _run_main(
+                oracle,
+                "--no-exhaustive",
+                "--ops", "v_cvt_pknorm_i16_f16,v_cvt_pknorm_i16_f16",
+                "--waves", "32,32",
+                "--json", str(rep),
+            )
+            self.assertEqual(rc, 0, err)
+            doc = json.loads(rep.read_text(encoding="utf-8"))
+            self.assertEqual(doc["ops"], ["v_cvt_pknorm_i16_f16"])
+            self.assertEqual(doc["waves"], [32])
+            self.assertEqual(doc["case_words"], 2 * len(pr.CASES))
+
+    def test_json_blocker_trailing_sep_and_atomic_write_report(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            blocker = Path(tmp) / "blocker"
+            blocker.write_bytes(b"keep")
+            with mock.patch.object(runner, "open_oracle") as open_mock, redirect_stderr(io.StringIO()) as err:
+                rc = pr.main(["--no-exhaustive", "--json", str(blocker / "r.json")])
+            self.assertEqual(rc, 2)
+            open_mock.assert_not_called()
+            self.assertIn("ERROR: cannot write", err.getvalue())
+            self.assertEqual(blocker.read_bytes(), b"keep")
+
+            with mock.patch.object(runner, "open_oracle") as open_mock, redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    pr.main(["--no-exhaustive", "--json", str(Path(tmp) / "sub") + os.sep])
+            self.assertEqual(cm.exception.code, 2)
+            open_mock.assert_not_called()
+
+            out = Path(tmp) / "sub" / "report.json"
+            self.assertTrue(pr.write_report(str(out), {"ok": 1}))
+            raw = out.read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+
+            with redirect_stderr(io.StringIO()):
+                self.assertFalse(pr.write_report(str(out), {"bad": float("nan")}))
+            self.assertEqual(json.loads(out.read_text(encoding="utf-8")), {"ok": 1})
+
+            if hasattr(os, "symlink"):
+                real = Path(tmp) / "real.json"
+                link = Path(tmp) / "link.json"
+                real.write_text("old", encoding="utf-8")
+                try:
+                    os.symlink(real, link)
+                except OSError:
+                    link = None
+                if link is not None:
+                    self.assertTrue(pr.write_report(str(link), {"via": "link"}))
+                    self.assertTrue(link.is_symlink())
+                    self.assertEqual(json.loads(real.read_text(encoding="utf-8")), {"via": "link"})
+
+            if os.name == "posix" and os.path.exists("/dev/null"):
+                self.assertTrue(pr.write_report("/dev/null", {"ok": 1}))
+
+    def test_evaluate_results_count_mismatch_and_unknown_arch_family(self):
+        _, meta = pr.build_jobs(["v_cvt_pknorm_i16_f16"], [32], exhaustive=False)
+        rep = pr.evaluate_results(["v_cvt_pknorm_i16_f16"], [32], meta, [], exhaustive=False)
+        self.assertEqual(len(rep["harness_errors"]), 1)
+        self.assertIn("expected", rep["harness_errors"][0]["error"])
+
+        oracle = FakeOracle(arch="unknown_arch_999", device="fake unknown")
+        rc, out, _ = _run_main(oracle, "--no-exhaustive")
+        self.assertEqual(rc, 77, out)
+        self.assertTrue(oracle.closed)
+
 
 class LiveHardwareTests(unittest.TestCase):
     def test_live_gfx1036_oracle(self):

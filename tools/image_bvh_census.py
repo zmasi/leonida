@@ -68,11 +68,16 @@ Usage: `python -I tools/image_bvh_census.py --help` lists the options.
 import argparse
 import json
 import os
+import struct
 import sys
+import tempfile
 from collections import Counter, defaultdict
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import file_mode  # noqa: E402
 import rdna2spirv  # noqa: E402  (base_op, BRANCHES, fold_far_branches, reachable_code, native_blob, stage_of)
+import replace_retry  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 from shader_ir import parse_file  # noqa: E402
 from wave64_graphics_scan import scanned_paths  # noqa: E402
 
@@ -112,7 +117,10 @@ class Skip(Exception):
 
 def load_program(path):
     """The reachable instructions of a listing, as rdna2spirv.translate() takes them (no SPIR-V is built)."""
-    info = parse_file(path)
+    try:
+        info = parse_file(path)
+    except ValueError:
+        raise Skip("invalid instruction encoding") from None
     insns = info["insns"]
     if not insns:
         raise Skip("no instructions")
@@ -125,7 +133,10 @@ def load_program(path):
             raise Skip("data words without the native blob to re-anchor them") from None
         pos = info["code_start"]
         for ins in insns:
-            enc = bytes.fromhex(ins["enc"])
+            try:
+                enc = bytes.fromhex(ins["enc"])
+            except ValueError:
+                raise Skip("invalid instruction encoding") from None
             at, skipped = pos, 0
             while not rdna2spirv.same_encoding(blob[at:at + len(enc)], enc, ins["op"], len(ins["args"])):
                 at += 4
@@ -166,8 +177,13 @@ def blocks_of(insns):
         v = imm["v"] & 0xFFFF
         return next_pc(ins) + 4 * (v - 0x10000 if v & 0x8000 else v)
 
+    if not insns:
+        return [], []
     pcs = {i["pc"] for i in insns}
     leaders = {insns[0]["pc"]}
+    for prev, ins in zip(insns, insns[1:]):
+        if next_pc(prev) != ins["pc"]:
+            leaders.add(ins["pc"])
     for ins in insns:
         op = rdna2spirv.base_op(ins["op"])
         if op in rdna2spirv.BRANCHES:
@@ -187,7 +203,7 @@ def blocks_of(insns):
     for n, blk in enumerate(blocks):
         last = blk[-1]
         op = rdna2spirv.base_op(last["op"])
-        fall = [n + 1] if n + 1 < len(blocks) else []
+        fall = [n + 1] if n + 1 < len(blocks) and next_pc(last) == starts[n + 1] else []
         if op in ("s_endpgm", "s_setpc_b64"):
             succ.append([])
         elif op == "s_branch":
@@ -239,7 +255,7 @@ def source_args(ins):
     """Indexes of the source operands (everything after the destination, or every operand of a store/compare)."""
     op, a = ins["op"], ins["args"]
     if op.startswith("v_cmpx"):
-        return list(range(len(a)))
+        return list(range(len(a))) if len(a) <= 2 else list(range(1, len(a)))
     if op.startswith(NO_VGPR_DST) and not op.startswith("v_cmp"):
         return list(range(len(a)))
     return list(range(1, len(a)))              # a v_cmp writes VCC or an SGPR pair first
@@ -263,14 +279,18 @@ def is_copy(ins):
     a = ins["args"]
     if bop not in ("v_mov_b32", "v_swap_b32") or ins["op"].endswith(("_sdwa", "_dpp")) or len(a) < 2:
         return False
-    return not ins.get("mods") and plain(a[1]) and bool(vregs(a[1]))
+    if ins.get("mods") or not plain(a[1]) or len(vregs(a[1])) != 1 or len(vregs(a[0])) != 1:
+        return False
+    return bop != "v_swap_b32" or plain(a[0])
 
 
 def high_half_operand(ins, n):
     """Operand n of a v_mul_i32_i24 is sext(src[31:16]) (SDWA src<n-1>_sel:WORD_1 with sext)."""
     if rdna2spirv.base_op(ins["op"]) != "v_mul_i32_i24" or not ins["op"].endswith("_sdwa") or n not in (1, 2):
         return False
-    return ins["args"][n].get("sext") and f"src{n - 1}_sel:WORD_1" in ins.get("mods", [])
+    a = ins["args"]
+    return len(a) > n and len(vregs(a[n])) == 1 and bool(a[n].get("sext")) and \
+        f"src{n - 1}_sel:WORD_1" in ins.get("mods", [])
 
 
 def kind_of(ins, n):
@@ -294,8 +314,10 @@ def imm32(a):
     if a["k"] == "imm" and not a.get("neg") and not a.get("abs"):
         return a["v"] & 0xFFFFFFFF
     if a["k"] == "fimm" and not a.get("neg") and not a.get("abs"):
-        import struct
-        return struct.unpack("<I", struct.pack("<f", a["v"]))[0]
+        try:
+            return struct.unpack("<I", struct.pack("<f", a["v"]))[0]
+        except OverflowError:
+            return None
     return None
 
 
@@ -304,7 +326,7 @@ def sgpr_step(sg, ins):
     op, a = ins["op"], ins["args"]
     bop = rdna2spirv.base_op(op)
     written = []
-    if a and not op.startswith(SALU_NO_DST):
+    if a and not op.startswith(SALU_NO_DST) and not (bop.startswith("v_cmpx") and len(a) <= 2):
         written += sregs(a[0])              # SALU destinations, v_cmp_*_e64 / v_readlane_b32 SGPR destinations
     if len(a) > 1 and ("_co_" in bop or bop.startswith("v_div_scale")):
         written += sregs(a[1])              # the carry / scale SGPR of a VOP3b op
@@ -445,10 +467,11 @@ def labels(entries, node):
 def mask_writes(ins):
     """SGPRs an instruction writes (destinations, VOP3b carry/scale outputs)."""
     a, op = ins["args"], ins["op"]
+    bop = rdna2spirv.base_op(op)
     out = []
-    if a and not op.startswith(SALU_NO_DST):
+    if a and not op.startswith(SALU_NO_DST) and not (bop.startswith("v_cmpx") and len(a) <= 2):
         out += sregs(a[0])
-    if len(a) > 1 and ("_co_" in rdna2spirv.base_op(op) or rdna2spirv.base_op(op).startswith("v_div_scale")):
+    if len(a) > 1 and ("_co_" in bop or bop.startswith("v_div_scale")):
         out += sregs(a[1])
     return out
 
@@ -686,11 +709,17 @@ def site_transfer(call_pc, events, product_reads):
             new = {r: st.read(a[1]["r"]) for r in writes[:1]}
             if bop == "v_swap_b32":
                 new[a[1]["r"]] = st.read(a[0]["r"])
-        elif bop == "v_rcp_f32" and writes and len(a) > 1 and len(vregs(a[1])) == 1:
+        elif bop == "v_rcp_f32" and writes and len(a) > 1 and len(vregs(a[1])) == 1 \
+                and plain(a[1]) and not ins.get("mods") and not ins["op"].endswith(("_sdwa", "_dpp")):
             new = {writes[0]: derived(st.read(a[1]["r"]), R1)}
         elif writes and any(high_half_operand(ins, n) for n in (1, 2)):
-            n = 1 if high_half_operand(ins, 1) else 2
-            new = {writes[0]: derived(st.read(a[n]["r"]), H)}
+            hh = [n for n in (1, 2) if high_half_operand(ins, n)]
+            w1_hh = [n for n in hh if ("w", 1) in st.read(a[n]["r"])]
+            if len(w1_hh) == 1:
+                combined = derived(st.read(a[w1_hh[0]]["r"]), H)
+            else:
+                combined = set().union(*(derived(st.read(a[n]["r"]), H) for n in hh))
+            new = {writes[0]: combined}
         else:
             new = {r: {OTHER} for r in writes}
         for r, labs in new.items():
@@ -723,6 +752,8 @@ def analyse(insns):
     program order; reach is "all" or "some" (paths), and the last field says whether the read lies after another
     call in program order. The pcs are for local inspection; summarise() drops them."""
     blocks, succ = blocks_of(insns)
+    if not blocks:
+        return []
     where = {i["pc"]: (b, n) for b, blk in enumerate(blocks) for n, i in enumerate(blk)}
     calls = [i for i in insns if rdna2spirv.base_op(i["op"]) in FORMS]
     desc = descriptor_words(blocks, succ, {c["pc"] for c in calls})
@@ -915,6 +946,66 @@ def print_summary(s, out=None):
     w("limits: " + "; ".join(f"{k} {v}" for k, v in s["limits"].items()))
 
 
+def _same_stat(st, path):
+    try:
+        return os.path.samestat(st, os.stat(path))
+    except OSError:
+        return False
+
+
+def _out_input_collision(out_path, src_dir, paths):
+    parent = os.path.dirname(os.path.abspath(src_dir))
+    index_path = os.path.join(parent, "index.json")
+    if same_report_path(out_path, index_path):
+        return "output must not overwrite the carve index it reads"
+    fssm_dir = os.path.join(parent, "fssm")
+    target_real = os.path.realpath(os.path.abspath(out_path))
+    target_dir = os.path.dirname(target_real)
+    try:
+        target_stat = os.stat(target_real)
+    except OSError:
+        target_stat = None
+    in_src = same_report_path(target_dir, src_dir)
+    in_fssm = same_report_path(target_dir, fssm_dir)
+    for p in paths:
+        if (target_stat is not None and _same_stat(target_stat, p)) or (
+            (in_src or os.path.islink(p)) and same_report_path(out_path, p)
+        ):
+            return "output must not overwrite a listing it scans"
+        stem = os.path.splitext(os.path.basename(p))[0]
+        fssm_path = os.path.join(fssm_dir, stem + ".fssm")
+        if (target_stat is not None and _same_stat(target_stat, fssm_path)) or (
+            (in_fssm or os.path.islink(fssm_path)) and same_report_path(out_path, fssm_path)
+        ):
+            return "output must not overwrite an FSSM blob it reads"
+    return None
+
+
+def _write_json_atomic(path, data):
+    payload = json.dumps(data, indent=1, allow_nan=False) + "\n"
+    abs_path = os.path.abspath(path)
+    parent = os.path.dirname(abs_path)
+    mode = file_mode.published_mode(abs_path)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n",
+            prefix=".image_bvh_census.", suffix=".tmp",
+            dir=parent, delete=False,
+        ) as f:
+            tmp_path = f.name
+            f.write(payload)
+        os.chmod(tmp_path, mode)
+        replace_retry.replace(tmp_path, abs_path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Count image_bvh*_intersect_ray sites, their descriptor fields and how "
                                              "their result words are read (counts only, no names)")
@@ -928,16 +1019,25 @@ def main(argv=None) -> int:
             ap.error(f"{args.out} is a directory, not a JSON file")
         if not os.path.isdir(os.path.dirname(os.path.abspath(args.out))):
             ap.error(f"output directory does not exist: {os.path.dirname(os.path.abspath(args.out))}")
-        if os.path.exists(args.out) and any(os.path.samefile(args.out, p) for p in scanned_paths(args.src)):
-            ap.error("output must not overwrite a listing it scans")
-    summary = summarise(*scan_directory(args.src))
+        try:
+            paths = scanned_paths(args.src)
+        except OSError as e:
+            print(f"ERROR: cannot read {args.src}: {e.strerror or e}", file=sys.stderr)
+            return 2
+        collision = _out_input_collision(args.out, args.src, paths)
+        if collision is not None:
+            ap.error(collision)
+    try:
+        summary = summarise(*scan_directory(args.src))
+    except OSError as e:
+        print(f"ERROR: cannot read {args.src}: {e.strerror or e}", file=sys.stderr)
+        return 2
     print_summary(summary)
     if args.out:
         try:
-            with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(summary, f, indent=1)
-        except OSError as e:
-            print(f"ERROR: cannot write {args.out}: {e.strerror or e}", file=sys.stderr)
+            _write_json_atomic(args.out, summary)
+        except (OSError, ValueError) as e:
+            print(f"ERROR: cannot write {args.out}: {getattr(e, 'strerror', None) or e}", file=sys.stderr)
             return 2
         print(f"wrote {args.out}")
     return 0

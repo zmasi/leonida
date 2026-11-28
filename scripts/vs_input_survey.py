@@ -18,13 +18,19 @@ Standard library only. Nothing from the game is printed or written beyond counts
 """
 import argparse
 import json
+import ntpath
 import os
+import posixpath
 import re
 import sys
+import tempfile
 from collections import Counter
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "tools"))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
+from report_paths import same_report_path  # noqa: E402
 import shader_ir  # noqa: E402
 from shader_meta import SGPR_RMW  # noqa: E402
 
@@ -109,21 +115,69 @@ def read_before_write(insns):
     return read_s, read_v
 
 
-def survey(dxbc_dir):
-    with open(os.path.join(dxbc_dir, "index.json"), encoding="utf-8") as f:
+def _safe_shader_stem(value):
+    """Validate an index.json 'file' basename against path traversal and return its stem."""
+    if (
+        not isinstance(value, str)
+        or not value
+        or any(ord(c) < 32 or ord(c) == 127 for c in value)
+        or ":" in value
+        or "/" in value
+        or "\\" in value
+        or ntpath.splitdrive(value)[0]
+        or ntpath.basename(value) != value
+        or posixpath.basename(value) != value
+    ):
+        raise ValueError(f"index.json has an invalid shader filename: {value!r}")
+    stem = os.path.splitext(value)[0]
+    if not stem or stem in (".", ".."):
+        raise ValueError(f"index.json has an invalid shader filename: {value!r}")
+    return stem
+
+
+def _write_json_atomic(path, payload):
+    """Write JSON to a sibling staging file and rename atomically, cleaning up read-only staging on error."""
+    dest = os.path.abspath(path)
+    parent = os.path.dirname(dest) or "."
+    staged = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", newline="\n", delete=False,
+            dir=parent, prefix=".vs_input_survey-", suffix=".tmp",
+        ) as f:
+            staged = f.name
+            json.dump(payload, f, indent=1)
+            f.write("\n")
+        os.chmod(staged, published_mode(dest))
+        replace_retry(staged, dest)
+        staged = None
+    finally:
+        if staged is not None:
+            try:
+                os.chmod(staged, 0o600)
+            except OSError:
+                pass
+            try:
+                os.unlink(staged)
+            except OSError:
+                pass
+
+
+def _survey_detail(dxbc_dir):
+    with open(os.path.join(dxbc_dir, "index.json"), encoding="utf-8-sig") as f:
         index = json.load(f)
     if not isinstance(index, list) or not all(isinstance(e, dict) for e in index):
         raise ValueError("index.json is not a list of shader entries")
-    if not all(isinstance(e.get("file"), str) for e in index if e.get("stage") == "vs"):
-        raise ValueError("index.json has a vertex shader entry without a string file")
-    names = [os.path.splitext(e["file"])[0] for e in index if e.get("stage") == "vs"]
+    names = [_safe_shader_stem(e.get("file")) for e in index if e.get("stage") == "vs"]
     markers, vgprs, families = Counter(), Counter(), Counter()
     missing = 0
+    disasm_paths = []
     for n in names:
         path = os.path.join(dxbc_dir, "disasm", n + ".s")
         if not os.path.isfile(path):
             missing += 1
             continue
+        disasm_paths.append(path)
         with open(path, encoding="utf-8", errors="replace") as f:
             text = f.read()
         _, read_v = read_before_write(shader_ir.parse_file(path)["insns"])
@@ -143,25 +197,39 @@ def survey(dxbc_dir):
             families["reads v0 (vertex id)" + (" and v3 (instance id)" if 3 in read_v else "")] += 1
         else:
             families["reads neither v0 nor a fetch call"] += 1
-    return {"vertex_shaders": len(names), "missing_listings": missing, "markers": dict(markers),
-            "input_vgprs_read": dict(sorted(vgprs.items(), key=lambda kv: int(kv[0][1:]))),
-            "families": dict(families)}
+    result = {"vertex_shaders": len(names), "missing_listings": missing, "markers": dict(markers),
+              "input_vgprs_read": dict(sorted(vgprs.items(), key=lambda kv: int(kv[0][1:]))),
+              "families": dict(families)}
+    return result, disasm_paths
 
 
-def main():
+def survey(dxbc_dir):
+    return _survey_detail(dxbc_dir)[0]
+
+
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("dxbc", help="<work>/shaders/dxbc from make_game.py")
     ap.add_argument("--json", help="also write the counts as JSON")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     index_path = os.path.join(a.dxbc, "index.json")
-    if a.json and os.path.exists(a.json) and os.path.exists(index_path) and os.path.samefile(a.json, index_path):
-        print(f"vs_input_survey: error: --json would overwrite the input {index_path}", file=sys.stderr)
-        return 2
+    if a.json:
+        if os.path.isdir(a.json):
+            print(f"vs_input_survey: error: --json is a directory: {a.json}", file=sys.stderr)
+            return 2
+        if same_report_path(a.json, index_path) or same_report_path(a.json, a.dxbc):
+            print(f"vs_input_survey: error: --json would overwrite the input {index_path}", file=sys.stderr)
+            return 2
     try:
-        r = survey(a.dxbc)
+        r, disasm_paths = _survey_detail(a.dxbc)
     except (OSError, ValueError) as e:  # missing or non-folder <dxbc>, unreadable, non-UTF-8 or malformed index.json
         print(f"vs_input_survey: error: cannot read {index_path}: {e}", file=sys.stderr)
         return 2
+    if a.json:
+        for src_path in disasm_paths:
+            if same_report_path(a.json, src_path):
+                print(f"vs_input_survey: error: --json would overwrite the input {src_path}", file=sys.stderr)
+                return 2
     m = r["markers"]
     print(f"{r['vertex_shaders']} vertex shaders ({r['missing_listings']} without a listing)")
     print(f"NGG markers: exp prim {m.get('exp prim', 0)}, s_sendmsg {m.get('s_sendmsg', 0)}, v_mbcnt {m.get('v_mbcnt', 0)}")
@@ -172,8 +240,7 @@ def main():
     print("layout:", "legacy (non-NGG) VS" if legacy else "NGG markers present: check the VS input layout")
     if a.json:
         try:
-            with open(a.json, "w", encoding="utf-8", newline="\n") as f:
-                json.dump(r, f, indent=1)
+            _write_json_atomic(a.json, r)
         except OSError as e:
             print(f"vs_input_survey: error: cannot write {a.json}: {e.strerror or e}", file=sys.stderr)
             return 2

@@ -268,6 +268,113 @@ class Cli(unittest.TestCase):
         self.assertIn("no SDWA", out)
         self.assertTrue(NoSdwa.closed)
 
+    def test_unknown_hw_arch_family_closes_oracle_and_exits_77(self):
+        from unittest import mock
+        from hw_oracle import runner
+
+        class UnknownArch:
+            arch, device, closed = "gfx900", "stub-gfx9", False
+
+            def close(self):
+                self.closed = True
+
+        stub = UnknownArch()
+        with mock.patch.object(runner, "open_oracle", return_value=stub):
+            rc, out = self.main("--oracle", "hw", "--programs", "1")
+        self.assertEqual(rc, 77, out)
+        self.assertIn("hardware oracle unavailable", out)
+        self.assertTrue(stub.closed)
+
+    def test_main_restores_known_flag_and_rejects_empty_string_options(self):
+        self.assertFalse(d.KNOWN)
+        rc, _ = self.main("--known", "--list-ops")
+        self.assertEqual(rc, 0)
+        self.assertFalse(d.KNOWN)
+
+        rc, _ = self.main("--known", "--programs", "2", "--seed", "1", "--ops", "v_xor_b32")
+        self.assertEqual(rc, 0)
+        self.assertFalse(d.KNOWN)
+
+        for flag in ("--hw-arch", "--build", "--work"):
+            for bad in ("", "   "):
+                with self.subTest(flag=flag, bad=bad):
+                    rc, _ = self.main(flag, bad, "--list-ops")
+                    self.assertEqual(rc, 2)
+
+    def test_hw_oracle_result_count_and_word_length_guards(self):
+        from unittest import mock
+        from hw_oracle import runner
+
+        with self.assertRaisesRegex(RuntimeError, "hardware oracle required"):
+            d.hw_prepare(None, [["v_mov_b32 v1, 0"]])
+
+        class BadCountOracle:
+            arch, device = "gfx1036", "stub-rdna2"
+
+            def __init__(self, responses):
+                self._responses = list(responses)
+                self.closed = False
+
+            def run(self, programs):
+                return self._responses.pop(0)
+
+            def close(self):
+                self.closed = True
+
+        # Short batch from oracle.run -> harness error exit 2, oracle closed.
+        stub_short = BadCountOracle([[[0, 0, 0, 0]]])
+        with mock.patch.object(runner, "open_oracle", return_value=stub_short):
+            rc, out = self.main("--oracle", "hw", "--programs", "2", "--ops", "v_xor_b32")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("harness error", out)
+        self.assertTrue(stub_short.closed)
+
+        # Malformed word count (<4 words) -> harness error exit 2, oracle closed.
+        stub_words = BadCountOracle([[[0, 1]]])
+        with mock.patch.object(runner, "open_oracle", return_value=stub_words):
+            rc, out = self.main("--oracle", "hw", "--programs", "1", "--ops", "v_xor_b32")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("expected 4 words", out)
+        self.assertTrue(stub_words.closed)
+
+        # Empty oracle response during shrink -> harness error exit 2, oracle closed.
+        stub_shrink = BadCountOracle([[[0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF]], []])
+        with mock.patch.object(runner, "open_oracle", return_value=stub_shrink):
+            rc, out = self.main("--oracle", "hw", "--programs", "1", "--max-ops", "1", "--ops", "v_xor_b32")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("harness error", out)
+        self.assertTrue(stub_shrink.closed)
+
+    def test_shrink_final_recheck_skip_falls_back_to_original_problem(self):
+        from unittest import mock
+
+        calls = {"n": 0}
+
+        def flaky_translated(lines):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return [w ^ 1 for w in d.reference(lines)]
+            raise d.Skip("transient skip during shrink recheck")
+
+        with mock.patch.object(d, "translated", flaky_translated):
+            rc, out = self.main("--programs", "1", "--seed", "1", "--max-ops", "1", "--ops", "v_xor_b32")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("MISMATCH program 0:", out)
+
+    def test_reference_rejects_unknown_selectors_unused_modes_and_operands(self):
+        bad_lines = (
+            "v_mov_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_BAD src0_sel:DWORD",
+            "v_mov_b32_sdwa v1, v2 dst_sel:NOPE dst_unused:UNUSED_PAD src0_sel:DWORD",
+            "v_mov_b32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:NOPE",
+            "v_mov_b32_sdwa s1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+            "v_mov_b32_sdwa v1, bogus dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+            "v_add_nc_u32_sdwa v1, v2 dst_sel:DWORD dst_unused:UNUSED_PAD src0_sel:DWORD",
+        )
+        for bad in bad_lines:
+            with self.subTest(line=bad):
+                with self.assertRaises(d.RefError):
+                    run(bad)
+
 
 class EverythingSkipped(unittest.TestCase):
     def test_a_run_where_every_program_was_skipped_is_not_a_success(self):

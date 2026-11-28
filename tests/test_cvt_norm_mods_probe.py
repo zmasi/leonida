@@ -309,6 +309,72 @@ class ProbeCliTests(unittest.TestCase):
         self.assertEqual(rc, 77)
         self.assertIn("unavailable", buf.getvalue())
 
+    def test_json_and_hw_arch_validated_upfront_before_oracle(self):
+        with tempfile.TemporaryDirectory() as d:
+            blocker = os.path.join(d, "blocker")
+            with open(blocker, "wb") as f:
+                f.write(b"keep")
+            bad_invocations = [
+                ["--json", ""],
+                ["--json", "   "],
+                ["--json", d],
+                ["--json", d + os.sep],
+                ["--json", os.path.join(d, "sub") + os.sep],
+                ["--json", os.path.join(blocker, "r.json")],
+                ["--hw-arch", ""],
+                ["--hw-arch", "   "],
+            ]
+            for extra in bad_invocations:
+                with self.subTest(args=extra):
+                    err = io.StringIO()
+                    with mock.patch.object(runner, "open_oracle") as open_mock, redirect_stderr(err):
+                        rc = pr.main(["--ops", "v_cvt_pknorm_i16_f32", "--waves", "32", *extra])
+                    self.assertEqual(rc, 2)
+                    open_mock.assert_not_called()
+                    self.assertIn("ERROR:", err.getvalue())
+            self.assertEqual(Path(blocker).read_bytes(), b"keep")
+
+    def test_write_json_report_atomic_symlink_nan_and_devnull(self):
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "sub", "report.json")
+            self.assertIsNone(pr.write_json_report(out, {"ok": 1}))
+            raw = Path(out).read_bytes()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+
+            # NaN must be rejected without clobbering the existing file.
+            self.assertIsNotNone(pr.write_json_report(out, {"bad": float("nan")}))
+            self.assertEqual(json.loads(Path(out).read_text(encoding="utf-8")), {"ok": 1})
+
+            if hasattr(os, "symlink"):
+                real = os.path.join(d, "real.json")
+                link = os.path.join(d, "link.json")
+                Path(real).write_text("old", encoding="utf-8")
+                try:
+                    os.symlink(real, link)
+                except OSError:
+                    link = None
+                if link is not None:
+                    self.assertIsNone(pr.write_json_report(link, {"via": "link"}))
+                    self.assertTrue(os.path.islink(link))
+                    self.assertEqual(json.loads(Path(real).read_text(encoding="utf-8")), {"via": "link"})
+
+            if os.name == "posix" and os.path.exists("/dev/null"):
+                self.assertIsNone(pr.write_json_report("/dev/null", {"ok": 1}))
+
+    def test_evaluate_results_result_count_mismatch_and_runtime_error(self):
+        _, meta = pr.build_jobs(["v_cvt_pknorm_i16_f32"], [32])
+        rep = pr.evaluate_results([32], meta, [])
+        self.assertEqual(len(rep["harness_errors"]), 1)
+        self.assertIn("expected", rep["harness_errors"][0]["error"])
+
+        oracle = FakeOracle()
+        with mock.patch.object(oracle, "run", side_effect=RuntimeError("gpu hang")):
+            rc, out, _ = _run_main(oracle, "--ops", "v_cvt_pknorm_i16_f32", "--waves", "32")
+        self.assertEqual(rc, 2)
+        self.assertIn("harness error: gpu hang", out)
+        self.assertTrue(oracle.closed)
+
 
 if __name__ == "__main__":
     unittest.main()

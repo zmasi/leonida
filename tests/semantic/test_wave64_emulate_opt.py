@@ -438,6 +438,28 @@ def run_emulated_workgroup(spvasm, local_size, push_constants=None, memory=None,
                 else:
                     p[0][p[1]] = new & MASK32
                 vals[res] = old
+            elif op in ("OpAtomicUMin", "OpAtomicUMax", "OpAtomicSMin", "OpAtomicSMax", "OpAtomicISub"):
+                # ds_min_u32 / ds_max_u32 / ds_min_i32 / ds_max_i32 / ds_sub_u32 and their buffer_atomic forms.
+                p = ptrs[a[1]]
+                old = (memory.get(p[1], 0) if p[0] == "psb" else p[0][p[1]]) & MASK32
+                v = vals[a[4]] & MASK32
+                s_old = old - (1 << 32) if old >> 31 else old
+                s_v = v - (1 << 32) if v >> 31 else v
+                if op == "OpAtomicUMin":
+                    new = min(old, v)
+                elif op == "OpAtomicUMax":
+                    new = max(old, v)
+                elif op == "OpAtomicSMin":
+                    new = old if s_old <= s_v else v
+                elif op == "OpAtomicSMax":
+                    new = old if s_old >= s_v else v
+                else:
+                    new = (old - v) & MASK32
+                if p[0] == "psb":
+                    memory[p[1]] = new
+                else:
+                    p[0][p[1]] = new
+                vals[res] = old
             elif op == "OpSelect":
                 vals[res] = vals[a[2]] if vals[a[1]] else vals[a[3]]
             elif op == "OpCopyObject":

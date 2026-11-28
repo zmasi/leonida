@@ -133,6 +133,12 @@ class ALUVExpF32Tests(unittest.TestCase):
                 res = run_op(x_bits)
                 self.assertEqual(res, ref_exp32(x_bits))
 
+    def test_exp_f32_denormal_results(self):
+        cases = [(-125.0, 0x01000000), (-126.0, 0x00800000), (-127.0, 0), (-128.0, 0), (-149.0, 0), (-150.0, 0)]
+        for x, expected in cases:
+            with self.subTest(x=x):
+                self.assertEqual(run_op(bits32(x)), expected)
+
     def test_exp_f32_negative_control(self):
         # Result differs from input for non-trivial inputs.
         x_bits = bits32(2.0)

@@ -1,5 +1,6 @@
 ; group: 1,1,1
-; Store binary64 (0.75 + 0.5) * 2 = 2.5 as low/high words: 0x00000000, 0x40040000.
+; Store binary64 0.75 + 0.5 = 1.25 as low/high words: 0x00000000, 0x3FF40000. The mul:2 below is a VOP3 omod, which
+; RDNA2 ignores while f64 denormals are kept (docs/design.md, "v_add_f64 output modifiers"); it would give 2.5.
 v_mov_b32 v0, 0
 v_mov_b32 v1, 0x3fe80000
 v_mov_b32 v2, 0

@@ -1535,6 +1535,90 @@ output scaling. This is a translation for the **inferred game MODE**, not a clai
 denormal-preserving or IEEE modes; native gfx1013 measurements of these new fixtures were not available.
 
 
+### v_div_scale on the hardware (`tools/div_scale_probe.py`, SHADER-DIV-SCALE-PROBE)
+
+**Not run on hardware yet.** This section describes a tool and has no results. The translator refuses
+`v_div_scale_f32` and `v_div_scale_f64`. Three public descriptions of them disagree at the edges, and the rule has to
+come from a measurement:
+- the ISA pseudocode (in the RDNA3, RDNA4 and CDNA3 wording; the RDNA2 document's was not read);
+- the D = S0 pass-through that LLVM's divide lowering relies on;
+- the rule tinygrad's RDNA3 emulator runs after fixes drawn from its hardware tests.
+
+Taken literally, the older f32 reading of the text makes LLVM's divide return +inf for 1.0 / 2^127.
+`tools/div_scale_probe.py` runs the measurement on a GFX10 GPU through `tools/hw_oracle`, the way
+`tools/f64_omod_probe.py` does: raw kernels, one lane, the kernel's MODE set from its descriptor, wave32 and wave64.
+It reads no game files.
+
+For both widths it runs 49 numerator/denominator pairs, each as the denominator call `(d, d, n)` and the numerator
+call `(n, d, n)` of LLVM's lowering, plus 10 cases with S0 = S1 = S2, which makes 108 rows per width. The pairs
+cover:
+- zero, infinite and NaN operands;
+- denormals, among them a denormal denominator under a mid-range numerator (2^-60 [2^-284]), whose exponent gap
+  is below 96 [768], so that the denormal-denominator branch is told apart from the gap branch;
+- biased-exponent gaps of 95/96/97 [767/768/769];
+- denominators on both sides of 2^126 [2^1022];
+- quotients on both sides of 2^-126 [2^-1022];
+- numerator exponent fields of 22/23/24 [52/53/54];
+- ordinary operands.
+
+Every row runs twice, once with the mask written to VCC and once to an SGPR (s10, or s[10:11] in wave64). The
+register is preset to all ones, so the probe records D, the lane's flag and the whole mask word. D is preset too,
+to a sentinel that no operand of the matrix and no candidate prediction equals, so a row whose D is not written
+reads the sentinel back and is reported as `d_unwritten` (counted in the summary, marked in `--json` and
+`--table`) instead of passing for a value. Thirty more rows per
+width put `neg` on each source and `clamp`, `mul:2` or `div:2` on the result. Each pair also runs through LLVM's whole
+divide sequence, and the final quotient is compared with the correctly rounded one and with that quotient flushed. The
+f32 sequence omits the `s_denorm_mode` switch that LLVM wraps around its f32 FMAs, so its verdicts are comparable
+with LLVM's lowering only in the MODE that keeps f32 denormals (`i0_d3_f32keep`); in the other MODEs the printed
+tallies are labeled as not comparable (and `llvm_comparable` is false in the JSON). It uses the five MODEs of
+`tools/f64_omod_probe.py`, `game_i0_d3` first.
+
+"D = S0 where no branch assigns it" is an assumption applied identically in all three candidates, for ordinary
+operands and inside every taken branch that assigns nothing; it is what LLVM's lowering relies on and it is not
+measured (the D sentinel above is what tests it). One public emulator initialises D differently: yoshou's amdgpu-sim
+(`gcn_processor.rs`) starts from `D = S0 * S2 / S1`; gem5's f64 model assigns D only in the branches that scale.
+Neither is a candidate.
+
+Each row is compared with three candidate readings, written in the tool from those sources and labelled as
+candidates:
+- `isa_newer`: the text as worded, where the f32 reciprocal test is made in binary64 and never fires;
+- `isa_recip_width`: the same text with the reciprocal tested in the operand's width (the public emulators of the
+  older instruction sets classify with "not normal", which also differs for a zero, infinite or NaN reciprocal and for
+  a quotient that underflows to zero; no candidate models that, and the matrix has rows that tell it apart);
+- `rdna3_emu`: tinygrad's rule.
+
+The summary gives, for each MODE and width, how many rows each candidate predicts exactly (D, with any NaN for a NaN,
+and the flag). `--json` writes every row and every divide with the candidates' predictions (the mask words as
+`mask_lo` and, in wave64, `mask_hi`); `--table` prints the rows under a one-line legend. The summary is not the
+measurement: a run without `--json` ends with a line saying so, and the file written by `--json` is what to post.
+The run is expected to settle:
+- which reading, if any, RDNA2 follows;
+- what a zero, denormal, inf or NaN operand does to D and to the flag in each MODE (whether `denorm_mode_32 = 0`
+  flushes the inputs before the tests);
+- the exact thresholds;
+- what clamp and the omods do;
+- whether an SGPR destination and wave64 behave like VCC and wave32.
+
+Only after a run can a `v_div_scale` row go into the contract table of `docs/design.md`.
+
+`--modes`, `--waves`, `--widths` (`f32,f64`), `--hw-arch` and `--json` work as in the other probes, and
+`--self-test` checks the candidates without a GPU. Exit codes:
+- 0: the run completed and wave32/wave64 and the VCC/SGPR destinations agree on every row, whichever candidate
+  matched;
+- 1: they disagree;
+- 2: a CLI or harness error;
+- 77: no oracle or no GFX10 device.
+
+`tests/test_div_scale_probe.py` checks the case matrix and its boundaries, the candidates' known disagreements and
+the parsing with a fake oracle. It also checks that the kernels assemble with `llvm-mc` where that is installed.
+
+```
+python -I tools/div_scale_probe.py --json div_scale.json     # all five MODEs, both widths, wave32 and wave64
+python -I tools/div_scale_probe.py --modes game_i0_d3 --table
+python -I tools/div_scale_probe.py --self-test
+python -I tests/test_div_scale_probe.py
+```
+
 ### f16 transcendentals on the hardware (`tools/f16_trans_sweep.py`, FUZZ-29)
 
 The `16-bit results` row of `docs/design.md` listed `v_exp_f16`/`v_log_f16` and the NaN and denormal operands as

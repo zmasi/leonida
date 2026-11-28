@@ -189,7 +189,7 @@ def check_random(res, info, flush, tally, bad):
                     if math.isfinite(w):
                         t(f"p2_f16 {tag} = fma(h20, J, p1ll) in f16", same(o[i2] & 0xFFFF, w, 16),
                           f"got {o[i2]:#010x} want {f16w(w):#06x}")
-                    t(f"p2_f16 {tag} keeps vdst[31:16]", o[i2] >> 16 == 0xDEAD, f"got {o[i2]:#010x}")
+                    t(f"p2_f16 {tag} keeps vdst[31:16]", (o[i2] & 0xFFFFFFFF) >> 16 == 0xDEAD, f"got {o[i2]:#010x}")
 
 
 # --- rounding ties for p2_f16 ----------------------------------------------------------------------------------------
@@ -240,6 +240,24 @@ def check_ties(res, info, tally, bad):
                 bad.append(f"tie: lane {lane} p1ll {p1!r} J {J!r} got {got:#06x} once {once:#06x} twice {twice:#06x}")
 
 
+def _validate_batch(raw, expected_kernels, expected_words, label):
+    if not isinstance(raw, (list, tuple)) or len(raw) != expected_kernels:
+        got_desc = len(raw) if isinstance(raw, (list, tuple)) else type(raw).__name__
+        raise RuntimeError(f"{label}: oracle returned {got_desc} results for {expected_kernels} kernel(s)")
+    out = []
+    for idx, r in enumerate(raw):
+        if isinstance(r, str):
+            raise RuntimeError(f"kernel failed: {r}")
+        if not isinstance(r, (list, tuple)) or len(r) < expected_words:
+            got_desc = len(r) if isinstance(r, (list, tuple)) else type(r).__name__
+            raise RuntimeError(f"{label}[{idx}]: expected at least {expected_words} words, got {got_desc}")
+        sliced = r[:expected_words]
+        if any(isinstance(w, bool) or not isinstance(w, int) for w in sliced):
+            raise RuntimeError(f"{label}[{idx}]: oracle word payload contains non-integer element")
+        out.append([w & 0xFFFFFFFF for w in sliced])
+    return out
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--arch", default="gfx1036", help="hw_oracle target (default gfx1036)")
@@ -248,8 +266,16 @@ def main(argv=None):
     ap.add_argument("--denorm32", type=int, choices=(0, 3), default=3,
                     help="MODE f32 denormal field: 3 keeps them (default), 0 flushes (denormal P0/P10/P20 words then read as 0)")
     args = ap.parse_args(argv)
+    args.arch = args.arch.strip()
+    if not args.arch:
+        ap.error("--arch must not be empty")
+    if args.kernels < 1:
+        ap.error("--kernels must be at least 1")
+    seed_tokens = [s.strip() for s in args.seeds.split(",")]
+    if not any(seed_tokens) or any(not s for s in seed_tokens):
+        ap.error("--seeds takes integers separated by commas")
     try:
-        seeds = [int(s) for s in args.seeds.split(",")]
+        seeds = list(dict.fromkeys(int(s) for s in seed_tokens))
     except ValueError:
         ap.error("--seeds takes integers separated by commas")
     mode = {"denorm32": args.denorm32}
@@ -263,20 +289,25 @@ def main(argv=None):
         for seed in seeds:
             rng = random.Random(seed)
             ks = [random_kernel(rng, mode) for _ in range(args.kernels)]
-            for r, (_, info) in zip(o.run([k for k, _ in ks]), ks):
-                if isinstance(r, str):
-                    print(f"kernel failed: {r}", file=sys.stderr)
-                    return 2
+            raw = o.run([k for k, _ in ks])
+            results = _validate_batch(raw, len(ks), ks[0][1][3] * LANES, f"seed {seed}")
+            for r, (_, info) in zip(results, ks):
                 check_random(r, info, args.denorm32 == 0, tally, bad)
         kern, info = tie_kernel(mode)
-        r = o.run([kern])[0]
-        if isinstance(r, str):
-            print(f"kernel failed: {r}", file=sys.stderr)
-            return 2
+        r = _validate_batch(o.run([kern]), 1, info[2] * LANES, "tie kernel")[0]
         check_ties(r, info, tally, bad)
+    except runner.Unavailable as e:
+        print(f"hardware oracle unavailable: {e}", file=sys.stderr)
+        return 77
+    except RuntimeError as e:
+        print(f"harness error: {e}", file=sys.stderr)
+        return 2
     finally:
         o.close()
-    print(f"{args.arch}, MODE denorm32 {args.denorm32}, seeds {args.seeds} x {args.kernels} kernels")
+    if not tally:
+        print("harness error: no checks were executed", file=sys.stderr)
+        return 2
+    print(f"{args.arch}, MODE denorm32 {args.denorm32}, seeds {','.join(map(str, seeds))} x {args.kernels} kernels")
     for (kind, name), (ok, nbad) in sorted(tally.items()):
         print(f"  {kind:7s} {name:44s} {ok:6d} match {nbad:5d} differ")
     for b in bad:

@@ -14,8 +14,8 @@ Reads what the shaders stage of make_game.py leaves in <work>/shaders, and print
   accesses (#16): the MTBUF instruction formats, and for MUBUF where V# word 3 (the format) comes from, each checked
   against the translator's typed-buffer table (rdna2spirv.Gen.FORMATS).
 - spirv/index.json (rdna2spirv.py): uses_code_base per stage. A graphics PSO can only need two code bases
-  (§5.2) if two of its stages use one; this gives the per-stage counts. Which stages are paired in one PSO is in
-  the executable, not in shaders.rpf.
+  (§5.2) if two of its stages use one; this gives the per-stage counts. Pairing programs to the stages of a PSO is
+  the pipeline library's job: tools/pso_code_base_pairs.py joins the two and counts whole PSOs.
 
 InnerCoverage metadata is cross-tabulated by stage: SFI0 set/clear/unknown versus ISG1
 present/absent/unknown. Unknown includes missing or truncated parts; unreadable containers

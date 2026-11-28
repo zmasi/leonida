@@ -937,11 +937,11 @@ def translate(progs, work, emulate, pc_tail=False, *, asm_jobs=1):
         cmd.append("--wave64-emulate")
     if pc_tail:
         cmd.append("--pc-tail-ubo")
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     index = spirv / "index.json"
     if not index.exists():
         raise RuntimeError(f"rdna2spirv.py exited {r.returncode} without an index.json:\n{(r.stdout + r.stderr)[-2000:]}")
-    return json.loads(index.read_text(encoding="utf-8")), (r.stdout + r.stderr)
+    return json.loads(index.read_text(encoding="utf-8-sig")), (r.stdout + r.stderr)
 
 
 def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
@@ -961,7 +961,7 @@ def run_gpu(p, spv, build, index_entry, emulate, dump, pc_tail=False):
         env["VKC_SUBGROUP_SIZE"] = str(index_entry["subgroup_size"])
     limit = gpu_test_timeout()
     try:
-        r = subprocess.run(args, capture_output=True, text=True, env=env, timeout=limit)
+        r = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=limit)
     except subprocess.TimeoutExpired:
         return 1, timed_out(exe, limit)
     return r.returncode, (r.stdout + r.stderr).strip()
@@ -1122,7 +1122,7 @@ def run_translator(progs, a):
     return 1 if failed or untranslated else 0
 
 
-def main():
+def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--family", choices=sorted(FAMILIES), required=True)
     ap.add_argument("--programs", type=int, default=50)
@@ -1153,7 +1153,7 @@ def main():
     ap.add_argument("--gfx10-word3", action="store_true",
                     help="mem on the hardware: V# word 3 in the GFX10 layout (RESOURCE_LEVEL set); informational")
     ap.add_argument("--keep", default=None, help="hw: write the native kernel of each mismatching program here")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     a.pc_tail_ubo = a.pc_tail_ubo or pc_tail_env()
     global HW_SYNC, W3_LAYOUT
     HW_SYNC = a.hw_sync
@@ -1169,29 +1169,11 @@ def main():
     unknown = sorted(set(a.skip_op) - known)
     if unknown:
         ap.error(f"--skip-op: unknown op {', '.join(unknown)} (known: {', '.join(sorted(known))})")
-    if a.negative_control and "hw" not in backends:
-        ap.error("--negative-control needs --oracle hw")
-    hw = "hw" in backends
-    oracle = None
-    if hw and not a.model_only:
-        from hw_oracle import runner
-        try:
-            oracle = runner.open_oracle(arch=a.hw_arch)
-        except runner.Unavailable as e:
-            print(f"hardware oracle unavailable: {e}")
-            return 77
-        from hw_oracle import asm
-        why = hw_family_skip_reason(a.family, oracle.arch)
-        if why:
-            oracle.close()
-            print(f"hardware oracle unavailable: {why}")
-            return 77
-        if W3_LAYOUT == "gfx10" and asm.family(oracle.arch) == "gfx12":
-            # GFX10's RESOURCE_LEVEL bit 24 is WRITE_COMPRESS_ENABLE in gfx12-rsrc.json: not an informational change there
-            oracle.close()
-            print(f"error: --gfx10-word3 sets V# word 3 bit 24, which is WRITE_COMPRESS_ENABLE on {oracle.arch}")
-            return 2
-        print(f"hardware oracle: {oracle.device}")
+    if (a.negative_control or a.keep is not None) and ("hw" not in backends or a.model_only):
+        ap.error("--negative-control and --keep need --oracle hw (without --model-only)")
+    if a.keep is not None and (not a.keep or (os.path.exists(a.keep) and not os.path.isdir(a.keep))):
+        ap.error("--keep requires a directory path")
+    show_spec = None
     if a.show is not None:
         parts = a.show.split(":")
         try:
@@ -1203,20 +1185,42 @@ def main():
             ap.error("--show expects SEED:INDEX[:WAVE] with INDEX >= 0 and WAVE in 32, 64")
         if index < 0 or wave not in (32, 64):
             ap.error("--show expects SEED:INDEX[:WAVE] with INDEX >= 0 and WAVE in 32, 64")
-        hw_fam = (asm.family(oracle.arch) if oracle else "gfx11") if hw else None
-        show(a.family, seed, index, wave, tuple(a.skip_op), hw_fam)
-        if oracle:
-            oracle.close()
-        return 0
-    waves = (64, 32) if a.wave == "both" else (int(a.wave),)
-    progs = programs(a.family, a.seed, a.programs, waves, tuple(a.skip_op))
-    if a.model_only:
-        for p in progs:
-            p.model()
-        print(f"{len(progs)} {a.family} programs generated and modelled")
-        return 0
+        show_spec = (seed, index, wave)
+    hw = "hw" in backends
+    oracle = None
+    asm = None
+    if hw and not a.model_only:
+        from hw_oracle import asm as hw_asm, runner
+        try:
+            oracle = runner.open_oracle(arch=a.hw_arch)
+        except runner.Unavailable as e:
+            print(f"hardware oracle unavailable: {e}")
+            return 77
+        asm = hw_asm
     code = 0
     try:
+        if oracle:
+            why = hw_family_skip_reason(a.family, oracle.arch)
+            if why:
+                print(f"hardware oracle unavailable: {why}")
+                return 77
+            if W3_LAYOUT == "gfx10" and asm.family(oracle.arch) == "gfx12":
+                # GFX10's RESOURCE_LEVEL bit 24 is WRITE_COMPRESS_ENABLE in gfx12-rsrc.json: not an informational change there
+                print(f"error: --gfx10-word3 sets V# word 3 bit 24, which is WRITE_COMPRESS_ENABLE on {oracle.arch}")
+                return 2
+            print(f"hardware oracle: {oracle.device}")
+        if show_spec is not None:
+            seed, index, wave = show_spec
+            hw_fam = (asm.family(oracle.arch) if oracle else "gfx11") if hw else None
+            show(a.family, seed, index, wave, tuple(a.skip_op), hw_fam)
+            return 0
+        waves = (64, 32) if a.wave == "both" else (int(a.wave),)
+        progs = programs(a.family, a.seed, a.programs, waves, tuple(a.skip_op))
+        if a.model_only:
+            for p in progs:
+                p.model()
+            print(f"{len(progs)} {a.family} programs generated and modelled")
+            return 0
         if oracle:
             if a.negative_control:
                 return negative_control(oracle, a, waves)

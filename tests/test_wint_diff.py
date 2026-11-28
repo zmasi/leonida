@@ -115,6 +115,83 @@ class Reference(unittest.TestCase):
         out = run(["s_mov_b32 s20, 0xa", "v_cndmask_b32_e64 v1, 0, 1, s20"])
         self.assertEqual([out[lane][0] for lane in range(5)], [0, 1, 0, 1, 0])
 
+    def test_mbcnt_and_writelane_semantics_respect_operands_exec_and_wrap(self):
+        # v_mbcnt_lo/hi honor dst VGPR, mask, addend, and EXEC; v_writelane honors scalar/imm src and wraps lane mod wave
+        body32 = [
+            "s_mov_b32 exec_lo, 0x0000000f",
+            "v_mbcnt_lo_u32_b32 v1, 0x55555555, 10",
+            "s_mov_b32 exec_lo, -1",
+            "v_writelane_b32 v2, 7, 32",          # wave32 wraps 32 -> lane 0
+            "v_writelane_b32 v3, s4, s5",         # lane s5 (=5) gets s4 (=4)
+        ]
+        out32 = run(body32, wave=32, obs=(1, 2, 3, 0))
+        self.assertEqual([out32[l][0] for l in range(6)], [10, 11, 11, 12, 4, 5])
+        self.assertEqual(out32[0][1], 7)
+        self.assertEqual(out32[5][2], 4)
+        self.assertEqual(out32[0][3], 0)          # v0 was not clobbered by v_mbcnt into v1
+
+        body64 = [
+            "v_mbcnt_lo_u32_b32 v1, 0x00000003, 5",
+            "v_mbcnt_hi_u32_b32 v2, 0x00000005, v1",
+            "v_writelane_b32 v3, 9, 65",          # wave64 wraps 65 -> lane 1
+        ]
+        out64 = run(body64, wave=64, obs=(1, 2, 3, 0))
+        self.assertEqual(out64[0][0], 5)
+        self.assertEqual(out64[2][0], 7)
+        self.assertEqual(out64[32][1], 7)
+        self.assertEqual(out64[33][1], 8)
+        self.assertEqual(out64[35][1], 9)
+        self.assertEqual(out64[1][2], 9)
+
+        # Cross-check with the SPIR-V translator on wave32
+        self.assertIsNone(d.check(program(body32, wave=32, obs=(1, 2, 3, 0))))
+
+    def test_operand_mask_pair_and_arity_validation_rejects_malformed_lines(self):
+        bad32 = [
+            "",
+            "s_mov_b32 v1, 5",
+            "s_mov_b32 s4, v1",
+            "s_mov_b32 exec_hi, 1",
+            "s_mov_b32 s4, 1, 2",
+            "v_mbcnt_lo_u32_b32 s1, -1, 0",
+            "v_mbcnt_lo_u32_b32 v1, -1",
+            "v_writelane_b32 s1, s4, 0",
+            "v_writelane_b32 v1, v2, 0",
+            "v_writelane_b32 v1, s4, v0",
+            "v_cmp_bad_u32_e64 s20, v0, v1",
+            "v_cmp_eq_u32_e64 s[20:21], v0, v1",
+            "v_cmp_eq_u32_e64 vcc, v0, v1",
+            "v_cmp_eq_u32_e64 v1, v0, v1",
+            "v_cmpx_eq_u32_e64 s20, v0, v1",
+            "v_cndmask_b32_e64 s1, v0, v2, s20",
+            "v_cndmask_b32_e64 v1, v0, v2",
+            "v_add_co_ci_u32_e64 v1, s20, v0, 1",
+            "v_add_co_u32_e64 v1, s20, v0, 1, s21",
+            "v_add_co_u32_e64 s1, s20, v0, 1",
+            "v_mad_u64_u32 v[2:4], s20, v0, v1, v[4:5]",
+            "v_mad_u64_u32 v2, s20, v0, v1, v[4:5]",
+            "v_mad_u64_u32 v[2:3], s20, v0, v1, v[4:6]",
+            "v_add_nc_u16 v1, v2, v3 op_sel:[1,0]",
+            "v_add_nc_u16 v1, v2, v3 op_sel:[1,0,1,0]",
+            "v_add_nc_u32_e64 s1, v0, 1",
+            "v_add_nc_u32_e64 v1, v0, 1, 2",
+            "v_add_nc_u32_e64 v1, , 1",
+            "v_add_nc_u32_e64 v1, badtok, 1",
+        ]
+        for line in bad32:
+            with self.subTest(wave=32, line=line), self.assertRaises(d.RefError):
+                run([line], wave=32)
+
+        bad64 = [
+            "v_cmp_eq_u32_e64 s20, v0, v1",
+            "v_cmp_eq_u32_e64 vcc_lo, v0, v1",
+            "v_cmp_eq_u32_e64 s[20:22], v0, v1",
+            "v_cndmask_b32_e64 v1, v0, v2, s20",
+        ]
+        for line in bad64:
+            with self.subTest(wave=64, line=line), self.assertRaises(d.RefError):
+                run([line], wave=64)
+
 
 class Generator(unittest.TestCase):
     def lines(self, known=False, wave=32, n=3000, seed=1):

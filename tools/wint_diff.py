@@ -443,6 +443,81 @@ def generate(rng, n_ops, ops, wave):
 # ---- the reference interpreter --------------------------------------------------------------------------------
 
 _MODS = re.compile(r"\s+op_sel:\[([01,]+)\]\s*$")
+_VGPR_RE = re.compile(r"^v([0-9]+)$")
+_VGPR_PAIR_RE = re.compile(r"^v\[([0-9]+):([0-9]+)\]$")
+_SGPR_RE = re.compile(r"^s([0-9]+)$")
+_SGPR_PAIR_RE = re.compile(r"^s\[([0-9]+):([0-9]+)\]$")
+_SCALAR_SRC_RE = re.compile(r"^(?:s[0-9]+|vcc_lo|vcc_hi)$")
+
+
+def _parse_int(tok):
+    try:
+        return int(tok, 0)
+    except ValueError as e:
+        raise RefError(f"invalid integer operand {tok!r}") from e
+
+
+def _parse_vgpr(tok):
+    m = _VGPR_RE.fullmatch(tok)
+    if not m:
+        raise RefError(f"expected VGPR, got {tok!r}")
+    return int(m.group(1), 10)
+
+
+def _parse_vgpr_pair(tok):
+    m = _VGPR_PAIR_RE.fullmatch(tok)
+    if not m:
+        raise RefError(f"expected VGPR pair v[N:N+1], got {tok!r}")
+    lo, hi = int(m.group(1), 10), int(m.group(2), 10)
+    if hi != lo + 1:
+        raise RefError(f"expected consecutive VGPR pair v[N:N+1], got {tok!r}")
+    return lo
+
+
+def _parse_sgpr_pair(tok):
+    m = _SGPR_PAIR_RE.fullmatch(tok)
+    if not m:
+        raise RefError(f"expected SGPR pair s[N:N+1], got {tok!r}")
+    lo, hi = int(m.group(1), 10), int(m.group(2), 10)
+    if hi != lo + 1:
+        raise RefError(f"expected consecutive SGPR pair s[N:N+1], got {tok!r}")
+    return lo
+
+
+def _parse_mask_operand(m, wave):
+    if wave == 64:
+        if m == "vcc":
+            return ("vcc", None)
+        if m.startswith("s["):
+            return ("pair", _parse_sgpr_pair(m))
+        raise RefError(f"expected 64-bit mask operand (s[N:N+1] or vcc) in wave64, got {m!r}")
+    if m == "vcc_lo" or _SGPR_RE.fullmatch(m):
+        return ("single", m)
+    raise RefError(f"expected 32-bit mask operand (sN or vcc_lo) in wave32, got {m!r}")
+
+
+def _parse_scalar_dst(tok, wave):
+    if tok == "exec_hi":
+        if wave != 64:
+            raise RefError("exec_hi is only modelled in wave64")
+        return tok
+    if tok in ("exec_lo", "vcc_lo", "vcc_hi") or _SGPR_RE.fullmatch(tok):
+        return tok
+    raise RefError(f"expected 32-bit scalar destination, got {tok!r}")
+
+
+def _split_args(line, rest):
+    if not rest.strip():
+        return []
+    args = [a.strip() for a in rest.split(",")]
+    if any(not a for a in args):
+        raise RefError(f"{line!r}: empty operand")
+    return args
+
+
+def _expect_args(line, args, count):
+    if len(args) != count:
+        raise RefError(f"{line!r}: expected {count} operand(s), got {len(args)}")
 
 
 class State:
@@ -461,36 +536,43 @@ class State:
         return self.s[name]
 
     def mask(self, m):
-        """The lane mask an operand names (64-bit pair, VCC or a single SGPR)."""
-        if m.startswith("s["):
-            lo = int(m[2:].split(":")[0])
-            return self.sget(f"s{lo}") | (self.sget(f"s{lo + 1}") << 32)
-        if m == "vcc":
+        """The lane mask an operand names (64-bit pair or VCC in wave64, single SGPR or vcc_lo in wave32)."""
+        kind, target = _parse_mask_operand(m, self.wave)
+        if kind == "pair":
+            return self.sget(f"s{target}") | (self.sget(f"s{target + 1}") << 32)
+        if kind == "vcc":
             return self.sget("vcc_lo") | (self.sget("vcc_hi") << 32)
-        return self.sget(m)
+        return self.sget(target)
 
     def set_mask(self, m, val):
-        if m.startswith("s["):
-            lo = int(m[2:].split(":")[0])
-            self.s[f"s{lo}"], self.s[f"s{lo + 1}"] = val & M32, (val >> 32) & M32
-        elif m == "vcc":
+        kind, target = _parse_mask_operand(m, self.wave)
+        if kind == "pair":
+            self.s[f"s{target}"], self.s[f"s{target + 1}"] = val & M32, (val >> 32) & M32
+        elif kind == "vcc":
             self.s["vcc_lo"], self.s["vcc_hi"] = val & M32, (val >> 32) & M32
         else:
-            self.s[m] = val & M32
+            self.s[target] = val & M32
+
+    def scalar_val(self, tok):
+        if _SCALAR_SRC_RE.fullmatch(tok):
+            return self.sget(tok)
+        return _parse_int(tok) & M32
 
     def val(self, tok, lane):
-        if re.fullmatch(r"v\d+", tok):
-            return self.vget(int(tok[1:]))[lane]
-        if re.fullmatch(r"s\d+|vcc_lo|vcc_hi", tok):
+        if _VGPR_RE.fullmatch(tok):
+            return self.vget(int(tok[1:], 10))[lane]
+        if _SCALAR_SRC_RE.fullmatch(tok):
             return self.sget(tok)
-        return int(tok, 0) & M32
+        return _parse_int(tok) & M32
 
     def lanes(self):
         return [lane for lane in range(self.wave) if (self.exec >> lane) & 1]
 
 
 def step(st, line):
-    op, _, rest = line.partition(" ")
+    op, _, rest = line.strip().partition(" ")
+    if not op:
+        raise RefError("empty instruction")
     osel = None
     clamp = rest.endswith(" clamp")
     if clamp:
@@ -499,7 +581,7 @@ def step(st, line):
     if m:
         osel = [int(x) for x in m.group(1).split(",")]
         rest = rest[:m.start()]
-    args = [a.strip() for a in rest.split(",")]
+    args = _split_args(line, rest)
     base = op[:-4] if op.endswith(("_e32", "_e64")) else op
     # the modifiers first: s_mov_b32, v_mbcnt and v_writelane return early below and would run with them
     if clamp and not (base in CARRY and op.endswith("_e64")):
@@ -507,26 +589,42 @@ def step(st, line):
     if osel is not None and base not in OPS16:
         raise RefError(f"{op}: op_sel is modelled only on the 16-bit ops")
     if op == "s_mov_b32":
-        v = st.val(args[1], 0)
-        if args[0] == "exec_lo":
+        _expect_args(line, args, 2)
+        dst = _parse_scalar_dst(args[0], st.wave)
+        v = st.scalar_val(args[1])
+        if dst == "exec_lo":
             st.exec = (st.exec & ~M32) | v if st.wave == 64 else v
-        elif args[0] == "exec_hi":
+        elif dst == "exec_hi":
             st.exec = (st.exec & M32) | (v << 32)
         else:
-            st.s[args[0]] = v
+            st.s[dst] = v
         return
-    if op == "v_mbcnt_lo_u32_b32":
-        st.v[0] = [min(lane, 32) for lane in range(st.wave)]
-        return
-    if op == "v_mbcnt_hi_u32_b32":
-        st.v[0] = [st.v[0][lane] + max(0, lane - 32) for lane in range(st.wave)]
+    if base in ("v_mbcnt_lo_u32_b32", "v_mbcnt_hi_u32_b32"):
+        _expect_args(line, args, 3)
+        dst = _parse_vgpr(args[0])
+        is_hi = base == "v_mbcnt_hi_u32_b32"
+        new = list(st.vget(dst))
+        for lane in st.lanes():
+            bits = max(0, lane - 32) if is_hi else min(lane, 32)
+            masked = st.val(args[1], lane) & ((1 << bits) - 1)
+            new[lane] = (masked.bit_count() + st.val(args[2], lane)) & M32
+        st.v[dst] = new
         return
     if op == "v_writelane_b32":
-        st.vget(int(args[0][1:]))[int(args[2])] = st.sget(args[1])
+        _expect_args(line, args, 3)
+        dst = _parse_vgpr(args[0])
+        val = st.scalar_val(args[1])
+        lane = st.scalar_val(args[2]) & (st.wave - 1)
+        st.vget(dst)[lane] = val
         return
     if base.startswith(("v_cmp_", "v_cmpx_")):
         cmpx = base.startswith("v_cmpx_")
         c = base[len("v_cmpx_" if cmpx else "v_cmp_"):]
+        if c not in CMPS:
+            raise RefError(f"{op} is not modelled")
+        _expect_args(line, args, 2 if cmpx else 3)
+        if not cmpx:
+            _parse_mask_operand(args[0], st.wave)
         a, b = (args[0], args[1]) if cmpx else (args[1], args[2])
         res = 0
         for lane in st.lanes():
@@ -538,16 +636,21 @@ def step(st, line):
             st.set_mask(args[0], res)
         return
     if base == "v_cndmask_b32":
+        _expect_args(line, args, 4)
+        dst = _parse_vgpr(args[0])
         mk = st.mask(args[3])
-        d = st.vget(int(args[0][1:]))
-        new = list(d)
+        new = list(st.vget(dst))
         for lane in st.lanes():
             new[lane] = st.val(args[2] if (mk >> lane) & 1 else args[1], lane)
-        st.v[int(args[0][1:])] = new
+        st.v[dst] = new
         return
     if base in CARRY:
-        cin = st.mask(args[4]) if len(args) > 4 else 0
-        new = list(st.vget(int(args[0][1:])))
+        ci = "_ci_" in base
+        _expect_args(line, args, 5 if ci else 4)
+        dst = _parse_vgpr(args[0])
+        _parse_mask_operand(args[1], st.wave)
+        cin = st.mask(args[4]) if ci else 0
+        new = list(st.vget(dst))
         co = 0
         for lane in st.lanes():
             res, c = CARRY[base](st.val(args[2], lane), st.val(args[3], lane), (cin >> lane) & 1)
@@ -555,12 +658,14 @@ def step(st, line):
                 res = M32 if base.startswith("v_add_") else 0
             new[lane] = res
             co |= c << lane
-        st.v[int(args[0][1:])] = new
+        st.v[dst] = new
         st.set_mask(args[1], co)
         return
     if base in MAD64:
-        dd = int(args[0][2:].split(":")[0])
-        cc = int(args[4][2:].split(":")[0])
+        _expect_args(line, args, 5)
+        dd = _parse_vgpr_pair(args[0])
+        _parse_mask_operand(args[1], st.wave)
+        cc = _parse_vgpr_pair(args[4])
         lo, hi = list(st.vget(dd)), list(st.vget(dd + 1))
         co = 0
         for lane in st.lanes():
@@ -578,11 +683,14 @@ def step(st, line):
         st.v[dd], st.v[dd + 1] = lo, hi
         st.set_mask(args[1], co)
         return
-    d = int(args[0][1:])
-    new = list(st.vget(d))
     if base in OPS16:
         _, n, fn = OPS16[base]
+        _expect_args(line, args, n + 1)
+        d = _parse_vgpr(args[0])
+        if osel is not None and len(osel) != n + 1:
+            raise RefError(f"{op}: op_sel needs {n + 1} entries, got {len(osel)}")
         sel = osel or [0] * (n + 1)
+        new = list(st.vget(d))
         for lane in st.lanes():
             ins = [(v >> 16) & M16 if sel[i] else v & M16
                    for i, v in enumerate(st.val(a, lane) for a in args[1:])]
@@ -591,7 +699,10 @@ def step(st, line):
         st.v[d] = new
         return
     if base in OPS32:
-        fn = OPS32[base][2]
+        _, n, fn = OPS32[base]
+        _expect_args(line, args, n + 1)
+        d = _parse_vgpr(args[0])
+        new = list(st.vget(d))
         for lane in st.lanes():
             new[lane] = fn(*[st.val(a, lane) for a in args[1:]]) & M32
         st.v[d] = new

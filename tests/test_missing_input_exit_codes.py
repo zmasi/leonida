@@ -31,6 +31,8 @@ MISSING_INPUT_TOOLS = (
     "navmesh_cell_fit",
     "psin_psch",
     "root_spill_census",
+    "root_layout_census",
+    "fssm_root_layout",
 )
 
 # One process per tool; a hung import is a failure, not an infinite test.

@@ -144,25 +144,27 @@ class AddF64ModifiersAndOperandsTests(unittest.TestCase):
                 self.assertEqual(got, f64_to_bits(exp))
 
     def test_output_modifiers(self):
-        # Use f32-exact values for clamp cases because spirv_interp.FClamp rounds via f32
+        # RDNA2 ignores mul:2/mul:4/div:2 on this op while f64 denormals are kept, the MODE assumed here
+        # (docs/design.md, "v_add_f64 output modifiers"); clamp does apply. Use f32-exact values for clamp
+        # cases because spirv_interp.FClamp rounds via f32
         cases = [
-            (0.75, 0.5, "v[0:1], v[2:3] mul:2", 2.5),
-            (0.75, 0.5, "v[0:1], v[2:3] mul:4", 5.0),
-            (0.75, 0.5, "v[0:1], v[2:3] div:2", 0.625),
+            (0.75, 0.5, "v[0:1], v[2:3] mul:2", 1.25),
+            (0.75, 0.5, "v[0:1], v[2:3] mul:4", 1.25),
+            (0.75, 0.5, "v[0:1], v[2:3] div:2", 1.25),
             (0.75, 0.5, "v[0:1], v[2:3] clamp", 1.0),
             (-1.5, 0.5, "v[0:1], v[2:3] clamp", 0.0),
             (0.75, 0.5, "v[0:1], v[2:3] mul:2 clamp", 1.0),
-            # div:2 before clamp: (1.0 + 0.5) * 0.5 = 0.75 -> clamp -> 0.75 (not 0.5)
-            (1.0, 0.5, "v[0:1], v[2:3] div:2 clamp", 0.75),
+            # clamp on its own: 1.25 -> 1.0, and the div:2 written in front of it changed nothing
+            (1.0, 0.5, "v[0:1], v[2:3] div:2 clamp", 1.0),
         ]
         for a_val, b_val, ops, exp in cases:
             with self.subTest(ops=ops):
                 got, _ = run_add_f64(f64_to_bits(a_val), f64_to_bits(b_val), operands=ops)
                 self.assertEqual(got, f64_to_bits(exp))
 
-        # Verify mul:2/mul:4/div:2 keep full f64 precision
+        # Nothing is scaled, not even at a magnitude where scaling would be exact: the sum is stored as it is.
         got, _ = run_add_f64(f64_to_bits(float(2**50)), f64_to_bits(1.0), operands="v[0:1], v[2:3] mul:2")
-        self.assertEqual(got, f64_to_bits(float(2**51 + 2)))
+        self.assertEqual(got, f64_to_bits(float(2**50 + 1)))
 
     def test_sgpr_pair_and_inline_float_operands(self):
         a = f64_to_bits(float(2**40))
