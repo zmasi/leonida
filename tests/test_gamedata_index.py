@@ -461,6 +461,28 @@ class XmlGroupingRegressionTest(GamedataIndexTest):
             [("xml", "Doc", True, 3)],
         )
 
+    def test_declared_xml_keeps_utf8_continuation_stream(self):
+        # Declared XML (<?xml ...?>) must also keep non-ASCII UTF-8 continuations that fall below
+        # printable()'s ASCII ratio and classify as "binary", matching declarationless XML.
+        accent = "é".encode("utf-8")
+        prefix = b'<?xml version="1.0"?><Doc>'
+        head = prefix + b" " * (65536 - len(prefix) - 1) + accent[:1]
+        middle = accent[1:] + b"<t>" + accent * 32766
+        tail = b"</t></Doc>"
+        self.add(head)
+        self.add(middle)
+        self.add(tail)
+        self.finish()
+        out = os.path.join(self.root, "index.json")
+        p = self.run_tool(self.carve, "--json", out)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        with open(out, encoding="utf-8") as f:
+            rows = json.load(f)["rows"]
+        self.assertEqual(
+            [(r["type"], r["root"], r["header"], r["complete"], r["chunks"]) for r in rows],
+            [("xml", "Doc", True, True, 3)],
+        )
+
 
 class BuildRowsReadCountTest(unittest.TestCase):
     """The XML-shaped text branch must join the chunks it already read, not reinflate the group twice."""
@@ -491,6 +513,120 @@ class BuildRowsReadCountTest(unittest.TestCase):
         self.assertEqual(source.read.call_count, 2)
         self.assertEqual([call.args[0]["off"] for call in source.read.call_args_list],
                          [0x1000, 0x2000])
+
+
+class IoAndResourceHardeningTest(unittest.TestCase):
+    def test_carved_stream_guard_catches_case_variant_and_hardlink_alias(self):
+        with tempfile.TemporaryDirectory() as root:
+            carve = os.path.join(root, "carve")
+            os.mkdir(carve)
+            stream = os.path.join(carve, "000000001000.bin")
+            with open(stream, "wb") as f:
+                f.write(b"<Root/>")
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": {"files": 1},
+                           "files": [{"off": 0x1000, "stored": 7, "size": 7, "head": b"<Root/>".hex()}]}, f)
+            # Case-variant spelling (e.g. .BIN on a case-insensitive volume).
+            upper = os.path.join(carve, "000000001000.BIN")
+            with mock.patch.object(T, "same_report_path", return_value=True):
+                self.assertEqual(T.carved_stream(upper, carve), stream)
+            # Hardlink alias with a .json name pointing at the same carved stream.
+            alias = os.path.join(root, "alias.json")
+            try:
+                os.link(stream, alias)
+            except OSError:
+                self.skipTest("hard links unavailable")
+            self.assertEqual(T.carved_stream(alias, carve), stream)
+            p = subprocess.run([sys.executable, "-I", TOOL, carve, "--json", alias],
+                               capture_output=True, text=True)
+            self.assertEqual(p.returncode, 2, p.stderr)
+            self.assertIn("would overwrite the carved stream", p.stderr)
+            with open(stream, "rb") as f:
+                self.assertEqual(f.read(), b"<Root/>")
+
+    def test_empty_and_whitespace_output_flags_rejected(self):
+        with tempfile.TemporaryDirectory() as root:
+            carve = os.path.join(root, "carve")
+            cwd = os.path.join(root, "cwd")
+            os.mkdir(carve)
+            os.mkdir(cwd)
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": {"files": 0}, "files": []}, f)
+            for flag in ("--json", "--csv"):
+                for bad in ("", "   "):
+                    with self.subTest(flag=flag, bad=bad):
+                        p = subprocess.run([sys.executable, "-I", TOOL, carve, flag, bad],
+                                           cwd=cwd, capture_output=True, text=True)
+                        self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
+                        self.assertIn("must not be empty", p.stderr)
+            self.assertEqual(os.listdir(cwd), [])
+
+    def test_write_json_and_csv_are_atomic_with_trailing_newline(self):
+        with tempfile.TemporaryDirectory() as root:
+            js = os.path.join(root, "out.json")
+            cs = os.path.join(root, "out.csv")
+            with open(js, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": 1}\n')
+            with open(cs, "w", encoding="utf-8", newline="\n") as f:
+                f.write("keep\n")
+            with self.assertRaises(ValueError):
+                T.write_json(js, {"bad": float("nan")}, [])
+            with open(js, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": 1}\n')
+            with mock.patch.object(T.csv.DictWriter, "writerows", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    T.write_csv(cs, [])
+            with open(cs, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "keep\n")
+            self.assertEqual(sorted(os.listdir(root)), ["out.csv", "out.json"])
+
+            T.write_json(js, {"ok": True}, [])
+            with open(js, "rb") as f:
+                raw = f.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r", raw)
+
+    def test_archive_source_cleans_up_on_init_failure(self):
+        import gc
+        import warnings
+        with tempfile.TemporaryDirectory() as root:
+            empty_rpf = os.path.join(root, "empty.rpf")
+            open(empty_rpf, "wb").close()
+            carve = os.path.join(root, "carve")
+            os.mkdir(carve)
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8", newline="\n") as f:
+                json.dump({"summary": {"files": 0}, "files": []}, f)
+            # Empty archive with existing carve dir fails mmap(): _fh must be closed explicitly.
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", ResourceWarning)
+                with self.assertRaises(ValueError):
+                    T.ArchiveSource(empty_rpf, carve)
+                gc.collect()
+            self.assertEqual([w for w in caught if issubclass(w.category, ResourceWarning)], [])
+            # Failed carver subprocess must clean up TemporaryDirectory explicitly (not via weakref GC).
+            cleaned = []
+            real_td = T.tempfile.TemporaryDirectory
+
+            def spy_td(*args, **kwargs):
+                td = real_td(*args, **kwargs)
+                orig_cleanup = td.cleanup
+
+                def wrapped_cleanup():
+                    cleaned.append(td.name)
+                    orig_cleanup()
+
+                td.cleanup = wrapped_cleanup
+                return td
+
+            with warnings.catch_warnings(record=True) as caught2:
+                warnings.simplefilter("always", ResourceWarning)
+                with mock.patch.object(T.tempfile, "TemporaryDirectory", side_effect=spy_td):
+                    with self.assertRaises(RuntimeError):
+                        T.ArchiveSource(empty_rpf)
+                gc.collect()
+            self.assertEqual(len(cleaned), 1)
+            self.assertFalse(os.path.exists(cleaned[0]))
+            self.assertEqual([w for w in caught2 if issubclass(w.category, ResourceWarning)], [])
 
 
 if __name__ == "__main__":

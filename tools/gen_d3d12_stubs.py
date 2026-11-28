@@ -17,9 +17,13 @@ import argparse
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402  one spelling comparison for every report pair
 
 INTERFACE = re.compile(
@@ -36,9 +40,15 @@ def find_header():
     return None
 
 
+def _strip_comment(match):
+    if match.group(1) is not None:
+        return match.group(1)
+    return "\n" if ("\n" in match.group(0) or "\r" in match.group(0)) else " "
+
+
 def parse_interfaces(text):
     """name -> (base, [lines]) where a line is ('#', text) or ('m', return, name, params, const)."""
-    text = COMMENTS_OR_LITERALS.sub(lambda match: match.group(1) or " ", text)
+    text = COMMENTS_OR_LITERALS.sub(_strip_comment, text)
     out = {}
     for match in INTERFACE.finditer(text):
         name, base, body = match.groups()
@@ -136,15 +146,40 @@ def coverage(interfaces, leaves, sources):
 
 
 def write_if_changed(path, text):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    destination = os.path.realpath(path)
+    out_dir = os.path.dirname(destination) or "."
+    os.makedirs(out_dir, exist_ok=True)
     try:
-        with open(path, encoding="utf-8") as f:
+        with open(destination, encoding="utf-8", newline="") as f:
             if f.read() == text:
                 return
     except OSError:
         pass
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(destination, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+        return
+    if mode is not None:
+        os.close(os.open(destination, os.O_WRONLY))
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=out_dir, prefix=".gen_d3d12_stubs-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            staged.write(text)
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 def same_path(first, second):
@@ -164,7 +199,7 @@ def write_report(path, text):
     return True
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--out", help="generated stub header (required unless --report is given)")
     parser.add_argument("--report", help="write a JSON method-coverage report here")
@@ -172,10 +207,13 @@ def main():
                         help="source file with overrides, repeatable (for --report)")
     parser.add_argument("--header")
     parser.add_argument("interfaces", nargs="+")
-    args = parser.parse_args()
-    if not args.out and not args.report:
+    args = parser.parse_args(argv)
+    for flag, value in (("--out", args.out), ("--report", args.report), ("--header", args.header)):
+        if value is not None and not value.strip():
+            parser.error(f"{flag} must not be empty")
+    if args.out is None and args.report is None:
         parser.error("--out is required unless --report is given")
-    if args.report and not args.source:
+    if args.report is not None and not args.source:
         parser.error("--report needs at least one --source")
     for path in args.source:
         if not os.path.isfile(path):
@@ -185,7 +223,7 @@ def main():
             parser.error(f"{path} is a folder, not a file")
     if args.out and args.report and same_path(args.out, args.report):
         parser.error("--out and --report must use different paths")
-    header = args.header or find_header()
+    header = args.header if args.header is not None else find_header()
     if not header:
         raise SystemExit("d3d12.h not found: pass --header or run from a vcvars environment")
     if not os.path.isfile(header):
@@ -194,12 +232,20 @@ def main():
         for flag, target in (("--out", args.out), ("--report", args.report)):
             if target and same_path(target, path):
                 parser.error(f"{flag} {target} would overwrite the input {path}")
-    with open(header, encoding="utf-8", errors="replace") as f:
-        interfaces = parse_interfaces(f.read())
+    try:
+        with open(header, encoding="utf-8", errors="replace") as f:
+            interfaces = parse_interfaces(f.read())
+    except OSError as e:
+        print(f"ERROR: cannot read {header}: {e}", file=sys.stderr)
+        return 2
 
     if args.report:
-        report = coverage(interfaces, args.interfaces, args.source)
-        if not write_report(args.report, json.dumps(report, indent=2) + "\n"):
+        try:
+            report = coverage(interfaces, args.interfaces, args.source)
+        except OSError as e:
+            print(f"ERROR: cannot read {e.filename or 'source'}: {e}", file=sys.stderr)
+            return 2
+        if not write_report(args.report, json.dumps(report, indent=2, allow_nan=False) + "\n"):
             return 2
     if not args.out:
         return 0

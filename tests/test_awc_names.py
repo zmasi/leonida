@@ -504,6 +504,43 @@ class TestCli(unittest.TestCase):
             with open(path, encoding="utf-8") as fh:
                 self.assertEqual(fh.read(), previous)
 
+    def test_publish_cleans_up_staged_file_when_replace_fails_even_if_readonly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "names.json")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write('{"initial": 1}\n')
+            os.chmod(path, 0o444)
+
+            real_unlink = os.unlink
+
+            def windows_strict_unlink(p):
+                mode = os.stat(p).st_mode
+                if not (mode & 0o200):
+                    raise PermissionError(13, f"Access is denied: {p}")
+                return real_unlink(p)
+
+            with mock.patch.object(A, "replace_retry", side_effect=OSError(13, "Permission denied")), \
+                 mock.patch("os.unlink", side_effect=windows_strict_unlink):
+                with self.assertRaises(OSError):
+                    A.write_json_report(path, {"summary": {}, "streams": []})
+
+            leftover = [f for f in os.listdir(tmp) if f.startswith(".awc_names-")]
+            self.assertEqual(leftover, [])
+
+    def test_publish_applies_published_mode_on_windows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "names_win.json")
+            chmod_calls = []
+            real_chmod = os.chmod
+
+            def track_chmod(p, mode):
+                chmod_calls.append((p, mode))
+                real_chmod(p, mode)
+
+            with mock.patch("os.name", "nt"), mock.patch("os.chmod", side_effect=track_chmod):
+                A.write_json_report(path, {"summary": {}, "streams": []})
+            self.assertTrue(len(chmod_calls) > 0)
+
 
 if __name__ == "__main__":
     unittest.main()

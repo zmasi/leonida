@@ -34,12 +34,15 @@ import json
 import os
 import re
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 from collections import Counter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+import file_mode  # noqa: E402
+import replace_retry  # noqa: E402
 
 BOM = b"\xef\xbb\xbf"
 VECTOR_KEYS = ("x", "y", "z", "w")
@@ -263,6 +266,42 @@ def documents(targets):
     return gx.load_documents(targets)
 
 
+_UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
+
+
+class _WriteError(OSError):
+    """Raised when writing an exported JSON file fails (still an OSError for callers of run())."""
+
+
+def _safe_stem(tag, name):
+    """Build a single safe filename stem from an XML tag (possibly namespaced) and document name."""
+    raw = f"{tag}_{name}"
+    cleaned = _UNSAFE_FILENAME.sub("_", raw).strip(" .")
+    return cleaned or "doc"
+
+
+def _write_json_atomic(path, value):
+    parent = os.path.dirname(os.path.abspath(path))
+    mode = file_mode.published_mode(path)
+    payload = json.dumps(value, indent=1, default=str) + "\n"
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", newline="\n", dir=parent,
+                prefix=f".{os.path.basename(path)}.", suffix=".tmp", delete=False) as f:
+            tmp_path = f.name
+            f.write(payload)
+        os.chmod(tmp_path, mode)
+        replace_retry.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def run(targets, root_filter=None, out_dir=None, reader=None):
     """Read every document; returns a summary of counts (no names of entries, no values)."""
     reader = reader or Reader()
@@ -270,7 +309,7 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
     written_names = set()
     for n, doc in enumerate(documents(targets)):
         hint = doc.get("root_hint")
-        if root_filter and hint != root_filter:
+        if root_filter and hint and hint != root_filter and not root_filter.endswith("}" + hint):
             continue
         try:
             tag, _, value = reader.read(doc["data"])
@@ -278,21 +317,27 @@ def run(targets, root_filter=None, out_dir=None, reader=None):
             # Unsupported encodings and malformed content arrays fail outside ET.ParseError too.
             failed[str(e).split(":")[0]] += 1
             continue
+        if root_filter and tag != root_filter:
+            continue
         read += 1
         roots[tag] += 1
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-            name = doc.get("offset_hex") or doc.get("name") or str(n)
-            stem = f"{tag}_{name}"
-            filename = f"{stem}.json"
-            suffix = 2
-            # Another input can have the same basename or carve offset. Keep existing names on ordinary reruns.
-            while filename.casefold() in written_names:
-                filename = f"{stem}_{suffix}.json"
-                suffix += 1
-            written_names.add(filename.casefold())
-            with open(os.path.join(out_dir, filename), "w", encoding="utf-8", newline="\n") as f:
-                json.dump(value, f, indent=1, default=str)
+        if out_dir is not None:
+            target_path = out_dir
+            try:
+                os.makedirs(out_dir, exist_ok=True)
+                name = doc.get("offset_hex") or doc.get("name") or str(n)
+                stem = _safe_stem(tag, name)
+                filename = f"{stem}.json"
+                suffix = 2
+                # Another input can have the same basename or carve offset. Keep existing names on ordinary reruns.
+                while filename.casefold() in written_names:
+                    filename = f"{stem}_{suffix}.json"
+                    suffix += 1
+                written_names.add(filename.casefold())
+                target_path = os.path.join(out_dir, filename)
+                _write_json_atomic(target_path, value)
+            except OSError as e:
+                raise _WriteError(e.errno, e.strerror or str(e), target_path) from None
     return {"documents": read, "roots": len(roots), "per_root_documents": dict(roots),
             "not_well_formed": sum(failed.values()), "parse_errors": dict(failed),
             "elements_by_convention": dict(reader.stats), "type_classes": len(reader.types),
@@ -306,11 +351,19 @@ def main(argv=None):
     ap.add_argument("--root", help="only documents with this root tag")
     ap.add_argument("--out", help="write one JSON file per document here (game data: keep it local)")
     a = ap.parse_args(argv)
-    if a.out and os.path.exists(a.out) and not os.path.isdir(a.out):
-        print(f"ERROR: --out {a.out} exists and is not a directory", file=sys.stderr)
-        return 2
+    if a.out is not None:
+        if not a.out.strip():
+            print("ERROR: --out path must not be empty", file=sys.stderr)
+            return 2
+        if os.path.exists(a.out) and not os.path.isdir(a.out):
+            print(f"ERROR: --out {a.out} exists and is not a directory", file=sys.stderr)
+            return 2
     try:
         s = run(a.targets, a.root, a.out)
+    except _WriteError as e:
+        where = e.filename or a.out
+        print(f"ERROR: cannot write {where}: {e.strerror or e}", file=sys.stderr)
+        return 2
     except FileNotFoundError as e:
         print(f"ERROR: {e} does not exist", file=sys.stderr)
         return 2
@@ -324,7 +377,7 @@ def main(argv=None):
     print("elements by convention:", ", ".join(f"{k} {v}" for k, v in sorted(s["elements_by_convention"].items())))
     print(f"type classes: {s['type_classes']} ({s['typed_elements']} typed elements); registered handlers: "
           f"{s['registered']['roots']} roots, {s['registered']['types']} types")
-    if a.out:
+    if a.out is not None:
         print(f"wrote {s['documents']} JSON files to {a.out} (game data: keep them local)")
     if not s["documents"] and s["not_well_formed"]:
         # Nothing parsed. A corpus with some truncated tails still reads the rest and stays 0; a run that read

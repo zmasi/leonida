@@ -365,6 +365,46 @@ class TestCli(unittest.TestCase):
             with open(index, "rb") as f:
                 self.assertEqual(f.read(), b'{"files": []}')
 
+    def test_report_cannot_replace_a_file_read_from_a_source_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.makedirs(os.path.join(src, "sub"))
+            resource = write(os.path.join(src, "a.bin"), make_resource(EN))
+            nested = write(os.path.join(src, "sub", "notes.txt"), b"keep")
+            for flag, target, old in (("--tables", nested, b"keep"), ("--strings", resource, make_resource(EN))):
+                with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as code:
+                    T.main([src, flag, target])
+                self.assertEqual(code.exception.code, 2)
+                self.assertIn(f"{flag} would overwrite the input", err.getvalue())
+                with open(target, "rb") as f:
+                    self.assertEqual(f.read(), old)
+
+    def test_new_report_inside_a_source_directory_is_still_written(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "src")
+            os.mkdir(src)
+            write(os.path.join(src, "a.bin"), make_resource(EN))
+            out = os.path.join(src, "tables.csv")
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(T.main([src, "--tables", out]), 0)
+            self.assertTrue(os.path.isfile(out))
+
+    def test_report_cannot_replace_a_carved_stream(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            carve = os.path.join(tmp, "carve")
+            os.mkdir(carve)
+            data = make_resource(EN)
+            stream = write(os.path.join(carve, f"{0x1100:012x}.bin"), data)
+            with open(os.path.join(carve, "index.json"), "w", encoding="utf-8") as fh:
+                json.dump({"files": [{"off": 0x1100, "stored": len(data), "size": len(data), "pre": "",
+                                      "head": data[:16].hex()}]}, fh)
+            with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as code:
+                T.main([carve, "--dialogue", stream])
+            self.assertEqual(code.exception.code, 2)
+            self.assertIn("--dialogue would overwrite the input", err.getvalue())
+            with open(stream, "rb") as f:
+                self.assertEqual(f.read(), data)
+
     def test_two_outputs_naming_one_file_are_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             src = os.path.join(tmp, "src")

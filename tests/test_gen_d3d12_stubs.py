@@ -158,6 +158,31 @@ class ParseInterfacesTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             gen.parse_interfaces(BROKEN_HEADER)
 
+    def test_multiline_block_comment_preserves_line_break_between_declarations_and_directives(self):
+        header = """\
+MIDL_INTERFACE("11111111-2222-3333-4444-555555555555")
+IBase : public IUnknown
+{
+public:
+    virtual void STDMETHODCALLTYPE Foo(void) = 0; /* line 1
+    line 2 */ virtual void STDMETHODCALLTYPE Bar(void) = 0; /* line 3
+    line 4 */ #if 0
+    virtual void STDMETHODCALLTYPE Baz(void) = 0;
+#endif
+};
+"""
+        items = gen.parse_interfaces(header)["IBase"][1]
+        self.assertEqual(
+            items,
+            [
+                ("m", "void", "Foo", "void", ""),
+                ("m", "void", "Bar", "void", ""),
+                ("#", "#if 0"),
+                ("m", "void", "Baz", "void", ""),
+                ("#", "#endif"),
+            ],
+        )
+
 
 class ChainTests(unittest.TestCase):
     def test_leaf_comes_last(self):
@@ -453,6 +478,99 @@ class MainTests(unittest.TestCase):
     def test_find_header_without_include_returns_none(self):
         with mock.patch.dict(os.environ, {"INCLUDE": ""}, clear=False):
             self.assertIsNone(gen.find_header())
+
+    def test_empty_and_whitespace_paths_rejected(self):
+        source = self.make_source()
+        report = os.path.join(self.dir, "coverage.json")
+        with tempfile.TemporaryDirectory() as cwd:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(cwd)
+                cases = [
+                    ["--header", self.header, "--out", "", "--report", report, "--source", source, "IChild"],
+                    ["--header", self.header, "--out", "   ", "IChild"],
+                    ["--header", self.header, "--out", self.out, "--report", "", "IChild"],
+                    ["--header", self.header, "--report", "   ", "--source", source, "IChild"],
+                    ["--header", "", "--out", self.out, "IChild"],
+                ]
+                with mock.patch.dict(os.environ, {"INCLUDE": self.dir}, clear=False):
+                    for argv in cases:
+                        with self.subTest(argv=argv):
+                            with contextlib.redirect_stderr(io.StringIO()):
+                                with self.assertRaises(SystemExit) as cm:
+                                    self.run_args(*argv)
+                            self.assertEqual(cm.exception.code, 2)
+                self.assertEqual(os.listdir(cwd), [])
+            finally:
+                os.chdir(old_cwd)
+
+    def test_write_if_changed_normalizes_crlf(self):
+        self.assertEqual(self.run_main("IChild"), 0)
+        with open(self.out, encoding="utf-8", newline="") as f:
+            expected = f.read()
+        with open(self.out, "wb") as f:
+            f.write(expected.replace("\n", "\r\n").encode("utf-8"))
+        self.assertEqual(self.run_main("IChild"), 0)
+        with open(self.out, "rb") as f:
+            self.assertNotIn(b"\r\n", f.read())
+
+    def test_write_if_changed_is_atomic_on_failure(self):
+        os.makedirs(os.path.dirname(self.out), exist_ok=True)
+        prior = "// prior header\n"
+        with open(self.out, "w", encoding="utf-8", newline="\n") as f:
+            f.write(prior)
+        err = io.StringIO()
+        real_open = open
+
+        class FailingWriter:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def write(self, _data):
+                raise OSError("disk full")
+
+        def fail_write(path, mode="r", *args, **kwargs):
+            if "w" in mode and os.path.dirname(os.path.abspath(path)) == os.path.dirname(os.path.abspath(self.out)):
+                if os.path.abspath(path) == os.path.abspath(self.out):
+                    real_open(path, "w", encoding="utf-8", newline="\n").close()
+                return FailingWriter()
+            return real_open(path, mode, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=fail_write), \
+                mock.patch.object(gen, "replace_retry", side_effect=OSError("disk full"), create=True), \
+                contextlib.redirect_stderr(err):
+            code = self.run_main("IChild")
+        self.assertEqual(code, 2)
+        self.assertIn("ERROR: cannot write", err.getvalue())
+        with open(self.out, encoding="utf-8", newline="") as f:
+            self.assertEqual(f.read(), prior)
+        self.assertEqual(os.listdir(os.path.dirname(self.out)), [os.path.basename(self.out)])
+
+    def test_unreadable_header_or_source_returns_clean_error(self):
+        source = self.make_source()
+        report = os.path.join(self.dir, "coverage.json")
+        real_open = open
+
+        def fail_header(path, *args, **kwargs):
+            if os.path.abspath(path) == os.path.abspath(self.header):
+                raise PermissionError(13, "Permission denied", path)
+            return real_open(path, *args, **kwargs)
+
+        err = io.StringIO()
+        with mock.patch("builtins.open", side_effect=fail_header), contextlib.redirect_stderr(err):
+            code = self.run_args("--header", self.header, "--out", self.out, "IChild")
+        self.assertEqual(code, 2)
+        self.assertIn("ERROR: cannot read", err.getvalue())
+
+        err2 = io.StringIO()
+        with mock.patch.object(gen, "implemented_names", side_effect=PermissionError(13, "Permission denied", source)), \
+                contextlib.redirect_stderr(err2):
+            code2 = self.run_args("--header", self.header, "--report", report, "--source", source, "IChild")
+        self.assertEqual(code2, 2)
+        self.assertIn("ERROR: cannot read", err2.getvalue())
 
 
 class ReportPathCollisions(unittest.TestCase):

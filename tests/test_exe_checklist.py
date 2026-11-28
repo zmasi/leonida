@@ -99,6 +99,98 @@ class ExeChecklist(unittest.TestCase):
         self.assertEqual(docs[2]["text"], "the same note in the docs' prose spelling.")
         self.assertEqual(docs[3]["text"], "the plural spelling is a note too.")
 
+    def test_doc_notes_stop_at_numbered_and_plus_list_items(self):
+        sample = """# Numbered and Plus Lists
+1. **VERIFY:** first numbered note
+   continuation line.
+2. **VERIFY:** second numbered note.
+3) **UNVERIFIED:** parenthesis numbered note.
++ **ASSUMPTION:** plus list note
+  wrapped plus line.
++ **VERIFY:** second plus note.
+"""
+        path = os.path.join(self.root, "docs", "lists.md")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(sample)
+        notes = ec.doc_notes(path, "docs/lists.md")
+        self.assertEqual(len(notes), 5)
+        self.assertEqual([(n["line"], n["kind"]) for n in notes],
+                         [(2, "VERIFY"), (4, "VERIFY"), (5, "UNVERIFIED"), (6, "ASSUMPTION"), (8, "VERIFY")])
+        self.assertEqual(notes[0]["text"], "first numbered note continuation line.")
+        self.assertEqual(notes[1]["text"], "second numbered note.")
+        self.assertEqual(notes[2]["text"], "parenthesis numbered note.")
+        self.assertEqual(notes[3]["text"], "plus list note wrapped plus line.")
+        self.assertEqual(notes[4]["text"], "second plus note.")
+
+    def test_doc_notes_bare_markers_nested_items_and_code_blocks(self):
+        sample = """# Edge Cases
+1. **VERIFY:** first item
+2.
+3. **VERIFY:** third item.
+- **VERIFY:** parent note
+  + nested plus continuation
+  1. nested ordered continuation
+  ```python
+  + inside code fence
+  1. also code
+  ```
+- **VERIFY:** prose note
+  2024. the year it occurred
+  + 5 cases passed.
+- next item.
+"""
+        path = os.path.join(self.root, "docs", "edge_cases.md")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(sample)
+        notes = ec.doc_notes(path, "docs/edge_cases.md")
+        self.assertEqual([(n["line"], n["kind"]) for n in notes],
+                         [(2, "VERIFY"), (4, "VERIFY"), (5, "VERIFY"), (12, "VERIFY")])
+        self.assertEqual(notes[0]["text"], "first item")
+        self.assertEqual(notes[1]["text"], "third item.")
+        self.assertEqual(notes[2]["text"], "parent note + nested plus continuation 1. nested ordered continuation")
+        self.assertEqual(notes[3]["text"], "prose note 2024. the year it occurred + 5 cases passed.")
+
+    def test_doc_notes_nested_item_with_own_marker_stops_continuation(self):
+        sample = """# Nested note with own marker
+- **VERIFY:** parent note
+  - **VERIFY:** child note
+- next item.
+"""
+        path = os.path.join(self.root, "docs", "nested_marker.md")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(sample)
+        notes = ec.doc_notes(path, "docs/nested_marker.md")
+        self.assertEqual([(n["line"], n["kind"], n["text"]) for n in notes],
+                         [(2, "VERIFY", "parent note"), (3, "VERIFY", "child note")])
+
+    def test_doc_notes_tilde_fences_are_recognised(self):
+        sample = """# Tilde fences
+- **VERIFY:** before tilde fence
+~~~
+- **VERIFY:** inside tilde fence
+~~~
+- **VERIFY:** after tilde fence
+"""
+        path = os.path.join(self.root, "docs", "tilde_fence.md")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(sample)
+        notes = ec.doc_notes(path, "docs/tilde_fence.md")
+        self.assertEqual([(n["line"], n["kind"], n["text"]) for n in notes],
+                         [(2, "VERIFY", "before tilde fence"), (6, "VERIFY", "after tilde fence")])
+
+    def test_doc_notes_unclosed_fence_does_not_hide_later_notes(self):
+        sample = """# Unclosed fence
+```python
+x = 1
+- **VERIFY:** note after unclosed fence
+"""
+        path = os.path.join(self.root, "docs", "unclosed_fence.md")
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(sample)
+        notes = ec.doc_notes(path, "docs/unclosed_fence.md")
+        self.assertEqual([(n["line"], n["kind"], n["text"]) for n in notes],
+                         [(4, "VERIFY", "note after unclosed fence")])
+
     def test_a_marker_inside_a_sentence_or_a_table_row_is_prose(self):
         with open(os.path.join(self.root, "docs", "demo.md"), "a", encoding="utf-8", newline="\n") as f:
             f.write("| `v_demo` | written without the console (**Assumption**: not a note) |\n"

@@ -45,13 +45,46 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(TOOLS)
 sys.path.insert(0, os.path.join(ROOT, "runtime", "test", "shaders"))
 from compute_fixture import find_test_program  # noqa: E402
 sys.path.insert(0, TOOLS)   # python -I leaves the script's own folder off sys.path
+from file_mode import published_mode  # noqa: E402
+from replace_retry import replace as replace_retry  # noqa: E402
 from stale_build import newer_sources  # noqa: E402
+
+
+def _write_json_atomic(path: str, payload: dict) -> None:
+    dest = os.path.realpath(path)
+    parent = os.path.dirname(dest) or "."
+    os.makedirs(parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=parent, prefix=".first_light-", suffix=".tmp")
+    try:
+        try:
+            f = os.fdopen(fd, "w", encoding="utf-8", newline="\n")
+        except BaseException:
+            os.close(fd)
+            raise
+        with f:
+            json.dump(payload, f, indent=1)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, published_mode(dest))
+        replace_retry(tmp, dest)
+    except BaseException:
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 DEFAULT_VS = "VS_main_170e32e6_Wrapped"
 DEFAULT_PS = "$PS_Rage_Untextured_14f8529b_Wrapped"
@@ -693,7 +726,7 @@ def rgba_probes_for_mesh(
 
 
 def check_image(data: bytes, manifest: dict) -> dict:
-    """The readback oracle: exact shape, coverage window, a clear corner and the centre UV.
+    """The readback oracle: exact shape, finite channels, coverage, a clear corner and the centre UV.
 
     tests/test_first_light.py imports this function, so the test and ``--check`` agree.
     """
@@ -718,6 +751,8 @@ def check_image(data: bytes, manifest: dict) -> dict:
             f"raw is {len(data)} bytes, expected {width * height * 16}"
         )
     pixels = struct.unpack(f"<{len(data) // 4}f", data)
+    if not all(map(math.isfinite, pixels)):
+        raise AssertionError("raw readback contains a non-finite channel")
     clear_val = manifest.get("clear", CLEAR)
     textured = (
         manifest.get("texture") is not None
@@ -846,8 +881,7 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
             os.unlink(path)
     if "result" in manifest:
         del manifest["result"]
-        with open(manifest_path, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(manifest, f, indent=1)
+        _write_json_atomic(manifest_path, manifest)
     subprocess.run(cmd, check=True, env=env)
     if not os.path.isfile(raw):
         raise SystemExit(f"the harness exited successfully but did not write {raw}")
@@ -868,8 +902,7 @@ def run_draw(args, manifest: dict, out_dir: str) -> dict:
         "ratio": result["ratio"],
         "ppm": ppm,
     }
-    with open(manifest_path, "w", encoding="utf-8", newline="\n") as f:
-        json.dump(manifest, f, indent=1)
+    _write_json_atomic(manifest_path, manifest)
     return result
 
 

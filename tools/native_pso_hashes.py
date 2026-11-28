@@ -16,6 +16,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from file_mode import published_mode
 from shader_carve import parts
 
 HEADER = "# native_pso_hashes 1"
@@ -45,7 +46,7 @@ def build(dxbc: str, spirv: str) -> dict:
     workspace = os.path.dirname(os.path.realpath(spirv))
     if os.path.commonpath((workspace, os.path.realpath(dxbc))) != workspace:
         raise ValueError("the carved folder must be inside the same shader workspace as the translation")
-    with open(os.path.join(spirv, "index.json"), encoding="utf-8") as f:
+    with open(os.path.join(spirv, "index.json"), encoding="utf-8-sig") as f:
         index = json.load(f)
     if not isinstance(index, dict):
         raise ValueError("index.json is not an object")
@@ -88,9 +89,14 @@ def write(spirv: str, table: dict) -> str:
             for key in sorted(table):
                 stage, path = table[key]
                 tmp.write(f"{key}\t{stage}\t{path}\n")
+        os.chmod(tmp.name, published_mode(out))
         os.replace(tmp.name, out)
     finally:
         if os.path.exists(tmp.name):
+            try:
+                os.chmod(tmp.name, 0o600)
+            except OSError:
+                pass
             os.unlink(tmp.name)
     return out
 

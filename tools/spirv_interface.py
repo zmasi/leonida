@@ -238,6 +238,8 @@ class Module:
         self.entry_points = []
         self.decorations = defaultdict(dict)
         self.member_decorations = defaultdict(dict)
+        self.struct_member_indices = defaultdict(set)
+        self.member_decorated_ids = set()
         self.groups = set()
         self.group_uses = []
         self.definition_ids = set()
@@ -281,6 +283,8 @@ class Module:
             self.require_operands(operands, at, 3, 4)
             pointer, identifier, storage = operands[:3]
             self.require_id(pointer)
+            if len(operands) == 4:
+                self.require_id(operands[3])
             self.define(identifier)
             self.variables[identifier] = (pointer, storage)
         elif opcode == OP_ENTRY_POINT:
@@ -302,14 +306,19 @@ class Module:
             self.require_operands(operands, at, split + 1)
             identifier = operands[0]
             self.require_id(identifier)
+            if opcode == OP_MEMBER_DECORATE:
+                self.member_decorated_ids.add(identifier)
             decoration, *extra = operands[split:]
             if decoration not in DECORATION_NAMES:
                 return
             expected = int(decoration in VALUE_DECORATIONS)
             if len(extra) != expected:
                 raise InterfaceError(f"invalid {DECORATION_NAMES[decoration]} decoration at word {at}")
-            target = (self.decorations[identifier] if split == 1
-                      else self.member_decorations[(identifier, operands[1])])
+            if split == 1:
+                target = self.decorations[identifier]
+            else:
+                self.struct_member_indices[identifier].add(operands[1])
+                target = self.member_decorations[(identifier, operands[1])]
             self.add_decoration(target, decoration, extra[0] if extra else True)
         elif opcode == OP_DECORATION_GROUP:
             self.require_operands(operands, at, 1, 1)
@@ -328,6 +337,8 @@ class Module:
         target[decoration] = value
 
     def apply_decoration_groups(self):
+        if self.member_decorated_ids & self.groups:
+            raise InterfaceError("OpMemberDecorate cannot target a decoration group")
         for opcode, operands in self.group_uses:
             group, *targets = operands
             if group not in self.groups:
@@ -341,10 +352,19 @@ class Module:
                 self.require_id(identifier)
                 if identifier in self.groups:
                     raise InterfaceError("decoration groups cannot decorate each other")
-                target = (self.decorations[identifier] if member is None
-                          else self.member_decorations[(identifier, member)])
+                if member is None:
+                    target = self.decorations[identifier]
+                else:
+                    if source:
+                        self.struct_member_indices[identifier].add(member)
+                    target = self.member_decorations[(identifier, member)]
                 for decoration, value in source.items():
                     self.add_decoration(target, decoration, value)
+
+    def check_member_indices(self, type_id, count):
+        for member in sorted(self.struct_member_indices.get(type_id, ())):
+            if member >= count:
+                raise InterfaceError(f"member decoration index {member} is out of range for structure %{type_id}")
 
     def type_declaration(self, identifier):
         try:
@@ -407,6 +427,8 @@ class Module:
         elif opcode == OP_TYPE_STRUCT:
             if not args:
                 raise InterfaceError("empty structure in graphics interface")
+            self.check_modes(self.decorations.get(identifier, {}))
+            self.check_member_indices(identifier, len(args))
             for i in range(len(args)):
                 if self.member_decorations.get((identifier, i)):
                     raise InterfaceError("decorated nested interface structure members are unsupported")
@@ -449,16 +471,19 @@ class Module:
             opcode, args = self.type_declaration(pointee)
             if opcode != OP_TYPE_ARRAY:
                 raise InterfaceError(f"{stage} requires an outer per-vertex or per-primitive array")
+            self.array_count(args[1])
             pointee = args[0]
         return pointee, indexed
 
     @staticmethod
-    def address(decorations, location=None):
+    def address(decorations, location=None, *, stage=None, storage=None):
         location = decorations.get(DEC_LOCATION, location)
         component = decorations.get(DEC_COMPONENT, 0)
         index = decorations.get(DEC_INDEX, 0)
         if location is None:
             raise InterfaceError("user varying is missing a Location decoration")
+        if DEC_INDEX in decorations and stage is not None and (stage, storage) != ("ps", STORAGE_OUTPUT):
+            raise InterfaceError("Index decoration is only valid on fragment outputs")
         if component > 3 or index > 1:
             raise InterfaceError("invalid Component or Index decoration")
         return Address(location, component, index)
@@ -470,6 +495,15 @@ class Module:
         if DEC_PATCH in decorations:
             raise InterfaceError("tessellation patch interfaces are unsupported")
 
+    @staticmethod
+    def check_per_primitive(per_primitive, per_vertex, stage, storage):
+        if not per_primitive:
+            return
+        if (stage, storage) not in (("ms", STORAGE_OUTPUT), ("ps", STORAGE_INPUT)):
+            raise InterfaceError("PerPrimitiveEXT is only supported on mesh outputs and fragment inputs")
+        if per_vertex:
+            raise InterfaceError("PerVertexKHR and PerPrimitiveEXT cannot both apply to the same varying")
+
     def declaration(self, symbol, pointer, storage, stage):
         decorations = self.decorations.get(symbol, {})
         self.check_modes(decorations)
@@ -477,17 +511,27 @@ class Module:
             return None
         type_id, indexed = self.varying_type(pointer, storage, stage, decorations)
         opcode, args = self.type_declaration(type_id)
+        per_vertex = DEC_PER_VERTEX in decorations
         per_primitive = DEC_PER_PRIMITIVE in decorations
         if opcode != OP_TYPE_STRUCT:
-            varying = Varying(self.address(decorations), self.shape(type_id), per_primitive)
+            self.check_per_primitive(per_primitive, per_vertex, stage, storage)
+            varying = Varying(self.address(decorations, stage=stage, storage=storage),
+                              self.shape(type_id), per_primitive)
             return Declaration((varying,), symbol, indexed_by_vertex_or_primitive=indexed)
 
+        type_decs = self.decorations.get(type_id, {})
+        self.check_modes(type_decs)
+        self.check_member_indices(type_id, len(args))
         member_decs = [self.member_decorations.get((type_id, i), {}) for i in range(len(args))]
         if member_decs and all(DEC_BUILTIN in member for member in member_decs):
             return None
         if any(DEC_BUILTIN in member for member in member_decs):
             raise InterfaceError("mixed built-in and user-defined structure members")
-        is_block = DEC_BLOCK in self.decorations.get(type_id, {})
+        if DEC_PER_VERTEX in type_decs:
+            raise InterfaceError("PerVertexKHR on structure types is unsupported")
+        per_primitive = per_primitive or DEC_PER_PRIMITIVE in type_decs
+        self.check_per_primitive(per_primitive, per_vertex, stage, storage)
+        is_block = DEC_BLOCK in type_decs
         base_location = decorations.get(DEC_LOCATION)
         if base_location is None and not is_block:
             raise InterfaceError("a non-block structure needs a Location")
@@ -501,9 +545,13 @@ class Module:
         next_location = base_location
         for child, member in zip(args, member_decs):
             self.check_modes(member)
-            address = self.address(member, next_location)
+            if DEC_PER_VERTEX in member:
+                raise InterfaceError("PerVertexKHR on structure members is unsupported")
+            member_per_prim = per_primitive or DEC_PER_PRIMITIVE in member
+            self.check_per_primitive(member_per_prim, per_vertex, stage, storage)
+            address = self.address(member, next_location, stage=stage, storage=storage)
             shape = self.shape(child, (type_id,))
-            members.append(Varying(address, shape, per_primitive or DEC_PER_PRIMITIVE in member))
+            members.append(Varying(address, shape, member_per_prim))
             if base_location is not None:
                 next_location += len(shape.location_masks(address.component))
         return Declaration(tuple(members), symbol, structure=True, block=is_block,

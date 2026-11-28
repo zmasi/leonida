@@ -479,12 +479,15 @@ def write_json(path, payload):
         ) as staged:
             staged_path = staged.name
             json.dump(payload, staged, indent=1)
-        if os.name != "nt":
-            os.chmod(staged_path, published_mode(destination))
+        os.chmod(staged_path, published_mode(destination))
         replace_retry(staged_path, destination)
         staged_path = None
     finally:
         if staged_path is not None:
+            try:
+                os.chmod(staged_path, 0o600)
+            except OSError:
+                pass
             try:
                 os.unlink(staged_path)
             except OSError:

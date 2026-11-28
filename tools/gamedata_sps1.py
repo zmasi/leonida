@@ -311,9 +311,18 @@ def lookup_preset_hash(payloads: list[dict], target_hash: int) -> list[dict]:
 
 def check_report_path(out_path: str, target: str, shaders_rpf: str | None = None,
                       rows: list[dict] | None = None) -> None:
-    """Refuse a --json destination that is a directory or aliases any input file."""
-    if os.path.isdir(out_path):
-        raise ValueError(f"--json is a directory: {out_path}")
+    """Refuse a --json destination that is a directory, blocked by a non-dir ancestor, or aliases any input file."""
+    for candidate in (os.path.abspath(out_path), os.path.realpath(out_path)):
+        if (os.path.exists(candidate) or os.path.islink(candidate)) and os.path.isdir(candidate):
+            raise ValueError(f"--json is a directory: {out_path}")
+        probe = os.path.dirname(candidate)
+        while probe and not (os.path.exists(probe) or os.path.islink(probe)):
+            nxt = os.path.dirname(probe)
+            if nxt == probe:
+                break
+            probe = nxt
+        if probe and not os.path.isdir(probe):
+            raise ValueError(f"--json parent {probe} is not a directory")
     if shaders_rpf and same_report_path(out_path, shaders_rpf):
         raise ValueError(f"--json would overwrite the input {shaders_rpf}")
     if os.path.isdir(target):
@@ -377,10 +386,19 @@ def main(argv=None) -> int:
         if a.json.endswith(("/", "\\")) or (os.sep and a.json.endswith(os.sep)):
             ap.error(f"--json is a directory path: {a.json}")
 
-    # A missing input path is a usage error (exit 2), not a failed run, as in BUILD-1046.
-    for path in (a.target, a.shaders):
-        if path is not None and not os.path.exists(path):
-            print(f"ERROR: {path} does not exist", file=sys.stderr)
+    # A missing or wrong-kind input path is a usage error (exit 2), not a failed run, as in BUILD-1046.
+    if not os.path.exists(a.target):
+        print(f"ERROR: {a.target} does not exist", file=sys.stderr)
+        return 2
+    if not (os.path.isfile(a.target) or os.path.isdir(a.target)):
+        print(f"ERROR: {a.target} is not a file or directory", file=sys.stderr)
+        return 2
+    if a.shaders is not None:
+        if not os.path.exists(a.shaders):
+            print(f"ERROR: {a.shaders} does not exist", file=sys.stderr)
+            return 2
+        if not os.path.isfile(a.shaders):
+            print(f"ERROR: --shaders {a.shaders} is not a file", file=sys.stderr)
             return 2
 
     try:

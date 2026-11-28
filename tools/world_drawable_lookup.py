@@ -3,16 +3,39 @@ import argparse
 from collections import Counter, defaultdict
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import world_build
 import world_names
 
+_HEX_KEY = re.compile(r"[0-9a-fA-F]+")
+
+
+def _parse_key(value):
+    if not isinstance(value, str) or not _HEX_KEY.fullmatch(value):
+        raise ValueError("key must be an unsigned 64-bit hex string")
+    key = int(value, 16)
+    if key >= (1 << 64):
+        raise ValueError("key exceeds 64 bits")
+    return key
+
+
+def _optional_u32(value, path):
+    if value is None:
+        return None
+    if type(value) is not int or not (0 <= value < (1 << 32)):
+        raise ValueError(f"{path}: invalid archetype row")
+    return value
+
 
 def report_rows(path, field):
     with open(path, encoding="utf-8-sig") as handle:
-        report = json.load(handle)
+        try:
+            report = json.load(handle)
+        except RecursionError as exc:
+            raise ValueError(f"{path}: JSON nesting too deep") from exc
     if not isinstance(report, dict) or not isinstance(report.get(field), list):
         raise ValueError(f"{path}: expected a {field} array")
     if any(not isinstance(row, dict) for row in report[field]):
@@ -23,14 +46,17 @@ def report_rows(path, field):
 def lookup(placements, archetypes, names, manifests):
     definitions = defaultdict(set)
     for row in report_rows(archetypes, "archetypes")["archetypes"]:
-        definitions[row.get("name")].add((row.get("asset_name"), row.get("asset_type")))
+        arch_name = _optional_u32(row.get("name"), archetypes)
+        asset_name = _optional_u32(row.get("asset_name"), archetypes)
+        asset_type = _optional_u32(row.get("asset_type"), archetypes)
+        definitions[arch_name].add((asset_name, asset_type))
 
     counts = world_build._placement_counts()
     wanted = Counter()
     outcomes = Counter()
     for row in world_build.iter_placements(placements, counts, world_build.ALL_LOD_LEVELS):
         try:
-            key = int(row.get("key"), 16)
+            key = _parse_key(row.get("key"))
         except (TypeError, ValueError):
             outcomes["missing_or_invalid_key"] += 1
             continue
@@ -46,7 +72,7 @@ def lookup(placements, archetypes, names, manifests):
     index = report_rows(names, "files")
     summary = index.get("summary")
     archive = summary.get("archive") if isinstance(summary, dict) else None
-    if not isinstance(archive, str) or not archive:
+    if not isinstance(archive, str) or not archive.strip():
         raise ValueError(f"{names}: missing archive in summary")
     for row in index["files"]:
         offset = row.get("offset")
@@ -84,7 +110,7 @@ def lookup(placements, archetypes, names, manifests):
 
 def export_window(report, budget):
     """Maximize single-offset placement predictions within one archive's scan budget."""
-    if not 0 < budget <= (1 << 63) - 1:
+    if type(budget) is not int or not 0 < budget <= (1 << 63) - 1:
         raise ValueError("window bytes must be a positive signed 64-bit integer")
 
     weights = Counter()
@@ -114,21 +140,22 @@ def export_window(report, budget):
     return best
 
 
-def main():
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("placements", help="world_index entity JSONL")
     parser.add_argument("archetypes", help="world_archetypes JSON")
     parser.add_argument("names", help="rpf9_names JSON for the source archive")
     parser.add_argument("--manifest", action="append", default=[], help="exclude identities already listed (repeatable)")
     parser.add_argument("--window-bytes", type=int, help="recommend one model scan of at most this many bytes")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         result = lookup(args.placements, args.archetypes, args.names, args.manifest)
         if args.window_bytes is not None:
             result["export_window"] = export_window(result, args.window_bytes)
-    except (OSError, ValueError, TypeError) as exc:
+    except (OSError, ValueError, TypeError, RecursionError) as exc:
         parser.exit(1, f"{parser.prog}: {exc}\n")
-    print(json.dumps(result, indent=1))
+    print(json.dumps(result, indent=1, allow_nan=False))
+    return 0
 
 
 if __name__ == "__main__":
@@ -136,4 +163,4 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(errors="replace")
     except (AttributeError, ValueError, OSError):
         pass
-    main()
+    sys.exit(main())

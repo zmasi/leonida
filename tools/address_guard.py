@@ -26,33 +26,67 @@ MASK48 = (1 << 48) - 1
 EMPTY_BLOCK, FULL_BLOCK = 0, 1   # every table has them; allocated blocks start at 2
 
 
-def header(limit, table_offset, refused=0, last=0):
+def header(limit, table_offset, refused=0, last=0, last_module=0):
     """The 64-byte header: magic, arena size (offsets below it pass without a lookup), the table's address minus
-    heap_base (mod 2^64), the refusal count and the last refused offset, which the shaders write."""
-    return struct.pack("<QQQIIQ24x", MAGIC, limit, table_offset & ((1 << 64) - 1), refused, 0, last)
+    heap_base (mod 2^64), the refusal count, the last refusing module id, and the last refused offset, which the
+    shaders write."""
+    return struct.pack(
+        "<QQQIIQ24x",
+        MAGIC,
+        limit,
+        table_offset & ((1 << 64) - 1),
+        refused & 0xFFFFFFFF,
+        last_module & 0xFFFFFFFF,
+        last & ((1 << 64) - 1),
+    )
+
+
+def _mark_pages(chunks, first, last):
+    """Set the page bits for inclusive 48-bit page range [first, last] in per-chunk level-2 bitmaps."""
+    for chunk in range(first >> 20, (last >> 20) + 1):
+        bits = chunks.get(chunk)
+        if bits is None:
+            bits = [0] * BLOCK_WORDS
+            chunks[chunk] = bits
+        lo = max(first, chunk << 20) & 0xFFFFF
+        hi = min(last, (chunk << 20) | 0xFFFFF) & 0xFFFFF
+        w_lo, b_lo = lo >> 5, lo & 31
+        w_hi, b_hi = hi >> 5, hi & 31
+        if w_lo == w_hi:
+            bits[w_lo] |= ((1 << (b_hi - b_lo + 1)) - 1) << b_lo
+        else:
+            bits[w_lo] |= (0xFFFFFFFF << b_lo) & 0xFFFFFFFF
+            for w in range(w_lo + 1, w_hi):
+                bits[w] = 0xFFFFFFFF
+            bits[w_hi] |= (1 << (b_hi + 1)) - 1
 
 
 def table_words(spans, max_blocks=None):
-    """The table's words for backed [start, end) heap offset spans: level 1, then the level-2 blocks. A page is
-    backed when any byte of it is (a GPU page is mapped whole). Past `max_blocks` allocated blocks a chunk gets the
-    full block: everything in it passes, as the runtime does when it runs out of room (and logs it)."""
+    """The table's words for backed [start, end) heap offset spans: level 1, then the level-2 blocks. Spans are
+    48-bit heap offsets and may wrap through 2^48 (for a negative offset below the arena, matching
+    runtime/src/address_guard.h). A page is backed when any byte of it is (a GPU page is mapped whole). Past
+    `max_blocks` allocated blocks a chunk gets the full block: everything in it passes, as the runtime does when
+    it runs out of room (and logs it)."""
     chunks = {}
+    max_page = MASK48 >> 12
     for start, end in spans:
-        if end <= start:
+        if ((end - start) & MASK48) == 0:
             continue
-        for page in range((start & MASK48) >> 12, (((end - 1) & MASK48) >> 12) + 1):
-            chunks.setdefault(page >> 20, set()).add(page & 0xFFFFF)
+        first = (start & MASK48) >> 12
+        last = ((end - 1) & MASK48) >> 12
+        if first <= last:
+            _mark_pages(chunks, first, last)
+        else:  # wraps through 2^48: two runs (runtime/src/address_guard.h)
+            _mark_pages(chunks, first, max_page)
+            _mark_pages(chunks, 0, last)
     level1 = [EMPTY_BLOCK] * L1
     blocks = []
     for chunk in sorted(chunks):
         if max_blocks is not None and len(blocks) >= max_blocks:
             level1[chunk] = FULL_BLOCK
             continue
-        bits = [0] * BLOCK_WORDS
-        for page in chunks[chunk]:
-            bits[page >> 5] |= 1 << (page & 31)
         level1[chunk] = 2 + len(blocks)
-        blocks.append(bits)
+        blocks.append(chunks[chunk])
     words = level1 + [0] * BLOCK_WORDS + [0xFFFFFFFF] * BLOCK_WORDS
     for bits in blocks:
         words += bits

@@ -130,6 +130,12 @@ def generate_program(rng, n_ops, *, ops=None):
     each exported VGPR to the (op_name, line) that last wrote it, for the
     first-mismatch report.
     """
+    if type(n_ops) is not int or n_ops < 0:
+        raise ValueError(f"n_ops must be non-negative, got {n_ops!r}")
+    templates = [(name, emit) for name, emit in _op_templates()
+                 if (name != "v_mov_b32" if ops is None else name in ops)]
+    if not templates:
+        raise ValueError("no matching op templates")
     lines = []
     writers = {}
     for v in SCRATCH:
@@ -138,8 +144,6 @@ def generate_program(rng, n_ops, *, ops=None):
     s_regs = (4, 5, 6, 7)
     for s in s_regs:
         lines.append(f"s_mov_b32 s{s}, {rng.choice(_SCALAR_SEEDS):#010x}")
-    templates = [(name, emit) for name, emit in _op_templates()
-                 if (name != "v_mov_b32" if ops is None else name in ops)]
     scalar_result = None
     # A float op may return any NaN payload (Vulkan does not promise one) and the
     # comparison accepts both-NaN. If that value then fed an integer op, the two
@@ -264,6 +268,16 @@ def run_one(name, lines, writers):
 
 def run_suite(programs, seed, max_ops, limit=None, *, start=0, ops=None):
     """Generate the seeded sequence, executing cases from index start. Return (counts, first_failure)."""
+    if type(programs) is not int or programs < 1:
+        raise ValueError(f"programs must be >= 1, got {programs!r}")
+    if type(max_ops) is not int or max_ops < 1:
+        raise ValueError(f"max_ops must be >= 1, got {max_ops!r}")
+    if type(start) is not int or start < 0:
+        raise ValueError(f"start must be >= 0, got {start!r}")
+    if limit is not None and (type(limit) is not int or limit < 1):
+        raise ValueError(f"limit must be >= 1, got {limit!r}")
+    if ops is not None:
+        ops = tuple(dict.fromkeys(ops))
     counts = {"pass": 0, "mismatch": 0, "skip": {}, "harness-error": 0}
     first_failure = None
     rng = random.Random(seed)
@@ -360,10 +374,11 @@ def main(argv=None):
         return 0 if self_test() else 1
     ops = None
     if a.ops is not None:
-        ops = tuple(token.strip() for token in a.ops.split(","))
+        raw_ops = [token.strip() for token in a.ops.split(",")]
         available = {name for name, _ in _op_templates()}
-        if not all(ops):
+        if not all(raw_ops):
             ap.error("--ops must be a comma-separated list of opcodes")
+        ops = tuple(dict.fromkeys(raw_ops))
         unknown = sorted(set(ops) - available)
         if unknown:
             ap.error("unknown --ops opcode(s): " + ", ".join(unknown))

@@ -543,6 +543,77 @@ class CharacterCensusTest(unittest.TestCase):
         self.assertIn(str(sub), err.getvalue())
         self.assertNotIn("Traceback", err.getvalue())
 
+    def test_model_row_reads_top_level_skin_kind_and_bone_binding_flags(self):
+        row = CC.model_row(
+            {"name": "top_flags", "IsFragment": True, "HasBoneBindings": True,
+             "skin_8": True, "vertex_count": 10, "triangle_count": 4},
+            "model.json",
+        )
+        self.assertEqual(row["kind"], "fragment")
+        self.assertIsNone(row["bones"])
+        self.assertIs(row["skin_8"], True)
+        self.assertEqual(row["issues"], [])
+
+        row_infl = CC.model_row(
+            {"name": "top_infl", "type": "dr", "skin_influences": 8,
+             "vertex_count": 10, "triangle_count": 4},
+            "model.json",
+        )
+        self.assertIs(row_infl["skin_8"], True)
+
+        row_bad_bones = CC.model_row(
+            {"name": "bad_bones", "type": "dr", "bones": "bad",
+             "vertex_count": 10, "triangle_count": 4},
+            "model.json",
+        )
+        bone_issues = [i for i in row_bad_bones["issues"] if "bones is not" in i]
+        self.assertEqual(bone_issues, ["model bones is not a non-negative integer or a list"])
+
+    def test_mesh_count_does_not_repeat_issues_across_passes(self):
+        bad_mesh = CC.model_row({"name": "bad_mesh", "meshes": ["not-a-dict"]}, "model.json")
+        self.assertEqual(bad_mesh["issues"].count("mesh 0 is not an object"), 1)
+
+        bad_idx = CC.model_row(
+            {"name": "bad_idx", "meshes": [{"vertex_count": 3, "indices": "bad"}]},
+            "model.json",
+        )
+        self.assertEqual(bad_idx["issues"].count("mesh 0 index count is not a non-negative integer"), 1)
+
+    def test_manifest_entry_path_strips_whitespace_and_ignores_blank_strings(self):
+        manifest = self.root / "spaced.json"
+        write_json(manifest, {"models": ["   ", "  static/model.json  "]})
+        rows = list(CC.load_rows(str(manifest)))
+        self.assertEqual(len(rows), 2)
+        self.assertIn("manifest entry is neither a model object nor a path", rows[0]["issues"])
+        self.assertEqual(rows[1]["name"], "synthetic_static")
+        self.assertEqual(rows[1]["issues"], [])
+
+    def test_atomic_report_writes_preserve_existing_files_and_reject_nan(self):
+        with tempfile.TemporaryDirectory() as td:
+            out_dir = pathlib.Path(td)
+            json_out = out_dir / "report.json"
+            csv_out = out_dir / "report.csv"
+            json_out.write_text('{"keep": true}\n', encoding="utf-8")
+            csv_out.write_text("source,name\nold,old\n", encoding="utf-8")
+            rows = [CC.model_row(static_model(), "static/model.json")]
+            summary = CC.summarize(rows)
+
+            with mock.patch.object(CC, "replace_retry", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    CC.write_json(str(json_out), summary, rows)
+                with self.assertRaises(OSError):
+                    CC.write_csv(str(csv_out), rows)
+
+            self.assertEqual(json_out.read_text(encoding="utf-8"), '{"keep": true}\n')
+            self.assertEqual(csv_out.read_text(encoding="utf-8"), "source,name\nold,old\n")
+            self.assertEqual([n for n in os.listdir(out_dir) if n.startswith(".character_census.")], [])
+
+            bad_summary = dict(summary, vertices=float("nan"))
+            with self.assertRaises(ValueError):
+                CC.write_json(str(json_out), bad_summary, rows)
+            self.assertEqual(json_out.read_text(encoding="utf-8"), '{"keep": true}\n')
+            self.assertEqual([n for n in os.listdir(out_dir) if n.startswith(".character_census.")], [])
+
 
 if __name__ == "__main__":
     unittest.main()

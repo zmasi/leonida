@@ -488,6 +488,81 @@ class PageIndexTest(unittest.TestCase):
                 self.assertEqual(actual, expected)
                 self.assertEqual(list(actual), list(expected))
 
+    def test_summarise_handles_mixed_none_and_int_versions(self):
+        def page(ver):
+            return {
+                "complete": True,
+                "counts": (0, 0, 0, 0),
+                "q38_records": [],
+                "q28_records": [],
+                "q28_error": "",
+                "continuations": [],
+                "span": 0,
+                "payload_at_0x60": False,
+                "resource": {"streams": [], "page_units": 1, "declared_matches_units": True},
+                "version": ver,
+                "page_count": 1,
+            }
+
+        summary = page_index.summarise([page(122), page(None), page(120), page(122)], "directory", "syn")
+        self.assertEqual(summary["versions"], {"120": 1, "122": 2, "None": 1})
+        self.assertEqual(list(summary["versions"]), ["120", "122", "None"])
+
+    def test_scan_rpf_rejects_nonpositive_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            arc = os.path.join(tmp, "a.rpf")
+            make_rpf(arc, [header(0x100)])
+            for bad_limit in (0, -4):
+                with self.subTest(limit=bad_limit):
+                    with self.assertRaisesRegex(ValueError, "limit must be at least 1"):
+                        list(page_index.scan_rpf(arc, limit=bad_limit))
+
+    def test_unreadable_source_directory_with_existing_output_exits_2(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "carve")
+            os.mkdir(src)
+            out = os.path.join(tmp, "pages.json")
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write("existing\n")
+            stderr = io.StringIO()
+            with (mock.patch.object(page_index.os, "listdir", side_effect=PermissionError("denied")),
+                  contextlib.redirect_stderr(stderr)):
+                rc = page_index.main([src, out, "--quiet"])
+            self.assertEqual(rc, 2)
+            self.assertIn("denied", stderr.getvalue())
+            self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_write_json_and_csv_are_atomic_with_trailing_newline(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            json_path = os.path.join(tmp, "pages.json")
+            csv_path = os.path.join(tmp, "pages.csv")
+            with open(json_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": 1}\n')
+            with open(csv_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write("keep\n")
+
+            with self.assertRaises(ValueError):
+                page_index.write_json(json_path, [], {"bad": float("nan")})
+            with open(json_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": 1}\n')
+
+            with mock.patch.object(page_index.csv.DictWriter, "writerow", side_effect=OSError("boom")):
+                with self.assertRaises(OSError):
+                    page_index.write_csv(csv_path, [{
+                        "offset": 0, "stored": 1, "inflated": 2, "version": 122,
+                        "page_count": 1, "counts": [0, 0, 0, 0], "span": 0,
+                        "complete": True, "q38_records": [],
+                    }])
+            with open(csv_path, encoding="utf-8") as f:
+                self.assertEqual(f.read(), "keep\n")
+            self.assertEqual(sorted(os.listdir(tmp)), ["pages.csv", "pages.json"])
+
+            page_index.write_json(json_path, [], {"pages": 0})
+            with open(json_path, "rb") as f:
+                raw = f.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r", raw)
+
 
 if __name__ == "__main__":
     unittest.main()

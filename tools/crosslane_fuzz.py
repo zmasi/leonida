@@ -1339,7 +1339,7 @@ def gpu_env(prog, emulate, dump, base=None, pc_tail=False):
 
 
 class HarnessError(RuntimeError):
-    """vk_compute_test did not give a result for one program: it hung, crashed or wrote no dump."""
+    """vk_compute_test did not give a usable result: it hung, failed or wrote no dump."""
 
 
 class Unpinned(RuntimeError):
@@ -1362,12 +1362,16 @@ def run_gpu(exe, spv, prog, work, emulate, pc_tail=False):
         raise HarnessError(f"vk_compute_test timed out after {GPU_TIMEOUT} s") from None
     import compute_fixture
     lanes = compute_fixture.unpinned_subgroup(r.stdout + r.stderr) if prog.wave == 32 else None
-    if lanes:
+    # Exit 77 is the harness's unsupported status; an unpinned subgroup is still a skip.
+    if lanes and r.returncode in (0, 77):
         raise Unpinned(f"the device can't run it at {lanes} lanes (vk_compute_test: compute subgroup size: {lanes} "
                        "not available)")
     if not os.path.exists(dump):
         detail = " ".join(f"{r.stdout}{r.stderr}".split())
         raise HarnessError(f"vk_compute_test gave no dump (exit {r.returncode}){': ' + detail if detail else ''}")
+    if r.returncode:
+        detail = " ".join(f"{r.stdout}{r.stderr}".split())
+        raise HarnessError(f"vk_compute_test failed (exit {r.returncode}){': ' + detail if detail else ''}")
     with open(dump, "rb") as f:
         data = f.read()
     return list(struct.unpack(f"<{len(data) // 4}I", data))

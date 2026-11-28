@@ -312,9 +312,114 @@ class CliTests(unittest.TestCase):
             self.assertEqual(saved["per_stage"]["vs"]["shaders"], 1)
             with open(out, encoding="utf-8") as f:
                 blob = f.read()
+            self.assertTrue(blob.endswith("\n"))
             self.assertNotIn(".s", blob)
             self.assertNotIn("ps_w64a", blob)
             self.assertIn("v_mbcnt_hi_u32_b32", blob)
+
+    def test_equal_count_opcodes_and_mask_word_sources_sort_deterministically(self):
+        # Emit tied opcodes in reverse alphabetical order so insertion order would not match (-count, name).
+        tied = fixture("ps_w64tied.s", [
+            "v_mbcnt_hi_u32_b32 v1, v2, v3",
+            "s_ff1_i32_b64 s0, exec",
+            "s_bcnt1_i32_b64 s1, exec",
+            "s_ff0_i32_b64 s2, s[4:5]",
+            "s_bcnt0_i32_b64 s3, s[4:5]",
+            "s_cbranch_execz 42",
+        ])
+        with tempfile.TemporaryDirectory() as src:
+            name, text = tied
+            with open(os.path.join(src, name), "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            ps = scan.scan_directory(src)["per_stage"]["ps"]
+        self.assertEqual(
+            list(ps["occurrences"].keys()),
+            sorted(ps["occurrences"].keys()),
+        )
+        self.assertEqual(
+            list(ps["mask_word_source"]["exec_vcc"].keys()),
+            ["s_bcnt1_i32_b64", "s_ff1_i32_b64"],
+        )
+        self.assertEqual(
+            list(ps["mask_word_source"]["other"].keys()),
+            ["s_bcnt0_i32_b64", "s_ff0_i32_b64"],
+        )
+
+    def test_empty_and_whitespace_out_rejected(self):
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as cwd:
+            old_cwd = os.getcwd()
+            try:
+                os.chdir(cwd)
+                for bad in ("", "   "):
+                    with self.subTest(out=bad):
+                        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                            with self.assertRaises(SystemExit) as cm:
+                                scan.main([src, "--out", bad])
+                        self.assertEqual(cm.exception.code, 2)
+                self.assertEqual(os.listdir(cwd), [])
+            finally:
+                os.chdir(old_cwd)
+
+    def test_unreadable_source_or_listing_fails_cleanly_without_leaking_shader_name(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as outdir:
+            secret = os.path.join(src, "ps_secret_name.s")
+            with open(secret, "w", encoding="utf-8", newline="\n") as f:
+                f.write(PS_W64_SENSITIVE[1])
+            err = io.StringIO()
+            with (mock.patch.object(scan, "parse_file", side_effect=PermissionError(13, "Permission denied", secret)),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(err)):
+                with self.assertRaises(SystemExit) as cm:
+                    scan.main([src])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("Permission denied", err.getvalue())
+            self.assertNotIn("ps_secret_name", err.getvalue())
+
+            err2 = io.StringIO()
+            with (mock.patch.object(scan, "scanned_paths", side_effect=PermissionError(13, "Permission denied", src)),
+                  contextlib.redirect_stdout(io.StringIO()),
+                  contextlib.redirect_stderr(err2)):
+                with self.assertRaises(SystemExit) as cm:
+                    scan.main([src, "--out", os.path.join(outdir, "report.json")])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertIn("Permission denied", err2.getvalue())
+
+    def test_out_write_is_atomic_and_preserves_existing_on_failure(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as outdir:
+            name, text = PS_W64_SENSITIVE
+            with open(os.path.join(src, name), "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+            out = os.path.join(outdir, "report.json")
+            prior = '{"previous": true}\n'
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write(prior)
+            stdout, stderr = io.StringIO(), io.StringIO()
+            with (mock.patch.object(scan.json, "dump", side_effect=OSError("disk full")),
+                  contextlib.redirect_stdout(stdout),
+                  contextlib.redirect_stderr(stderr)):
+                with self.assertRaises(SystemExit) as cm:
+                    scan.main([src, "--out", out])
+            self.assertEqual(cm.exception.code, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("disk full", stderr.getvalue())
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), prior)
+            self.assertEqual(os.listdir(outdir), ["report.json"])
+
+    def test_dangling_symlink_out_with_missing_target_parent_rejected(self):
+        with tempfile.TemporaryDirectory() as src, tempfile.TemporaryDirectory() as outdir:
+            link = os.path.join(outdir, "report.json")
+            missing_target = os.path.join(outdir, "no_such_subdir", "target.json")
+            try:
+                os.symlink(missing_target, link)
+            except OSError:
+                self.skipTest("symlinks not supported")
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as cm:
+                    scan.main([src, "--out", link])
+            self.assertEqual(cm.exception.code, 2)
 
 
 if __name__ == "__main__":

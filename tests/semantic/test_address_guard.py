@@ -142,6 +142,9 @@ class TableModel(unittest.TestCase):
         self.assertFalse(ag.passes(words, 0x80000, 0x6_0000_0000, 4))  # another chunk, nothing backed
         self.assertTrue(ag.passes(words, 0x80000, 0x7fffc, 4))         # the arena, no lookup
         self.assertFalse(ag.passes(words, 0x80000, 0x7fffc, 8))        # past the arena, page 0x80 unbacked
+        self.assertTrue(ag.passes(words, 0x80000, -0x2000, 4))         # third span: ends at 0 (wraps 2^48)
+        self.assertTrue(ag.passes(words, 0x80000, -0x1000, 4))
+        self.assertFalse(ag.passes(words, 0x80000, -0x3000, 4))
 
     def test_negative_offsets(self):
         """A buffer below the arena (LEONIDA_IMPORT_BELOW_ARENA=1): its 48-bit offset, sign-extended."""
@@ -149,6 +152,18 @@ class TableModel(unittest.TestCase):
         self.assertTrue(ag.passes(words, 0x80000, (-0x2000) & ag.MASK48, 4))
         self.assertFalse(ag.passes(words, 0x80000, (-0x1000) & ag.MASK48, 4))
         self.assertFalse(ag.passes(words, 0x80000, (-4) & ag.MASK48, 8))  # wraps through 0: not the arena
+
+    def test_wrapping_spans_match_runtime(self):
+        """Spans crossing 0 (negative signed or 48-bit unsigned) back both sides, matching AddressGuardTable::assign."""
+        for span in (((-0x1000) & ag.MASK48, 0x1000), (-0x1000, 0x1000)):
+            with self.subTest(span=span):
+                words = ag.table_words([span])
+                self.assertTrue(ag.page_backed(words, -0x1000))
+                self.assertTrue(ag.page_backed(words, 0))
+                self.assertFalse(ag.page_backed(words, -0x2000))
+                self.assertFalse(ag.page_backed(words, 0x1000))
+                self.assertTrue(ag.passes(words, 0x80000, -4, 8))
+                self.assertFalse(ag.passes(words, 0x80000, -0x1004, 8))
 
     def test_full_block_when_out_of_room(self):
         words = ag.table_words([(1 << 32, (1 << 32) + 1), (2 << 32, (2 << 32) + 1)], max_blocks=1)

@@ -499,6 +499,15 @@ class OracleTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_image(b"", self.manifest)
 
+    def test_rejects_nonfinite_channels_outside_the_probes(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                raw = bytearray(self.image())
+                # The red channel of covered pixel (1, 1) is outside the clear and UV probes.
+                struct.pack_into("<f", raw, (self.manifest["width"] + 1) * 16, value)
+                with self.assertRaisesRegex(AssertionError, "non-finite channel"):
+                    check_image(raw, self.manifest)
+
 
 class ProbeCoordinateTests(unittest.TestCase):
     rgba = (0.25, 0.75, 0.0, 1.0)
@@ -1036,6 +1045,29 @@ class CameraTests(unittest.TestCase):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+    def test_write_json_atomic_and_replace_failure_preserves_existing(self):
+        import first_light
+        import tempfile
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "manifest.json")
+            first_light._write_json_atomic(out, {"ok": True})
+            self.assertEqual(os.listdir(tmp), ["manifest.json"])
+            with open(out, "rb") as f:
+                raw = f.read()
+            self.assertTrue(raw.endswith(b"\n"))
+            self.assertNotIn(b"\r\n", raw)
+
+            with open(out, "w", encoding="utf-8", newline="\n") as f:
+                f.write('{"keep": true}\n')
+            with mock.patch.object(first_light, "replace_retry", side_effect=OSError("replace denied")):
+                with self.assertRaises(OSError):
+                    first_light._write_json_atomic(out, {"ok": False})
+            self.assertEqual(os.listdir(tmp), ["manifest.json"])
+            with open(out, encoding="utf-8") as f:
+                self.assertEqual(f.read(), '{"keep": true}\n')
 
 
 if __name__ == "__main__":

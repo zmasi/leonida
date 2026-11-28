@@ -68,6 +68,9 @@ for _p in (HERE, os.path.join(ROOT, "tests", "semantic")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import file_mode  # noqa: E402
+import replace_retry  # noqa: E402
+
 INF, NAN = float("inf"), float("nan")
 QNAN = 0x7FC00000
 MISS = 0xFFFFFFFF
@@ -245,6 +248,16 @@ class Kernel:
         return r
 
 
+_STORE_WIDTH = {
+    "global_store_byte": 1,
+    "global_store_short": 2,
+    "global_store_dword": 4,
+    "global_store_dwordx2": 8,
+    "global_store_dwordx3": 12,
+    "global_store_dwordx4": 16,
+}
+
+
 def check_kernel(k):
     """The memory rules above, from the kernel's bookkeeping and its lines; raises ValueError on a violation."""
     L = k.L
@@ -253,6 +266,8 @@ def check_kernel(k):
     for s, ws in k.slots.items():
         if not (0 <= s < NSLOTS and len(ws) * 4 == NODE_BYTES):
             raise ValueError(f"{k.label}: node slot {s}")
+    if not k.cases:
+        raise ValueError(f"{k.label}: no cases")
     for c in k.cases:
         if c["slot"] not in k.slots or not 0 <= c["type"] <= 3:
             raise ValueError(f"{k.label}: case {c['label']}")
@@ -265,19 +280,30 @@ def check_kernel(k):
     if len(bvh) != 2 * len(k.cases):
         raise ValueError(f"{k.label}: {len(bvh)} BVH instructions for {len(k.cases)} cases")
     guard = lines.index(f"s_cbranch_scc1 .Lbad{k.uid}")
-    if lines[guard - 2:guard] != ["s_and_b32 s22, s20, 0xff", "s_cmp_lg_u32 s22, 0"] or \
-            guard > lines.index(next(ln for ln in lines if ln.startswith("image_bvh"))):
+    if guard < 2 or lines[guard - 2:guard] != ["s_and_b32 s22, s20, 0xff", "s_cmp_lg_u32 s22, 0"] or \
+            guard > lines.index(bvh[0]):
         raise ValueError(f"{k.label}: no alignment guard before the first BVH instruction")
     for ln in lines:
         if ln.startswith(("s_mov_b32 s6", "s_mov_b32 s10")) and not ln.endswith(f"0x{DESC['w2']:08x}"):
             raise ValueError(f"{k.label}: descriptor w2 `{ln}`")
         if ln.startswith(("s_mov_b32 s7", "s_mov_b32 s11")) and not ln.endswith(f"0x{DESC['w3']:08x}"):
             raise ValueError(f"{k.label}: descriptor w3 `{ln}`")
-        if ln.startswith("global_store") and ln.split()[-1].startswith("offset:"):
-            off = int(ln.split(":")[-1])
-            base = ln.split(", ")[2].split()[0]
-            hi = {"s[20:21]": L["node"] + off + 16, "s[24:25]": L["ctl"] + off + 4,
-                  "s[2:3]": L["res"] + off + 16 + (k.threads - 1) * 256 * (k.threads == 64)}[base]
+        if ln.startswith("global_store"):
+            parts = ln.split()
+            width = _STORE_WIDTH.get(parts[0])
+            if width is None:
+                raise ValueError(f"{k.label}: unexpected store op `{ln}`")
+            off = int(parts[-1].split(":", 1)[1]) if parts[-1].startswith("offset:") else 0
+            if off < 0:
+                raise ValueError(f"{k.label}: negative store offset `{ln}`")
+            fields = ln.split(", ")
+            if len(fields) < 3:
+                raise ValueError(f"{k.label}: malformed store `{ln}`")
+            base = fields[2].split()[0]
+            if base not in ("s[20:21]", "s[24:25]", "s[2:3]"):
+                raise ValueError(f"{k.label}: unexpected store base `{ln}`")
+            hi = {"s[20:21]": L["node"] + off + width, "s[24:25]": L["ctl"] + off + width,
+                  "s[2:3]": L["res"] + off + width + (k.threads - 1) * 256 * (k.threads == 64)}[base]
             limit = {"s[20:21]": L["node_end"], "s[24:25]": L["ctl"] + 16, "s[2:3]": L["ctl"]}[base]
             if hi > limit:
                 raise ValueError(f"{k.label}: store past its region `{ln}`")
@@ -923,8 +949,12 @@ def compare(kernels, tr, hw):
                         x = got[i]["lanes"][ln] if ln is not None else got[i]
                         row.update(x)
                 vals = [row[x] for x in ("tr32", "tr64", "hw32", "hw64") if x in row]
-                row["status"] = "OK" if all(v == want for v in vals) else "MISMATCH"
-                if row["status"] != "OK":
+                if not vals:
+                    row["status"] = "SKIP"
+                elif all(v == want for v in vals):
+                    row["status"] = "OK"
+                else:
+                    row["status"] = "MISMATCH"
                     bad += 1
                     print(f"[MISMATCH] {k.label}: {c['label']}" + (f", lane {ln}" if ln is not None else ""))
                     for x in ("rule", "tr32", "tr64", "hw32", "hw64"):
@@ -965,19 +995,40 @@ def self_test():
     return 0
 
 
+def _write_text_atomic(path, text):
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+    mode = file_mode.published_mode(path)
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+                "w", encoding="utf-8", newline="\n", dir=parent,
+                prefix=f".{os.path.basename(path)}.", suffix=".tmp", delete=False) as f:
+            tmp_path = f.name
+            f.write(text)
+        os.chmod(tmp_path, mode)
+        replace_retry.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+
+
 def write_kernels(kernels, out_dir):
     os.makedirs(out_dir, exist_ok=True)
     for k in kernels:
-        with open(os.path.join(out_dir, k.label + ".s"), "w", encoding="utf-8", newline="\n") as f:
-            f.write("\n".join(k.lines()) + "\n")
+        text = "\n".join(k.lines()) + "\n"
+        _write_text_atomic(os.path.join(out_dir, k.label + ".s"), text)
         tab = dict(label=k.label, uid=k.uid, threads=k.threads, wave=k.wave, nsa=k.nsa, layout=k.L,
                    lane_offsets=k.lane_offsets, desc={x: f"0x{v:08x}" for x, v in DESC.items()},
                    nodes={str(s): [f"0x{w:08x}" for w in ws] for s, ws in sorted(k.slots.items())},
                    cases=[dict(c, ray=[f"0x{w:08x}" for w in c["ray"]], node32=f"0x{k.node32(c):x}",
                                rule=[f"0x{w:08x}" for w in rule_words(k.slots[c["slot"]], c["type"], c["ray"])])
                           for c in k.cases])
-        with open(os.path.join(out_dir, k.label + ".json"), "w", encoding="utf-8", newline="\n") as f:
-            json.dump(tab, f, indent=1)
+        _write_text_atomic(os.path.join(out_dir, k.label + ".json"), json.dumps(tab, indent=1, allow_nan=False) + "\n")
         print(f"{k.label}: {len(k.cases)} cases, lines sha256 "
               f"{hashlib.sha256(chr(10).join(k.lines()).encode('utf-8')).hexdigest()[:16]}")
     return 0
@@ -1009,14 +1060,22 @@ def main(argv=None):
     if args.json_out is not None and (not args.json_out.strip() or os.path.isdir(args.json_out)):
         print(f"error: --json {args.json_out.strip() or '(empty)'} is not a file path", file=sys.stderr)
         return 2
+    if args.write_kernels is not None and (not args.write_kernels.strip() or os.path.isfile(args.write_kernels)):
+        print(f"error: --write-kernels {args.write_kernels.strip() or '(empty)'} is not a directory path",
+              file=sys.stderr)
+        return 2
     if args.list:
         for k in kernels:
             print(f"{k.label:15} threads={k.threads:2} wave={k.wave} nsa={str(k.nsa):5} cases={len(k.cases)}")
             for c in k.cases:
                 print(f"    {c['label']}")
         return 0
-    if args.write_kernels:
-        return write_kernels(kernels, args.write_kernels)
+    if args.write_kernels is not None:
+        try:
+            return write_kernels(kernels, args.write_kernels)
+        except (OSError, ValueError) as e:
+            print(f"error: cannot write --write-kernels {args.write_kernels}: {e}", file=sys.stderr)
+            return 2
     tr = run_translator(kernels) if "translator" in backends else None
     hw, device = None, None
     if "hw" in backends:
@@ -1027,7 +1086,11 @@ def main(argv=None):
             print(f"hardware oracle unavailable: {e}", file=sys.stderr)
             return 77
         try:
-            if asm.family(oracle.arch) != "gfx10":
+            try:
+                fam = asm.family(oracle.arch)
+            except ValueError:
+                fam = None
+            if fam != "gfx10":
                 print(f"SKIP: {oracle.arch} is not GFX10 (RDNA1/RDNA2)", file=sys.stderr)
                 return 77
             device = getattr(oracle, "device", oracle.arch)
@@ -1040,20 +1103,24 @@ def main(argv=None):
         finally:
             oracle.close()
     rows, bad = compare(kernels, tr, hw)
+    skipped = sum(r["status"] == "SKIP" for r in rows)
+    matched = len(rows) - bad - skipped
     srcs = [x for x, v in (("translator", tr), ("hardware", hw)) if v is not None]
+    skip_note = f", {skipped} skipped" if skipped else ""
     print(f"summary: {len(rows)} results ({sum(r['lane'] is None for r in rows)} single-lane) of {len(kernels)} "
-          f"kernels, {' and '.join(srcs)} against the rule, both forms: {len(rows) - bad} match, {bad} mismatch")
+          f"kernels, {' and '.join(srcs)} against the rule, both forms: {matched} match, {bad} mismatch{skip_note}")
     if args.json_out is not None:
-        parent = os.path.dirname(os.path.abspath(args.json_out))
         try:
-            os.makedirs(parent, exist_ok=True)
-            with open(args.json_out, "w", encoding="utf-8", newline="\n") as f:
-                json.dump({"device": device, "rows": rows}, f, indent=1)
-                f.write("\n")
-        except OSError as e:
+            _write_text_atomic(args.json_out, json.dumps({"device": device, "rows": rows}, indent=1,
+                                                         allow_nan=False) + "\n")
+        except (OSError, ValueError) as e:
             print(f"error: cannot write --json {args.json_out}: {e}", file=sys.stderr)
             return 2
-    return 1 if bad else 0
+    if bad:
+        return 1
+    if rows and skipped == len(rows):
+        return 77
+    return 0
 
 
 if __name__ == "__main__":

@@ -367,5 +367,67 @@ class DelayImportCallSitesTest(unittest.TestCase):
                                    thunks=[DELAY_THUNK], call=DELAY_CALLS, jmp=[DELAY_JMP])
 
 
+
+class DirectSlotCallsTest(unittest.TestCase):
+    def test_direct_call_slot_counted_without_thunk(self):
+        # Image where XMemBar's thunk is wiped, but an instruction calls its IAT slot directly via FF 15.
+        data = bytearray(build_image([]))
+        data[THUNK_BAR:THUNK_BAR + 6] = b"\x90" * 6  # Nop out the thunk
+        call_rva = TEXT_RVA + 0x150
+        data[call_rva:call_rva + 6] = b"\xff\x15" + rel32(call_rva + 6, IAT_BAR)
+
+        out = import_call_sites.call_sites(bytes(data))["imports"]
+        bar = out["xmem.dll!XMemBar"]
+        self.assertEqual(bar["thunks"], [])
+        self.assertEqual(bar["call"], [call_rva])
+        self.assertEqual(bar["jmp"], [])
+
+    def test_direct_call_and_thunk_call_combined_and_sorted(self):
+        # XMemFoo called both through its thunk (at 0x160) and directly via FF 15 (at 0x120).
+        data = bytearray(build_image([(TEXT_RVA + 0x160, 0xE8, THUNK_FOO)]))
+        direct_rva = TEXT_RVA + 0x120
+        data[direct_rva:direct_rva + 6] = b"\xff\x15" + rel32(direct_rva + 6, IAT_FOO)
+
+        out = import_call_sites.call_sites(bytes(data))["imports"]
+        foo = out["xmem.dll!XMemFoo"]
+        self.assertEqual(foo["thunks"], [THUNK_FOO])
+        self.assertEqual(foo["call"], [direct_rva, TEXT_RVA + 0x160])
+        self.assertEqual(foo["jmp"], [])
+
+    def test_direct_call_to_non_slot_is_ignored(self):
+        data = bytearray(build_image([]))
+        call_rva = TEXT_RVA + 0x180
+        data[call_rva:call_rva + 6] = b"\xff\x15" + rel32(call_rva + 6, IDATA_RVA + 0x500)
+
+        out = import_call_sites.call_sites(bytes(data))["imports"]
+        for entry in out.values():
+            self.assertNotIn(call_rva, entry["call"])
+
+    def test_direct_call_truncated_at_section_end(self):
+        data = bytearray(build_image([]))
+        # Place FF 15 in the last 4 bytes of .text so s + 6 > len(blob)
+        cut = TEXT_RVA + 0x1000 - 4
+        data[cut:cut + 2] = b"\xff\x15"
+
+        out = import_call_sites.call_sites(bytes(data))["imports"]
+        self.assertIn("xmem.dll!XMemFoo", out)
+
+    def test_cli_output_includes_direct_slot_calls(self):
+        data = bytearray(build_image([]))
+        call_rva = TEXT_RVA + 0x150
+        data[call_rva:call_rva + 6] = b"\xff\x15" + rel32(call_rva + 6, IAT_BAR)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "image.exe")
+            with open(path, "wb") as f:
+                f.write(data)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = import_call_sites.main([path, "--dll", "xmem.dll", "--json"])
+            self.assertEqual(rc, 0)
+            parsed = json.loads(out.getvalue())
+            self.assertEqual(parsed["imports"]["xmem.dll!XMemBar"]["call"], [hex(call_rva)])
+
+
 if __name__ == "__main__":
     unittest.main()

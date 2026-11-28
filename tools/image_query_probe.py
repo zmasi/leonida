@@ -308,8 +308,7 @@ def write_report(path, report):
         ) as f:
             tmp = f.name
             json.dump(report, f, indent=1)
-        if os.name != "nt":
-            os.chmod(tmp, published_mode(destination))
+        os.chmod(tmp, published_mode(destination))
         replace_retry(tmp, destination)
     except BaseException:
         if tmp is not None:

@@ -36,12 +36,16 @@ Usage: `python -I tools/wave64_graphics_scan.py --help` lists the options.
 import argparse
 import json
 import os
+import stat
 import sys
+import tempfile
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+from file_mode import published_mode  # noqa: E402
 import fssm_header  # noqa: E402
 import rdna2spirv  # noqa: E402  (same directory; WAVE64_RE, stage_of, base_op)
+from replace_retry import replace as replace_retry  # noqa: E402
 from report_paths import same_report_path  # noqa: E402
 from shader_ir import parse_file  # noqa: E402
 
@@ -143,10 +147,50 @@ def scan_directory(disasm):
             other["wave64"] += int(wave64)
     for stage in per_stage:
         bucket = per_stage[stage]
-        bucket["occurrences"] = dict(sorted(bucket["occurrences"].items(), key=lambda kv: -kv[1]))
-        bucket["mask_word_source"] = {part: dict(sorted(cnt.items(), key=lambda kv: -kv[1]))
+        bucket["occurrences"] = dict(sorted(bucket["occurrences"].items(), key=lambda kv: (-kv[1], kv[0])))
+        bucket["mask_word_source"] = {part: dict(sorted(cnt.items(), key=lambda kv: (-kv[1], kv[0])))
                                       for part, cnt in bucket["mask_word_source"].items()}
     return {"per_stage": per_stage, "other_stages": other}
+
+
+def _os_error_detail(exc):
+    """Reason text for an OSError without echoing a scanned shader's file name."""
+    if exc.strerror:
+        return exc.strerror
+    return type(exc).__name__ if exc.filename is not None else str(exc)
+
+
+def _write_json_report(path, report):
+    """Publish complete JSON atomically, or leave any previous report intact on failure."""
+    destination = os.path.realpath(path)
+    out_dir = os.path.dirname(destination) or "."
+    try:
+        mode = os.stat(destination).st_mode
+    except FileNotFoundError:
+        mode = None
+    if mode is not None and not stat.S_ISREG(mode):
+        with open(destination, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(report, f, indent=1, allow_nan=False)
+            f.write("\n")
+        return
+    if mode is not None:
+        os.close(os.open(destination, os.O_WRONLY))
+    staged = tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", newline="\n", delete=False,
+        dir=out_dir, prefix=".wave64_graphics_scan-", suffix=".tmp",
+    )
+    try:
+        with staged:
+            json.dump(report, staged, indent=1, allow_nan=False)
+            staged.write("\n")
+        if os.name != "nt":
+            os.chmod(staged.name, published_mode(destination))
+        replace_retry(staged.name, destination)
+    finally:
+        try:
+            os.unlink(staged.name)
+        except FileNotFoundError:
+            pass
 
 
 def main(argv=None) -> int:
@@ -157,12 +201,17 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     if not os.path.isdir(args.src):
         ap.error(f"not a directory: {args.src}")
-    if args.out:
+    if args.out is not None:
+        if not args.out.strip():
+            ap.error("--out must not be empty")
         if os.path.isdir(args.out):
             ap.error(f"{args.out} is a directory, not a JSON file")
         out_dir = os.path.dirname(os.path.abspath(args.out))
         if not os.path.isdir(out_dir):
             ap.error(f"output directory does not exist: {out_dir}")
+        real_dir = os.path.dirname(os.path.realpath(args.out))
+        if not os.path.isdir(real_dir):
+            ap.error(f"output directory does not exist: {real_dir}")
         # --out must not replace the source directory or any input the scan reads (each scanned listing,
         # its FSSM header, and the carve index), even through a hardlink or symlink alias the
         # name check alone would miss. samefile also catches a case-only spelling on Windows and macOS's
@@ -170,11 +219,22 @@ def main(argv=None) -> int:
         # rather than statting N listings for nothing.
         if same_report_path(args.src, args.out):
             ap.error("output must not overwrite the source directory")
-        listings = scanned_paths(args.src)
+        try:
+            listings = scanned_paths(args.src)
+        except OSError as exc:
+            ap.error(f"cannot read shader listings in {args.src}: {_os_error_detail(exc)}")
         for path in [*listings, *metadata_paths(listings)]:
             if same_report_path(path, args.out):
                 ap.error(f"output must not overwrite an input it scans: {path}")
-    report = scan_directory(args.src)
+    try:
+        report = scan_directory(args.src)
+    except OSError as exc:
+        ap.error(f"cannot read shader listings in {args.src}: {_os_error_detail(exc)}")
+    if args.out is not None:
+        try:
+            _write_json_report(args.out, report)
+        except OSError as exc:
+            ap.error(f"cannot write {args.out}: {_os_error_detail(exc)}")
     for stage, b in report["per_stage"].items():
         occ = ", ".join("%s x%d" % (op, n) for op, n in b["occurrences"].items()) or "none"
         print("%s: %d shaders, %d wave64, %d with a selected opcode (candidates: %s)"
@@ -186,9 +246,7 @@ def main(argv=None) -> int:
             print("    mask-word sources (%s)" % "; ".join(parts))
     o = report["other_stages"]
     print("other stages: %d shaders, %d wave64 (not counted)" % (o["shaders"], o["wave64"]))
-    if args.out:
-        with open(args.out, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(report, f, indent=1)
+    if args.out is not None:
         print("wrote %s" % args.out)
     return 0
 

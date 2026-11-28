@@ -131,9 +131,12 @@ def summarize(run: str, limit_seconds: int | None = None, top: int = 12) -> dict
             exit_event = kind, event.get("code") if type(event.get("code")) is int else None
 
     code = _read_int(os.path.join(run, "exit_code"))
+    seconds = _read_int(os.path.join(run, "seconds"))
+    # GNU timeout also forwards a child's exit status and can report a SIGKILL before its deadline.
+    finished_before_limit = limit_seconds is not None and seconds is not None and 0 <= seconds < limit_seconds
     if code is None:
         end = "no exit code recorded: the run did not start or the session ended first"
-    elif code in TIMEOUT_CODES:
+    elif code in TIMEOUT_CODES and not finished_before_limit:
         end = f"time limit{f' ({limit_seconds} s)' if limit_seconds else ''} reached, stopped (exit {code})"
     elif exit_event and exit_event[0] == "exit":
         end = f"guest returned {exit_event[1]} (process exit {code})"
@@ -143,7 +146,7 @@ def summarize(run: str, limit_seconds: int | None = None, top: int = 12) -> dict
         end = f"process exit {code} (0x{code & 0xFFFFFFFF:08x}), no exit event in the startup trace"
 
     return {
-        "seconds": _read_int(os.path.join(run, "seconds")),
+        "seconds": seconds,
         "exit_code": code,
         "end": end,
         "exceptions": sum(exception_codes.values()),
