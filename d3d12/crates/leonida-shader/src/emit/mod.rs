@@ -1268,7 +1268,11 @@ fn emit_program(
         }
         _ => EarlyDepth::NotAsked,
     };
-    let l = lower::lower(&lower::Parts {
+    let rsrc1 = c
+        .part(FourCC::DXIL)
+        .or(c.part(FourCC::ACCC))
+        .and_then(|part| crate::native::fspx_rsrc1(part.data));
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -1278,7 +1282,11 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    let l = match rsrc1 {
+        Some(r1) => lower::with_pgm_rsrc1(Some(r1), || lower::lower(&parts))?,
+        None => lower::lower(&parts)?,
+    };
     let counted = match early {
         EarlyDepth::NotAsked => None,
         EarlyDepth::Given => Some(0),
@@ -1575,9 +1583,10 @@ mod tests {
             let io = crate::io::raise(&p, &native).unwrap();
             super::emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
         };
-        let (Some(low), Some(high)) = (
+        let (Some(low), Some(high), Some(high_flush)) = (
             dump_dxil(&dump(false, 0, false)),
             dump_dxil(&dump(true, 1, true)),
+            dump_dxil(&super::lower::with_pgm_rsrc1(Some(0), || dump(true, 1, true))),
         ) else {
             eprintln!("no dxc.exe; DXIL check skipped");
             return;
@@ -1586,11 +1595,16 @@ mod tests {
         assert!(low.contains("-65536"), "low write keeps the high half");
         // The high-half write shifts the result up by 16.
         assert!(high.contains("shl i32"), "op_sel[3] writes the high half");
-        // omod mul:2 and clamp (dx.op.unary.f32, opcode 7) are applied.
-        assert!(high.contains("2.000000e+00"), "omod multiplies by two");
+        // Console default `denorm_mode_16_64 = 3` ignores f16 `omod` while keeping `clamp`;
+        // flushed `denorm_mode_16_64 = 0, IEEE = 0` scales by two before `clamp`.
+        assert!(!high.contains("2.000000e+00"), "console default ignores f16 omod");
         assert!(
             high.contains("dx.op.unary.f32(i32 7"),
             "clamp saturates the result"
+        );
+        assert!(
+            high_flush.contains("2.000000e+00") && high_flush.contains("dx.op.unary.f32(i32 7"),
+            "denorm_mode_16_64 = 0, IEEE = 0 multiplies by two before clamp"
         );
         assert!(!low.contains("dx.op.unary.f32(i32 7"));
     }

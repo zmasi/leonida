@@ -1578,6 +1578,43 @@ pub(super) fn with_first_half_pairs<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
+thread_local! {
+    /// `COMPUTE_PGM_RSRC1` of the `FSPX` (`ACCC`) program being lowered, when
+    /// the container carries one ([`with_pgm_rsrc1`]). `None` for `FSSM` stages,
+    /// which record no `PGM_RSRC1` and run under the console's default `MODE`
+    /// (`FLOAT_MODE = 0xC0`: `denorm_mode_16_64 = 3`, `IEEE = 0`).
+    static PGM_RSRC1: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Runs `f` with `PGM_RSRC1` set to `rsrc1` for this thread, restoring the
+/// previous setting even if `f` unwinds.
+pub(super) fn with_pgm_rsrc1<R>(rsrc1: Option<u32>, f: impl FnOnce() -> R) -> R {
+    struct Reset(Option<u32>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PGM_RSRC1.set(self.0);
+        }
+    }
+    let _reset = Reset(PGM_RSRC1.replace(rsrc1));
+    f()
+}
+
+/// Whether VOP3 / SDWA `omod` (`mul:2`, `mul:4`, `div:2`) scales an `f16`
+/// destination. Measured on RDNA2 (`gfx1036`, `docs/shader_validation.md`
+/// SHADER-135, `docs/design.md`), silicon applies `f16` `omod` only when
+/// `IEEE = 0` (`COMPUTE_PGM_RSRC1` bit 23) and `denorm_mode_16_64 = 0`
+/// (`FLOAT_MODE[7:6]`, bits [19:18]); under console default `FLOAT_MODE = 0xC0`
+/// (`denorm_mode_16_64 = 3`, including all 29 shipped `FSPX` programs in
+/// `docs/fspx.md`), `omod` is ignored while `clamp` still saturates `[0, 1]`.
+// shortcut: `FSSM` records carry no `PGM_RSRC1` (defaulting to console
+// `denorm_mode_16_64 = 3`), dynamic `s_denorm_mode` (`ir.rs`) is not modelled,
+// and SDWA `f16` `omod` follows the VOP3 gate by design.
+fn f16_omod_enabled() -> bool {
+    PGM_RSRC1
+        .get()
+        .is_some_and(|r1| (r1 >> 18 & 3) == 0 && (r1 >> 23 & 1) == 0)
+}
+
 /// How many exchanges of a console wave64 program in two host waves get dwords of their own
 /// (`LEONIDA_EXCHANGE_SITES`, 24 unless set; 0: all share one pair, as before). An exchange
 /// that runs once per thread (no loop around it) needs one group barrier, after the stores
@@ -9905,18 +9942,6 @@ impl<'a> Lower<'a> {
                 let r = self.s.m.bin(c, Bin::Or, lo, hi);
                 int(self, r)
             }
-            "v_cvt_f16_f32" if v.opsel == 0 => {
-                // Rounded to nearest even (the MODE default) into the low half.
-                let a = f(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]);
-                let Some(Operand::Vector { reg, .. }) = v.dst else {
-                    return Err("a 16-bit result outside a VGPR");
-                };
-                let r = self.low_half(inst, reg, r);
-                int(self, r)
-            }
             "v_pack_b32_f16" => {
                 // Two f16 sources (op_sel: their high halves; abs and neg on
                 // the sign bit) into the low and high half.
@@ -10718,10 +10743,17 @@ impl<'a> Lower<'a> {
             return self.write_f(inst, f, guard);
         }
         let float_result = |l: &mut Self, mut f: V| -> Result<(), Why> {
-            // Under RDNA2 console MODE (`denorm_mode_16_64 = 3`, `IEEE = 0`,
-            // `docs/shader_validation.md` SHADER-135), silicon ignores `omod`
-            // (`mul:2`, `mul:4`, `div:2`) on `f16` destinations while `clamp`
-            // still saturates to `[0, 1]`.
+            // RDNA2 silicon scales `f16` destinations by `omod` (`mul:2`, `mul:4`,
+            // `div:2`) before `[0, 1]` `clamp` only when `f16_omod_enabled()` holds
+            // (`IEEE = 0` and `denorm_mode_16_64 = 0`, SHADER-135); under console
+            // default `denorm_mode_16_64 = 3` `omod` is ignored while `clamp` stays.
+            // shortcut: see `f16_omod_enabled` (`FSSM` lacks `PGM_RSRC1`, `s_denorm_mode`
+            // is unmodelled, and `omod` scales in `f32` before narrowing to `f16`).
+            if v.omod != 0 && f16_omod_enabled() {
+                let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(v.omod)];
+                let k = l.s.m.f32(factor.to_bits());
+                f = l.s.m.bin(l.cur, Bin::Mul, f, k);
+            }
             if v.clamp {
                 f = l.unary(7, f);
             }
@@ -11949,11 +11981,12 @@ impl<'a> Lower<'a> {
                 } else if f16 {
                     let mut f = half(self, h)?.ok_or("a packed input half no element holds")?;
                     if let Fields::Valu(v) = &inst.fields {
-                        // omod, then clamp, before the one rounding to 16 bits; op_sel[3]
-                        // picks the destination half (Leonida e29391f: the low half was
-                        // always written, the high one's value never arrived).
+                        // `omod` (gated on `f16_omod_enabled()`, SHADER-135), then `clamp`,
+                        // before rounding to 16 bits; `op_sel[3]` picks the destination half
+                        // (Leonida e29391f: the low half was always written, the high one's
+                        // value never arrived).
                         let (omod, clamp) = (v.omod, v.clamp);
-                        if omod != 0 {
+                        if omod != 0 && f16_omod_enabled() {
                             let factor = [1.0f32, 2.0, 4.0, 0.5][usize::from(omod)];
                             let k = self.s.m.f32(factor.to_bits());
                             f = self.s.m.bin(c, Bin::Mul, f, k);

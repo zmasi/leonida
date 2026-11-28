@@ -1420,42 +1420,47 @@ fn bfe_signed_and_unsigned_match_rdna2() {
 
 #[test]
 fn f16_omod_applies_before_clamp() {
-    // Under RDNA2 console MODE (`denorm_mode_16_64 = 3`, `IEEE = 0`, `SHADER-135`),
-    // VOP3 `omod` (`mul:2`, `mul:4`, `div:2`) is ignored on `f16` destinations while
-    // `clamp` still saturates to `[0.0, 1.0]`.
-    let mul2 = build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 1, false));
-    let mul4 = build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 2, false));
-    let div2 = build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 3, false));
-    let div2_clamp = build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 3, true));
+    // Under `denorm_mode_16_64 = 0, IEEE = 0` (`COMPUTE_PGM_RSRC1` `FLOAT_MODE[7:6] = 0`,
+    // bit 23 = 0), VOP3 `omod` (`mul:2`, `mul:4`, `div:2`) scales `f16` results before
+    // `clamp` saturates `[0.0, 1.0]`. Console default `denorm_mode_16_64 = 3` is covered
+    // in `f16_omod_tests`.
+    let (mul2, mul4, div2, div2_clamp) = lower::with_pgm_rsrc1(Some(0), || {
+        (
+            build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 1, false)),
+            build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 2, false)),
+            build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 3, false)),
+            build_valu_cs(&vop3_mod(0x132, 0, vgpr(1), vgpr(2), 0, 0, 0, 3, true)),
+        )
+    });
 
-    // f16 constants: 0.25=0x3400, 0.5=0x3800, 0.75=0x3A00, 1.0=0x3C00, 1.5=0x3E00, 3.0=0x4200, -0.5=0xB800
+    // f16 constants: 0.25=0x3400, 0.5=0x3800, 0.75=0x3A00, 1.0=0x3C00, 1.5=0x3E00, 2.0=0x4000, -0.5=0xB800
     run_cases(
         &mul2,
-        &[[0x3400, 0x3800, 0, 0]], // 0.25 + 0.5 = 0.75 (0x3A00, mul:2 ignored)
+        &[[0x3400, 0x3800, 0, 0]], // (0.25 + 0.5) * 2 = 1.5 (0x3E00)
         |backend, _, _, got| {
-            assert_eq!(got as u16, 0x3A00, "{backend}: v_add_f16 mul:2");
+            assert_eq!(got as u16, 0x3E00, "{backend}: v_add_f16 mul:2");
         },
     );
     run_cases(
         &mul4,
-        &[[0x3400, 0x3400, 0, 0]], // 0.25 + 0.25 = 0.5 (0x3800, mul:4 ignored)
+        &[[0x3400, 0x3400, 0, 0]], // (0.25 + 0.25) * 4 = 2.0 (0x4000)
         |backend, _, _, got| {
-            assert_eq!(got as u16, 0x3800, "{backend}: v_add_f16 mul:4");
+            assert_eq!(got as u16, 0x4000, "{backend}: v_add_f16 mul:4");
         },
     );
     run_cases(
         &div2,
-        &[[0x3E00, 0x3E00, 0, 0]], // 1.5 + 1.5 = 3.0 (0x4200, div:2 ignored)
+        &[[0x3E00, 0x3E00, 0, 0]], // (1.5 + 1.5) * 0.5 = 1.5 (0x3E00)
         |backend, _, _, got| {
-            assert_eq!(got as u16, 0x4200, "{backend}: v_add_f16 div:2");
+            assert_eq!(got as u16, 0x3E00, "{backend}: v_add_f16 div:2");
         },
     );
-    // (0.75 + 0.75) = 1.5; with `div:2` ignored under `denorm_mode_16_64 = 3`, `clamp`
-    // saturates 1.5 to 1.0 (0x3C00) rather than halving to 0.75 (0x3A00).
+    // Critical order check: (0.75 + 0.75) * 0.5 = 0.75 (0x3A00) when omod runs BEFORE clamp;
+    // if clamp ran first, (0.75 + 0.75)=1.5 -> clamped to 1.0 -> *0.5 = 0.5 (0x3800, WRONG).
     let clamp_cases: &[(u16, u16, u16)] = &[
-        (0x3A00, 0x3A00, 0x3C00), // 0.75 + 0.75 = 1.5 -> clamped to 1.0
-        (0x3400, 0x3800, 0x3A00), // 0.25 + 0.50 = 0.75 -> in-range 0.75
-        (0xB800, 0xB800, 0x0000), // -0.5 + -0.5 = -1.0 -> clamped to +0.0
+        (0x3A00, 0x3A00, 0x3A00), // (0.75 + 0.75) * 0.5 = 0.75 -> clamped [0,1] = 0.75
+        (0x3E00, 0x3E00, 0x3C00), // (1.5 + 1.5) * 0.5 = 1.5 -> clamped [0,1] = 1.0
+        (0xB800, 0xB800, 0x0000), // (-0.5 + -0.5) * 0.5 = -0.5 -> clamped [0,1] = +0.0
     ];
     let inputs: Vec<[u32; 4]> = clamp_cases
         .iter()

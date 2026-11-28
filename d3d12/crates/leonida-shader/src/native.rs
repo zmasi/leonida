@@ -565,6 +565,28 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
     })
 }
 
+/// `COMPUTE_PGM_RSRC1` (`PACKET_RSRC1`) of an `FSPX` (`ACCC`) part, if `part`
+/// carries a valid `FSPX` dispatch packet (`kind 0`). `FSSM` blobs record no
+/// `PGM_RSRC1` and return `None`.
+pub fn fspx_rsrc1(part: &[u8]) -> Option<u32> {
+    if !part.starts_with(b"FSPX") || u32_at(part, 4).ok()? != FSPX_VERSION {
+        return None;
+    }
+    let count = u32_at(part, 8).ok()? as usize;
+    if count > MAX_XDAT_ENTRIES {
+        return None;
+    }
+    for i in 0..count {
+        let at = FSPX_HEADER + 16 * i;
+        if u32_at(part, at).ok()? == FSPX_PACKET {
+            let (offset, size) = (u32_at(part, at + 4).ok()?, u32_at(part, at + 8).ok()?);
+            let packet = bytes(part, offset.into(), size.into())?;
+            return u32_at(packet, PACKET_RSRC1).ok();
+        }
+    }
+    None
+}
+
 fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
     data.get(at..at + 2)
         .map(|b| u16::from_le_bytes([b[0], b[1]]))
@@ -1250,5 +1272,62 @@ mod tests {
         let mut bad_adler = good.clone();
         *bad_adler.last_mut().unwrap() ^= 1;
         assert!(unpack(&bad_adler).is_err());
+    }
+
+    #[test]
+    fn reads_fspx_pgm_rsrc1_and_ignores_fssm_and_corrupt_fspx() {
+        let rsrc1 = (0xC0u32 << 12) | (1 << 21) | 3;
+        let code = [0xBF81_0000u32]; // s_endpgm
+        let mut packet = [0u8; 0x1c];
+        packet[PACKET_THREADS..PACKET_THREADS + 6].copy_from_slice(&[1, 0, 1, 0, 1, 0]);
+        packet[PACKET_FLAGS..PACKET_FLAGS + 2].copy_from_slice(&PACKET_WAVE32.to_le_bytes());
+        packet[PACKET_RSRC1..PACKET_RSRC1 + 4].copy_from_slice(&rsrc1.to_le_bytes());
+        packet[PACKET_RSRC2..PACKET_RSRC2 + 4].copy_from_slice(&(2u32 << 1).to_le_bytes());
+
+        let mut meta = vec![0u8; FSPX_RECORDS + FSPX_RECORD];
+        meta[0..4].copy_from_slice(&0x403u32.to_le_bytes());
+        meta[8..12].copy_from_slice(&(code.len() as u32).to_le_bytes());
+        meta[FSPX_RECORDS] = 0x43;
+
+        let dir_end = FSPX_HEADER + 16 * 3;
+        let code_off = dir_end + packet.len();
+        let meta_off = code_off + code.len() * 4;
+        let total = meta_off + meta.len();
+
+        let mut fspx = Vec::with_capacity(total);
+        fspx.extend_from_slice(b"FSPX");
+        fspx.extend_from_slice(&FSPX_VERSION.to_le_bytes());
+        fspx.extend_from_slice(&3u32.to_le_bytes());
+        fspx.extend_from_slice(&(total as u32).to_le_bytes());
+        for (kind, off, len) in [
+            (FSPX_PACKET, dir_end, packet.len()),
+            (FSPX_CODE, code_off, code.len() * 4),
+            (FSPX_METADATA, meta_off, meta.len()),
+        ] {
+            fspx.extend_from_slice(&kind.to_le_bytes());
+            fspx.extend_from_slice(&(off as u32).to_le_bytes());
+            fspx.extend_from_slice(&(len as u32).to_le_bytes());
+            fspx.extend_from_slice(&0u32.to_le_bytes());
+        }
+        fspx.extend_from_slice(&packet);
+        for w in code {
+            fspx.extend_from_slice(&w.to_le_bytes());
+        }
+        fspx.extend_from_slice(&meta);
+
+        assert_eq!(fspx_rsrc1(&fspx), Some(rsrc1));
+        assert!(fspx_program(&fspx).is_ok());
+
+        let fssm_part = part(&[(KIND_NATIVE, &xbch(&fssm(&[(HwStage::Cs, &VS_CODE)])))]);
+        assert_eq!(fspx_rsrc1(&fssm_part), None);
+        assert_eq!(fspx_rsrc1(&fspx[..12]), None);
+
+        let mut bad_ver = fspx.clone();
+        bad_ver[4] = 9;
+        assert_eq!(fspx_rsrc1(&bad_ver), None);
+
+        let mut bad_off = fspx.clone();
+        bad_off[FSPX_HEADER + 4..FSPX_HEADER + 8].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert_eq!(fspx_rsrc1(&bad_off), None);
     }
 }
