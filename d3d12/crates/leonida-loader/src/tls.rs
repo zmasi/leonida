@@ -31,27 +31,63 @@ const THUNK_SIZE: usize = 32;
 /// `base` is the image `info` describes, mapped and not yet running.
 pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
     let Some(tls) = &info.tls else { return Ok(0) };
-    // SAFETY: the TLS directory and the index it points to are in the image;
-    // the OS relocated the pointer and wrote the index.
-    let index_at = unsafe {
-        ((base + tls.directory_rva as usize + TLS64_ADDRESS_OF_INDEX) as *const usize).read()
-    } as *mut u32;
-    // SAFETY: as above.
-    let index = unsafe { index_at.read() };
+    if base == 0 {
+        bail!("cannot redirect TLS at null image base");
+    }
+    let image_size = info.size_of_image as usize;
+    let image_end = base
+        .checked_add(image_size)
+        .ok_or_else(|| anyhow::anyhow!("image range overflows address space"))?;
+    let index_ptr_end = (tls.directory_rva as usize)
+        .checked_add(TLS64_ADDRESS_OF_INDEX + size_of::<usize>())
+        .filter(|&end| end <= image_size)
+        .ok_or_else(|| anyhow::anyhow!("TLS directory AddressOfIndex lies outside image"))?;
+    let index_ptr_slot = base + index_ptr_end - size_of::<usize>();
+    // SAFETY: `index_ptr_slot..index_ptr_slot+8` lies within `[base, image_end)`.
+    let index_addr = unsafe { (index_ptr_slot as *const usize).read_unaligned() };
+    if index_addr < base
+        || index_addr
+            .checked_add(size_of::<u32>())
+            .is_none_or(|end| end > image_end)
+    {
+        bail!("TLS AddressOfIndex {index_addr:#x} lies outside image [{base:#x}, {image_end:#x})");
+    }
+    let index_at = index_addr as *mut u32;
+    // SAFETY: `index_at..index_at+4` lies within `[base, image_end)`.
+    let index = unsafe { index_at.read_unaligned() };
     if index == 0 {
         return Ok(0);
     }
-    let thunks = thunks(near(base, info.size_of_image as usize)?, index)?;
+    for section in info
+        .sections
+        .iter()
+        .filter(|s| s.characteristics & SCN_MEM_EXECUTE != 0)
+    {
+        let end = (section.rva as usize)
+            .checked_add(section.virtual_size as usize)
+            .ok_or_else(|| anyhow::anyhow!("executable section RVA overflows"))?;
+        if end > image_size {
+            bail!(
+                "executable section {:?} ({:#x}..{end:#x}) exceeds image size {image_size:#x}",
+                section.name,
+                section.rva
+            );
+        }
+    }
+    let thunks = thunks(near(base, image_size)?, index)?;
     let mut patched = 0;
     for section in info
         .sections
         .iter()
         .filter(|s| s.characteristics & SCN_MEM_EXECUTE != 0)
     {
-        let start = base + section.rva as usize;
         let len = section.virtual_size as usize;
+        if len == 0 {
+            continue;
+        }
+        let start = base + section.rva as usize;
         let mut old = 0;
-        // SAFETY: the section is part of the mapped image.
+        // SAFETY: `[start, start + len)` was verified inside `[base, image_end)` above.
         if unsafe { VirtualProtect(start as _, len, PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
             bail!(
                 "VirtualProtect(code) failed: {}",
@@ -60,23 +96,25 @@ pub(crate) unsafe fn redirect(base: usize, info: &ImageInfo) -> Result<usize> {
         }
         // SAFETY: writable now, and no title code runs yet.
         let code = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len) };
-        patched += patch(code, start, thunks);
+        let res = try_patch(code, start, thunks);
         // SAFETY: restoring the protection we changed; flushing our own code.
         unsafe {
             VirtualProtect(start as _, len, old, &mut old);
             FlushInstructionCache(GetCurrentProcess(), start as _, len);
         }
+        patched += res?;
     }
-    // SAFETY: see `index_at`; `.data` is writable.
-    unsafe { index_at.write(0) };
+    // SAFETY: `index_at` lies in writable mapped image data verified above.
+    unsafe { index_at.write_unaligned(0) };
     tracing::info!(index, patched, "static TLS redirected");
     Ok(patched)
 }
 
 /// Rewrites each `mov r64, gs:[0x58]` in `code` (at address `at`) as
-/// `call thunks[r]; nop4`. `thunks` must be within 2 GiB of `code`.
-fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
-    let mut count = 0;
+/// `call thunks[r]; nop4`, failing without modifying `code` if any target is
+/// outside signed 32-bit `rel32` reach.
+fn try_patch(code: &mut [u8], at: usize, thunks: usize) -> Result<usize> {
+    let mut sites = Vec::new();
     let mut i = 0;
     while i + LOAD_LEN <= code.len() {
         let c = &code[i..i + LOAD_LEN];
@@ -92,23 +130,46 @@ fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
             && c[4..] == [0x25, 0x58, 0, 0, 0]
             && reg != 4
         {
-            let rel = (thunks + reg * THUNK_SIZE) as i64 - (at + i + 5) as i64;
-            code[i] = 0xE8;
-            code[i + 1..i + 5].copy_from_slice(&(rel as i32).to_le_bytes());
-            code[i + 5..i + 9].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]);
-            count += 1;
+            let Some(target) = thunks.checked_add(reg * THUNK_SIZE) else {
+                bail!("TLS thunk target overflows address space");
+            };
+            let Some(next_ip) = at.checked_add(i).and_then(|p| p.checked_add(5)) else {
+                bail!("TLS load site overflows address space");
+            };
+            let Ok(rel) = i32::try_from(i128::from(target as u64) - i128::from(next_ip as u64))
+            else {
+                bail!("TLS thunk {target:#x} is out of rel32 reach from {next_ip:#x}");
+            };
+            sites.push((i, rel));
             i += LOAD_LEN;
         } else {
             i += 1;
         }
     }
-    count
+    let count = sites.len();
+    for (offset, rel) in sites {
+        code[offset] = 0xE8;
+        code[offset + 1..offset + 5].copy_from_slice(&rel.to_le_bytes());
+        code[offset + 5..offset + 9].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]);
+    }
+    Ok(count)
+}
+
+#[cfg(test)]
+fn patch(code: &mut [u8], at: usize, thunks: usize) -> usize {
+    try_patch(code, at, thunks).unwrap_or(0)
 }
 
 /// Fills `block` with one thunk per register: `mov r, gs:[0x58];
 /// lea r, [r + index * 8]; ret` (flags untouched, like the load it replaces).
 fn thunks(block: *mut u8, index: u32) -> Result<usize> {
-    let disp = (index * 8).to_le_bytes();
+    if block.is_null() {
+        bail!("null TLS thunk block");
+    }
+    let Ok(disp) = i32::try_from(u64::from(index) * 8) else {
+        bail!("TLS slot index {index:#x} exceeds signed 32-bit displacement");
+    };
+    let disp = disp.to_le_bytes();
     for reg in 0..16u8 {
         let (r, low) = (reg >> 3, reg & 7);
         let mut code = vec![0x65, 0x48 | r << 2, 0x8B, low << 3 | 4, 0x25, 0x58, 0, 0, 0];
@@ -135,6 +196,8 @@ fn thunks(block: *mut u8, index: u32) -> Result<usize> {
             std::io::Error::last_os_error()
         );
     }
+    // SAFETY: flushing our own thunk page.
+    unsafe { FlushInstructionCache(GetCurrentProcess(), block as _, 4096) };
     Ok(block as usize)
 }
 
@@ -146,11 +209,16 @@ fn near(base: usize, size: usize) -> Result<*mut u8> {
     if size >= 1 << 30 {
         bail!("image too large for TLS thunks within rel32 reach");
     }
-    let above = (base + size).next_multiple_of(GRANULE);
+    let Some(above) = base
+        .checked_add(size)
+        .and_then(|end| end.checked_next_multiple_of(GRANULE))
+    else {
+        bail!("image range overflows address space");
+    };
     for k in 0..(1usize << 14) {
         for hint in [
             base.checked_sub((k + 1) * GRANULE),
-            Some(above + k * GRANULE),
+            above.checked_add(k * GRANULE),
         ] {
             let Some(hint) = hint else { continue };
             // SAFETY: a fresh allocation at a free address, or null.
@@ -215,5 +283,158 @@ mod tests {
             // SAFETY: our page again.
             unsafe { VirtualProtect(page as _, 4096, PAGE_READWRITE, &mut old) };
         }
+    }
+
+    #[test]
+    fn redirect_and_thunks_validate_disp32_zero_sections_and_bounds() {
+        use leonida_pe::{SectionInfo, TlsInfo};
+        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
+
+        let block = near(tls_array as *const () as usize, 0).unwrap();
+        // `0x1000_0000 * 8 == 0x8000_0000`, which sign-extends negative in `lea r, [r + disp32]`.
+        assert!(thunks(block, 0x1000_0000).is_err());
+        assert!(thunks(block, 0x2000_0000).is_err());
+        assert!(thunks(std::ptr::null_mut(), 1).is_err());
+        // `0x0fff_ffff * 8 == 0x7fff_fff8 <= i32::MAX` is the largest valid slot.
+        assert!(thunks(block, 0x0fff_ffff).is_ok());
+
+        // `patch` must not truncate a >2 GiB displacement (`0x1_0000_0000` -> `0`) into `call $+5`.
+        let orig_load: [u8; 9] = [0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0];
+        let mut far_code = orig_load;
+        assert_eq!(patch(&mut far_code, 0x1_0000_0000, 0x2_0000_0005), 0);
+        assert_eq!(far_code, orig_load);
+
+        // Allocate 3 pages (12 KiB); expose only the first 2 pages (8 KiB) as `size_of_image`
+        // so out-of-image pointers land in our owned 3rd canary page without UB.
+        // SAFETY: fresh 3-page read-write allocation freed at the end of the test.
+        let alloc = unsafe {
+            VirtualAlloc(
+                std::ptr::null(),
+                3 * 4096,
+                MEM_COMMIT | MEM_RESERVE,
+                PAGE_READWRITE,
+            )
+        } as *mut u8;
+        assert!(!alloc.is_null());
+        let base = alloc as usize;
+
+        let make_info = |sections: Vec<SectionInfo>, directory_rva: u32| ImageInfo {
+            machine: 0x8664,
+            characteristics: 0x2002,
+            timestamp: 0,
+            subsystem: 3,
+            dll_characteristics: 0,
+            image_base: base as u64,
+            size_of_image: 8192,
+            entry_rva: 0,
+            stack_reserve: 0,
+            stack_commit: 0,
+            sections,
+            imports: Vec::new(),
+            delay_imports: Vec::new(),
+            exports: Vec::new(),
+            tls: Some(TlsInfo {
+                directory_rva,
+                callbacks_va: 0,
+                callback_rvas: Vec::new(),
+            }),
+            has_relocations: false,
+            has_exception_table: false,
+            has_load_config: false,
+            codeview: None,
+        };
+
+        // 1. Zero-length executable section (`virtual_size == 0`) alongside a real `.text`
+        // section must be skipped instead of failing `VirtualProtect(..., 0, ...)`.
+        // Page 0 (`0x0000..0x1000`): TLS directory at `+0x100`, `_tls_index` = 2 at `+0x200`.
+        // Page 1 (`0x1000..0x2000`): `.text` containing one `mov rax, gs:[0x58]; ret`.
+        // SAFETY: writing within our 3-page allocation.
+        unsafe {
+            let index_slot = alloc.add(0x200).cast::<u32>();
+            index_slot.write(2);
+            alloc
+                .add(0x100 + TLS64_ADDRESS_OF_INDEX)
+                .cast::<usize>()
+                .write(index_slot as usize);
+            let text_code: [u8; 10] = [0x65, 0x48, 0x8B, 0x04, 0x25, 0x58, 0, 0, 0, 0xC3];
+            std::ptr::copy_nonoverlapping(text_code.as_ptr(), alloc.add(0x1000), text_code.len());
+            let mut old = 0;
+            assert_ne!(
+                VirtualProtect(alloc.add(0x1000).cast(), 4096, PAGE_EXECUTE_READ, &mut old),
+                0
+            );
+        }
+
+        let valid_with_empty_exec = make_info(
+            vec![
+                SectionInfo {
+                    name: ".empty".into(),
+                    rva: 0x1000,
+                    virtual_size: 0,
+                    file_offset: 0,
+                    file_size: 0,
+                    characteristics: SCN_MEM_EXECUTE,
+                },
+                SectionInfo {
+                    name: ".text".into(),
+                    rva: 0x1000,
+                    virtual_size: 16,
+                    file_offset: 0,
+                    file_size: 16,
+                    characteristics: SCN_MEM_EXECUTE,
+                },
+            ],
+            0x100,
+        );
+        // SAFETY: `alloc` holds the synthetic mapped image described by `valid_with_empty_exec`.
+        assert_eq!(unsafe { redirect(base, &valid_with_empty_exec) }.unwrap(), 1);
+        // SAFETY: `_tls_index` was zeroed by `redirect`.
+        assert_eq!(unsafe { alloc.add(0x200).cast::<u32>().read() }, 0);
+
+        // 2. `AddressOfIndex` pointing past `size_of_image` (into canary page 2) is rejected
+        // without zeroing the canary word.
+        // SAFETY: canary page `+0x2000` is within our 3-page allocation.
+        unsafe {
+            let canary = alloc.add(0x2000).cast::<u32>();
+            canary.write(7);
+            alloc
+                .add(0x100 + TLS64_ADDRESS_OF_INDEX)
+                .cast::<usize>()
+                .write(canary as usize);
+        }
+        let oob_index = make_info(Vec::new(), 0x100);
+        // SAFETY: `oob_index` points into our owned allocation.
+        assert!(unsafe { redirect(base, &oob_index) }.is_err());
+        // SAFETY: canary must remain untouched.
+        assert_eq!(unsafe { alloc.add(0x2000).cast::<u32>().read() }, 7);
+
+        // 3. Executable section extending past `size_of_image` is rejected before patching.
+        // SAFETY: reset `_tls_index` inside image to 2.
+        unsafe {
+            let index_slot = alloc.add(0x200).cast::<u32>();
+            index_slot.write(2);
+            alloc
+                .add(0x100 + TLS64_ADDRESS_OF_INDEX)
+                .cast::<usize>()
+                .write(index_slot as usize);
+        }
+        let oob_section = make_info(
+            vec![SectionInfo {
+                name: ".oob".into(),
+                rva: 0x1000,
+                virtual_size: 0x1800,
+                file_offset: 0,
+                file_size: 0x1800,
+                characteristics: SCN_MEM_EXECUTE,
+            }],
+            0x100,
+        );
+        // SAFETY: `alloc` owns all 3 pages (`0..0x3000`).
+        assert!(unsafe { redirect(base, &oob_section) }.is_err());
+        // SAFETY: `_tls_index` must remain 2 when `redirect` fails.
+        assert_eq!(unsafe { alloc.add(0x200).cast::<u32>().read() }, 2);
+
+        // SAFETY: freeing our test allocation; no code in it is called again.
+        unsafe { VirtualFree(alloc.cast(), 0, MEM_RELEASE) };
     }
 }
