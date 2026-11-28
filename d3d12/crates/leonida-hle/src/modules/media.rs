@@ -53,21 +53,38 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         let b = s.as_bytes();
         b.len() >= 2 && b[..2].iter().all(|c| b"/\\".contains(c))
     };
-    let path = if let Some(rest) = text.strip_prefix(r"\\?\") {
-        if !drive(rest) {
-            return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
+    fn dos_prefix(s: &str) -> Option<&str> {
+        match s.as_bytes() {
+            [s1, s2, kind, s3, ..]
+                if b"/\\".contains(s1)
+                    && b"/\\".contains(s2)
+                    && (*kind == b'?' || *kind == b'.')
+                    && b"/\\".contains(s3) =>
+            {
+                Some(&s[4..])
+            }
+            [s1, b'?', b'?', s2, ..] if b"/\\".contains(s1) && b"/\\".contains(s2) => {
+                Some(&s[4..])
+            }
+            _ => None,
         }
-        text.clone()
-    } else if let Some(rest) = text.strip_prefix(r"\??\") {
-        // The same prefix as the object manager spells it; the host's file
-        // calls take it too.
+    }
+    let path = if let Some(rest) = dos_prefix(&text) {
         if !drive(rest) {
-            return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
+            let unc = match rest.as_bytes() {
+                [u, n, c, sep, ..]
+                    if u.eq_ignore_ascii_case(&b'u')
+                        && n.eq_ignore_ascii_case(&b'n')
+                        && c.eq_ignore_ascii_case(&b'c')
+                        && b"/\\".contains(sep) =>
+                {
+                    &rest[4..]
+                }
+                _ => rest,
+            };
+            return Err(("unc".into(), host_of(unc)));
         }
-        // On a virtual drive, its host folder, as for `\\?\` just above;
-        // on any other drive, the path as it is.
-        let verbatim: Vec<u16> = r"\\?\".encode_utf16().chain(url[4..].iter().copied()).collect();
-        return Ok(files::translate(&verbatim).unwrap_or_else(|| with_nul(url)));
+        return Ok(files::translate(url).unwrap_or_else(|| with_nul(url)));
     } else if share(&text) {
         return Err(("unc".into(), host_of(&text[2..])));
     } else if drive(&text) {
@@ -558,10 +575,13 @@ mod tests {
 
     /// Other spellings of `\\server\share\a.mp4`, as paths and as `file:`
     /// URLs without a host.
-    const SHARE_PATHS: [&str; 3] = [
+    const SHARE_PATHS: [&str; 6] = [
         r"/\server\share\a.mp4",
         r"\/server/share/a.mp4",
         r"\??\UNC\server\share\a.mp4",
+        r"\\?\UNC\server\share\a.mp4",
+        r"//?/unc/server/share/a.mp4",
+        r"\\.\UNC\server\share\a.mp4",
     ];
     const SHARE_URLS: [&str; 5] = [
         "file:////server/share/a.mp4",
@@ -649,6 +669,9 @@ mod tests {
             format!(r"\??\{letter}:\movies\logo.mp4"),
             format!(r"\??\{letter}:/movies/logo.mp4"),
             format!(r"\\?\{letter}:\movies\logo.mp4"),
+            format!(r"//?/{letter}:/movies/logo.mp4"),
+            format!(r"\\.\{letter}:\movies\..\movies\logo.mp4"),
+            format!(r"//./{letter}:/../../movies/logo.mp4"),
         ] {
             let host = text(&local(&wide(&url)).unwrap());
             assert_eq!(std::fs::read(&host).ok().as_deref(), Some(&b"3"[..]), "{url}: {host}");

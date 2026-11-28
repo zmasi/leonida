@@ -169,13 +169,34 @@ fn verbatim(root: &[u16], tail: &[u16]) -> Vec<u16> {
     out
 }
 
+/// Strips a Win32 extended/device/NT drive prefix (`\\?\`, `//?/`, `\\.\`,
+/// `//./`, `\??\`) so all spellings of a virtual drive rewrite and clamp `..`
+/// identically instead of reaching a hidden host drive.
+fn strip_drive_prefix(path: &[u16]) -> (bool, &[u16]) {
+    let q = u16::from(b'?');
+    let dot = u16::from(b'.');
+    match path {
+        [s1, s2, kind, s3, rest @ ..]
+            if SEPARATORS.contains(s1)
+                && SEPARATORS.contains(s2)
+                && (*kind == q || *kind == dot)
+                && SEPARATORS.contains(s3) =>
+        {
+            (true, rest)
+        }
+        [s1, q1, q2, s2, rest @ ..]
+            if SEPARATORS.contains(s1) && *q1 == q && *q2 == q && SEPARATORS.contains(s2) =>
+        {
+            (true, rest)
+        }
+        _ => (false, path),
+    }
+}
+
 /// The host path, NUL-terminated, for `path` (without its NUL) if it is on
 /// a virtual drive.
 pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
-    let (prefix, rest) = match path.strip_prefix(&VERBATIM[..]) {
-        Some(rest) => (&VERBATIM[..], rest),
-        None => (&[][..], path),
-    };
+    let (prefixed, rest) = strip_drive_prefix(path);
     let &[letter, colon, ..] = rest else {
         return None;
     };
@@ -187,7 +208,7 @@ pub(crate) fn translate(path: &[u16]) -> Option<Vec<u16>> {
     let drives = drives();
     let (_, root) = drives.iter().find(|(l, _)| *l == letter)?;
     let tail = &rest[2..];
-    if !prefix.is_empty() || root.starts_with(&VERBATIM) {
+    if prefixed || root.starts_with(&VERBATIM) {
         let mut out = verbatim(root, tail);
         out.push(0);
         return Some(out);
@@ -1156,18 +1177,58 @@ mod tests {
         );
         assert!(bps > 0);
 
-        // Letters 'A' and 'B' are outside `mount()`'s 'D'..='Z' pool.
+        // Letters 'A' and 'B' are outside `mount()`'s 'D'..='Z' pool; guard
+        // cleanup on unwind so a panic cannot pollute parallel tests.
+        struct UnmountOnDrop([u16; 2]);
+        impl Drop for UnmountOnDrop {
+            fn drop(&mut self) {
+                drives().retain(|(l, _)| !self.0.contains(l));
+            }
+        }
+        let _cleanup = UnmountOnDrop([b'A' as u16, b'B' as u16]);
+
         mount_at('A', Path::new(r"\\server\share\folder"));
-        assert_eq!(
-            tr(r"\\?\A:/x/../y/file.bin".into()),
-            Some(r"\\?\UNC\server\share\folder\y\file.bin".into())
-        );
+        for prefix in [r"\\?\", r"//?/", r"\\.\", r"//./", r"\??\"] {
+            assert_eq!(
+                tr(format!("{prefix}A:/x/../y/file.bin")),
+                Some(r"\\?\UNC\server\share\folder\y\file.bin".into()),
+                "{prefix}"
+            );
+        }
 
         mount_at('B', Path::new(r"C:\"));
         assert_eq!(tr("B:".into()), Some(r"C:\".into()));
         assert_eq!(tr("B:sub\\file.bin".into()), Some(r"C:\sub\file.bin".into()));
-        assert_eq!(tr(r"\\?\B:".into()), Some(r"\\?\C:\".into()));
-        assert_eq!(tr(r"\\?\B:\..".into()), Some(r"\\?\C:\".into()));
-        drives().retain(|(l, _)| *l != u16::from(b'A') && *l != u16::from(b'B'));
+        for prefix in [r"\\?\", r"//?/", r"\\.\", r"//./", r"\??\"] {
+            assert_eq!(tr(format!("{prefix}B:")), Some(r"\\?\C:\".into()), "{prefix}");
+            assert_eq!(
+                tr(format!(r"{prefix}B:\..")),
+                Some(r"\\?\C:\".into()),
+                "{prefix}"
+            );
+            assert_eq!(
+                tr(format!("{prefix}{letter}:/../../clamped.txt")),
+                Some(format!(r"\\?\{root}\clamped.txt")),
+                "{prefix}"
+            );
+        }
+
+        // Verify Win32 `CreateFileW` opens inside the mounted folder (and
+        // never escapes via `..`) across all four extended/device/NT prefixes.
+        for (i, prefix) in [r"\\?\", r"//?/", r"\\.\", r"\??\"].into_iter().enumerate() {
+            let name = format!("prefixed_{i}.bin");
+            let h = CreateFileW(
+                w(&format!(r"{prefix}{letter}:\sub\..\..\{name}")).as_ptr(),
+                GENERIC_WRITE,
+                0,
+                null,
+                CREATE_ALWAYS,
+                0,
+                null,
+            );
+            assert_ne!(h as isize, -1, "{prefix}");
+            close(h);
+            assert!(dir.path().join(&name).is_file(), "{prefix}");
+        }
     }
 }
