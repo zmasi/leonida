@@ -353,8 +353,17 @@ fn containers(root: &Path) -> Vec<(String, PathBuf)> {
 /// Moves a container of the old layout (blob files named by encoded name,
 /// a `.display` file) into a committed version, then removes it.
 fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
     let dir = container_dir(root, name);
-    let done = current_named(&dir, name).ok()?.is_some(); // a crash after the commit
+    let done = match current(&dir) {
+        Ok(Some(v)) if v.name == name => true, // a crash after the commit
+        Ok(Some(_)) => return None,            // another container hashes alike
+        Ok(None) => false,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => return None,
+    };
     if !done {
         let display = std::fs::read_to_string(old.join(".display")).unwrap_or_default();
         let mut blobs = Vec::new();
@@ -364,18 +373,21 @@ fn migrate(root: &Path, name: &str, old: &Path) -> Option<PathBuf> {
             let Some(blob) = decode(&file) else {
                 continue;
             };
-            if !entry.file_type().ok()?.is_file() {
+            if blob.is_empty() || !entry.file_type().ok()?.is_file() {
                 return None;
             }
-            blobs.push((blob, std::fs::read(entry.path()).ok()?));
+            let non_canonical = file != file_name(&blob);
+            blobs.push((blob, non_canonical, file, std::fs::read(entry.path()).ok()?));
         }
         blobs.sort();
+        blobs.dedup_by(|a, b| a.0 == b.0);
         let sources: Vec<_> = blobs
             .iter()
-            .map(|(n, d)| (n.as_str(), Source::Data(d)))
+            .map(|(n, _, _, d)| (n.as_str(), Source::Data(d)))
             .collect();
         commit(&dir, 1, name, &display, &sources).ok()?;
     }
+    current_named(&dir, name).ok()??;
     std::fs::remove_dir_all(old).ok()?;
     tracing::info!(container = name, "game save moved to the versioned layout");
     Some(dir)
@@ -456,10 +468,11 @@ fn remaining(root: &Path) -> u64 {
 }
 
 /// Why an update writing `written` bytes, `replaced` of them over blobs it
-/// replaces, does not fit: past the per-user quota (`used` bytes kept), or
-/// past the host disk's `free` bytes, which is not the user's quota (the
-/// new version is written before the old one goes, so nothing it replaces
-/// counts there).
+/// replaces, does not fit: past the per-user quota (`used` bytes kept; if
+/// `used` is already above `QUOTA`, only an update that shrinks total usage
+/// back within `QUOTA` fits), or past the host disk's `free` bytes, which is
+/// not the user's quota (the new version is written before the old one goes,
+/// so nothing it replaces counts there).
 fn no_room(written: u64, replaced: u64, used: u64, free: u64) -> Option<HRESULT> {
     if u128::from(used) + u128::from(written) > u128::from(QUOTA) + u128::from(replaced) {
         Some(QUOTA_EXCEEDED)
@@ -1808,5 +1821,63 @@ mod tests {
             Some(QUOTA_EXCEEDED)
         );
         assert_eq!(no_room(2 * mb, 8 * mb, QUOTA + 4 * mb, 100 * mb), None);
+    }
+
+    #[test]
+    fn legacy_duplicate_decoded_names_deduplicate_and_preserve_save() {
+        let saves = tempfile::tempdir().unwrap();
+        let root = saves
+            .path()
+            .join(format!("{:016X}", xuser::XUID))
+            .join("scid");
+        let old = root.join("Player");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join(".display"), b"Chapter 2").unwrap();
+        std::fs::write(old.join("Save Data"), b"raw").unwrap();
+        std::fs::write(old.join("Save%20Data"), b"canonical").unwrap();
+        std::fs::write(old.join("Slot%5F1"), b"percent").unwrap();
+        std::fs::write(old.join("Slot_1"), b"canonical_slot").unwrap();
+        std::fs::write(old.join("Header"), b"ok").unwrap();
+
+        let p = Provider::open(saves.path(), Some("scid")).unwrap();
+        assert!(!old.exists(), "migrated legacy folder should be removed");
+        let c = p.container("Player");
+        let blobs = read(&c, None).expect("migrated save must be readable");
+        assert_eq!(
+            blobs,
+            [
+                ("Header".into(), b"ok".to_vec()),
+                ("Save Data".into(), b"canonical".to_vec()),
+                ("Slot_1".into(), b"canonical_slot".to_vec()),
+            ]
+        );
+        let v = current_named(&c.dir, "Player").unwrap().unwrap();
+        assert_eq!(v.display, "Chapter 2");
+
+        // If the target versioned folder is already owned by a colliding
+        // container name at `v2`, `migrate` must not delete `old`.
+        let saves2 = tempfile::tempdir().unwrap();
+        let root2 = saves2
+            .path()
+            .join(format!("{:016X}", xuser::XUID))
+            .join("scid");
+        let target = container_dir(&root2, "Player");
+        commit(
+            &target,
+            2,
+            "Other",
+            "other display",
+            &[("x", Source::Data(b"other"))],
+        )
+        .unwrap();
+        let old2 = root2.join("Player");
+        std::fs::create_dir_all(&old2).unwrap();
+        std::fs::write(old2.join("Save%20Data"), b"precious").unwrap();
+
+        let _p2 = Provider::open(saves2.path(), Some("scid")).unwrap();
+        assert!(
+            old2.join("Save%20Data").is_file(),
+            "legacy save must not be deleted when current_named does not resolve to it"
+        );
     }
 }
