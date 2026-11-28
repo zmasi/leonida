@@ -2434,6 +2434,14 @@ if(TARGET Vulkan::Headers)
     add_test(NAME vk_host_region_import_validation COMMAND vk_host_region_import_test 185)
     set_tests_properties(vk_host_region_import_validation PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
                          ENVIRONMENT "LEONIDA_VK_VALIDATION=1;VK_VALIDATE_SYNC=1")
+    # For an adapter known to be capable: 1 MiB, and an answer that the host handle type is not importable (or a
+    # missing extension) fails instead of skipping. Off by default, as the other variants skip where import is
+    # legitimately unsupported.
+    option(LEONIDA_STRICT_HOST_IMPORT "Register vk_host_region_import_strict (fails, not skips, where host import is unsupported)" OFF)
+    if(LEONIDA_STRICT_HOST_IMPORT)
+      add_test(NAME vk_host_region_import_strict COMMAND vk_host_region_import_test 1 --strict)
+      set_tests_properties(vk_host_region_import_strict PROPERTIES TIMEOUT 120)
+    endif()
     # VulkanPresenter tracker lock / failed-submit rollback and capture-buffer WAW synchronization.
     add_executable(vk_presenter_sync_test test/vk_presenter_sync_test.cpp)
     target_link_libraries(vk_presenter_sync_test PRIVATE Vulkan::Headers user32 advapi32)

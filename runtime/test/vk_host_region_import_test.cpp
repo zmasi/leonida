@@ -2,6 +2,12 @@
 // Vulkan buffer with VK_EXT_external_memory_host. The optional argument is the region size in MiB (default 185).
 // A successful import is checked in both directions: GPU reads CPU writes, and GPU writes are visible to the CPU.
 //
+// --strict (for an adapter known to be capable): the stack must answer that the host handle type is importable for
+// this usage, and VK_EXT_external_memory_host and bufferDeviceAddress must be there, or the test fails (1) instead of
+// skipping (77). The query is answered before any buffer exists, so a failing strict run creates, imports and binds
+// nothing. Run it small: `vk_host_region_import_test 1 --strict`. A layer between the program and the driver that
+// rewrites the handle type (GE-Proton11-14's win32u, see docs/testing.md) fails it at the query.
+//
 // Exit codes: 0 when the region imported and both directions matched; 77 (the ctest SKIP_RETURN_CODE) when this
 // machine cannot import - the driver reports the usage or the handle type as not importable, refuses the host
 // pointer, has no memory left to commit it, or has no Vulkan device - and 1 when the probe contradicts itself
@@ -106,7 +112,7 @@ int result_outcome(std::uint64_t mib, const char* what, VkResult result, const c
     return kSkip;
 }
 
-int run(vktest::Device& vk, std::uint64_t mib) {
+int run(vktest::Device& vk, std::uint64_t mib, bool strict) {
     if (!mib || mib > (std::numeric_limits<std::size_t>::max)() / kMiB) return fail("invalid region size");
     const auto size = static_cast<VkDeviceSize>(mib * kMiB);
     const auto alignment = static_cast<std::size_t>(vk.host_pointer_alignment);
@@ -123,6 +129,13 @@ int run(vktest::Device& vk, std::uint64_t mib) {
     const VkExternalMemoryProperties& external = external_properties.externalMemoryProperties;
     if (!(external.compatibleHandleTypes & VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT) ||
         !(external.externalMemoryFeatures & VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT)) {
+        if (strict) {
+            std::fprintf(stderr,
+                         "host-region import: --strict: the stack does not answer that the host handle type is "
+                         "importable (handleTypes=0x%x features=0x%x); nothing was created or bound\n",
+                         external.compatibleHandleTypes, external.externalMemoryFeatures);
+            return 1;
+        }
         std::printf("SKIP vk_host_region_import: size=%llu MiB result=not-importable handleTypes=0x%x features=0x%x\n",
                     static_cast<unsigned long long>(mib), external.compatibleHandleTypes,
                     external.externalMemoryFeatures);
@@ -325,13 +338,14 @@ int main(int argc, char** argv) {
         return kSkip;
     }
     std::uint64_t mib = 185;
-    if (argc > 1) {
-        char* end = nullptr;
-        mib = std::strtoull(argv[1], &end, 10);
-        if (!end || *end) {
-            std::fprintf(stderr, "usage: vk_host_region_import_test [MiB]\n");
-            return 1;
-        }
+    int args = argc - 1;  // [MiB] [--strict]
+    const bool strict = args > 0 && std::strcmp(argv[args], "--strict") == 0;
+    if (strict) --args;
+    char* end = nullptr;
+    if (args == 1) mib = std::strtoull(argv[1], &end, 10);
+    if (args > 1 || (args == 1 && (!end || *end))) {
+        std::fprintf(stderr, "usage: vk_host_region_import_test [MiB] [--strict]\n");
+        return 1;
     }
     vktest::Device vk;
     vk.request_buffer_device_address = true;
@@ -342,11 +356,16 @@ int main(int argc, char** argv) {
     }
     if (status != vktest::DeviceStatus::ready) return 1;
     if (!vk.host_pointer_alignment || !vk.buffer_device_address) {
+        if (strict) {
+            std::fprintf(stderr, "host-region import: --strict: VK_EXT_external_memory_host or bufferDeviceAddress is "
+                                 "not available\n");
+            return 1;
+        }
         std::printf("SKIP vk_host_region_import: VK_EXT_external_memory_host or bufferDeviceAddress is not "
                     "available\n");
         return kSkip;
     }
-    const int result = run(vk, mib);
+    const int result = run(vk, mib, strict);
     if (vk.validation_errors()) {
         std::fprintf(stderr, "%u validation errors\n", vk.validation_errors());
         return 1;

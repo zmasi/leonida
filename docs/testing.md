@@ -334,6 +334,56 @@ against Microsoft's answers recorded in the test (`d3d12_subresource_copy` and `
 A few still compare with the host (`root_sig`, `device_proxy`, and some of `d3d12_vulkan_device`'s cases), so some
 of those fail for that reason.
 
+#### Host import under Proton-GE and the validation layer
+
+GE-Proton11-14 (wine-11.0 Staging) drops `VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT` from
+`VkExternalMemoryBufferCreateInfo::handleTypes` and from `vkGetPhysicalDeviceExternalBufferProperties` before they reach
+the driver, while `VkImportMemoryHostPointerInfoEXT` keeps it. Under `VK_LAYER_KHRONOS_validation` a buffer made for an
+import (`Resource::create_host_buffer`) is then bound to imported memory with `handleTypes` 0:
+`VUID-vkBindBufferMemory-memory-02985`, and the capability query itself draws
+`VUID-VkPhysicalDeviceExternalBufferInfo-handleType-parameter` and answers "not importable" (`features=0x0`; `0x4` where
+the type reaches the driver). The runtime's calls are correct; the import works. The cause is
+`map_external_memory_handle_types` in `dlls/win32u/vulkan.c`, added by GE's
+[wineland-child-rendering patch][ge-patch]; [Wine 11.0][wine-buffer] and Valve's wine at GE's base (`a47c73f52`) have no
+such function and leave a type they do not map as it is. No GE-Proton release with a change to this function was found on 2026-11-27 (GE-Proton11-14 is the newest tag).
+
+The correction is one change to that function's mask: keep the host-allocation bit next to the fd and dma-buf bits
+(`and 0x201` becomes `and 0x281`). Its source:
+
+```diff
++static const UINT EXTERNAL_MEMORY_HOST_BITS = VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+@@ static UINT map_external_memory_handle_types( UINT handle_types )
+-    UINT host_handle_types = handle_types & EXTERNAL_MEMORY_FD_BITS;
++    UINT host_handle_types = handle_types & (EXTERNAL_MEMORY_FD_BITS | EXTERNAL_MEMORY_HOST_BITS);
+-    if (handle_types & ~(EXTERNAL_MEMORY_WIN32_BITS | EXTERNAL_MEMORY_FD_BITS))
++    if (handle_types & ~(EXTERNAL_MEMORY_WIN32_BITS | EXTERNAL_MEMORY_FD_BITS | EXTERNAL_MEMORY_HOST_BITS))
+```
+
+(the last line only decides whether the `FIXME` prints). Built from the GE-Proton11-14 sources (Valve wine `a47c73f52`,
+wine-staging `6cc805ea`, GE's patches) and run on a Radeon Pro Vega II (RADV, Khronos validation 1.4.341), the shipped
+and the unchanged build give 6 validation errors, all 02985, at the 6 `create_host_buffer` binds of a synthetic probe
+built from 431ceba4f, and the corrected build 0, with the same imports and the same bytes. Only that call site was
+traced; the console-heap and scratch imports in `shims/d3d12_vulkan_device.cpp` build the same buffer info and fall under
+the same mask, untraced.
+
+`vk_host_region_import_test 1 --strict` is the repeatable check, and a different one from the bind above: it fails at
+the capability query, before any buffer is created, imported or bound (the default run skips there, as it must on a
+device that cannot import). Where the type reaches the driver it imports 1 MiB and compares the bytes the GPU reads of
+the CPU's writes and the CPU reads of the GPU's. Register it with `-DLEONIDA_STRICT_HOST_IMPORT=ON` (CTest name
+`vk_host_region_import_strict`), or run the executable under Wine with the layer in the loader's environment (Wine does
+not list layers to the program, so `LEONIDA_VK_VALIDATION=1` would skip) and count the layer's lines:
+
+```bash
+export VK_LAYER_PATH=/path/to/the/folder/holding/VkLayer_khronos_validation.json   # unless the layer is installed
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation wine runtime/build/vk_host_region_import_test.exe 1 --strict 2>&1 | tee run.log
+echo "exit ${PIPESTATUS[0]}"; grep -c '^Validation Error' run.log
+```
+
+GE-Proton11-14 as shipped: exit 1, 1 error (the query's). With the mask change: exit 0, `result=imported`, 0 errors.
+
+[ge-patch]: https://github.com/GloriousEggroll/proton-ge-custom/blob/GE-Proton11-14/patches/wine-hotfixes/wineland-child-rendering/0001-winewayland-win32u-Add-cross-process-dmabuf-composit.patch
+[wine-buffer]: https://gitlab.winehq.org/wine/wine/-/blob/wine-11.0/dlls/win32u/vulkan.c
+
 ### Run a Windows CI artifact under Wine
 
 The `Runtime` workflow uploads `runtime-windows` for seven days. It contains the Windows executables, DLLs,
