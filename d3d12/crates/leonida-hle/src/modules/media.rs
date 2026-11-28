@@ -64,7 +64,10 @@ fn local(url: &[u16]) -> Result<Vec<u16>, (String, String)> {
         if !drive(rest) {
             return Err(("unc".into(), host_of(rest.trim_start_matches("UNC\\"))));
         }
-        return Ok(with_nul(url));
+        // On a virtual drive, its host folder, as for `\\?\` just above;
+        // on any other drive, the path as it is.
+        let verbatim: Vec<u16> = r"\\?\".encode_utf16().chain(url[4..].iter().copied()).collect();
+        return Ok(files::translate(&verbatim).unwrap_or_else(|| with_nul(url)));
     } else if share(&text) {
         return Err(("unc".into(), host_of(&text[2..])));
     } else if drive(&text) {
@@ -631,6 +634,30 @@ mod tests {
         );
         assert_eq!(host_path("file:////C:/Windows/a.wav"), r"C:\Windows\a.wav");
         assert_eq!(host_path("file:///movies/a.mp4"), r"\movies\a.mp4");
+    }
+
+    /// The object manager's spelling of a path on a virtual drive goes to
+    /// the drive's host folder like the `\\?\` one: it used to reach the
+    /// host as it was, at whatever the host has at that letter.
+    #[test]
+    fn object_prefix_paths_on_a_virtual_drive_reach_its_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("movies")).unwrap();
+        std::fs::write(dir.path().join("movies").join("logo.mp4"), b"3").unwrap();
+        let letter = files::mount(dir.path()).expect("a free drive letter");
+        for url in [
+            format!(r"\??\{letter}:\movies\logo.mp4"),
+            format!(r"\??\{letter}:/movies/logo.mp4"),
+            format!(r"\\?\{letter}:\movies\logo.mp4"),
+        ] {
+            let host = text(&local(&wide(&url)).unwrap());
+            assert_eq!(std::fs::read(&host).ok().as_deref(), Some(&b"3"[..]), "{url}: {host}");
+        }
+        // A drive that is not virtual: as it is, the object prefix included.
+        assert_eq!(
+            text(&local(&wide(r"\??\C:\Windows\a.wav")).unwrap()),
+            r"\??\C:\Windows\a.wav"
+        );
     }
 
     #[test]
