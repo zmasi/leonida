@@ -540,3 +540,137 @@ fn the_regions_that_need_no_order_between_the_halves_are_told_from_those_that_do
     assert_eq!(exact_region(&p, &region, &single, true), Ok(()));
     assert_eq!(exact_region(&p, &region, &single, false), Err("an atomic that returns the old value"));
 }
+
+/// Builds a 128-thread (two console wave64) compute shader whose per-lane loop region reads LDS at
+/// offset 256 (`ds_read2st64_b32`, so `paired` declines), writes `s22` (read after the join, so
+/// `without_skips` declines), and runs two DS atomics (`op_a` with `val_a` in lanes `< 32` of each
+/// wave and `op_b` with `val_b` in lanes `>= 32`) on LDS dword 0 seeded to `seed`.
+fn wave_atomic_pair_program(
+    op_a: u32,
+    val_a: u32,
+    op_b: u32,
+    val_b: u32,
+    seed: u32,
+) -> NativeProgram {
+    const DS_READ2ST64_B32: u32 = 0x38;
+    let mut head = vec![
+        sop1(3, 22, k(0)), // s22 = 0 (modified inside region and read in tail -> without_skips declines)
+        vop1(1, 4, k(0)),  // v4 = 0 (LDS base address)
+        vop1(1, 5, 0xFF),
+        seed,
+        vop1(1, 6, 0xFF),
+        0xCAFE_BABD,
+    ];
+    head.extend(ds(DS_WRITE_B32, 0, 4, 5, 0, 0, 0));
+    head.extend(ds(DS_WRITE_B32, 0, 4, 6, 0, 256, 0));
+    head.extend([S_WAITCNT_LGKM0, S_BARRIER, vop2(0x1B, 5, k(1), 0)]); // v5 = v0 & 1
+    let cmp = vopc(0xC5, k(0), 5); // odd threads only -> lane-branch region
+
+    let mut region = vec![
+        sop1(3, 22, k(1)), // s22 = 1 inside the skipped region
+        sop1(4, 14, EXEC), // s[14:15] = loop mask
+        vop1(1, 20, k(0)), // v20 = 0
+        0xBF82_0001,       // s_branch past `top`
+        vop1(0, 0, 0),     // top: v_nop
+    ];
+    let top_at = 4usize;
+    region.extend(ds(DS_READ2ST64_B32, 8, 4, 0, 0, 1, 1)); // disjoint read at [256..259] -> v[8:9]
+    region.extend(mbcnt(false, 13, K_M1, k(0)));
+    region.extend(mbcnt(true, 10, K_M1, V + 13)); // v10 = console lane 0..63
+    // Lanes < 32 (host wave 0) run op_a(val_a); lanes >= 32 (host wave 1) run op_b(val_b).
+    region.extend([
+        sop1(4, 18, EXEC),
+        vopc(0xD4, k(32), 10), // v_cmpx_gt_u32 exec, 32, v10 (v10 < 32)
+        vop1(1, 11, 0xFF),
+        val_a,
+    ]);
+    region.extend(ds(op_a, 0, 4, 11, 0, 0, 0));
+    region.extend([
+        sop1(4, EXEC, 18),
+        vopc(0xD3, k(32), 10), // v_cmpx_le_u32 exec, 32, v10 (v10 >= 32)
+        vop1(1, 11, 0xFF),
+        val_b,
+    ]);
+    region.extend(ds(op_b, 0, 4, 11, 0, 0, 0));
+    region.extend([
+        sop1(4, EXEC, 18),
+        vop2(0x25, 20, k(1), 20), // v20 += 1
+        vopc(0xD4, k(1), 20),     // v_cmpx_gt_u32 exec, 1, v20 (v20 < 1)
+    ]);
+    let branch_at = region.len();
+    let offset = (top_at as i32 - (branch_at as i32 + 1)) as i16 as u16 as u32;
+    region.push(0xBF89_0000 | offset); // s_cbranch_execnz top
+
+    let mut tail = vec![S_WAITCNT_LGKM0, S_BARRIER, vop1(1, 4, k(0))];
+    tail.extend(ds(DS_READ_B32, 7, 4, 0, 0, 0, 0));
+    tail.extend([
+        S_WAITCNT_LGKM0,
+        vop2(0x25, 8, 22, 8),    // v8 += s22 (0xCAFE_BABD + 1 = 0xCAFE_BABE)
+        vop2(0x1A, 12, k(3), 0), // v12 = thread * 8
+    ]);
+    tail.extend(store(7, 12, 0));
+    tail.extend(store(8, 12, 4));
+    two_waves(&head, cmp, &region, &tail)
+}
+
+#[test]
+fn exact_region_refuses_noncommuting_minmax_and_executes_same_type_minmax_on_gpu() {
+    const DS_MIN_I32: u32 = 0x05;
+    const DS_MAX_I32: u32 = 0x06;
+    const DS_MIN_F32: u32 = 0x12;
+
+    // Non-commuting pairs across the two 32-lane host waves must be refused by `lds_exact`:
+    // 1. ds_min_i32(-1) vs ds_min_u32(2) on seed 1 (2 in wave0->wave1 order, 0xFFFF_FFFF in wave1->wave0).
+    let mixed_min = wave_atomic_pair_program(DS_MIN_I32, u32::MAX, DS_MIN_U32, 2, 1);
+    assert!(
+        translated_for_32(&mixed_min, Some(true)).is_err(),
+        "mixed signed/unsigned ds_min_i32 + ds_min_u32 must not elide cross-wave ordering"
+    );
+    // 2. ds_max_i32(-1) vs ds_max_u32(2) on seed 0.
+    let mixed_max = wave_atomic_pair_program(DS_MAX_I32, u32::MAX, DS_MAX_U32, 2, 0);
+    assert!(
+        translated_for_32(&mixed_max, Some(true)).is_err(),
+        "mixed signed/unsigned ds_max_i32 + ds_max_u32 must not elide cross-wave ordering"
+    );
+    // 3. ds_min_f32(qNaN_1) vs ds_min_f32(qNaN_2) on qNaN_0 (last writer wins in Lower::lds_float_pick).
+    let float_min = wave_atomic_pair_program(DS_MIN_F32, 0x7FC0_0001, DS_MIN_F32, 0x7FC0_0002, 0x7FC0_0000);
+    assert!(
+        translated_for_32(&float_min, Some(true)).is_err(),
+        "ds_min_f32 + ds_min_f32 must not elide cross-wave ordering due to NaN payload order"
+    );
+
+    // Same-type integer min/max commute across the two 32-lane host waves: refused with
+    // `lds_exact` off, translated and executed bit-exactly on the 32-lane hardware GPU with
+    // `lds_exact` on.
+    let same_u32 = wave_atomic_pair_program(DS_MIN_U32, 3, DS_MIN_U32, 7, 20);
+    assert!(
+        translated_for_32(&same_u32, Some(false)).is_err(),
+        "must require lds_exact to translate"
+    );
+    let shader_u32 = translated_for_32(&same_u32, Some(true))
+        .expect("same-type ds_min_u32 + ds_min_u32 translates via lds_exact");
+
+    let same_i32 = wave_atomic_pair_program(DS_MIN_I32, (-3i32) as u32, DS_MIN_I32, (-9i32) as u32, 5);
+    let shader_i32 = translated_for_32(&same_i32, Some(true))
+        .expect("same-type ds_min_i32 + ds_min_i32 translates via lds_exact");
+
+    let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    if Host::new(false).is_err() {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    }
+    for (shader, want_min, label) in [
+        (&shader_u32, 3u32, "ds_min_u32"),
+        (&shader_i32, (-9i32) as u32, "ds_min_i32"),
+    ] {
+        let Some(out) = whole_uav(shader, [0, 0], 256) else {
+            return;
+        };
+        for t in 0..128usize {
+            assert_eq!(out[2 * t], want_min, "{label} thread {t} min");
+            if t % 2 == 1 {
+                assert_eq!(out[2 * t + 1], 0xCAFE_BABE, "{label} thread {t} read");
+            }
+        }
+    }
+}

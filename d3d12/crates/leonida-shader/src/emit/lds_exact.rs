@@ -254,13 +254,67 @@ fn bounds(p: &Program, def: &HashMap<Value, (usize, usize)>, v: Value, depth: u3
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AtomicOp {
+    AddU32,
+    AddU64,
+    SubU32,
+    SubU64,
+    MinI32,
+    MinU32,
+    MinI64,
+    MinU64,
+    MinF32,
+    MaxI32,
+    MaxU32,
+    MaxI64,
+    MaxU64,
+    MaxF32,
+    AndB32,
+    AndB64,
+    OrB32,
+    OrB64,
+    XorB32,
+    XorB64,
+}
+
+impl AtomicOp {
+    fn size(self) -> u64 {
+        match self {
+            Self::AddU64
+            | Self::SubU64
+            | Self::MinI64
+            | Self::MinU64
+            | Self::MaxI64
+            | Self::MaxU64
+            | Self::AndB64
+            | Self::OrB64
+            | Self::XorB64 => 8,
+            _ => 4,
+        }
+    }
+
+    /// Integer atomics of the same operation and width commute on naturally
+    /// aligned elements; float `min`/`max` (`Lower::lds_float_pick`) choose the
+    /// later writer's payload when both operands are quiet or signalling NaNs.
+    fn commutes_with(self, other: Self, ra: &Range, rb: &Range) -> bool {
+        let mask = self.size() - 1;
+        self == other
+            && !matches!(self, Self::MinF32 | Self::MaxF32)
+            && ra.0 & mask == 0
+            && (ra.1 + 1) & mask == 0
+            && rb.0 & mask == 0
+            && (rb.1 + 1) & mask == 0
+    }
+}
+
 /// How an LDS access touches memory.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Read,
     Write,
     /// An atomic of this operation; whether it returns the old value.
-    Atomic(&'static str, bool),
+    Atomic(AtomicOp, bool),
 }
 
 /// The bytes an LDS instruction can touch, per dword access of it, and how: `None` for one this
@@ -279,13 +333,14 @@ fn accesses(p: &Program, def: &HashMap<Value, (usize, usize)>, inst: &Inst) -> O
         }
         _ => return None,
     };
-    let (op, size) = match name.rsplit_once('_') {
-        Some((op, "b32" | "u32" | "i32")) => (op, 4u64),
-        Some((op, "b64" | "u64" | "i64")) => (op, 8),
-        Some((op, "u8" | "i8" | "b8")) => (op, 1),
-        Some((op, "u16" | "i16" | "b16")) => (op, 2),
-        // (float atomics round: their order shows)
-        Some((op, "f32")) if !op.contains("_add") && !op.contains("_sub") => (op, 4),
+    let (op, ty, size) = match name.rsplit_once('_') {
+        Some((op, ty @ ("b32" | "u32" | "i32"))) => (op, ty, 4u64),
+        Some((op, ty @ ("b64" | "u64" | "i64"))) => (op, ty, 8),
+        Some((op, ty @ ("u8" | "i8" | "b8"))) => (op, ty, 1),
+        Some((op, ty @ ("u16" | "i16" | "b16"))) => (op, ty, 2),
+        // (float add/sub round: their order shows; float min/max reach is known,
+        // though two meeting float min/max do not commute on NaN payloads)
+        Some((op, ty @ "f32")) if !op.contains("_add") && !op.contains("_sub") => (op, ty, 4),
         _ => return None,
     };
     let (o0, o1) = (u64::from(*offset0), u64::from(*offset1));
@@ -304,14 +359,27 @@ fn accesses(p: &Program, def: &HashMap<Value, (usize, usize)>, inst: &Inst) -> O
         (vec![o0 | o1 << 8], Kind::Write)
     } else {
         let returns = op.contains("_rtn");
-        let atomic = match op.replace("_rtn", "").as_str() {
-            "ds_add" => "add",
-            "ds_sub" => "sub",
-            "ds_min" => "min",
-            "ds_max" => "max",
-            "ds_and" => "and",
-            "ds_or" => "or",
-            "ds_xor" => "xor",
+        let atomic = match (op.replace("_rtn", "").as_str(), ty) {
+            ("ds_add", "u32") => AtomicOp::AddU32,
+            ("ds_add", "u64") => AtomicOp::AddU64,
+            ("ds_sub", "u32") => AtomicOp::SubU32,
+            ("ds_sub", "u64") => AtomicOp::SubU64,
+            ("ds_min", "i32") => AtomicOp::MinI32,
+            ("ds_min", "u32") => AtomicOp::MinU32,
+            ("ds_min", "i64") => AtomicOp::MinI64,
+            ("ds_min", "u64") => AtomicOp::MinU64,
+            ("ds_min", "f32") => AtomicOp::MinF32,
+            ("ds_max", "i32") => AtomicOp::MaxI32,
+            ("ds_max", "u32") => AtomicOp::MaxU32,
+            ("ds_max", "i64") => AtomicOp::MaxI64,
+            ("ds_max", "u64") => AtomicOp::MaxU64,
+            ("ds_max", "f32") => AtomicOp::MaxF32,
+            ("ds_and", "b32") => AtomicOp::AndB32,
+            ("ds_and", "b64") => AtomicOp::AndB64,
+            ("ds_or", "b32") => AtomicOp::OrB32,
+            ("ds_or", "b64") => AtomicOp::OrB64,
+            ("ds_xor", "b32") => AtomicOp::XorB32,
+            ("ds_xor", "b64") => AtomicOp::XorB64,
             _ => return None,
         };
         (vec![o0 | o1 << 8], Kind::Atomic(atomic, returns))
@@ -368,10 +436,77 @@ pub(super) fn exact_region(
             }
             match (ka, kb) {
                 (Kind::Read, Kind::Read) | (Kind::Write, Kind::Write) => {}
-                (Kind::Atomic(x, _), Kind::Atomic(y, _)) if x == y => {}
+                (Kind::Atomic(x, _), Kind::Atomic(y, _)) if x.commutes_with(*y, ra, rb) => {}
                 _ => return Err("an LDS range read and written in one region"),
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{exact_region, with_exact};
+    use crate::ir;
+
+    const S_ENDPGM: u32 = 0xBF81_0000;
+    const DS_READ_B32: u32 = 0x36;
+
+    const fn vop1(op: u32, vdst: u32, src0: u32) -> u32 {
+        0x7E00_0000 | vdst << 17 | op << 9 | src0
+    }
+
+    const fn ds(op: u32, vdst: u32, addr: u32, data0: u32, offset0: u32) -> [u32; 2] {
+        [
+            0x36 << 26 | op << 18 | offset0,
+            vdst << 24 | data0 << 8 | addr,
+        ]
+    }
+
+    fn check_pair(op_a: u32, off_a: u32, op_b: u32, off_b: u32) -> Result<(), &'static str> {
+        let mut words = vec![vop1(1, 1, 128)]; // v_mov_b32 v1, 0
+        words.extend(ds(DS_READ_B32, 3, 1, 0, 64));
+        words.extend(ds(op_a, 0, 1, 2, off_a));
+        words.extend(ds(op_b, 0, 1, 2, off_b));
+        words.push(S_ENDPGM);
+        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+        let p = ir::build(&code, true, 8).expect("ir::build");
+        with_exact(|| exact_region(&p, &[0], &[false], true))
+    }
+
+    #[test]
+    fn exact_region_distinguishes_signedness_width_alignment_and_float_nan_order() {
+        const REJECTED: Result<(), &str> = Err("an LDS range read and written in one region");
+
+        // Signed vs unsigned min/max (32-bit and 64-bit) do not commute:
+        // e.g. smin(1, -1) = 0xFFFF_FFFF then umin(0xFFFF_FFFF, 2) = 2, vs 0xFFFF_FFFF.
+        assert_eq!(check_pair(0x05, 0, 0x07, 0), REJECTED, "ds_min_i32 + ds_min_u32");
+        assert_eq!(check_pair(0x06, 0, 0x08, 0), REJECTED, "ds_max_i32 + ds_max_u32");
+        assert_eq!(check_pair(0x45, 0, 0x47, 0), REJECTED, "ds_min_i64 + ds_min_u64");
+        assert_eq!(check_pair(0x46, 0, 0x48, 0), REJECTED, "ds_max_i64 + ds_max_u64");
+        assert_eq!(check_pair(0x25, 0, 0x27, 0), REJECTED, "ds_min_rtn_i32 + ds_min_rtn_u32");
+
+        // Mixed 32-bit vs 64-bit integer atomics do not commute (32-bit wraps without carry into [63:32]).
+        assert_eq!(check_pair(0x00, 0, 0x40, 0), REJECTED, "ds_add_u32 + ds_add_u64");
+        assert_eq!(check_pair(0x01, 0, 0x41, 0), REJECTED, "ds_sub_u32 + ds_sub_u64");
+        assert_eq!(check_pair(0x07, 0, 0x47, 0), REJECTED, "ds_min_u32 + ds_min_u64");
+        assert_eq!(check_pair(0x09, 0, 0x49, 0), REJECTED, "ds_and_b32 + ds_and_b64");
+
+        // Staggered 64-bit atomics overlapping on bytes [4..7] do not commute.
+        assert_eq!(check_pair(0x40, 0, 0x40, 4), REJECTED, "staggered ds_add_u64 at 0 and 4");
+
+        // Float min/max (`Lower::lds_float_pick`) pick the later writer's NaN payload when both are qNaN/sNaN.
+        assert_eq!(check_pair(0x12, 0, 0x12, 0), REJECTED, "ds_min_f32 + ds_min_f32");
+        assert_eq!(check_pair(0x13, 0, 0x13, 0), REJECTED, "ds_max_f32 + ds_max_f32");
+        assert_eq!(check_pair(0x12, 0, 0x05, 0), REJECTED, "ds_min_f32 + ds_min_i32");
+
+        // Same-type aligned integer atomics continue to commute, and a single ds_min_f32
+        // disjoint from a read is still accepted.
+        assert_eq!(check_pair(0x05, 0, 0x05, 0), Ok(()), "ds_min_i32 + ds_min_i32");
+        assert_eq!(check_pair(0x07, 0, 0x07, 0), Ok(()), "ds_min_u32 + ds_min_u32");
+        assert_eq!(check_pair(0x45, 0, 0x45, 0), Ok(()), "ds_min_i64 + ds_min_i64");
+        assert_eq!(check_pair(0x47, 0, 0x47, 0), Ok(()), "ds_min_u64 + ds_min_u64");
+        assert_eq!(check_pair(0x40, 0, 0x40, 0), Ok(()), "ds_add_u64 + ds_add_u64");
+        assert_eq!(check_pair(0x12, 0, 0x12, 8), Ok(()), "disjoint ds_min_f32 at 0 and 8");
+    }
 }
